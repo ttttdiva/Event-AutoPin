@@ -1,0 +1,27 @@
+{
+  "name": "eventtrail-studio-app",
+  "private": true,
+  "version": "0.1.8",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "npm run test:state",
+    "test:state": "tsc --target ES2020 --module CommonJS --moduleResolution Node --strict --skipLibCheck --outDir node_modules/.state-test src/state/operation-state.ts src/state/revisioned-save-queue.ts src/state/operation-state.test.ts src/state/revisioned-save-queue.test.ts src/state/event-document-ownership.test.ts && node node_modules/.state-test/operation-state.test.js && node node_modules/.state-test/revisioned-save-queue.test.js && node node_modules/.state-test/event-document-ownership.test.js",
+    "preview": "vite preview",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@tauri-apps/cli": "^1.6.0",
+    "@types/qrcode": "^1.5.6",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^1.6.0",
+    "qrcode": "^1.5.4"
+  }
+}

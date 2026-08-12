@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Map Cell Highlight Mock</title>
+  <style>
+    :root {
+      --ink: #073f3c;
+      --paper: #fffefb;
+      --guide: rgba(91, 206, 166, 0.13);
+      --guide-line: rgba(91, 206, 166, 0.2);
+      --p15: 198, 40, 40;
+      --p10: 245, 127, 23;
+      --p11: 46, 125, 50;
+      --p5: 2, 119, 189;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #202020;
+      color: #0f172a;
+      font-family: "Yu Gothic", "Meiryo", system-ui, sans-serif;
+      display: grid;
+      place-items: center;
+    }
+
+    .phone {
+      position: relative;
+      width: min(420px, 100vw);
+      height: min(920px, 100vh);
+      overflow: hidden;
+      background: var(--paper);
+    }
+
+    .status-bar {
+      height: 58px;
+      background: #242424;
+      color: white;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 36px;
+      font-size: 19px;
+      font-weight: 700;
+    }
+
+    .status-icons {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 17px;
+    }
+
+    .map-shell {
+      position: absolute;
+      inset: 58px 0 70px;
+      overflow: hidden;
+      background: var(--paper);
+    }
+
+    .side-band {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 102px;
+      background:
+        linear-gradient(150deg, transparent 38%, white 38% 45%, transparent 45%) 0 0 / 76px 46px,
+        linear-gradient(30deg, transparent 38%, white 38% 45%, transparent 45%) 0 0 / 76px 46px,
+        #cdeff4;
+      border-right: 3px solid var(--ink);
+    }
+
+    .map-page {
+      position: absolute;
+      left: 102px;
+      top: 0;
+      width: 560px;
+      min-height: 760px;
+      border-left: 3px solid var(--ink);
+      border-bottom: 3px solid var(--ink);
+      background: var(--paper);
+      transform: translateX(-42px);
+    }
+
+    .notice {
+      position: absolute;
+      left: -84px;
+      top: 16px;
+      width: 260px;
+      height: 38px;
+      border-radius: 20px;
+      background: rgba(0, 15, 26, 0.72);
+      color: rgba(255, 255, 255, 0.9);
+      display: flex;
+      align-items: center;
+      padding-left: 22px;
+      font-size: 15px;
+    }
+
+    .floor-tabs {
+      position: absolute;
+      left: 72px;
+      top: 10px;
+      width: 360px;
+      height: 74px;
+      display: flex;
+      gap: 8px;
+      padding: 10px;
+      border-radius: 0 0 24px 24px;
+      background: rgba(35, 35, 35, 0.78);
+      backdrop-filter: blur(9px);
+    }
+
+    .floor-tab {
+      flex: 1;
+      border: 0;
+      border-radius: 14px;
+      font-size: 22px;
+      font-weight: 800;
+      color: white;
+      background: rgba(255, 255, 255, 0.16);
+    }
+
+    .floor-tab.active {
+      color: #14202e;
+      background: white;
+    }
+
+    .blocks {
+      position: absolute;
+      left: 124px;
+      top: 138px;
+      display: grid;
+      grid-template-columns: repeat(3, 154px);
+      gap: 50px 56px;
+    }
+
+    .block-wrap {
+      width: 154px;
+      text-align: center;
+    }
+
+    .block {
+      position: relative;
+      width: 154px;
+      height: 190px;
+      color: var(--ink);
+    }
+
+    .cell {
+      position: absolute;
+      width: 77px;
+      height: 23.75px;
+      background: var(--guide);
+      border: 1px solid var(--guide-line);
+      cursor: pointer;
+    }
+
+    .cell.left {
+      left: 0;
+    }
+
+    .cell.right {
+      left: 77px;
+    }
+
+    .cell[data-row="0"] { top: 0; }
+    .cell[data-row="1"] { top: 23.75px; }
+    .cell[data-row="2"] { top: 47.5px; }
+    .cell[data-row="3"] { top: 71.25px; }
+    .cell[data-row="4"] { top: 95px; }
+    .cell[data-row="5"] { top: 118.75px; }
+    .cell[data-row="6"] { top: 142.5px; }
+    .cell[data-row="7"] { top: 166.25px; }
+
+    .cell.pin.p15 {
+      background: rgba(var(--p15), 0.28);
+      border-color: rgba(var(--p15), 0.72);
+    }
+
+    .cell.pin.p10 {
+      background: rgba(var(--p10), 0.3);
+      border-color: rgba(var(--p10), 0.72);
+    }
+
+    .cell.pin.p11 {
+      background: rgba(var(--p11), 0.26);
+      border-color: rgba(var(--p11), 0.7);
+    }
+
+    .cell.pin.p5 {
+      background: rgba(var(--p5), 0.3);
+      border-color: rgba(var(--p5), 0.72);
+    }
+
+    .cell.selected {
+      outline: 3px solid rgba(var(--p5), 0.9);
+      outline-offset: -3px;
+      z-index: 4;
+    }
+
+    .cell.span2 {
+      height: 47.5px;
+      z-index: 3;
+    }
+
+    .rails,
+    .numbers {
+      pointer-events: none;
+      position: absolute;
+      inset: 0;
+    }
+
+    .rail {
+      position: absolute;
+      top: 0;
+      width: 25px;
+      height: 190px;
+      border: 2px solid var(--ink);
+      background: rgba(255, 255, 255, 0.24);
+    }
+
+    .rail.left {
+      left: 27px;
+    }
+
+    .rail.right {
+      right: 27px;
+    }
+
+    .rail-line {
+      position: absolute;
+      left: -2px;
+      right: -2px;
+      height: 2px;
+      background: var(--ink);
+    }
+
+    .rail-line:nth-child(1) { top: 47.5px; }
+    .rail-line:nth-child(2) { top: 95px; }
+    .rail-line:nth-child(3) { top: 142.5px; }
+
+    .num {
+      position: absolute;
+      width: 44px;
+      height: 23.75px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      line-height: 1;
+      font-weight: 500;
+      color: var(--ink);
+      letter-spacing: 0;
+    }
+
+    .num.left {
+      left: 53px;
+    }
+
+    .num.right {
+      left: 94px;
+    }
+
+    .row-0 { top: 0; }
+    .row-1 { top: 23.75px; }
+    .row-2 { top: 47.5px; }
+    .row-3 { top: 71.25px; }
+    .row-4 { top: 95px; }
+    .row-5 { top: 118.75px; }
+    .row-6 { top: 142.5px; }
+    .row-7 { top: 166.25px; }
+
+    .block-label {
+      margin-top: 10px;
+      font-size: 28px;
+      line-height: 1;
+      font-weight: 700;
+      color: var(--ink);
+    }
+
+    .company {
+      position: absolute;
+      left: 190px;
+      top: 580px;
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      color: var(--ink);
+      font-size: 24px;
+      font-weight: 700;
+    }
+
+    .company-box {
+      min-width: 112px;
+      height: 58px;
+      display: grid;
+      place-items: center;
+      padding: 0 24px;
+      border: 2px solid var(--ink);
+      border-radius: 6px;
+      background: rgba(91, 206, 166, 0.1);
+      font-size: 25px;
+      letter-spacing: 1px;
+    }
+
+    .float-buttons {
+      position: absolute;
+      right: 22px;
+      bottom: 78px;
+      display: grid;
+      gap: 20px;
+    }
+
+    .float-btn {
+      width: 58px;
+      height: 58px;
+      border: 0;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 10px 22px rgba(0, 0, 0, 0.18);
+      font-size: 34px;
+      line-height: 1;
+      color: #111;
+    }
+
+    .float-btn.small {
+      font-size: 24px;
+    }
+
+    .bottom-bar {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 70px;
+      background: #242424;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .url-pill {
+      width: 82%;
+      height: 46px;
+      border-radius: 24px;
+      background: #3b3b3b;
+      color: white;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 20px;
+      font-size: 17px;
+    }
+
+    .url-pill span {
+      color: rgba(255, 255, 255, 0.84);
+      white-space: nowrap;
+    }
+
+    .active-badge {
+      position: absolute;
+      left: 40px;
+      bottom: 92px;
+      min-width: 140px;
+      height: 38px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 14px;
+      border-radius: 999px;
+      background: rgba(5, 16, 24, 0.72);
+      color: white;
+      font-size: 14px;
+      backdrop-filter: blur(8px);
+    }
+
+    .active-chip {
+      width: 18px;
+      height: 18px;
+      border-radius: 3px;
+      background: rgba(var(--p5), 0.45);
+      border: 2px solid rgba(var(--p5), 0.9);
+    }
+  </style>
+</head>
+<body>
+  <main class="phone">
+    <div class="status-bar">
+      <div>16:47</div>
+      <div class="status-icons"><span>⌁</span><span>⌘</span><span>▮▮▮</span><span>⌒</span><span>100</span></div>
+    </div>
+
+    <section class="map-shell">
+      <div class="side-band"></div>
+      <div class="map-page">
+        <div class="notice">制作者: あおもりりんご</div>
+        <div class="floor-tabs">
+          <button class="floor-tab active">1F</button>
+          <button class="floor-tab">2F</button>
+        </div>
+
+        <div class="blocks" id="blocks"></div>
+
+        <div class="company">
+          <span>企業</span>
+          <span class="company-box">1001</span>
+          <span class="company-box">1002</span>
+        </div>
+      </div>
+
+      <div class="float-buttons">
+        <button class="float-btn">＋</button>
+        <button class="float-btn">−</button>
+        <button class="float-btn small">⟳</button>
+        <button class="float-btn small">📤</button>
+      </div>
+
+      <div class="active-badge">
+        <span class="active-chip"></span>
+        <span id="activeLabel">A-32</span>
+      </div>
+    </section>
+
+    <div class="bottom-bar">
+      <div class="url-pill">
+        <strong>▰</strong>
+        <span>kowane6-map.pages.dev</span>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const rowsTop = [
+      ["16", "17"],
+      ["15", "18"],
+      ["14", "19"],
+      ["13", "20"],
+      ["12", "21"],
+      ["11", "22"],
+      ["10", "23"],
+      ["09", "24"],
+    ];
+    const rowsBottom = [
+      ["08", "25"],
+      ["07", "26"],
+      ["06", "27"],
+      ["05", "28"],
+      ["04", "29"],
+      ["03", "30"],
+      ["02", "31"],
+      ["01", "32"],
+    ];
+    const blocks = [
+      { label: "A", rows: rowsTop, pins: { "0-left": "p10", "2-right": "p11", "7-left": "p5" } },
+      { label: "B", rows: rowsTop, pins: { "1-left": "p15", "4-right": "p10", "6-left": "p11 span2" } },
+      { label: "C", rows: rowsTop, pins: { "3-left": "p11", "6-right": "p10" } },
+      { label: "A", rows: rowsBottom, pins: { "3-left": "p15", "4-left": "p5", "4-right": "p10", "7-right": "p5 selected" } },
+      { label: "B", rows: rowsBottom, pins: { "1-right": "p11", "6-left": "p10" } },
+      { label: "C", rows: rowsBottom, pins: { "0-left": "p5", "5-right": "p15" } },
+    ];
+
+    const blocksEl = document.getElementById("blocks");
+    const activeLabel = document.getElementById("activeLabel");
+
+    function blockHtml(block) {
+      const cells = [];
+      const nums = [];
+      for (let r = 0; r < 8; r += 1) {
+        for (const side of ["left", "right"]) {
+          const key = `${r}-${side}`;
+          const pinClass = block.pins[key] ? ` pin ${block.pins[key]}` : "";
+          const space = block.rows[r][side === "left" ? 0 : 1];
+          cells.push(`<button class="cell ${side}${pinClass}" data-row="${r}" data-space="${block.label}-${space}" aria-label="${block.label}-${space}"></button>`);
+        }
+        nums.push(`<span class="num left row-${r}">${block.rows[r][0]}</span>`);
+        nums.push(`<span class="num right row-${r}">${block.rows[r][1]}</span>`);
+      }
+      return `
+        <div class="block-wrap">
+          <div class="block">
+            ${cells.join("")}
+            <div class="rails">
+              <div class="rail left"><span class="rail-line"></span><span class="rail-line"></span><span class="rail-line"></span></div>
+              <div class="rail right"><span class="rail-line"></span><span class="rail-line"></span><span class="rail-line"></span></div>
+            </div>
+            <div class="numbers">${nums.join("")}</div>
+          </div>
+          <div class="block-label">${block.label}</div>
+        </div>
+      `;
+    }
+
+    blocksEl.innerHTML = blocks.map(blockHtml).join("");
+    blocksEl.addEventListener("click", (event) => {
+      const cell = event.target.closest(".cell");
+      if (!cell) return;
+      document.querySelectorAll(".cell.selected").forEach((el) => el.classList.remove("selected"));
+      cell.classList.add("selected");
+      activeLabel.textContent = cell.dataset.space;
+    });
+  </script>
+</body>
+</html>

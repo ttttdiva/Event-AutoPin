@@ -1,0 +1,2348 @@
+"""Desktop bridge entrypoint for Tauri <-> Python integration."""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _write_json_atomic(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _resolve_output_image_path(output_dir: str, image_ref: str) -> Optional[Path]:
+    image_ref = str(image_ref or "").strip()
+    if not image_ref:
+        return None
+    path = Path(image_ref)
+    if not path.is_absolute():
+        path = Path(output_dir) / image_ref
+    return path if path.exists() else None
+
+
+def _apply_missing_circle_cut_from_catalog(
+    project_root: Path,
+    output_dir: str,
+    latest_circle: Dict[str, Any],
+    circle_patch: Dict[str, Any],
+) -> None:
+    if latest_circle.get("circle_cut_filename") or circle_patch.get("circle_cut_filename"):
+        return
+
+    image_ref = ""
+    image_path: Optional[Path] = None
+    for image in circle_patch.get("item_images") or latest_circle.get("item_images") or []:
+        if isinstance(image, dict):
+            image_ref = str(image.get("path") or "").strip()
+        else:
+            image_ref = str(image or "").strip()
+        image_path = _resolve_output_image_path(output_dir, image_ref)
+        if image_path:
+            break
+
+    if not image_ref or not image_path:
+        return
+
+    circle_patch["circle_cut_filename"] = image_ref
+    try:
+        from ..utils.circle_master import CircleMasterManager
+
+        manager = CircleMasterManager(
+            config_path=str(project_root / "circle_master.json"),
+            cuts_dir=str(project_root / "default_cuts"),
+        )
+        manager.register_default_cut(
+            str(latest_circle.get("name") or ""),
+            str(latest_circle.get("penname") or ""),
+            image_path,
+        )
+    except Exception:
+        # event.jsonへのサークルカット反映は継続し、マスター登録失敗は再処理全体を落とさない。
+        pass
+
+
+def _default_mobile_full_sync_zip_path(project_root: Path) -> Path:
+    root_key = hashlib.sha1(str(project_root).encode("utf-8")).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / "eventtrail-studio" / root_key / "mobile_full_sync.zip"
+
+
+def _matches_circle_identity(candidate: Dict[str, Any], identity: Dict[str, Any]) -> bool:
+    checks = [
+        ("name", "name"),
+        ("penname", "penname"),
+        ("space", "space"),
+        ("hall", "hall"),
+    ]
+    matched_any = False
+    for identity_key, circle_key in checks:
+        expected = str(identity.get(identity_key) or "").strip()
+        if not expected:
+            continue
+        matched_any = True
+        actual = str(candidate.get(circle_key) or "").strip()
+        if actual != expected:
+            return False
+    return matched_any
+
+
+def _resolve_latest_circle_index(
+    latest_circles: List[Dict[str, Any]],
+    preferred_idx: int,
+    identity: Dict[str, Any],
+) -> int:
+    if 0 <= preferred_idx < len(latest_circles):
+        if not identity or _matches_circle_identity(latest_circles[preferred_idx], identity):
+            return preferred_idx
+    if identity:
+        matches = [
+            i
+            for i, candidate in enumerate(latest_circles)
+            if isinstance(candidate, dict) and _matches_circle_identity(candidate, identity)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(
+                "circle_identity matched multiple circles; cannot apply reprocess result safely"
+            )
+    raise ValueError(
+        f"target circle was changed or removed while reprocessing: index={preferred_idx}"
+    )
+
+
+def _normalized_item_key(item: Dict[str, Any]) -> tuple[str, str]:
+    name = str(item.get("name") or "").strip().lower()
+    item_type = str(item.get("type") or item.get("genre") or "").strip().lower()
+    return name, item_type
+
+
+def _merge_catalog_items(
+    existing_items: List[Any],
+    detected_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = [
+        dict(item) for item in existing_items if isinstance(item, dict)
+    ]
+    key_to_index = {
+        _normalized_item_key(item): index
+        for index, item in enumerate(merged)
+        if any(_normalized_item_key(item))
+    }
+
+    for detected in detected_items:
+        if not isinstance(detected, dict):
+            continue
+        item = dict(detected)
+        key = _normalized_item_key(item)
+        if any(key) and key in key_to_index:
+            current = merged[key_to_index[key]]
+            for field, value in item.items():
+                if value not in (None, ""):
+                    current[field] = value
+        else:
+            merged.append(item)
+            if any(key):
+                key_to_index[key] = len(merged) - 1
+    return merged
+
+
+def _load_payload(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.payload and args.payload_json:
+        raise ValueError("--payload and --payload-json cannot be used together")
+
+    if args.payload_json:
+        return json.loads(args.payload_json)
+
+    if args.payload:
+        payload_path = Path(args.payload)
+        if not payload_path.exists():
+            raise FileNotFoundError(f"Payload file not found: {payload_path}")
+        return json.loads(payload_path.read_text(encoding="utf-8"))
+
+    return {}
+
+
+def _payload_url_list(payload: Dict[str, Any]) -> List[str]:
+    raw_urls = payload.get("urls", payload.get("event_urls"))
+    urls = _value_url_list(raw_urls)
+
+    raw_url = payload.get("url")
+    if isinstance(raw_url, str):
+        for url in _value_url_list(raw_url):
+            if url not in urls:
+                urls.append(url)
+    return urls
+
+
+def _value_url_list(value: Any) -> List[str]:
+    candidates: List[str] = []
+
+    if isinstance(value, list):
+        candidates.extend(str(url).strip() for url in value)
+    elif isinstance(value, str):
+        candidates.extend(re.findall(r"https?://[^\s,]+", value))
+
+    urls: List[str] = []
+    seen: set[str] = set()
+    for url in candidates:
+        cleaned = url.strip().rstrip(",])};")
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        urls.append(cleaned)
+    return urls
+
+
+def _payload_event_source_settings(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    settings: Dict[str, Dict[str, Any]] = {}
+    raw_sources = payload.get("event_sources")
+    if not isinstance(raw_sources, list):
+        return settings
+
+    for raw_source in raw_sources:
+        if not isinstance(raw_source, dict):
+            continue
+        url = raw_source.get("url")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        source_url = url.strip()
+        source_settings: Dict[str, Any] = {}
+        map_urls = _value_url_list(raw_source.get("map_urls"))
+        for map_url in _value_url_list(raw_source.get("map_url")):
+            if map_url not in map_urls:
+                map_urls.append(map_url)
+        if map_urls:
+            source_settings["map_urls"] = map_urls
+
+        prompt = raw_source.get("catalog_additional_prompt")
+        if prompt is None:
+            prompt = raw_source.get("additional_prompt")
+        if isinstance(prompt, str):
+            source_settings["catalog_additional_prompt"] = prompt
+
+        if source_settings:
+            settings[source_url] = source_settings
+    return settings
+
+
+def _build_extract_command(payload: Dict[str, Any]) -> list[str]:
+    required = ["event_file", "event_date"]
+    for key in required:
+        if key not in payload or not payload[key]:
+            raise ValueError(f"Missing required payload field: {key}")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "src.commands.extract_twitter_catalogs",
+        str(payload["event_file"]),
+        "--event-date",
+        str(payload["event_date"]),
+    ]
+
+    if payload.get("output_dir"):
+        cmd += ["--output-dir", str(payload["output_dir"])]
+    if payload.get("days_before") is not None:
+        cmd += ["--days-before", str(payload["days_before"])]
+    if payload.get("days_after") is not None:
+        cmd += ["--days-after", str(payload["days_after"])]
+    if payload.get("backup"):
+        cmd.append("--backup")
+
+    return cmd
+
+
+def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    urls = _payload_url_list(payload)
+    if not urls and not payload.get("reprocess"):
+        raise ValueError("Missing required payload field: url")
+
+    # model欄はカンマ区切りの文字列 → modelsリストに変換
+    raw_model = payload.get("model", "gpt-5.6-sol")
+    models = (
+        [m.strip() for m in raw_model.split(",") if m.strip()]
+        if isinstance(raw_model, str)
+        else [raw_model]
+    )
+
+    # output_dirはtempディレクトリからの相対パスだと消えるため、project_rootからの絶対パスに変換
+    project_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+    output_dir = payload.get("output_dir")
+    if not output_dir:
+        raise ValueError("output_dir is required")
+    if not Path(output_dir).is_absolute():
+        output_dir = str(project_root / output_dir)
+
+    config: Dict[str, Any] = {
+        "url": urls[0] if urls else "",
+        "output_dir": output_dir,
+        "models": models,
+        "enable_twitter_catalog": payload.get("enable_twitter_catalog", True),
+    }
+    if len(urls) > 1 and not payload.get("reprocess"):
+        config["source_urls"] = urls
+
+    map_urls = _value_url_list(payload.get("map_urls"))
+    for map_url in _value_url_list(payload.get("map_url")):
+        if map_url not in map_urls:
+            map_urls.append(map_url)
+    if map_urls:
+        config["map_url"] = map_urls[0]
+        config["map_urls"] = map_urls
+
+    optional_keys = [
+        "event_date",
+        "event_name",
+        "catalog_additional_prompt",
+        "debug_limit",
+        "use_grok_search",
+        "text_llm_provider",
+        "text_llm_cli_models",
+        "text_llm_cli_efforts",
+        "text_llm_cli_timeout",
+        "api_reasoning_effort",
+        "api_reasoning_effort_map",
+        "text_fallback_llm_provider",
+        "text_fallback_llm_model",
+        "text_fallback_llm_effort",
+        "image_llm_provider",
+        "image_llm_model",
+        "image_llm_effort",
+        "image_fallback_llm_provider",
+        "image_fallback_llm_model",
+        "image_fallback_llm_effort",
+        "image_api_reasoning_effort_map",
+        "tweet_llm_cli_providers",
+        "tweet_llm_cli_models",
+        "tweet_llm_cli_efforts",
+        "tweet_llm_cli_timeout",
+        "skip_circle_images",
+        "force_relearn_pattern",
+        "site_parsing",
+        "cookie_file",
+        "pagination",
+        "days_before",
+        "days_after",
+    ]
+    for key in optional_keys:
+        if key in payload and payload[key] not in (None, ""):
+            config[key] = payload[key]
+
+    return config
+
+
+def _job_ping(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "job": "ping",
+        "timestamp": _utc_now_iso(),
+        "echo": payload,
+        "python": sys.executable,
+    }
+
+
+def _job_extract_twitter_catalogs(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cmd = _build_extract_command(payload)
+    run_cwd = payload.get("project_root")
+    sub_env = os.environ.copy()
+    sub_env["PYTHONIOENCODING"] = "utf-8"
+    completed = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=run_cwd,
+        env=sub_env,
+    )
+
+    return {
+        "status": "ok" if completed.returncode == 0 else "error",
+        "job": "extract_twitter_catalogs",
+        "timestamp": _utc_now_iso(),
+        "returncode": completed.returncode,
+        "command": cmd,
+        "cwd": run_cwd,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
+def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        proc.terminate()
+
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def _run_main_process(
+    project_root: Path,
+    main_py: Path,
+    config: Dict[str, Any],
+    payload: Dict[str, Any],
+    run_dir: Path,
+) -> Dict[str, Any]:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    config_path = run_dir / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(config, allow_unicode=True), encoding="utf-8"
+    )
+
+    cmd = [sys.executable, str(main_py)]
+    if payload.get("verbose"):
+        cmd.append("--verbose")
+    if payload.get("reprocess"):
+        cmd.append("--reprocess")
+    if payload.get("regenerate_coordinates"):
+        cmd.append("--regenerate-coordinates")
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        str(project_root)
+        if not existing_pythonpath
+        else f"{project_root}{os.pathsep}{existing_pythonpath}"
+    )
+
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(run_dir),
+        env=env,
+    )
+
+    stderr_lines: List[str] = []
+    stdout_output = ""
+    try:
+        if proc.stderr is not None:
+            for line in proc.stderr:
+                line_stripped = line.rstrip("\n").rstrip("\r")
+                stderr_lines.append(line_stripped)
+                sys.stderr.write(line_stripped + "\n")
+                sys.stderr.flush()
+
+        stdout_output = proc.stdout.read() if proc.stdout is not None else ""
+        proc.wait()
+    finally:
+        _terminate_process_tree(proc)
+
+    result = {
+        "status": "ok" if proc.returncode == 0 else "error",
+        "job": "run_main_pipeline",
+        "timestamp": _utc_now_iso(),
+        "returncode": proc.returncode,
+        "command": cmd,
+        "cwd": str(run_dir),
+        "project_root": str(project_root),
+        "config_used": config,
+        "stdout": stdout_output,
+        "stderr": "\n".join(stderr_lines),
+    }
+    twitter_processing = _extract_twitter_processing_result(stderr_lines)
+    if twitter_processing:
+        result["twitter_processing"] = twitter_processing
+    return result
+
+
+def _extract_twitter_processing_result(
+    stderr_lines: List[str],
+) -> Optional[Dict[str, Any]]:
+    marker = "TWITTER_PROCESSING_RESULT="
+    for line in reversed(stderr_lines):
+        marker_index = line.find(marker)
+        if marker_index < 0:
+            continue
+        try:
+            result = json.loads(line[marker_index + len(marker):])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return result if isinstance(result, dict) else None
+    return None
+
+
+def _aggregate_twitter_processing_results(
+    run_results: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    summaries = [
+        result.get("twitter_processing")
+        for result in run_results
+        if isinstance(result.get("twitter_processing"), dict)
+    ]
+    if not summaries:
+        return None
+    failed = [summary for summary in summaries if summary.get("status") == "failed"]
+    reasons = [str(summary.get("reason")) for summary in failed if summary.get("reason")]
+    return {
+        "status": "failed" if failed else "ok",
+        "target_count": sum(int(s.get("target_count") or 0) for s in summaries),
+        "processed_count": sum(int(s.get("processed_count") or 0) for s in summaries),
+        "failed_count": sum(int(s.get("failed_count") or 0) for s in summaries),
+        "invalid_url_count": sum(
+            int(s.get("invalid_url_count") or 0) for s in summaries
+        ),
+        "reason": "; ".join(dict.fromkeys(reasons)) or None,
+    }
+
+
+def _clear_output_dir(output_dir: Path) -> None:
+    from src.utils.output_cleanup import protected_output_entry_names
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    protected_names = protected_output_entry_names(output_dir)
+    for item in output_dir.iterdir():
+        if item.name in protected_names:
+            continue
+        if item.is_dir():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
+
+
+def _copy_referenced_output_file(
+    source_dir: Path, dest_dir: Path, value: Any, prefix: str
+) -> Any:
+    if not isinstance(value, str) or not value.strip():
+        return value
+    if re.match(r"^[a-z][a-z0-9+.-]*://", value, flags=re.IGNORECASE):
+        return value
+
+    raw_path = Path(value)
+    src_path = raw_path if raw_path.is_absolute() else source_dir / raw_path
+    if not src_path.exists() or not src_path.is_file():
+        return value
+
+    safe_name = f"{prefix}{src_path.name}"
+    dest_path = dest_dir / safe_name
+    counter = 1
+    while dest_path.exists():
+        safe_name = f"{prefix}{counter}_{src_path.name}"
+        dest_path = dest_dir / safe_name
+        counter += 1
+
+    shutil.copy2(src_path, dest_path)
+    return safe_name
+
+
+def _first_non_empty(values: List[Any]) -> Any:
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _same_or_first(values: List[Any]) -> Any:
+    filtered = [v for v in values if v not in (None, "")]
+    if not filtered:
+        return None
+    unique = []
+    for value in filtered:
+        if value not in unique:
+            unique.append(value)
+    return unique[0]
+
+
+def _merge_multi_event_outputs(
+    sources: List[Dict[str, Any]],
+    final_output_dir: Path,
+    final_event_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    _clear_output_dir(final_output_dir)
+
+    source_events: List[Dict[str, Any]] = []
+    source_urls: List[str] = []
+    event_dicts: List[Dict[str, Any]] = []
+    merged_maps: List[Dict[str, Any]] = []
+    merged_circles: List[Dict[str, Any]] = []
+
+    for source_index, source in enumerate(sources, start=1):
+        source_dir = Path(source["output_dir"])
+        event_json = source_dir / "event.json"
+        if not event_json.exists():
+            raise FileNotFoundError(f"event.json not found: {event_json}")
+        data = json.loads(event_json.read_text(encoding="utf-8"))
+        event = data.get("event") or {}
+        circles = data.get("circles") or []
+        source_url = str(source["url"])
+        source_name = (
+            str(event.get("name") or "").strip()
+            or str(source.get("name") or "").strip()
+            or source_url
+        )
+        prefix = f"ev{source_index:02d}_"
+
+        raw_source_urls = event.get("source_urls")
+        if isinstance(raw_source_urls, list) and raw_source_urls:
+            for raw_url in raw_source_urls:
+                if isinstance(raw_url, str) and raw_url and raw_url not in source_urls:
+                    source_urls.append(raw_url)
+        elif source_url not in source_urls:
+            source_urls.append(source_url)
+        event_dicts.append(event)
+        raw_source_events = event.get("source_events")
+        if isinstance(raw_source_events, list) and raw_source_events:
+            for raw_event in raw_source_events:
+                if not isinstance(raw_event, dict):
+                    continue
+                raw_event_url = str(raw_event.get("url") or "").strip()
+                if raw_event_url and any(e.get("url") == raw_event_url for e in source_events):
+                    continue
+                source_events.append(dict(raw_event))
+        else:
+            source_events.append(
+                {"name": source_name, "url": source_url, "circle_count": len(circles)}
+            )
+
+        map_number_map: Dict[int, int] = {}
+        for event_map in event.get("maps") or []:
+            if not isinstance(event_map, dict):
+                continue
+            original_map_number = int(event_map.get("map_number") or 1)
+            map_url = str(event_map.get("url") or "").strip()
+            existing_map_number = None
+            if map_url:
+                for merged_map in merged_maps:
+                    if str(merged_map.get("url") or "").strip() == map_url:
+                        existing_map_number = int(merged_map.get("map_number") or 1)
+                        break
+            if existing_map_number is not None:
+                map_number_map[original_map_number] = existing_map_number
+                continue
+
+            new_map = dict(event_map)
+            new_map_number = len(merged_maps) + 1
+            new_map["map_number"] = new_map_number
+            new_map["filename"] = _copy_referenced_output_file(
+                source_dir, final_output_dir, new_map.get("filename"), prefix
+            )
+            map_number_map[original_map_number] = new_map_number
+            merged_maps.append(new_map)
+
+        for circle in circles:
+            if not isinstance(circle, dict):
+                continue
+            merged_circle = dict(circle)
+            merged_circle["circle_cut_filename"] = _copy_referenced_output_file(
+                source_dir,
+                final_output_dir,
+                merged_circle.get("circle_cut_filename"),
+                prefix,
+            )
+            item_images = []
+            for image in merged_circle.get("item_images") or []:
+                if not isinstance(image, dict):
+                    continue
+                new_image = dict(image)
+                new_image["path"] = _copy_referenced_output_file(
+                    source_dir, final_output_dir, new_image.get("path"), prefix
+                )
+                item_images.append(new_image)
+            merged_circle["item_images"] = item_images
+
+            if map_number_map and merged_circle.get("map_number") is not None:
+                try:
+                    original = int(merged_circle["map_number"])
+                    merged_circle["map_number"] = map_number_map.get(original, original)
+                except (TypeError, ValueError):
+                    pass
+
+            circle_source_name = (
+                str(merged_circle.get("source_event_name") or "").strip()
+                or source_name
+            )
+            circle_source_url = (
+                str(merged_circle.get("source_event_url") or "").strip()
+                or source_url
+            )
+            source_tag = f"併催:{circle_source_name}"
+            tags = merged_circle.get("tags")
+            if not isinstance(tags, list):
+                tags = []
+            if source_tag not in tags:
+                tags = [*tags, source_tag]
+            merged_circle["tags"] = tags
+            merged_circle["source_event_name"] = circle_source_name
+            merged_circle["source_event_url"] = circle_source_url
+            merged_circles.append(merged_circle)
+
+    event_name = final_event_name or " / ".join(e["name"] for e in source_events)
+    merged_event = {
+        "name": event_name,
+        "url": source_urls[0] if source_urls else "",
+        "event_url": source_urls[0] if source_urls else "",
+        "source_urls": source_urls,
+        "source_events": source_events,
+        "date": _same_or_first([e.get("date") for e in event_dicts]),
+        "venue": _same_or_first([e.get("venue") for e in event_dicts]),
+        "organizer": _same_or_first([e.get("organizer") for e in event_dicts]),
+        "maps": merged_maps,
+        "memo": _first_non_empty([e.get("memo") for e in event_dicts])
+        or "併催イベント:\n"
+        + "\n".join(f"- {e['name']}: {e['url']}" for e in source_events),
+        "created_at": _utc_now_iso(),
+    }
+
+    merged_data = {
+        "event": merged_event,
+        "circles": merged_circles,
+        "metadata": {
+            "generated_at": _utc_now_iso(),
+            "format_version": "3.0",
+            "total_circles": len(merged_circles),
+            "source": "multi_event_pipeline",
+            "source_urls": source_urls,
+            "source_events": source_events,
+        },
+    }
+    output_path = final_output_dir / "event.json"
+    output_path.write_text(
+        json.dumps(merged_data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return merged_data
+
+
+def _job_run_multi_main_pipeline(
+    payload: Dict[str, Any], project_root: Path, main_py: Path, urls: List[str]
+) -> Dict[str, Any]:
+    base_config = _build_main_config(payload)
+    final_output_dir = Path(base_config["output_dir"])
+    run_results: List[Dict[str, Any]] = []
+    source_outputs: List[Dict[str, Any]] = []
+    source_settings = _payload_event_source_settings(payload)
+    has_event_sources = isinstance(payload.get("event_sources"), list)
+
+    with tempfile.TemporaryDirectory(prefix="eventtrail-studio-multi-") as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        urls_to_crawl = urls
+
+        if payload.get("reprocess") and (final_output_dir / "event.json").exists():
+            existing_url = urls[0]
+            try:
+                existing_data = json.loads(
+                    (final_output_dir / "event.json").read_text(encoding="utf-8")
+                )
+                existing_event = existing_data.get("event") or {}
+                existing_source_urls = existing_event.get("source_urls")
+                if isinstance(existing_source_urls, list) and existing_source_urls:
+                    existing_urls = [
+                        str(u).strip() for u in existing_source_urls if str(u).strip()
+                    ]
+                else:
+                    existing_urls = [
+                        str(existing_event.get("url") or existing_url).strip()
+                    ]
+                existing_url = existing_urls[0] if existing_urls else existing_url
+            except Exception:
+                existing_urls = [existing_url]
+
+            reprocess_payload = dict(payload)
+            reprocess_payload["url"] = existing_url
+            reprocess_payload.pop("urls", None)
+            reprocess_payload.pop("event_urls", None)
+            reprocess_payload.pop("event_sources", None)
+            reprocess_payload.pop("event_name", None)
+            reprocess_payload["output_dir"] = str(final_output_dir)
+            reprocess_config = _build_main_config(reprocess_payload)
+            reprocess_run_dir = temp_dir_path / "existing_reprocess" / "run"
+            reprocess_result = _run_main_process(
+                project_root,
+                main_py,
+                reprocess_config,
+                reprocess_payload,
+                reprocess_run_dir,
+            )
+            run_results.append(reprocess_result)
+            if reprocess_result["status"] != "ok":
+                return {
+                    "status": "error",
+                    "job": "run_main_pipeline",
+                    "timestamp": _utc_now_iso(),
+                    "mode": "multi_event",
+                    "returncode": reprocess_result["returncode"],
+                    "project_root": str(project_root),
+                    "config_used": base_config,
+                    "source_results": run_results,
+                    "stdout": str(reprocess_result.get("stdout", "")),
+                    "stderr": str(reprocess_result.get("stderr", "")),
+                }
+
+            existing_output = temp_dir_path / "existing_reprocessed" / "output"
+            shutil.copytree(final_output_dir, existing_output)
+            source_outputs.append({"url": existing_url, "output_dir": str(existing_output)})
+            urls_to_crawl = [url for url in urls if url not in existing_urls]
+
+        for index, url in enumerate(urls_to_crawl, start=1):
+            source_output = temp_dir_path / f"source_{index:02d}" / "output"
+            source_payload = dict(payload)
+            source_payload["url"] = url
+            source_payload.pop("urls", None)
+            source_payload.pop("event_urls", None)
+            source_payload.pop("event_sources", None)
+            source_payload.pop("event_name", None)
+            source_payload.pop("map_url", None)
+            source_payload.pop("map_urls", None)
+            if has_event_sources:
+                source_payload.pop("catalog_additional_prompt", None)
+            source_payload["reprocess"] = False
+            settings = source_settings.get(url)
+            if settings:
+                map_urls = settings.get("map_urls")
+                if isinstance(map_urls, list) and map_urls:
+                    source_payload["map_urls"] = map_urls
+                    source_payload["map_url"] = map_urls[0]
+                if "catalog_additional_prompt" in settings:
+                    source_payload["catalog_additional_prompt"] = settings[
+                        "catalog_additional_prompt"
+                    ]
+            source_payload["output_dir"] = str(source_output)
+            source_config = _build_main_config(source_payload)
+            run_dir = temp_dir_path / f"source_{index:02d}" / "run"
+            result = _run_main_process(
+                project_root, main_py, source_config, source_payload, run_dir
+            )
+            run_results.append(result)
+            source_outputs.append({"url": url, "output_dir": str(source_output)})
+            if result["status"] != "ok":
+                return {
+                    "status": "error",
+                    "job": "run_main_pipeline",
+                    "timestamp": _utc_now_iso(),
+                    "mode": "multi_event",
+                    "returncode": result["returncode"],
+                    "project_root": str(project_root),
+                    "config_used": base_config,
+                    "source_results": run_results,
+                    "stdout": "\n".join(str(r.get("stdout", "")) for r in run_results),
+                    "stderr": "\n".join(str(r.get("stderr", "")) for r in run_results),
+                }
+
+        merged = _merge_multi_event_outputs(
+            source_outputs,
+            final_output_dir,
+            final_event_name=str(payload.get("event_name") or "").strip() or None,
+        )
+
+        twitter_processing = _aggregate_twitter_processing_results(run_results)
+        if twitter_processing:
+            merged.setdefault("metadata", {})["twitter_processing"] = twitter_processing
+            (final_output_dir / "event.json").write_text(
+                json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+    result = {
+        "status": "ok",
+        "job": "run_main_pipeline",
+        "timestamp": _utc_now_iso(),
+        "mode": "multi_event",
+        "returncode": 0,
+        "project_root": str(project_root),
+        "config_used": base_config,
+        "source_results": run_results,
+        "merged_circle_count": len(merged.get("circles") or []),
+        "merged_source_count": len(merged.get("event", {}).get("source_events") or []),
+        "stdout": "\n".join(str(r.get("stdout", "")) for r in run_results),
+        "stderr": "\n".join(str(r.get("stderr", "")) for r in run_results),
+    }
+    if twitter_processing:
+        result["twitter_processing"] = twitter_processing
+    return result
+
+
+def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
+    project_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+    main_py = project_root / "main.py"
+    if not main_py.exists():
+        raise FileNotFoundError(f"main.py not found under project_root: {project_root}")
+
+    urls = _payload_url_list(payload)
+    if len(urls) > 1 and not payload.get("reprocess"):
+        return _job_run_multi_main_pipeline(payload, project_root, main_py, urls)
+
+    config = _build_main_config(payload)
+
+    with tempfile.TemporaryDirectory(prefix="eventtrail-studio-") as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        config_path = temp_dir_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(config, allow_unicode=True), encoding="utf-8"
+        )
+
+        cmd = [sys.executable, str(main_py)]
+        if payload.get("verbose"):
+            cmd.append("--verbose")
+        if payload.get("reprocess"):
+            cmd.append("--reprocess")
+        if payload.get("regenerate_coordinates"):
+            cmd.append("--regenerate-coordinates")
+
+        env = os.environ.copy()
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            str(project_root)
+            if not existing_pythonpath
+            else f"{project_root}{os.pathsep}{existing_pythonpath}"
+        )
+
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(temp_dir_path),
+            env=env,
+        )
+
+        # stderrを1行ずつ読んで自身のstderrにリアルタイム転送
+        stderr_lines: List[str] = []
+        stdout_output = ""
+        try:
+            for line in proc.stderr:
+                line_stripped = line.rstrip("\n").rstrip("\r")
+                stderr_lines.append(line_stripped)
+                sys.stderr.write(line_stripped + "\n")
+                sys.stderr.flush()
+
+            stdout_output = proc.stdout.read()
+            proc.wait()
+        finally:
+            _terminate_process_tree(proc)
+
+        result = {
+            "status": "ok" if proc.returncode == 0 else "error",
+            "job": "run_main_pipeline",
+            "timestamp": _utc_now_iso(),
+            "returncode": proc.returncode,
+            "command": cmd,
+            "cwd": str(temp_dir_path),
+            "project_root": str(project_root),
+            "config_used": config,
+            "stdout": stdout_output,
+            "stderr": "\n".join(stderr_lines),
+        }
+        twitter_processing = _extract_twitter_processing_result(stderr_lines)
+        if twitter_processing:
+            result["twitter_processing"] = twitter_processing
+        return result
+
+
+def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """特定サークルをXポストURLから再処理する。
+
+    Required payload:
+        event_json: event.jsonのパス
+        circle_index: 対象サークルのindex (circles配列内)
+        post_url: X/TwitterのポストURL (例: https://x.com/user/status/1234567890)
+        output_dir: 画像保存先ディレクトリ (通常はイベントディレクトリ)
+
+    Optional payload:
+        project_root, model, image_llm_provider,
+        catalog_additional_prompt, event_date
+    """
+    import re
+
+    event_json = payload.get("event_json")
+    circle_index = payload.get("circle_index")
+    post_url = payload.get("post_url")
+    output_dir = payload.get("output_dir")
+
+    for key, val in [
+        ("event_json", event_json),
+        ("post_url", post_url),
+        ("output_dir", output_dir),
+    ]:
+        if not val:
+            raise ValueError(f"Missing required payload field: {key}")
+    if circle_index is None:
+        raise ValueError("Missing required payload field: circle_index")
+
+    # ポストURLからtweet_idを抽出
+    match = re.search(r"(?:twitter\.com|x\.com)/[^/]+/status(?:es)?/(\d+)", str(post_url))
+    if not match:
+        raise ValueError(f"Invalid post URL (tweet_id not found): {post_url}")
+    tweet_id = match.group(1)
+
+    project_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+    proj_str = str(project_root)
+    if proj_str not in sys.path:
+        sys.path.insert(0, proj_str)
+
+    # .envをロード（APIキー用）
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(project_root / ".env")
+    except ImportError:
+        pass
+
+    json_path = Path(event_json)
+    if not json_path.exists():
+        raise FileNotFoundError(f"event.json not found: {json_path}")
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    circles = data.get("circles", [])
+    idx = int(circle_index)
+    if idx < 0 or idx >= len(circles):
+        raise ValueError(f"circle_index out of range: {idx} (circles={len(circles)})")
+
+    circle_identity = payload.get("circle_identity") or {}
+    if not any(
+        str(circle_identity.get(key) or "").strip()
+        for key in ("name", "penname", "space", "hall")
+    ):
+        circle_identity = {}
+    circle_dict = circles[idx]
+
+    def _matches_identity(candidate: Dict[str, Any], identity: Dict[str, Any]) -> bool:
+        checks = [
+            ("name", "name"),
+            ("penname", "penname"),
+            ("space", "space"),
+            ("hall", "hall"),
+        ]
+        matched_any = False
+        for identity_key, circle_key in checks:
+            expected = str(identity.get(identity_key) or "").strip()
+            if not expected:
+                continue
+            matched_any = True
+            actual = str(candidate.get(circle_key) or "").strip()
+            if actual != expected:
+                return False
+        return matched_any
+
+    def _resolve_latest_circle_index(
+        latest_circles: List[Dict[str, Any]],
+        preferred_idx: int,
+        identity: Dict[str, Any],
+    ) -> int:
+        if 0 <= preferred_idx < len(latest_circles):
+            if not identity or _matches_identity(latest_circles[preferred_idx], identity):
+                return preferred_idx
+        if identity:
+            matches = [
+                i
+                for i, candidate in enumerate(latest_circles)
+                if isinstance(candidate, dict) and _matches_identity(candidate, identity)
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise ValueError(
+                    "circle_identity matched multiple circles; cannot apply reprocess result safely"
+                )
+        raise ValueError(
+            f"target circle was changed or removed while reprocessing: index={preferred_idx}"
+        )
+
+    # Circleオブジェクト構築（更新対象フィールドのみ）
+    from src.models import Circle, ItemImage
+    from src.processors.twitter_post_processor import TwitterPostProcessor, TwitterConfig
+    import asyncio
+
+    circle_obj = Circle(
+        name=circle_dict.get("name", ""),
+        penname=circle_dict.get("penname"),
+        space=circle_dict.get("space"),
+        hall=circle_dict.get("hall"),
+        twitter_url=circle_dict.get("twitter_url"),
+        items=list(circle_dict.get("items", [])),
+        memo=circle_dict.get("memo", "") or "",
+        existing_only_status=circle_dict.get("existing_only_status"),
+        catalog_status=circle_dict.get("catalog_status"),
+    )
+    # item_imagesはdict→ItemImageに変換
+    for img_dict in circle_dict.get("item_images", []) or []:
+        if isinstance(img_dict, dict) and img_dict.get("path"):
+            circle_obj.item_images.append(
+                ItemImage(path=img_dict["path"], source=img_dict.get("source", "unknown"))
+            )
+
+    twitter_config = TwitterConfig({
+        "enabled": True,
+        "model": payload.get("model", "gemini-pro"),
+        "text_llm_provider": payload.get("text_llm_provider", "api"),
+        "text_llm_cli_models": payload.get("text_llm_cli_models", {}),
+        "text_llm_cli_efforts": payload.get("text_llm_cli_efforts", {}),
+        "text_fallback_llm_provider": payload.get("text_fallback_llm_provider"),
+        "text_fallback_llm_model": payload.get("text_fallback_llm_model"),
+        "text_fallback_llm_effort": payload.get("text_fallback_llm_effort"),
+        "output_dir": output_dir,
+        "image_llm_provider": payload.get("image_llm_provider"),
+        "image_llm_model": payload.get("image_llm_model"),
+        "image_llm_effort": payload.get(
+            "image_llm_effort",
+            payload.get("api_reasoning_effort", "medium"),
+        ),
+        "image_fallback_llm_provider": payload.get("image_fallback_llm_provider"),
+        "image_fallback_llm_model": payload.get("image_fallback_llm_model"),
+        "image_fallback_llm_effort": payload.get("image_fallback_llm_effort"),
+        "image_api_reasoning_effort_map": payload.get(
+            "image_api_reasoning_effort_map", {}
+        ),
+        "tweet_llm_cli_providers": payload.get("tweet_llm_cli_providers", []),
+        "tweet_llm_cli_models": payload.get(
+            "tweet_llm_cli_models",
+            {"codex": "gpt-5.3-codex"},
+        ),
+        "tweet_llm_cli_efforts": payload.get("tweet_llm_cli_efforts", {}),
+        "tweet_llm_cli_timeout": payload.get("tweet_llm_cli_timeout", 900),
+        "api_reasoning_effort": payload.get("api_reasoning_effort", "medium"),
+        "api_reasoning_effort_map": payload.get("api_reasoning_effort_map", {}),
+        "catalog_additional_prompt": payload.get("catalog_additional_prompt", ""),
+        "event_date": payload.get("event_date"),
+    })
+    processor = TwitterPostProcessor(twitter_config)
+
+    event_name = data.get("event", {}).get("name", "")
+
+    async def _run() -> Dict[str, bool]:
+        before_images = [
+            (img.path, img.source)
+            for img in circle_obj.item_images
+        ]
+        updated = await processor.process_circle_from_post_url(
+            circle_obj,
+            post_url,
+            event_name,
+            use_text_detail=True,
+        )
+        after_images = [
+            (img.path, img.source)
+            for img in circle_obj.item_images
+        ]
+        return {
+            "updated": bool(updated),
+            "image_updated": before_images != after_images,
+        }
+
+    run_result = asyncio.run(_run())
+    success = bool(run_result.get("updated"))
+
+    # 更新結果をパッチ化する。完了時に最新event.jsonへ差し込み、並行編集を巻き戻さない。
+    circle_patch: Dict[str, Any] = {}
+    if success or circle_obj.items or circle_obj.catalog_status or circle_obj.existing_only_status:
+        circle_patch["items"] = list(circle_obj.items)
+        if circle_obj.catalog_status:
+            circle_patch["catalog_status"] = circle_obj.catalog_status
+        if circle_obj.existing_only_status:
+            circle_patch["existing_only_status"] = circle_obj.existing_only_status
+        # item_imagesはdictに直す（新規追加分のみ置換ではなく、既存と合体しても良いが
+        # 「そのポストで差し替え」の意図を踏まえ item_imagesは新規結果で置換）
+        if circle_obj.item_images:
+            circle_patch["item_images"] = [
+                {"path": img.path, "source": img.source} for img in circle_obj.item_images
+            ]
+
+    # memoにポストURLを追記（成功/失敗に関わらず記録）
+    existing_memo = circle_dict.get("memo", "") or ""
+    if post_url not in existing_memo:
+        circle_patch["memo"] = (existing_memo + "\n" + post_url) if existing_memo else post_url
+
+    # 保存直前に最新のevent.jsonを読み直し、対象サークルだけへ反映する。
+    latest_data = json.loads(json_path.read_text(encoding="utf-8"))
+    latest_circles = latest_data.get("circles", [])
+    if not isinstance(latest_circles, list):
+        raise ValueError("event.json circles must be a list")
+    resolved_idx = _resolve_latest_circle_index(latest_circles, idx, circle_identity)
+    latest_circle = latest_circles[resolved_idx]
+    if not isinstance(latest_circle, dict):
+        raise ValueError(f"target circle is not an object: index={resolved_idx}")
+    _apply_missing_circle_cut_from_catalog(
+        project_root,
+        output_dir,
+        latest_circle,
+        circle_patch,
+    )
+    latest_circle.update(circle_patch)
+    _write_json_atomic(json_path, latest_data)
+
+    return {
+        "status": "ok",
+        "job": "reprocess_circle_from_post",
+        "timestamp": _utc_now_iso(),
+        "event_json": str(json_path),
+        "circle_index": resolved_idx,
+        "requested_circle_index": idx,
+        "circle_name": latest_circle.get("name", ""),
+        "tweet_id": tweet_id,
+        "post_url": post_url,
+        "image_updated": bool(run_result.get("image_updated")),
+        "items_count": len(latest_circle.get("items", [])),
+        "updated_circle": latest_circle,
+    }
+
+
+def _job_reprocess_circle_from_image(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """特定サークルをローカルおしながき画像から再処理する。"""
+
+    event_json = payload.get("event_json")
+    circle_index = payload.get("circle_index")
+    image_path = payload.get("image_path")
+    image_filename = payload.get("image_filename")
+
+    for key, val in [
+        ("event_json", event_json),
+        ("image_path", image_path),
+    ]:
+        if not val:
+            raise ValueError(f"Missing required payload field: {key}")
+    if circle_index is None:
+        raise ValueError("Missing required payload field: circle_index")
+
+    project_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+    proj_str = str(project_root)
+    if proj_str not in sys.path:
+        sys.path.insert(0, proj_str)
+
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(project_root / ".env")
+    except ImportError:
+        pass
+
+    json_path = Path(event_json)
+    if not json_path.exists():
+        raise FileNotFoundError(f"event.json not found: {json_path}")
+
+    local_image_path = Path(str(image_path))
+    if not local_image_path.exists():
+        raise FileNotFoundError(f"image file not found: {local_image_path}")
+    if not image_filename:
+        image_filename = local_image_path.name
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    circles = data.get("circles", [])
+    idx = int(circle_index)
+    if idx < 0 or idx >= len(circles):
+        raise ValueError(f"circle_index out of range: {idx} (circles={len(circles)})")
+
+    circle_identity = payload.get("circle_identity") or {}
+    if not any(
+        str(circle_identity.get(key) or "").strip()
+        for key in ("name", "penname", "space", "hall")
+    ):
+        circle_identity = {}
+    circle_dict = circles[idx]
+    existing_items = list(circle_dict.get("items", []) or [])
+    previous_images = list(circle_dict.get("item_images", []) or [])
+
+    from src.utils.catalog_image_analyzer import CatalogImageAnalyzer
+    from src.utils.llm_attempts import api_models_from_attempts, build_image_llm_attempts
+
+    raw_model = payload.get("model", "gemini-pro")
+    primary_model = (
+        [m.strip() for m in raw_model.split(",") if m.strip()][0]
+        if isinstance(raw_model, str) and "," in raw_model
+        else raw_model
+    )
+    image_attempts = build_image_llm_attempts(
+        payload.get("image_llm_provider"),
+        payload.get("image_llm_model") or primary_model,
+        payload.get("image_llm_effort", payload.get("api_reasoning_effort", "medium")),
+        payload.get("image_fallback_llm_provider"),
+        payload.get("image_fallback_llm_model"),
+        payload.get("image_fallback_llm_effort"),
+    )
+    has_image_cli = any(attempt.get("kind") == "cli" for attempt in image_attempts)
+    analyzer = CatalogImageAnalyzer(
+        model=api_models_from_attempts(image_attempts),
+        use_cli=has_image_cli,
+        api_reasoning_effort=payload.get(
+            "image_llm_effort",
+            payload.get("api_reasoning_effort", "medium"),
+        ),
+        api_reasoning_effort_map=payload.get("image_api_reasoning_effort_map", {}),
+        attempts=image_attempts,
+    )
+
+    detected_items = analyzer.analyze_catalog_items(local_image_path) or []
+    for item in detected_items:
+        if isinstance(item, dict) and not item.get("image"):
+            item["image"] = image_filename
+
+    merged_items = _merge_catalog_items(existing_items, detected_items)
+    circle_patch: Dict[str, Any] = {
+        "items": merged_items,
+        "item_images": [{"path": image_filename, "source": "local"}],
+        "catalog_status": "confirmed" if detected_items else "no_extractable_items",
+    }
+
+    latest_data = json.loads(json_path.read_text(encoding="utf-8"))
+    latest_circles = latest_data.get("circles", [])
+    if not isinstance(latest_circles, list):
+        raise ValueError("event.json circles must be a list")
+    resolved_idx = _resolve_latest_circle_index(latest_circles, idx, circle_identity)
+    latest_circle = latest_circles[resolved_idx]
+    if not isinstance(latest_circle, dict):
+        raise ValueError(f"target circle is not an object: index={resolved_idx}")
+    _apply_missing_circle_cut_from_catalog(
+        project_root,
+        str(local_image_path.parent),
+        latest_circle,
+        circle_patch,
+    )
+    latest_circle.update(circle_patch)
+    _write_json_atomic(json_path, latest_data)
+
+    image_updated = previous_images != circle_patch["item_images"]
+    return {
+        "status": "ok",
+        "job": "reprocess_circle_from_image",
+        "timestamp": _utc_now_iso(),
+        "event_json": str(json_path),
+        "circle_index": resolved_idx,
+        "requested_circle_index": idx,
+        "circle_name": latest_circle.get("name", ""),
+        "image_filename": image_filename,
+        "image_path": str(local_image_path),
+        "image_updated": image_updated,
+        "detected_items_count": len(detected_items),
+        "items_count": len(latest_circle.get("items", [])),
+        "updated_circle": latest_circle,
+    }
+
+
+def _job_load_event_json(payload: Dict[str, Any]) -> Dict[str, Any]:
+    event_json = payload.get("event_json")
+    if not event_json:
+        raise ValueError("Missing required payload field: event_json")
+
+    path = Path(event_json)
+    if not path.exists():
+        raise FileNotFoundError(f"event.json not found: {path}")
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    return {
+        "status": "ok",
+        "job": "load_event_json",
+        "timestamp": _utc_now_iso(),
+        "event_json": str(path),
+        "data": data,
+    }
+
+
+def _job_save_event_json(payload: Dict[str, Any]) -> Dict[str, Any]:
+    event_json = payload.get("event_json")
+    data = payload.get("data")
+    if not event_json:
+        raise ValueError("Missing required payload field: event_json")
+    if data is None:
+        raise ValueError("Missing required payload field: data")
+
+    path = Path(event_json)
+    _write_json_atomic(path, data)
+
+    circle_count = len(data.get("circles", []))
+    return {
+        "status": "ok",
+        "job": "save_event_json",
+        "timestamp": _utc_now_iso(),
+        "event_json": str(path),
+        "saved_circles": circle_count,
+    }
+
+
+def _job_validate_mobile_json(payload: Dict[str, Any]) -> Dict[str, Any]:
+    json_file = payload.get("json_file")
+    if not json_file:
+        raise ValueError("Missing required payload field: json_file")
+
+    path = Path(json_file)
+    if not path.exists():
+        raise FileNotFoundError(f"JSON file not found: {path}")
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    errors = []
+    warnings = []
+    image_counts = {
+        "map_image_data": 0,
+        "circle_cut_data": 0,
+        "item_image_data": 0,
+    }
+
+    if not isinstance(data, dict):
+        errors.append("ルートがオブジェクトではありません")
+    else:
+        for k in ["event", "circles", "metadata"]:
+            if k not in data:
+                errors.append(f"必須キー不足: {k}")
+
+        event_maps = (
+            data.get("event", {}).get("maps", [])
+            if isinstance(data.get("event"), dict)
+            else []
+        )
+        if isinstance(event_maps, list):
+            for m in event_maps:
+                if isinstance(m, dict) and m.get("image_data"):
+                    image_counts["map_image_data"] += 1
+
+        circles = data.get("circles", [])
+        if not isinstance(circles, list):
+            errors.append("circles が配列ではありません")
+        else:
+            for i, c in enumerate(circles):
+                if not isinstance(c, dict):
+                    errors.append(f"circles[{i}] がオブジェクトではありません")
+                    continue
+                if "name" not in c:
+                    errors.append(f"circles[{i}] name が不足")
+                for compat_key in [
+                    "pin_x",
+                    "pin_y",
+                    "map_number",
+                    "absence_status",
+                    "existing_only_status",
+                ]:
+                    if compat_key not in c:
+                        warnings.append(f"circles[{i}] {compat_key} が不足")
+
+                if c.get("circle_cut_data"):
+                    image_counts["circle_cut_data"] += 1
+                for img in (
+                    c.get("item_images", [])
+                    if isinstance(c.get("item_images"), list)
+                    else []
+                ):
+                    if isinstance(img, dict) and img.get("image_data"):
+                        image_counts["item_image_data"] += 1
+
+    total_embedded = sum(image_counts.values())
+    if total_embedded == 0:
+        warnings.append(
+            "画像埋め込み（image_data）が検出されませんでした。モバイル連携で画像が欠ける可能性があります"
+        )
+
+    return {
+        "status": "ok" if not errors else "error",
+        "job": "validate_mobile_json",
+        "timestamp": _utc_now_iso(),
+        "json_file": str(path),
+        "errors": errors,
+        "warnings": warnings,
+        "image_counts": image_counts,
+    }
+
+
+def _find_event_map_image(
+    event_dir: Path,
+    event_data: Dict[str, Any],
+    map_number: int,
+) -> Optional[Path]:
+    event = event_data.get("event", {})
+    if isinstance(event, dict):
+        for event_map in event.get("maps", []) or []:
+            if not isinstance(event_map, dict):
+                continue
+            try:
+                entry_map_number = int(event_map.get("map_number") or 1)
+            except (TypeError, ValueError):
+                entry_map_number = 1
+            if entry_map_number != map_number:
+                continue
+            filename = str(event_map.get("filename") or "").strip()
+            if not filename:
+                continue
+            candidate = Path(filename)
+            if not candidate.is_absolute():
+                candidate = event_dir / filename
+            if candidate.exists():
+                return candidate
+
+    for folder in [event_dir / "maps", event_dir]:
+        for suffix in ["jpg", "jpeg", "png", "webp"]:
+            candidate = folder / f"map_{map_number:02d}.{suffix}"
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
+    event_json_value = payload.get("event_json")
+    event_dir_value = payload.get("event_dir")
+    map_number = int(payload.get("map_number") or 1)
+
+    if event_json_value:
+        event_json_path = Path(str(event_json_value))
+        event_dir = event_json_path.parent
+    elif event_dir_value:
+        event_dir = Path(str(event_dir_value))
+        event_json_path = event_dir / "event.json"
+    else:
+        raise ValueError("Missing required payload field: event_json or event_dir")
+
+    if not event_json_path.exists():
+        raise FileNotFoundError(f"event.json not found: {event_json_path}")
+    with open(event_json_path, "r", encoding="utf-8") as f:
+        event_data = json.load(f)
+
+    map_image_value = payload.get("map_image")
+    map_image_path = Path(str(map_image_value)) if map_image_value else None
+    if map_image_path is None:
+        map_image_path = _find_event_map_image(event_dir, event_data, map_number)
+    elif not map_image_path.is_absolute():
+        map_image_path = event_dir / map_image_path
+    if map_image_path is None or not map_image_path.exists():
+        raise FileNotFoundError(f"map image not found for map_number={map_number}")
+
+    model = str(
+        payload.get("model")
+        or payload.get("image_llm_model")
+        or payload.get("fallback_model")
+        or "gpt-5-mini"
+    )
+    output_json_path = event_dir / f"coordinates_map_{map_number}.json"
+
+    from src.space_locator import generate_coordinates_from_map
+    from src.space_locator.json_updater import JSONUpdater
+
+    coord_map = generate_coordinates_from_map(
+        image_path=str(map_image_path),
+        event_json_path=str(event_json_path),
+        output_json_path=str(output_json_path),
+        model=model,
+        map_number=map_number,
+        use_calibration=bool(payload.get("use_calibration", True)),
+    )
+    if coord_map is None:
+        raise RuntimeError("map pin coordinate generation failed")
+
+    updater = JSONUpdater()
+    update_result = updater.update_event_json(
+        event_json_path=str(event_json_path),
+        coordinate_map=coord_map.get("complete_grid", []),
+        map_number=map_number,
+    )
+
+    return {
+        "status": "ok",
+        "job": "auto_place_map_pins",
+        "timestamp": _utc_now_iso(),
+        "event_json": str(event_json_path),
+        "map_image": str(map_image_path),
+        "map_number": map_number,
+        "coordinate_json": str(output_json_path),
+        "generated_count": len(coord_map.get("complete_grid", [])),
+        "updated_count": update_result.get("updated_count", 0),
+        "skipped_count": update_result.get("skipped_count", 0),
+        "calibration": coord_map.get("calibration", {}),
+    }
+
+
+def _job_load_circle_master(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """circle_master.json を読み込んで返す"""
+    from ..utils.circle_master import CircleMasterManager
+
+    manager = CircleMasterManager()
+    return {
+        "status": "ok",
+        "job": "load_circle_master",
+        "timestamp": _utc_now_iso(),
+        "data": manager.to_dict(),
+    }
+
+
+def _job_save_circle_master(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """circle_master.json を上書き保存する"""
+    data = payload.get("data")
+    if data is None:
+        raise ValueError("Missing required payload field: data")
+    from ..utils.circle_master import CircleMasterManager
+
+    manager = CircleMasterManager()
+    manager.data = data
+    manager.save()
+    return {
+        "status": "ok",
+        "job": "save_circle_master",
+        "timestamp": _utc_now_iso(),
+        "count": len(data.get("circles", {})),
+    }
+
+
+def _job_merge_circle_master(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """受け取ったデータを既存のcircle_masterとマージして保存する"""
+    other_data = payload.get("data")
+    if other_data is None:
+        raise ValueError("Missing required payload field: data")
+    from ..utils.circle_master import CircleMasterManager
+
+    manager = CircleMasterManager()
+    changed = manager.merge(other_data)
+    manager.save()
+    return {
+        "status": "ok",
+        "job": "merge_circle_master",
+        "timestamp": _utc_now_iso(),
+        "changed": changed,
+        "total": len(manager.data.get("circles", {})),
+    }
+
+
+def _job_create_mobile_zip(payload: Dict[str, Any]) -> Dict[str, Any]:
+    event_json_file = payload.get("event_json")
+    output_dir = payload.get("output_dir")
+    zip_output_path = payload.get("zip_output_path")
+
+    for key, val in [
+        ("event_json", event_json_file),
+        ("output_dir", output_dir),
+        ("zip_output_path", zip_output_path),
+    ]:
+        if not val:
+            raise ValueError(f"Missing required payload field: {key}")
+
+    json_path = Path(event_json_file)
+    out_dir = Path(output_dir)
+    zip_path = Path(zip_output_path)
+
+    if not json_path.exists():
+        raise FileNotFoundError(f"event.json not found: {json_path}")
+    if not out_dir.exists():
+        raise FileNotFoundError(f"Output directory not found: {out_dir}")
+
+    # event.jsonを読み込み
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    circles = data.get("circles", [])
+
+    # 画像ファイル名を抽出
+    event_image_files: List[str] = []
+    circle_image_files: List[str] = []
+    item_image_files: List[str] = []
+
+    event_info = data.get("event", {})
+    if isinstance(event_info, dict):
+        for key in ("event_image_filename", "event_image"):
+            filename = event_info.get(key)
+            if isinstance(filename, str) and filename.strip():
+                event_image_files.append(filename.strip())
+
+    for circle in circles:
+        cut = circle.get("circle_cut_filename", "")
+        if cut:
+            circle_image_files.append(cut)
+        for img in circle.get("item_images", []):
+            path = img.get("path", "")
+            if path:
+                item_image_files.append(path)
+
+    # マップ画像を収集
+    map_image_files: List[str] = []
+    for event_map in data.get("event", {}).get("maps", []) or []:
+        if not isinstance(event_map, dict):
+            continue
+        filename = event_map.get("filename")
+        if isinstance(filename, str) and filename.strip():
+            map_image_files.append(filename.strip())
+    for pattern in ["map_*.jpg", "map_*.png", "map_*.jpeg", "map_*.webp"]:
+        for match in glob.glob(str(out_dir / pattern)):
+            map_image_files.append(Path(match).name)
+
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    circle_count = 0
+    item_count = 0
+    map_count = 0
+    event_image_count = 0
+    default_cut_count = 0
+
+    asset_manifest: Dict[str, Any] = {
+        "format": "eventtrail_asset_manifest",
+        "format_version": 1,
+        "assets": {},
+        "aliases": {},
+    }
+    added_assets: set[str] = set()
+
+    def add_asset(zf: zipfile.ZipFile, source_path: Path, archive_name: str) -> bool:
+        if not source_path.exists() or not source_path.is_file():
+            return False
+        logical_name = archive_name.replace("\\", "/").lstrip("/")
+        digest = hashlib.sha256()
+        with open(source_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        content_hash = digest.hexdigest()
+        ext = source_path.suffix.lower() or Path(logical_name).suffix.lower() or ".bin"
+        asset_name = f"assets/sha256/{content_hash[:2]}/{content_hash}{ext}"
+        if asset_name not in added_assets:
+            zf.write(str(source_path), asset_name)
+            added_assets.add(asset_name)
+        asset = asset_manifest["assets"].setdefault(
+            content_hash,
+            {
+                "algorithm": "sha256",
+                "hash": content_hash,
+                "path": asset_name,
+                "size": source_path.stat().st_size,
+                "original_names": [],
+            },
+        )
+        if logical_name not in asset["original_names"]:
+            asset["original_names"].append(logical_name)
+        asset_manifest["aliases"][logical_name] = asset_name
+        return True
+
+    with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
+        # event.json
+        zf.writestr("event.json", json.dumps(data, ensure_ascii=False, indent=2))
+
+        # circle_master.json（サークルマスターデータ）
+        from ..utils.circle_master import CircleMasterManager
+
+        cm = CircleMasterManager()
+        zf.writestr(
+            "circle_master.json", json.dumps(cm.to_dict(), ensure_ascii=False, indent=2)
+        )
+
+        if cm.cuts_dir.exists():
+            for cut_path in cm.cuts_dir.iterdir():
+                if not cut_path.is_file():
+                    continue
+                archive_name = f"default_cuts/{cut_path.name}"
+                if add_asset(zf, cut_path, archive_name):
+                    default_cut_count += 1
+
+        for fname in event_image_files:
+            zip_name = Path(fname).name
+            archive_name = f"event_image/{zip_name}"
+            img_path = Path(fname) if Path(fname).is_absolute() else out_dir / fname
+            if add_asset(zf, img_path, archive_name):
+                event_image_count += 1
+
+        for fname in circle_image_files:
+            img_path = out_dir / fname
+            if add_asset(zf, img_path, fname):
+                circle_count += 1
+
+        for fname in item_image_files:
+            img_path = out_dir / fname
+            if add_asset(zf, img_path, fname):
+                item_count += 1
+
+        for fname in map_image_files:
+            img_path = out_dir / fname
+            if add_asset(zf, img_path, fname):
+                map_count += 1
+
+        zf.writestr(
+            "asset_manifest.json",
+            json.dumps(asset_manifest, ensure_ascii=False, indent=2),
+        )
+
+    total_size = zip_path.stat().st_size
+
+    return {
+        "status": "ok",
+        "job": "create_mobile_zip",
+        "timestamp": _utc_now_iso(),
+        "zip_path": str(zip_path),
+        "event_images": event_image_count,
+        "circle_images": circle_count,
+        "item_images": item_count,
+        "map_images": map_count,
+        "default_cuts": default_cut_count,
+        "total_size": total_size,
+    }
+
+
+def _zip_event_directory(
+    zf: zipfile.ZipFile,
+    event_dir: Path,
+    archive_prefix: str,
+    skip_path: Path,
+) -> Dict[str, int]:
+    file_count = 0
+    image_count = 0
+    total_bytes = 0
+    image_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+    for file_path in event_dir.rglob("*"):
+        if not file_path.is_file():
+            continue
+        if file_path.resolve() == skip_path:
+            continue
+        if file_path.suffix.lower() == ".zip":
+            continue
+
+        rel_path = file_path.relative_to(event_dir).as_posix()
+        zf.write(str(file_path), f"{archive_prefix}/{rel_path}")
+        file_count += 1
+        total_bytes += file_path.stat().st_size
+        if file_path.suffix.lower() in image_suffixes:
+            image_count += 1
+
+    return {"files": file_count, "images": image_count, "bytes": total_bytes}
+
+
+def _job_create_mobile_full_sync_zip(payload: Dict[str, Any]) -> Dict[str, Any]:
+    project_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+    zip_output_path = payload.get("zip_output_path")
+    zip_path = (
+        Path(zip_output_path)
+        if zip_output_path
+        else _default_mobile_full_sync_zip_path(project_root)
+    )
+    events_dir = project_root / "events"
+    if not events_dir.exists():
+        raise FileNotFoundError(f"events directory not found: {events_dir}")
+
+    event_dirs = [
+        p
+        for p in sorted(events_dir.iterdir(), key=lambda item: item.name)
+        if p.is_dir() and (p / "event.json").exists()
+    ]
+
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    zip_resolved = zip_path.resolve()
+    bundle_events: List[Dict[str, Any]] = []
+    event_count = 0
+    file_count = 0
+    image_count = 0
+    default_cut_count = 0
+
+    with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
+        for event_dir in event_dirs:
+            event_json = event_dir / "event.json"
+            event_data: Dict[str, Any] = {}
+            try:
+                event_data = json.loads(event_json.read_text(encoding="utf-8"))
+            except Exception:
+                event_data = {}
+
+            slug = event_dir.name
+            archive_prefix = f"events/{slug}"
+            counts = _zip_event_directory(zf, event_dir, archive_prefix, zip_resolved)
+            event_count += 1
+            file_count += counts["files"]
+            image_count += counts["images"]
+
+            meta = event_data.get("event", {}) if isinstance(event_data, dict) else {}
+            bundle_events.append(
+                {
+                    "slug": slug,
+                    "path": f"{archive_prefix}/event.json",
+                    "name": meta.get("name") or slug,
+                    "date": meta.get("date"),
+                    "file_count": counts["files"],
+                    "image_count": counts["images"],
+                }
+            )
+
+        cm_path = project_root / "circle_master.json"
+        if cm_path.exists():
+            zf.write(str(cm_path), "circle_master.json")
+            file_count += 1
+
+        cuts_dir = project_root / "default_cuts"
+        if cuts_dir.exists():
+            for file_path in cuts_dir.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                rel_path = file_path.relative_to(cuts_dir).as_posix()
+                zf.write(str(file_path), f"default_cuts/{rel_path}")
+                file_count += 1
+                default_cut_count += 1
+
+        manifest = {
+            "format": "eventtrail_full_sync",
+            "format_version": 1,
+            "generated_at": _utc_now_iso(),
+            "event_count": event_count,
+            "events": bundle_events,
+            "includes": {
+                "circle_master": cm_path.exists(),
+                "default_cuts": default_cut_count,
+            },
+        }
+        zf.writestr("sync_bundle.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+
+    return {
+        "status": "ok",
+        "job": "create_mobile_full_sync_zip",
+        "timestamp": _utc_now_iso(),
+        "zip_path": str(zip_path),
+        "event_count": event_count,
+        "file_count": file_count,
+        "image_count": image_count,
+        "default_cut_count": default_cut_count,
+        "total_size": zip_path.stat().st_size,
+    }
+
+
+def _job_parse_site_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """HTML取得+サークル抽出のみ実行（画像DLなし）。プレビュー用。"""
+    url = payload.get("url")
+    if not url:
+        raise ValueError("Missing required field: url")
+
+    project_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+
+    # プロジェクトルートをPYTHONPATHに追加
+    proj_str = str(project_root)
+    if proj_str not in sys.path:
+        sys.path.insert(0, proj_str)
+
+    # .envをロード（APIキー用）
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(project_root / ".env")
+    except ImportError:
+        pass
+
+    from src.models import SiteConfig, SiteType, ExtractorConfig
+    from src.models.config import SiteParsingConfig
+    from src.adapters import AdapterFactory
+    from src.utils.llm_client import LLMClient
+    from src.utils.llm_attempts import api_models_from_attempts, build_text_llm_attempts
+    from src.utils.pattern_manager import PatternManager
+    from src.utils.downloader import Downloader
+    from src.utils.cookie_loader import load_cookies_for_url
+    from bs4 import BeautifulSoup
+
+    site_type = AdapterFactory.detect_site_type(url)
+
+    # モデル設定
+    raw_model = payload.get("model", "gpt-5-mini")
+    models = (
+        [m.strip() for m in raw_model.split(",") if m.strip()]
+        if isinstance(raw_model, str)
+        else [raw_model]
+    )
+
+    # サイトパース専用モデル
+    sp_raw = payload.get("site_parsing")
+    site_parsing_config = None
+    if sp_raw and isinstance(sp_raw, dict):
+        site_reasoning_effort = sp_raw.get(
+            "reasoning_effort",
+            sp_raw.get("api_reasoning_effort", "medium"),
+        )
+        site_parsing_config = SiteParsingConfig(
+            codex_model=sp_raw.get("codex_model", "gpt-5.4"),
+            api_model=sp_raw.get("api_model", "gpt-5.6-sol"),
+            reasoning_effort=site_reasoning_effort,
+            api_reasoning_effort=site_reasoning_effort,
+            prefer_cli=sp_raw.get("prefer_cli", True),
+            cli_timeout=sp_raw.get(
+                "cli_timeout",
+                payload.get("text_llm_cli_timeout", 900),
+            ),
+        )
+
+    site_config = SiteConfig(
+        site_type=site_type,
+        base_url=url,
+        extractor_config=ExtractorConfig(),
+        use_llm=True,
+        llm_model=models[0] if models else "gpt-5.6-sol",
+        text_llm_provider=payload.get("text_llm_provider", "api"),
+        text_llm_cli_models=payload.get("text_llm_cli_models", {}),
+        text_llm_cli_efforts=payload.get("text_llm_cli_efforts", {}),
+        text_llm_cli_timeout=payload.get("text_llm_cli_timeout", 900),
+        api_reasoning_effort=payload.get("api_reasoning_effort", "medium"),
+        api_reasoning_effort_map=payload.get("api_reasoning_effort_map", {}),
+        text_fallback_llm_provider=payload.get(
+            "text_fallback_llm_provider", "cli:codex"
+        ),
+        text_fallback_llm_model=payload.get(
+            "text_fallback_llm_model", "gpt-5.5"
+        ),
+        text_fallback_llm_effort=payload.get(
+            "text_fallback_llm_effort", "medium"
+        ),
+        image_llm_provider=payload.get("image_llm_provider", "api:gemini"),
+        image_llm_model=payload.get("image_llm_model")
+        or (models[0] if models else "gpt-5.6-sol"),
+        image_llm_effort=payload.get(
+            "image_llm_effort",
+            payload.get("api_reasoning_effort", "medium"),
+        ),
+        image_fallback_llm_provider=payload.get(
+            "image_fallback_llm_provider", "openai"
+        ),
+        image_fallback_llm_model=payload.get(
+            "image_fallback_llm_model", "gpt-5-mini"
+        ),
+        image_fallback_llm_effort=payload.get(
+            "image_fallback_llm_effort", "medium"
+        ),
+        image_api_reasoning_effort_map=payload.get(
+            "image_api_reasoning_effort_map", {}
+        ),
+        catalog_additional_prompt=payload.get("catalog_additional_prompt", ""),
+        site_parsing_config=site_parsing_config,
+        cookie_file=payload.get("cookie_file"),
+    )
+
+    # Cookie読み込み
+    cookies = load_cookies_for_url(
+        url,
+        cookie_file=site_config.cookie_file,
+        project_root=project_root,
+    )
+
+    # HTML取得
+    downloader = Downloader(
+        headers=site_config.headers, timeout=30, retry_count=3, cookies=cookies
+    )
+    html_content = downloader.fetch_content(url)
+    soup = BeautifulSoup(html_content or "", "html.parser")
+
+    # アダプター作成・サークル抽出
+    text_attempts = build_text_llm_attempts(
+        payload.get("text_llm_provider", "api"),
+        site_config.llm_model,
+        payload.get("text_llm_cli_models", {}),
+        payload.get("text_llm_cli_efforts", {}),
+        payload.get("text_fallback_llm_provider", "cli:codex"),
+        payload.get("text_fallback_llm_model", "gpt-5.5"),
+        payload.get("text_fallback_llm_effort", "medium"),
+    )
+    llm_client = LLMClient(
+        model=api_models_from_attempts(text_attempts),
+        attempts=text_attempts,
+        cli_model_map=payload.get("text_llm_cli_models", {}),
+        cli_effort_map=payload.get("text_llm_cli_efforts", {}),
+        cli_timeout=payload.get("text_llm_cli_timeout", 900),
+        cli_cwd=str(project_root),
+        reasoning_effort=payload.get("api_reasoning_effort", "medium"),
+        api_reasoning_effort_map=payload.get("api_reasoning_effort_map", {}),
+    )
+    pattern_manager = PatternManager()
+    adapter = AdapterFactory.create_adapter(
+        site_config, llm_client, pattern_manager, session=downloader.session
+    )
+    event = adapter.extract_event_info(soup)
+    circles = adapter.extract_circles(soup)
+
+    # LLMに渡したHTMLコンテキストを取得（再パース用）
+    html_context = ""
+    if hasattr(adapter, "_get_circle_context"):
+        html_context = adapter._get_circle_context(soup)
+
+    adapter_type = type(adapter).__name__
+
+    return {
+        "status": "ok",
+        "job": "parse_site_preview",
+        "timestamp": _utc_now_iso(),
+        "event": event.to_dict() if hasattr(event, "to_dict") else {},
+        "circles": [
+            {
+                "name": c.name,
+                "penname": c.penname,
+                "space": c.space,
+                "hall": c.hall,
+                "twitter_url": c.twitter_url,
+                "website_url": c.website_url,
+            }
+            for c in circles
+        ],
+        "circle_count": len(circles),
+        "html_context": html_context,
+        "adapter_type": adapter_type,
+    }
+
+
+def _job_reparse_with_feedback(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """ユーザーの修正指示をもとにHTMLを再パースする。"""
+    html_context = payload.get("html_context")
+    feedback = payload.get("feedback")
+    if not html_context:
+        raise ValueError("Missing required field: html_context")
+    if not feedback:
+        raise ValueError("Missing required field: feedback")
+
+    project_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+    proj_str = str(project_root)
+    if proj_str not in sys.path:
+        sys.path.insert(0, proj_str)
+
+    # .envをロード（APIキー用）
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(project_root / ".env")
+    except ImportError:
+        pass
+
+    from src.models.config import SiteParsingConfig
+    from src.utils.site_parsing_llm import parse_with_high_end_model
+    from src.utils.llm_client import LLMClient
+    from src.utils.llm_attempts import api_models_from_attempts, build_text_llm_attempts
+
+    # 前回の結果をプロンプトに含める
+    previous_result = payload.get("previous_result", [])
+    prev_sample = ""
+    if previous_result:
+        import json as _json
+
+        prev_sample = f"\n\n前回の抽出結果（最初の5件）:\n```json\n{_json.dumps(previous_result[:5], ensure_ascii=False, indent=2)}\n```\n"
+
+    prompt = f"""以下のHTMLからサークルリストの情報を抽出してください。
+
+前回の抽出結果にユーザーから以下の修正指示がありました:
+{feedback}
+{prev_sample}
+このフィードバックを反映して、正しく抽出し直してください。
+
+HTML:
+{html_context}
+
+以下のJSON形式で返してください:
+{{
+    "circles": [
+        {{
+            "name": "サークル名",
+            "penname": "ペンネーム（作者名）",
+            "space": "スペース番号",
+            "hall": "ホール名",
+            "twitter_url": "Twitter/X URL",
+            "website_url": "WebサイトURL"
+        }}
+    ]
+}}
+
+可能な限り多くのサークル情報を抽出してください。
+JSONのみを返してください。
+"""
+
+    # サイトパース専用モデル設定
+    sp_raw = payload.get("site_parsing")
+    circles = []
+
+    if sp_raw and isinstance(sp_raw, dict):
+        site_reasoning_effort = sp_raw.get(
+            "reasoning_effort",
+            sp_raw.get("api_reasoning_effort", "medium"),
+        )
+        spc = SiteParsingConfig(
+            codex_model=sp_raw.get("codex_model", "gpt-5.4"),
+            api_model=sp_raw.get("api_model", "gpt-5.6-sol"),
+            reasoning_effort=site_reasoning_effort,
+            api_reasoning_effort=site_reasoning_effort,
+            prefer_cli=sp_raw.get("prefer_cli", True),
+            cli_timeout=sp_raw.get(
+                "cli_timeout",
+                payload.get("text_llm_cli_timeout", 900),
+            ),
+        )
+        try:
+            result = parse_with_high_end_model(prompt, spc)
+            import json as _json
+
+            data = _json.loads(result)
+            circles = data.get("circles", [])
+        except Exception as e:
+            sys.stderr.write(f"高性能モデルでの再パース失敗: {e}\n")
+
+    # 高性能モデルが使えない/失敗した場合は通常LLMにフォールバック
+    if not circles:
+        raw_model = payload.get("model", "gpt-5.6-sol")
+        models = (
+            [m.strip() for m in raw_model.split(",") if m.strip()]
+            if isinstance(raw_model, str)
+            else [raw_model]
+        )
+        try:
+            primary_model = models[0] if models else "gpt-5.6-sol"
+            text_attempts = build_text_llm_attempts(
+                payload.get("text_llm_provider", "api"),
+                primary_model,
+                payload.get("text_llm_cli_models", {}),
+                payload.get("text_llm_cli_efforts", {}),
+                payload.get("text_fallback_llm_provider", "cli:codex"),
+                payload.get("text_fallback_llm_model", "gpt-5.5"),
+                payload.get("text_fallback_llm_effort", "medium"),
+            )
+            client = LLMClient(
+                model=api_models_from_attempts(text_attempts),
+                attempts=text_attempts,
+                cli_model_map=payload.get("text_llm_cli_models", {}),
+                cli_effort_map=payload.get("text_llm_cli_efforts", {}),
+                cli_timeout=payload.get("text_llm_cli_timeout", 900),
+                cli_cwd=str(project_root),
+                reasoning_effort=payload.get("api_reasoning_effort", "medium"),
+                api_reasoning_effort_map=payload.get(
+                    "api_reasoning_effort_map", {}
+                ),
+            )
+            result = client.extract_data(prompt)
+            import json as _json
+
+            data = _json.loads(result)
+            circles = data.get("circles", [])
+        except Exception as e:
+            sys.stderr.write(f"通常LLMでの再パース失敗: {e}\n")
+
+    return {
+        "status": "ok" if circles else "error",
+        "job": "reparse_with_feedback",
+        "timestamp": _utc_now_iso(),
+        "circles": circles,
+        "circle_count": len(circles),
+        "html_context": html_context,
+    }
+
+
+def run_job(job: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if job == "ping":
+        return _job_ping(payload)
+    if job == "extract_twitter_catalogs":
+        return _job_extract_twitter_catalogs(payload)
+    if job == "run_main_pipeline":
+        return _job_run_main_pipeline(payload)
+    if job == "load_event_json":
+        return _job_load_event_json(payload)
+    if job == "save_event_json":
+        return _job_save_event_json(payload)
+    if job == "validate_mobile_json":
+        return _job_validate_mobile_json(payload)
+    if job == "auto_place_map_pins":
+        return _job_auto_place_map_pins(payload)
+    if job == "create_mobile_zip":
+        return _job_create_mobile_zip(payload)
+    if job == "create_mobile_full_sync_zip":
+        return _job_create_mobile_full_sync_zip(payload)
+    if job == "load_circle_master":
+        return _job_load_circle_master(payload)
+    if job == "save_circle_master":
+        return _job_save_circle_master(payload)
+    if job == "merge_circle_master":
+        return _job_merge_circle_master(payload)
+    if job == "parse_site_preview":
+        return _job_parse_site_preview(payload)
+    if job == "reparse_with_feedback":
+        return _job_reparse_with_feedback(payload)
+    if job == "reprocess_circle_from_post":
+        return _job_reprocess_circle_from_post(payload)
+    if job == "reprocess_circle_from_image":
+        return _job_reprocess_circle_from_image(payload)
+    if job == "list_jobs":
+        return {
+            "status": "ok",
+            "job": "list_jobs",
+            "jobs": [
+                "ping",
+                "list_jobs",
+                "extract_twitter_catalogs",
+                "run_main_pipeline",
+                "parse_site_preview",
+                "reparse_with_feedback",
+                "reprocess_circle_from_post",
+                "reprocess_circle_from_image",
+                "load_event_json",
+                "save_event_json",
+                "validate_mobile_json",
+                "auto_place_map_pins",
+                "create_mobile_zip",
+                "create_mobile_full_sync_zip",
+                "load_circle_master",
+                "save_circle_master",
+                "merge_circle_master",
+            ],
+            "timestamp": _utc_now_iso(),
+        }
+
+    raise ValueError(f"Unknown job: {job}")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Desktop bridge for Tauri integration")
+    parser.add_argument("--job", default="ping", help="Job name (default: ping)")
+    parser.add_argument("--payload", help="Path to JSON payload file")
+    parser.add_argument("--payload-json", help="Inline JSON payload")
+    return parser
+
+
+def main() -> int:
+    # Windows cp932環境でもUTF-8で出力する
+    if sys.stdout.encoding != "utf-8":
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    if sys.stderr.encoding != "utf-8":
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+
+    parser = _parser()
+    args = parser.parse_args()
+
+    try:
+        payload = _load_payload(args)
+        result = run_job(args.job, payload)
+    except Exception as exc:
+        result = {
+            "status": "error",
+            "job": args.job,
+            "timestamp": _utc_now_iso(),
+            "error": str(exc),
+        }
+
+    sys.stdout.write(json.dumps(result, ensure_ascii=False))
+    sys.stdout.write("\n")
+    return 0 if result.get("status") == "ok" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
