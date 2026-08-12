@@ -54,3 +54,15 @@ def test_parse_det_text_format_observed_from_unlimited_ocr():
         {"text": "16 17", "x1": 311, "y1": 798, "x2": 449, "y2": 858},
         {"text": "15 18", "x1": 595, "y1": 869, "x2": 734, "y2": 912},
     ]
+
+
+def test_parse_det_prefix_text_format_observed_from_newer_runner():
+    raw = "<|det|>image [58, 84, 877, 158]<|/det|>"
+    assert parse_grounding_output(raw, image_width=1200, image_height=900) == [
+        {"text": "image", "x1": 69, "y1": 75, "x2": 1053, "y2": 142}
+    ]
+
+
+def test_parse_skips_normalized_coordinates_outside_model_range():
+    raw = "<|ref|>bad<|/ref|><|det|>[[-1, 0, 10, 10]]<|/det|>"
+    assert parse_grounding_output(raw, image_width=100, image_height=100) == []

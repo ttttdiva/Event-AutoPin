@@ -1,0 +1,1 @@
+﻿{"schema_version":1,"model":"fixture/manual","revision":"fixture","device":"cpu","results":[{"image":"tests/fixtures/unlimited_ocr_pin_center/map_01.png","image_width":320,"image_height":160,"elements":[{"text":"01","x1":55,"y1":45,"x2":105,"y2":95},{"text":"02","x1":215,"y1":45,"x2":265,"y2":95}],"strategy":"fixture"}]}

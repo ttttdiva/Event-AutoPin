@@ -26,15 +26,15 @@ class ApkInstallerModule : Module() {
       // 既存のダウンロードファイルを削除
       try {
         val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val existingFile = File(downloadDir, "EventTrailGo-update.apk")
+        val existingFile = File(downloadDir, "EventAutoPin-update.apk")
         if (existingFile.exists()) existingFile.delete()
       } catch (_: Exception) {}
 
       val request = DownloadManager.Request(Uri.parse(url))
-        .setTitle("EventTrail Go Update")
+        .setTitle("Event AutoPin Update")
         .setDescription("APKをダウンロードしています…")
         .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-        .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "EventTrailGo-update.apk")
+        .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "EventAutoPin-update.apk")
         .setMimeType("application/vnd.android.package-archive")
 
       val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
@@ -69,7 +69,7 @@ class ApkInstallerModule : Module() {
           // APKファイルのインストーラーを起動
           val apkFile = File(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-            "EventTrailGo-update.apk"
+            "EventAutoPin-update.apk"
           )
           if (!apkFile.exists()) return
 

@@ -22,7 +22,7 @@ class SetupTool:
     
     def run(self):
         """セットアップを実行"""
-        print("=== サークルリスト生成ツール セットアップ ===\n")
+        print("=== Event AutoPin セットアップ ===\n")
         
         # 1. Python バージョンチェック
         self.check_python_version()
@@ -143,6 +143,7 @@ class SetupTool:
             
             # 設定内容を表示
             target_url = config.get('target', {}).get('url', '未設定')
+            # `caico` remains the legacy config key for existing projects.
             output_format = config.get('output', {}).get('format', 'caico')
             print(f"    - ターゲットURL: {target_url}")
             print(f"    - 出力フォーマット: {output_format}")

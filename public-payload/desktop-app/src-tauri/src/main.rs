@@ -147,6 +147,42 @@ struct DesktopConfig {
     timeout_ms: u64,
     #[serde(default)]
     foam_dir: String,
+    #[serde(default = "default_ocr_model")]
+    unlimited_ocr_model: String,
+    #[serde(default)]
+    unlimited_ocr_model_path: String,
+    #[serde(default)]
+    unlimited_ocr_venv: String,
+    #[serde(default)]
+    unlimited_ocr_hf_home: String,
+    #[serde(default = "default_ocr_revision")]
+    unlimited_ocr_revision: String,
+    #[serde(default = "default_ocr_device")]
+    unlimited_ocr_device: String,
+    #[serde(default = "default_ocr_mode")]
+    unlimited_ocr_mode: String,
+    #[serde(default = "default_ocr_strategy")]
+    unlimited_ocr_strategy: String,
+}
+
+fn default_ocr_model() -> String {
+    "baidu/Unlimited-OCR".to_string()
+}
+
+fn default_ocr_revision() -> String {
+    "ee63731b6461c8afcdcc7b15352e7d2ffecc2ead".to_string()
+}
+
+fn default_ocr_device() -> String {
+    "auto".to_string()
+}
+
+fn default_ocr_mode() -> String {
+    "gundam".to_string()
+}
+
+fn default_ocr_strategy() -> String {
+    "small_digits".to_string()
 }
 
 fn exe_dir() -> PathBuf {
@@ -164,6 +200,15 @@ impl Default for DesktopConfig {
             project_root: root,
             timeout_ms: 3_600_000,
             foam_dir: String::new(),
+            unlimited_ocr_model: "baidu/Unlimited-OCR".to_string(),
+            unlimited_ocr_model_path: String::new(),
+            unlimited_ocr_venv: String::new(),
+            unlimited_ocr_hf_home: String::new(),
+            unlimited_ocr_revision:
+                "ee63731b6461c8afcdcc7b15352e7d2ffecc2ead".to_string(),
+            unlimited_ocr_device: "auto".to_string(),
+            unlimited_ocr_mode: "gundam".to_string(),
+            unlimited_ocr_strategy: "small_digits".to_string(),
         }
     }
 }
@@ -888,6 +933,7 @@ fn run_python_bridge_sync(
 
     // Windows コマンドライン長制限(~32KB)を回避: 大きいペイロードは一時ファイル経由
     let payload_file: Option<PathBuf> = if payload_json.len() > 28000 {
+        // eventtrail_* の一時ファイル名は既存インストールとの互換性のため維持する。
         let tmp =
             std::env::temp_dir().join(format!("eventtrail_payload_{}.json", std::process::id()));
         fs::write(&tmp, &payload_json)
@@ -1247,6 +1293,7 @@ fn append_log(project_root: Option<String>, message: String) -> Result<(), Strin
     let base = project_root.map(PathBuf::from).unwrap_or_else(exe_dir);
     let logs_dir = base.join("logs");
     let _ = fs::create_dir_all(&logs_dir);
+    // eventtrail_* のログ名は既存インストールとの互換性のため維持する。
     let log_path = logs_dir.join("eventtrail_studio.log");
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
@@ -5268,7 +5315,7 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
 }
 
 const UPDATE_CHECK_URL: &str =
-    "https://raw.githubusercontent.com/ttttdiva/autocircle/main/latest.json";
+    "https://raw.githubusercontent.com/ttttdiva/Event-AutoPin-Publish/main/latest.json";
 
 /// 更新チェック: latest.json をフェッチし、バージョン比較
 #[tauri::command]
@@ -5407,7 +5454,7 @@ fn apply_update(app_handle: tauri::AppHandle) -> Result<Value, String> {
     let bak_name = format!("{}.bak", exe_name);
 
     let script = format!(
-        r#"# EventTrail Studio 自動更新スクリプト
+        r#"# Event AutoPin 自動更新スクリプト
 $ErrorActionPreference = "Stop"
 $exeDir = "{exe_dir}"
 $exePath = Join-Path $exeDir "{exe_name}"

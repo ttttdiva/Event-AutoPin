@@ -6,8 +6,8 @@
     "distDir": "../dist"
   },
   "package": {
-    "productName": "EventTrailStudio",
-    "version": "0.1.9"
+    "productName": "Event AutoPin",
+    "version": "0.1.10"
   },
   "tauri": {
     "allowlist": {
@@ -37,7 +37,7 @@
     },
     "windows": [
       {
-        "title": "EventTrail Studio",
+        "title": "Event AutoPin",
         "width": 1920,
         "height": 1080,
         "center": true,

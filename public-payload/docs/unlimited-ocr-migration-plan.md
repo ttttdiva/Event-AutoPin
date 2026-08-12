@@ -45,7 +45,7 @@
   - `transformers==4.57.1`, `Pillow==12.1.1`, `matplotlib==3.10.8`, `einops==0.8.2`,
     `addict==2.4.0`, `easydict==1.13`, `pymupdf==1.27.2.2`, `psutil==7.2.2`
   - ※ pymupdf はPDF用なので本リポジトリでは不要（マップは画像のみ）。
-- GPU: RTX 5090 (32GB)。cu130 ビルドが動作確認済み。CPUフォールバックも `device="cpu"` + float32 で動く（遅い）。
+- GPU: RTX 5090 (32GB)。cu130 ビルドが動作確認済み。固定した既定revisionのremote codeは `.cuda()` / CUDA autocastを内包するためCPU非対応。`device=cpu` またはCUDAのない`auto`はdoctor/runnerでfail-closedする。CPU対応の別モデルを明示した場合だけCPUを選択できる。
 - モデル: `baidu/Unlimited-OCR`、単一 safetensors 約 **6.4GB**、
   ダウンロード済みキャッシュ: `<prototype-root>/temp/hf_cache/hub/models--baidu--Unlimited-OCR`
   （snapshot revision: `ee63731b6461c8afcdcc7b15352e7d2ffecc2ead`）。
@@ -60,7 +60,7 @@
   tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
   model = AutoModel.from_pretrained(model_name, trust_remote_code=True,
                                     use_safetensors=True, torch_dtype=dtype)
-  model = model.eval().cuda()  # CPU時は .cuda() しない
+  model = model.eval().cuda()  # 固定revisionのremote codeもCUDAを直接要求する
   ```
 - 推論: `model.infer(tokenizer, prompt=..., image_file=..., output_path=..., base_size, image_size, crop_mode, eval_mode, save_results, max_length, no_repeat_ngram_size, ngram_window, temperature=0.0)`
 - **`eval_mode=True` にすると生の出力テキストが return される**（`<|ref|>`/`<|det|>` トークンを含む）。
@@ -77,7 +77,7 @@
   - `"<image>\nFree OCR. "` ← 座標なし（使わない）
   - ※ `<|grounding|>` を含まないプロンプトでは ref/det が出ない。テスト時の `"<image>document parsing."` は座標が取れないので流用しない。
 - モード: gundam（`base_size=1024, image_size=640, crop_mode=True`）/ base（`base_size=1024, image_size=1024, crop_mode=False`）。高解像度マップには gundam を既定とする。det座標は crop_mode でも**元画像全体**に対する 0–999 正規化。
-- 生成パラメータの実証値: `max_length=32768, no_repeat_ngram_size=35, ngram_window=128, temperature=0.0`。
+- Generation parameters: `max_length=4096` by default (explicit values capped at 32768), `no_repeat_ngram_size=35`, `ngram_window=128`, `temperature=0.0`.
 
 ## 3. 設計方針
 
@@ -120,7 +120,7 @@
 | `src/space_locator/unlimited_ocr_parser.py` | ref/det パース + 0–999→px変換の**純stdlib**関数。runnerと単体テストの双方から import |
 | `src/space_locator/unlimited_ocr_runner.py` | OCR venv内で実行する推論CLI。stdlib + torch/transformers/PIL のみ |
 | `scripts/setup_unlimited_ocr.py` | OCR専用venv構築 + doctor（09_testの `setup_unlimited_ocr_env.py` を移植） |
-| `scripts/setup_unlimited_ocr.bat` | 上記のbatラッパー（`py -3.12` 起動） |
+| `scripts/setup_unlimited_ocr.bat` | Launcher wrapper that accepts `UNLIMITED_OCR_PYTHON`, uv, python, or py |
 | `tests/unit/test_unlimited_ocr_parser.py` | パーサ単体テスト |
 | `tests/unit/test_ocr_engine_numbers.py` | 要素→番号変換（フィルタ・分割）の単体テスト |
 
@@ -168,7 +168,7 @@ def parse_grounding_output(raw_text, image_width, image_height) -> list[dict]:
 
 - 引数: `--image <path>`（複数指定可）, `--output-json <path>`, `--device auto|cuda|cpu`（既定 auto）,
   `--mode gundam|base`（既定 gundam）, `--prompt`（既定 `"<image>\n<|grounding|>OCR this image. "`）,
-  `--max-length 32768`, `--no-repeat-ngram-size 35`, `--ngram-window 128`,
+  `--max-length 4096` by default (explicit values capped at 32768), `--no-repeat-ngram-size 35`, `--ngram-window 128`,
   `--include-raw`（デバッグ用に生出力をJSONへ含める）。
 - 処理:
   1. `HF_HOME` 未設定なら `os.environ.setdefault("HF_HOME", str(REPO_ROOT / "temp" / "hf_cache"))`。
@@ -205,8 +205,8 @@ def parse_grounding_output(raw_text, image_width, image_height) -> list[dict]:
 
 - venv パス: `<repo>/temp/unlimited_ocr_venv`（環境変数 `UNLIMITED_OCR_VENV` で上書き可）。
 - 依存リストから `pymupdf` を除外（PDF非対応で良い）。
-- `--doctor` はそのまま（CUDA検出チェック）。CPUのみ環境でも警告止まりにし exit 0 とする（runnerがcpuフォールバックするため。09_test版の「CUDA無しで exit 2」は変更する）。
-- doctor 出力に「モデルキャッシュの有無」（`HF_HOME/hub/models--baidu--Unlimited-OCR` の存在）を追加。
+- `--doctor` checks CUDA/model/venv and exits non-zero for missing assets, explicit `device=cuda` without CUDA, or the default CUDA-only revision selected with `device=cpu` / no-CUDA `auto` (fail-closed).
+- doctor resolves model cache from explicit GUI/CLI `hf_home` first (`<hf_home>/hub`), then `HF_HUB_CACHE`/`HF_HOME/hub` for legacy environment-only calls; stale cache aliases are removed from the runner child environment.
 
 ### 5.4 `src/space_locator/ocr_engine.py` の書き換え
 
@@ -225,8 +225,8 @@ def parse_grounding_output(raw_text, image_width, image_height) -> list[dict]:
    - `HF_HOME` / `UNLIMITED_OCR_DEVICE` 環境変数を透過。
    - 失敗時は stderr 末尾を含む例外を投げる（呼び出し元 `generate_coordinates_from_map` は既に「OCR 0件→そのマップをスキップして継続」のエラーハンドリングを持つが、例外は捕捉していないため、**ここでは例外を投げず空リストを返し、logger.error に詳細を出す**方が既存のエラー方針（設計書「エラーハンドリング」表）に合う。venv未構築の場合のみ例外とし、明確にユーザー操作を促す）。
 3. `elements` を `_elements_to_numbers(elements)`（純関数・単体テスト対象）で契約形式へ変換:
-   - ref テキストを `strip()` し、全体が1〜2桁の数字（`1 <= int <= 99`）なら単独採用。
-   - そうでなければ空白区切りでトークン分割し、トークンの8割以上が1〜2桁数字なら、boxを**トークン数で横等分**して各数字に割り当てる（マップの番号列が1refに束ねられた場合の救済）。それ以外のrefは捨てる。
+   - ref テキストを `strip()` し、全体が1〜2桁の数字（`1 <= int <= 99`）なら単独採用。`企業 - 01` / `A-01` 等の明示区切りprefixも一意の数字だけ採用する。
+   - 通常の空白区切りrefはトークンの8割以上が1〜2桁数字の場合のみ、既存契約互換の1D横分割を行う。`<table>` はHTMLParserで行・列・rowspan/colspanを復元できる場合だけ2Dセル矩形へ分割し、構造不明の巨大boxは座標を捏造せず拒否する。
    - `number=str(n).zfill(2)`, `x=x1`, `y=y1`, `width=x2-x1`, `height=y2-y1`,
      `confidence=99`, `variant="unlimited_ocr_0"`。
    - 同一番号かつ中心距離15px以内は重複統合（既存 `add_candidate` 相当）。
@@ -255,19 +255,25 @@ Copy-Item -Recurse $SourceCache $DestinationCache
 
 ## 6. 検証計画（マイルストーン）
 
-実行環境: 本マシン（RTX 5090 / Python 3.12 は `py -3.12` で利用可能）。
+Execution environment: RTX 5090 / Python 3.12 is available through uv or the distribution launcher.
 
 - **M1: 環境構築**
   `scripts\setup_unlimited_ocr.bat` → doctor で torch 2.10.0+cu130 / cuda_available=True / モデルキャッシュ有を確認。
-- **M2: runner 単体検証（最重要）**
+- **M2: runner 単体検証（最重要・未完了条件を明示）**
   実マップ画像1枚（`events/*/maps/map_*.png` がローカルにあればそれを使用。無ければユーザーにサンプル画像の場所を確認する）に対し
   `--include-raw` 付きで実行し、以下を確認:
   1. ref/det が出力されること（出なければプロンプトを `Given the layout of the image. ` 等へ変更して比較）。
-  2. **boxの粒度**: スペース番号が1refずつ分かれるか、行単位で束ねられるか。束ねられる場合は 5.4 の横等分ヒューリスティックの妥当性を raw_output で確認し、必要なら分割ロジックを調整する。
+  2. **boxの粒度**: スペース番号が1refずつ分かれるか、行単位で束ねられるか。tableはDOMの行列が得られる場合のみ2Dセル分割し、構造不明な巨大boxは番号座標を捏造せず拒否する。
   3. gundam と base の両モードで検出数を比較し、良い方を既定にする。
-- **M3: ocr_engine 統合検証**
+- **M3: ocr_engine 統合検証（0%を完了扱いにしない）**
   `venv\Scripts\python.exe src\space_locator\ocr_engine.py <マップ画像>` を実行し、
-  `.ocr.json` の検出番号数・座標と `save_debug_image` の目視確認（従来の検出率約60%を上回ること）。
+  `.ocr.json` の検出番号数・座標と `save_debug_image` の目視確認を行う。実マップpin-center GTの
+  recall 60%以上（またはリリース時に合意した明示threshold）を実測できるまでM3は未完了とする。
+  Ariaers実マップではfull-frame単独は0%だったが、2026-08-13に標準runnerの相対ROI tile経路で
+  **36/56（recall 64.29%）** を再現しM3を完了した。設定は320px、overlap 160px、上限160枚
+  （実行158枚）、full-frame=`small_digits`、tile=`single/gundam + 標準grounding`、max_length=4096。
+  pin-center GTは番号文字の輪郭ではなくブース中心で、右端縦番号は約45〜55px離れるため、番号一致
+  + 50px以内の一対一中心距離を受入指標とした（precision 40.45%、平均中心距離21.68px、IoU対象外）。
 - **M4: 回帰テスト**
   - `venv\Scripts\python.exe -m pytest tests/unit` 全通過。
   - 新規単体テスト: パーサ（単一box/複数box/不正det/リテラル形式）、`_elements_to_numbers`（単独数字・複数数字分割・非数字除外・重複統合・zfill）。
@@ -281,18 +287,42 @@ Copy-Item -Recurse $SourceCache $DestinationCache
 
 | リスク | 対策 |
 |---|---|
-| groundingのbox粒度が行単位で、番号ごとの座標が取れない | M2で最初に検証。横等分分割ヒューリスティック + プロンプト変更（layout系）で対処。それでも不十分なら `Locate <|ref|>...<|/ref|>` 型の番号指定プロンプトを検討（event.jsonから番号一覧は取得可能） |
+| groundingのbox粒度が行単位で、番号ごとの座標が取れない | table DOMの行列分割とgrouped番号の等分に加え、320px重複tileを最大160枚に制限する。全体coarse sweepと画像寸法由来の上半分中央/右端detail ROIを併用し、絶対座標をコードへ持たない。実測recall threshold未達ならM3未完了。 |
 | 初回実行時のモデルロードが遅い（10〜20秒/プロセス） | マップは1イベント数枚のため許容。runnerは `--image` 複数指定可にしてあり、将来まとめ処理に拡張可能 |
 | `no_repeat_ngram_size=35` が番号の繰り返し出力を抑制する懸念 | 番号列は35-gramに満たないため通常影響なし。M2で検出漏れが規則的に出る場合は 0（無効）と比較する |
 | trust_remote_code のサプライチェーンリスク | revision固定（`ee63731b...`）。HFキャッシュ済みコードと同一revisionのため追加DLも発生しない |
-| GPU非搭載環境（他ユーザー配布時） | `--device auto` でCPUフォールバック（低速だが動作）。doctor はCUDA無しでも exit 0 |
+| No-GPU distribution | 既定revisionはremote codeがCUDA専用のため、`cpu`およびCUDAなし`auto`をdoctor/runnerでfail-closedする。CPU対応モデルを明示した場合のみCPU解決を許可する |
 | OCR venv未構築でデスクトップからOCR実行 | 明確なメッセージの例外 → desktop_bridge がエラーとして返す。setup.bat に構築手順を組込み |
 
 ## 8. 完了条件チェックリスト
 
-- [ ] 新規6ファイル作成、変更7ファイル反映（§4の一覧どおり）
-- [ ] `grep -ri tesseract` ヒット0（本計画書を除く）
-- [ ] M1〜M4 完了（M2の粒度検証結果を報告に含める）
-- [ ] `ai-rules/SPACE_LOCATOR_DESIGN.md` の処理フロー・実装状況を更新済み
-- [ ] `temp/` がgitignoreされ、`git status --short` にモデル・venv・生成物が出ない
-- [ ] コミットメッセージは日本語（例: `マップOCRをTesseractからUnlimited OCRへ置換`）
+- [x] §4の実装対象を反映（製品化で追加された設定・doctor・評価ファイルも含む）
+- [x] 実行経路からTesseract依存/フォールバックを削除（計画書の移行説明上の語は残る）
+- [x] M1〜M4完了。M2/M3のpin-center粒度と実測値は§9および再現reportへ記録
+- [x] `ai-rules/SPACE_LOCATOR_DESIGN.md` の処理フロー・実装状況を更新
+- [x] `temp/` のモデル・venv・実行生成物はgitignore対象
+- [x] 今回の指示によりcommit/pushは実施しない（commitを完了条件にしない）
+
+## 9. 製品化拡張（2026-08）
+
+移行後に判明した配布・小文字連番の課題を、既存JSON契約を壊さず補完した。
+
+- `src/space_locator/ocr_config.py` がモデルHub ID/ローカルモデル、HF_HOME、専用venv、
+  revision、device、mode、`small_digits`戦略を環境変数・GUI payloadから正規化する。
+- `unlimited_ocr_runner.py` はgundamの小文字連番プロンプトを優先し、0件時だけbase/全文OCRへ
+  フォールバックする。full-frame候補が12件未満なら、320px半strideの全体coarse sweepと
+  相対detail ROIを最大160枚で走査する。tile内は実測で安定したsingle/gundam標準groundingを使う。
+  モデルはCLI/設定で差し替えられ、revision既定値は維持する。
+- Desktop設定画面のOCR欄と `unlimited_ocr_doctor` ブリッジジョブで配布先PCの差異を可視化する。
+- OCR失敗時は番号リストを空にして既存処理を継続しつつ、`ocr_diagnostics`（コード、stderr、
+  モデル、戦略、試行履歴）をログと座標JSONへ残す。
+- `scripts/evaluate_unlimited_ocr.py` は実マップとground-truthのprecision/recall、中心座標誤差を
+  モデル/revision/strategyごとに比較する。repo event由来pin-center GTではIoUを使わず、手動輪郭GT時だけ併記する。
+  `--model-spec` JSONを複数指定すればHub ID/ローカルpath/revision/mode/strategyを一括比較できる。
+  実画像がない環境では保存済みrunner JSONを評価できる。
+- Ariaers実マップ（3035x1803、event.json由来GT 56点）の標準経路実測は、RTX 5090で434.6秒。
+  raw正規化はpredicted 89 / matched 36 / recall 64.29%、overlap重複排除後はpredicted 76 /
+  matched 35 / precision 46.05% / recall 62.50% / mean distance 21.657px。
+  詳細、SHA/provenance、0%ベースラインは `docs/ocr-evaluation.repo-events.json` と
+  `docs/ocr-evaluation-reproduction.md` に保存する。
+- モバイルはOCRを実行せず、デスクトップが生成した正規化pin座標の表示・手動補正に責務を限定する。

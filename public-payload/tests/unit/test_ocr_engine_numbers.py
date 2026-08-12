@@ -42,6 +42,42 @@ def test_elements_to_numbers_splits_numeric_ref_by_token_position():
     assert all(item["width"] == 50 for item in numbers)
 
 
+def test_elements_to_numbers_splits_newline_group_vertically():
+    numbers = _elements_to_numbers(
+        [{"text": "02\n03\n04", "x1": 2918, "y1": 100, "x2": 2960, "y2": 302}]
+    )
+
+    assert [item["number"] for item in numbers] == ["02", "03", "04"]
+    assert [item["x"] for item in numbers] == [2918, 2918, 2918]
+    assert [item["y"] for item in numbers] == [100, 167, 234]
+
+
+def test_elements_to_numbers_keeps_space_group_horizontal_even_in_tall_box():
+    numbers = _elements_to_numbers(
+        [{"text": "02 03 04", "x1": 0, "y1": 100, "x2": 42, "y2": 302}]
+    )
+
+    assert [item["x"] for item in numbers] == [0, 14, 28]
+    assert all(item["y"] == 100 and item["height"] == 202 for item in numbers)
+
+
+def test_elements_to_numbers_splits_html_table_grouped_numbers():
+    numbers = _elements_to_numbers(
+        [
+            {
+                "text": "<table><tr><td>01</td><td>A</td><td>02</td></tr></table>",
+                "x1": 0,
+                "y1": 0,
+                "x2": 300,
+                "y2": 30,
+            }
+        ]
+    )
+
+    assert [item["number"] for item in numbers] == ["01", "02"]
+    assert [item["x"] for item in numbers] == [0, 200]
+
+
 def test_elements_to_numbers_accepts_eighty_percent_numeric_tokens():
     numbers = _elements_to_numbers(
         [{"text": "1 2 X 4 5", "x1": 0, "y1": 0, "x2": 500, "y2": 20}]
@@ -59,6 +95,36 @@ def test_elements_to_numbers_rejects_below_eighty_percent_numeric_tokens():
     assert numbers == []
 
 
+def test_elements_to_numbers_splits_short_row_with_non_numeric_heading():
+    numbers = _elements_to_numbers(
+        [{"text": "あ 01 02", "x1": 100, "y1": 20, "x2": 220, "y2": 50}]
+    )
+
+    assert [item["number"] for item in numbers] == ["01", "02"]
+    assert [item["x"] for item in numbers] == [140, 180]
+
+
+def test_elements_to_numbers_prefix_policy_rejects_dates_and_long_ids():
+    accepted = _elements_to_numbers(
+        [
+            {"text": "企業-01", "x1": 0, "y1": 0, "x2": 20, "y2": 20},
+            {"text": "A-01", "x1": 40, "y1": 0, "x2": 60, "y2": 20},
+            {"text": "P-12", "x1": 80, "y1": 0, "x2": 100, "y2": 20},
+        ]
+    )
+    rejected = _elements_to_numbers(
+        [
+            {"text": "2025-01", "x1": 0, "y1": 0, "x2": 20, "y2": 20},
+            {"text": "2025/01", "x1": 30, "y1": 0, "x2": 50, "y2": 20},
+            {"text": "123-45", "x1": 60, "y1": 0, "x2": 80, "y2": 20},
+            {"text": "AB-12", "x1": 90, "y1": 0, "x2": 110, "y2": 20},
+        ]
+    )
+
+    assert [item["number"] for item in accepted] == ["01", "01", "12"]
+    assert rejected == []
+
+
 def test_elements_to_numbers_merges_near_duplicates_and_sorts_by_y_x():
     numbers = _elements_to_numbers(
         [
@@ -69,8 +135,22 @@ def test_elements_to_numbers_merges_near_duplicates_and_sorts_by_y_x():
     )
 
     assert [item["number"] for item in numbers] == ["01", "02"]
-    assert numbers[0]["x"] == 52
-    assert numbers[0]["width"] == 16
+    assert numbers[0]["x"] == 50
+    assert numbers[0]["width"] == 20
+
+
+def test_elements_to_numbers_deduplicates_overlap_but_keeps_distinct_same_number():
+    numbers = _elements_to_numbers(
+        [
+            {"text": "12", "x1": 100, "y1": 100, "x2": 150, "y2": 140},
+            {"text": "12", "x1": 125, "y1": 100, "x2": 165, "y2": 140},
+            {"text": "12", "x1": 220, "y1": 100, "x2": 260, "y2": 140},
+        ]
+    )
+
+    assert len(numbers) == 2
+    assert [item["x"] for item in numbers] == [100, 220]
+    assert numbers[0]["width"] == 65
 
 
 def test_elements_to_numbers_skips_missing_coordinates_and_invalid_boxes():

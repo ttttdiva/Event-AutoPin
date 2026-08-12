@@ -50,6 +50,16 @@ class CircleListGenerator:
         )
 
         self.logger.info("サークルリスト生成ツール初期化完了")
+        # GUI/CLIへ返す座標生成の機械可読な診断。既存の event.json 契約には
+        # 影響させず、bridge が必要に応じて結果を返せるようにする。
+        self.coordinate_generation_summary: Dict[str, Any] = {
+            "status": "not_requested",
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "total_updated": 0,
+            "maps": [],
+        }
 
     def _get_model_config(self) -> Union[str, List[str]]:
         """モデル設定を取得（単一または複数モデル対応）"""
@@ -209,6 +219,11 @@ class CircleListGenerator:
                 return self._run_reprocess_mode(
                     regenerate_coordinates=regenerate_coordinates
                 )
+
+            coordinate_requested = bool(
+                regenerate_coordinates and self._should_generate_coordinates()
+            )
+            coordinate_ok = True
 
             # output_dirの既存ファイルをクリア（フルパイプラインは最初からやり直す）
             output_dir = Path(self.config["output_dir"])
@@ -520,13 +535,16 @@ class CircleListGenerator:
                 pipeline_progress.update(1, "Twitter処理完了")
 
             # 座標自動生成（オプショナル）
-            if regenerate_coordinates and self._should_generate_coordinates():
+            if coordinate_requested:
                 self.logger.info("\n=== 座標自動生成を開始 ===")
-                coord_result = self._generate_coordinates()
-                if coord_result:
+                coordinate_ok = self._generate_coordinates()
+                if coordinate_ok:
                     self.logger.info("✅ 座標生成完了")
                 else:
-                    self.logger.warning("⚠️ 座標生成に失敗しましたが、処理は継続します")
+                    self.logger.error(
+                        "❌ 座標生成に失敗しました: "
+                        f"{self.coordinate_generation_summary.get('error') or self.coordinate_generation_summary.get('status')}"
+                    )
                 pipeline_progress.update(1, "座標生成完了")
 
             # 古いファイルのクリーンアップは不要（event.jsonは上書き）
@@ -538,12 +556,13 @@ class CircleListGenerator:
                 )
             else:
                 self.logger.info("✅ サークルリスト生成が正常に完了しました！")
+            result["coordinate_generation"] = self.coordinate_generation_summary
             self._print_summary(result)
 
             # API料金サマリー
             get_cost_tracker().log_summary()
 
-            return True
+            return not coordinate_requested or coordinate_ok
 
         except Exception as e:
             self.logger.error(f"❌ 予期しないエラー: {e}", exc_info=True)
@@ -592,15 +611,19 @@ class CircleListGenerator:
                     "✅ すべてのサークルにおしながきリンクが記載されています"
                 )
 
-                if regenerate_coordinates and self._should_generate_coordinates():
+                coordinate_requested = bool(
+                    regenerate_coordinates and self._should_generate_coordinates()
+                )
+                coordinate_ok = True
+                if coordinate_requested:
                     self.logger.info("\n=== 座標再生成のみ実行します ===")
-                    coord_result = self._generate_coordinates()
-                    if coord_result:
+                    coordinate_ok = self._generate_coordinates()
+                    if coordinate_ok:
                         self.logger.info("✅ 座標再生成完了")
                     else:
                         self.logger.warning("⚠️ 座標再生成に失敗しました")
 
-                return True
+                return not coordinate_requested or coordinate_ok
 
             self.logger.info(
                 f"\n{len(circles_without_catalog)}件のサークルを再処理します"
@@ -841,10 +864,14 @@ class CircleListGenerator:
             reprocess_progress.update(1, "event.json保存完了")
             self.logger.info(f"✅ {len(update_data)}件のおしながきリンクを追加しました")
 
-            if regenerate_coordinates and self._should_generate_coordinates():
+            coordinate_requested = bool(
+                regenerate_coordinates and self._should_generate_coordinates()
+            )
+            coordinate_ok = True
+            if coordinate_requested:
                 self.logger.info("\n=== 座標再生成を開始 ===")
-                coord_result = self._generate_coordinates()
-                if coord_result:
+                coordinate_ok = self._generate_coordinates()
+                if coordinate_ok:
                     self.logger.info("✅ 座標再生成完了")
                 else:
                     self.logger.warning(
@@ -852,7 +879,7 @@ class CircleListGenerator:
                     )
 
             get_cost_tracker().log_summary()
-            return True
+            return not coordinate_requested or coordinate_ok
 
         except Exception as e:
             self.logger.error(f"再処理中にエラー: {e}", exc_info=True)
@@ -962,6 +989,18 @@ class CircleListGenerator:
                     return candidate
         return None
 
+    def _save_coordinate_generation_summary(self) -> None:
+        """座標生成診断をoutput_dirへ保存（GUI bridgeが回収する）。"""
+        try:
+            path = Path(self.config["output_dir"]) / "coordinate_generation_summary.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(self.coordinate_generation_summary, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            self.logger.debug("座標生成サマリーの保存に失敗しました", exc_info=True)
+
     def _generate_coordinates(self) -> bool:
         """座標を自動生成してevent.jsonを更新"""
         from src.space_locator import generate_coordinates_from_map
@@ -977,6 +1016,16 @@ class CircleListGenerator:
                 map_urls.append(map_url)
         if not map_urls:
             self.logger.error("map_urlが設定されていません")
+            self.coordinate_generation_summary = {
+                "status": "failed",
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "total_updated": 0,
+                "maps": [],
+                "error": "map_urlが設定されていません",
+            }
+            self._save_coordinate_generation_summary()
             return False
 
         models = self._get_model_config()
@@ -989,10 +1038,28 @@ class CircleListGenerator:
 
         if not event_json_path.exists():
             self.logger.error(f"event.jsonが見つかりません: {event_json_path}")
+            self.coordinate_generation_summary = {
+                "status": "failed",
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "total_updated": 0,
+                "maps": [],
+                "error": f"event.jsonが見つかりません: {event_json_path}",
+            }
+            self._save_coordinate_generation_summary()
             return False
 
         try:
             total_updated = 0
+            attempted = 0
+            succeeded = 0
+            failed = 0
+            map_diagnostics: list[Dict[str, Any]] = []
+            ocr_config = self.config.get("ocr_config")
+            if not isinstance(ocr_config, dict):
+                # config.yaml を直接実行する旧利用者も環境変数設定を利用可能。
+                ocr_config = None
 
             for i, map_url in enumerate(map_urls):
                 self.logger.info(f"\nマップ{i+1}/{len(map_urls)}: {map_url}")
@@ -1003,19 +1070,49 @@ class CircleListGenerator:
                     self.logger.error(
                         f"マップファイルが見つかりません: map_{map_number:02d}.jpg/png/webp"
                     )
+                    failed += 1
+                    attempted += 1
+                    map_diagnostics.append(
+                        {
+                            "map_number": map_number,
+                            "status": "failed",
+                            "error": "マップファイルが見つかりません",
+                        }
+                    )
                     continue
 
+                attempted += 1
                 output_json = Path(output_dir) / f"coordinates_map_{map_number}.json"
-                coord_map = generate_coordinates_from_map(
-                    image_path=str(local_map_path),
-                    event_json_path=str(event_json_path),
-                    output_json_path=str(output_json),
-                    model=model,
-                    map_number=map_number,
-                )
+                generation_kwargs = {
+                    "image_path": str(local_map_path),
+                    "event_json_path": str(event_json_path),
+                    "output_json_path": str(output_json),
+                    "model": model,
+                    "map_number": map_number,
+                }
+                if ocr_config:
+                    generation_kwargs["ocr_config"] = ocr_config
+                coord_map = generate_coordinates_from_map(**generation_kwargs)
 
                 if coord_map is None:
                     self.logger.error(f"座標生成失敗: {local_map_path}")
+                    failed += 1
+                    diagnostic: Dict[str, Any] = {
+                        "map_number": map_number,
+                        "status": "failed",
+                        "image_path": str(local_map_path),
+                        "output_json": str(output_json),
+                        "error": "座標生成関数が結果を返しませんでした",
+                    }
+                    try:
+                        if output_json.exists():
+                            saved = json.loads(output_json.read_text(encoding="utf-8-sig"))
+                            if isinstance(saved, dict):
+                                diagnostic["error"] = saved.get("error") or diagnostic["error"]
+                                diagnostic["ocr_diagnostics"] = saved.get("ocr_diagnostics", {})
+                    except (OSError, ValueError, TypeError):
+                        pass
+                    map_diagnostics.append(diagnostic)
                     continue
 
                 # event.jsonを更新
@@ -1035,12 +1132,58 @@ class CircleListGenerator:
                     skipped = update_result["skipped_count"]
                     total_updated += updated
                     self.logger.info(f"更新: {updated}件 / スキップ: {skipped}件")
+                    succeeded += 1
+                    map_diagnostics.append(
+                        {
+                            "map_number": map_number,
+                            "status": "success",
+                            "image_path": str(local_map_path),
+                            "output_json": str(output_json),
+                            "updated_count": updated,
+                            "skipped_count": skipped,
+                        }
+                    )
+                else:
+                    failed += 1
+                    map_diagnostics.append(
+                        {
+                            "map_number": map_number,
+                            "status": "failed",
+                            "image_path": str(local_map_path),
+                            "output_json": str(output_json),
+                            "error": "event.jsonの座標更新に失敗しました",
+                        }
+                    )
 
             self.logger.info(f"\n合計 {total_updated} 件の座標を更新しました")
-            return True
+            status = "success" if succeeded == attempted and attempted else (
+                "partial" if succeeded else "failed"
+            )
+            self.coordinate_generation_summary = {
+                "status": status,
+                "attempted": attempted,
+                "succeeded": succeeded,
+                "failed": failed,
+                "total_updated": total_updated,
+                "maps": map_diagnostics,
+            }
+            self._save_coordinate_generation_summary()
+            # 一部成功は既存仕様どおり継続可能だが、全マップ失敗はGUI/CLIの
+            # 成功表示を許可しない。
+            return succeeded > 0
 
         except Exception as e:
             self.logger.error(f"座標生成中にエラー: {e}", exc_info=True)
+            self.coordinate_generation_summary = {
+                "status": "failed",
+                "attempted": locals().get("attempted", 0),
+                "succeeded": locals().get("succeeded", 0),
+                "failed": locals().get("failed", 0) + 1,
+                "total_updated": locals().get("total_updated", 0),
+                "maps": locals().get("map_diagnostics", []),
+                "error": str(e),
+            }
+            self._save_coordinate_generation_summary()
             return False
 
     def _print_summary(self, result: Dict[str, Any]):
@@ -1062,6 +1205,19 @@ class CircleListGenerator:
             print(f"  不正URL除外: {twitter_summary.get('invalid_url_count', 0)}件")
             if twitter_summary.get("reason"):
                 print(f"  理由: {twitter_summary['reason']}")
+
+        coordinate_summary = result.get("coordinate_generation")
+        if coordinate_summary and coordinate_summary.get("status") != "not_requested":
+            print("\n座標生成:")
+            print(f"  状態: {coordinate_summary.get('status')}")
+            print(
+                "  マップ: "
+                f"{coordinate_summary.get('succeeded', 0)}/"
+                f"{coordinate_summary.get('attempted', 0)} 成功"
+            )
+            print(f"  更新: {coordinate_summary.get('total_updated', 0)}件")
+            if coordinate_summary.get("error"):
+                print(f"  診断: {coordinate_summary['error']}")
 
         print("\n出力ファイル:")
         for file_type, file_path in result["output_files"].items():

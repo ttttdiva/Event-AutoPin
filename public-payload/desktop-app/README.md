@@ -1,4 +1,4 @@
-# EventTrail Studio (Tauri)
+# Event AutoPin (Tauri)
 
 日本語UIで、クロール実行・サークルリスト編集・モバイル互換チェックをタブ分離して行うデスクトップアプリです。
 

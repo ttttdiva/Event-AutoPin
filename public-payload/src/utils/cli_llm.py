@@ -172,14 +172,14 @@ def execute_cli_prompt(
             mode="w",
             encoding="utf-8",
             suffix=".txt",
-            prefix="eventtrail-agy-prompt-",
+            prefix="event-autopin-agy-prompt-",
             delete=False,
             dir=str(tmp_dir),
         )
         prompt_file.write(prompt)
         prompt_file.close()
         prompt = (
-            "Read the full EventTrail Studio prompt from this UTF-8 file and "
+            "Read the full Event AutoPin prompt from this UTF-8 file and "
             f"answer it: {prompt_file.name}"
         )
 

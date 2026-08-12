@@ -355,12 +355,88 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         "pagination",
         "days_before",
         "days_after",
+        # GUI の Unlimited OCR 設定は一つの辞書として main.py まで渡す。
+        "ocr_config",
     ]
     for key in optional_keys:
         if key in payload and payload[key] not in (None, ""):
             config[key] = payload[key]
 
+    # 旧版GUI/外部呼び出しがフラットなキーを送る場合も同じ契約へ寄せる。
+    # ocr_config が明示されていれば優先し、空の値で既定を壊さない。
+    if not isinstance(config.get("ocr_config"), dict):
+        flat_ocr_keys = {
+            "unlimited_ocr_model": "model",
+            "unlimited_ocr_model_path": "model_path",
+            "unlimited_ocr_venv": "venv_path",
+            "unlimited_ocr_hf_home": "hf_home",
+            "unlimited_ocr_revision": "revision",
+            "unlimited_ocr_device": "device",
+            "unlimited_ocr_mode": "mode",
+            "unlimited_ocr_strategy": "strategy",
+            "unlimited_ocr_prompt": "prompt",
+            "unlimited_ocr_timeout_sec": "timeout_sec",
+            "unlimited_ocr_max_length": "max_length",
+            "unlimited_ocr_no_repeat_ngram_size": "no_repeat_ngram_size",
+            "unlimited_ocr_ngram_window": "ngram_window",
+            "unlimited_ocr_temperature": "temperature",
+        }
+        flat_config = {
+            target: payload[source]
+            for source, target in flat_ocr_keys.items()
+            if source in payload and payload[source] not in (None, "")
+        }
+        if flat_config:
+            config["ocr_config"] = flat_config
+
     return config
+
+
+def _collect_coordinate_diagnostics(output_dir: str | Path) -> Dict[str, Any] | None:
+    """main.py/auto generator が保存した座標結果をGUI応答へ要約する。"""
+    root = Path(output_dir)
+    summary_path = root / "coordinate_generation_summary.json"
+    if summary_path.exists():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8-sig"))
+            if isinstance(summary, dict):
+                return summary
+        except (OSError, ValueError, TypeError):
+            pass
+
+    files = sorted(root.glob("coordinates_map_*.json")) if root.exists() else []
+    if not files:
+        return None
+    maps: list[Dict[str, Any]] = []
+    for path in files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, TypeError) as exc:
+            maps.append({"file": str(path), "status": "failed", "error": str(exc)})
+            continue
+        if not isinstance(data, dict):
+            maps.append({"file": str(path), "status": "failed", "error": "結果JSONがobjectではありません"})
+            continue
+        grid = data.get("complete_grid")
+        failed = bool(data.get("error")) or not isinstance(grid, list) or not grid
+        maps.append(
+            {
+                "file": str(path),
+                "map_number": data.get("map_number"),
+                "status": "failed" if failed else "success",
+                "generated_count": len(grid) if isinstance(grid, list) else 0,
+                "error": data.get("error"),
+                "ocr_diagnostics": data.get("ocr_diagnostics", {}),
+            }
+        )
+    succeeded = sum(1 for item in maps if item.get("status") == "success")
+    return {
+        "status": "success" if succeeded == len(maps) else ("partial" if succeeded else "failed"),
+        "attempted": len(maps),
+        "succeeded": succeeded,
+        "failed": len(maps) - succeeded,
+        "maps": maps,
+    }
 
 
 def _job_ping(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -490,6 +566,17 @@ def _run_main_process(
         "stdout": stdout_output,
         "stderr": "\n".join(stderr_lines),
     }
+    coordinate_diagnostics = _collect_coordinate_diagnostics(config.get("output_dir"))
+    if coordinate_diagnostics is not None:
+        result["coordinate_generation"] = coordinate_diagnostics
+        if (
+            payload.get("regenerate_coordinates")
+            and coordinate_diagnostics.get("status") == "failed"
+            and proc.returncode == 0
+        ):
+            result["status"] = "error"
+            result["returncode"] = 1
+            result["stderr"] += "\n座標生成が全マップで失敗しました。"
     twitter_processing = _extract_twitter_processing_result(stderr_lines)
     if twitter_processing:
         result["twitter_processing"] = twitter_processing
@@ -974,6 +1061,18 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
             "stdout": stdout_output,
             "stderr": "\n".join(stderr_lines),
         }
+        coordinate_diagnostics = _collect_coordinate_diagnostics(config.get("output_dir"))
+        if coordinate_diagnostics is not None:
+            result["coordinate_generation"] = coordinate_diagnostics
+            if (
+                payload.get("regenerate_coordinates")
+                and coordinate_diagnostics.get("status") == "failed"
+                and proc.returncode == 0
+            ):
+                # 古い main.py が座標失敗を0で返してもGUIでは成功扱いにしない。
+                result["status"] = "error"
+                result["returncode"] = 1
+                result["stderr"] += "\n座標生成が全マップで失敗しました。"
         twitter_processing = _extract_twitter_processing_result(stderr_lines)
         if twitter_processing:
             result["twitter_processing"] = twitter_processing
@@ -1552,19 +1651,51 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     output_json_path = event_dir / f"coordinates_map_{map_number}.json"
 
+    # OCR設定は desktop.config.json 由来の ocr_config オブジェクト、または
+    # 旧UI/CLI互換のフラットな unlimited_ocr_* キーのどちらでも受け付ける。
+    ocr_config = payload.get("ocr_config")
+    if not isinstance(ocr_config, dict):
+        ocr_config = {}
+    for payload_key, config_key in (
+        ("unlimited_ocr_model", "model"),
+        ("unlimited_ocr_model_path", "model_path"),
+        ("unlimited_ocr_venv", "venv_path"),
+        ("unlimited_ocr_hf_home", "hf_home"),
+        ("unlimited_ocr_revision", "revision"),
+        ("unlimited_ocr_device", "device"),
+        ("unlimited_ocr_mode", "mode"),
+        ("unlimited_ocr_strategy", "strategy"),
+        ("unlimited_ocr_prompt", "prompt"),
+    ):
+        if payload_key in payload and payload[payload_key] not in (None, ""):
+            ocr_config.setdefault(config_key, payload[payload_key])
+
     from src.space_locator import generate_coordinates_from_map
     from src.space_locator.json_updater import JSONUpdater
 
-    coord_map = generate_coordinates_from_map(
-        image_path=str(map_image_path),
-        event_json_path=str(event_json_path),
-        output_json_path=str(output_json_path),
-        model=model,
-        map_number=map_number,
-        use_calibration=bool(payload.get("use_calibration", True)),
-    )
+    generation_kwargs = {
+        "image_path": str(map_image_path),
+        "event_json_path": str(event_json_path),
+        "output_json_path": str(output_json_path),
+        "model": model,
+        "map_number": map_number,
+        "use_calibration": bool(payload.get("use_calibration", True)),
+    }
+    if ocr_config:
+        generation_kwargs["ocr_config"] = ocr_config
+    coord_map = generate_coordinates_from_map(**generation_kwargs)
     if coord_map is None:
-        raise RuntimeError("map pin coordinate generation failed")
+        details = ""
+        try:
+            failure_payload = json.loads(output_json_path.read_text(encoding="utf-8"))
+            diagnostics = failure_payload.get("ocr_diagnostics")
+            if diagnostics:
+                error = diagnostics.get("error") if isinstance(diagnostics, dict) else None
+                if isinstance(error, dict):
+                    details = f"; OCR診断: {error.get('code', 'unknown')} - {error.get('message', '')}"
+        except (OSError, ValueError, TypeError):
+            pass
+        raise RuntimeError(f"map pin coordinate generation failed{details}")
 
     updater = JSONUpdater()
     update_result = updater.update_event_json(
@@ -1585,6 +1716,146 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
         "updated_count": update_result.get("updated_count", 0),
         "skipped_count": update_result.get("skipped_count", 0),
         "calibration": coord_map.get("calibration", {}),
+        "ocr_diagnostics": coord_map.get("ocr_diagnostics", {}),
+    }
+
+
+def _job_unlimited_ocr_doctor(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """配布先PCのOCR専用venv・モデル設定をGUIから診断する。"""
+    from src.space_locator.ocr_config import (
+        DEFAULT_MODEL_CPU_UNSUPPORTED_REASON,
+        UnlimitedOCRConfig,
+        model_requires_cuda,
+    )
+
+    raw_config = payload.get("ocr_config")
+    # GUIのフォームは空欄を「親環境の値を解除」として送るため、空欄を
+    # stale env で補完しない。
+    config = UnlimitedOCRConfig.from_mapping(
+        raw_config if isinstance(raw_config, dict) else None,
+        empty_overrides=isinstance(raw_config, dict),
+    )
+    repo_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+    venv_dir = Path(
+        config.venv_path
+        or (
+            repo_root / "temp" / "unlimited_ocr_venv"
+            if isinstance(raw_config, dict)
+            else os.environ.get("UNLIMITED_OCR_VENV", repo_root / "temp" / "unlimited_ocr_venv")
+        )
+    )
+    python_path = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    model_source = Path(config.model_path).expanduser() if config.model_path else None
+    configured_hub_cache = "" if isinstance(raw_config, dict) else os.environ.get("HF_HUB_CACHE", "").strip()
+    hf_home = Path(config.hf_home).expanduser() if config.hf_home else Path(
+        repo_root / "temp" / "hf_cache"
+        if isinstance(raw_config, dict)
+        else os.environ.get("HF_HOME", repo_root / "temp" / "hf_cache")
+    )
+    hub_cache = Path(configured_hub_cache).expanduser() if configured_hub_cache else hf_home / "hub"
+    model_cache = hub_cache / f"models--{config.model.replace('/', '--')}"
+    cache_path = model_cache
+    issues: list[str] = []
+
+    def local_model_artifacts(path: Path) -> tuple[bool, list[str]]:
+        if not path.is_dir():
+            return False, ["directory"]
+        missing: list[str] = []
+        config_path = path / "config.json"
+        if not config_path.is_file() or config_path.stat().st_size == 0:
+            missing.append("config.json")
+        else:
+            try:
+                if not isinstance(json.loads(config_path.read_text(encoding="utf-8")), dict):
+                    missing.append("config.json(object)")
+            except (OSError, ValueError, UnicodeError):
+                missing.append("config.json(valid JSON)")
+        if not any(
+            candidate.is_file() and candidate.stat().st_size > 0
+            for pattern in ("*.safetensors", "*.bin", "*.pt", "*.pth")
+            for candidate in path.glob(pattern)
+        ):
+            missing.append("weights")
+        if not any(
+            (path / name).is_file() and (path / name).stat().st_size > 0
+            for name in (
+                "tokenizer.json", "tokenizer_config.json", "tokenizer.model", "spiece.model",
+                "preprocessor_config.json", "processor_config.json",
+            )
+        ):
+            missing.append("tokenizer/processor")
+        return not missing, missing
+
+    if not python_path.exists():
+        issues.append(f"専用venvのPythonがありません: {python_path}")
+    if model_source and not model_source.exists():
+        issues.append(f"指定モデルパスがありません: {model_source}")
+    elif model_source:
+        model_ready, missing = local_model_artifacts(model_source)
+        if not model_ready:
+            issues.append(
+                f"指定モデルパスに実ロード用ファイルが不足しています: {model_source} "
+                f"({', '.join(missing)})"
+            )
+    if not model_source and not cache_path.exists():
+        issues.append(f"モデルキャッシュがありません: {cache_path}")
+    elif not model_source:
+        snapshot = cache_path / "snapshots" / config.revision
+        if not snapshot.is_dir():
+            issues.append(f"指定revisionのモデルsnapshotがありません: {snapshot}")
+        else:
+            snapshot_ready, missing = local_model_artifacts(snapshot)
+            if not snapshot_ready:
+                issues.append(
+                    f"モデルsnapshotに実ロード用ファイルが不足しています: {snapshot} "
+                    f"({', '.join(missing)})"
+                )
+
+    torch_info: Dict[str, Any] = {}
+    if python_path.exists():
+        try:
+            probe = subprocess.run(
+                [str(python_path), "-c", "import torch; print(torch.__version__); print(torch.cuda.is_available())"],
+                cwd=repo_root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+            )
+            lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+            torch_info = {
+                "returncode": probe.returncode,
+                "version": lines[0] if lines else None,
+                "cuda_available": any(line.lower() == "true" for line in lines),
+                "stderr": probe.stderr[-1000:] if probe.returncode else "",
+            }
+            if probe.returncode != 0:
+                issues.append("専用venvでtorchをimportできません")
+            elif config.device == "cuda" and not torch_info.get("cuda_available"):
+                issues.append("device=cuda ですが専用venvでCUDAが利用できません（fail-closed）")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            issues.append(f"専用venvの診断に失敗しました: {exc}")
+
+    requires_cuda = model_requires_cuda(
+        model=config.model,
+        revision=config.revision,
+        model_path=config.model_path,
+    )
+    if requires_cuda and config.device == "cpu":
+        issues.append("device=cpu: " + DEFAULT_MODEL_CPU_UNSUPPORTED_REASON + "（fail-closed）")
+    elif requires_cuda and config.device == "auto" and not torch_info.get("cuda_available"):
+        issues.append("device=auto でCUDAを検出できません: " + DEFAULT_MODEL_CPU_UNSUPPORTED_REASON + "（fail-closed）")
+
+    return {
+        "status": "ok" if not issues else "error",
+        "job": "unlimited_ocr_doctor",
+        "ready": not issues,
+        "issues": issues,
+        "config": config.to_public_dict(),
+        "python": str(python_path),
+        "model_source": str(model_source or config.model),
+        "hf_home": str(hf_home),
+        "model_cache": str(cache_path),
+        "model_cache_exists": cache_path.exists(),
+        "model_requires_cuda": requires_cuda,
+        "torch": torch_info,
+        "timestamp": _utc_now_iso(),
     }
 
 
@@ -2263,6 +2534,8 @@ def run_job(job: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return _job_validate_mobile_json(payload)
     if job == "auto_place_map_pins":
         return _job_auto_place_map_pins(payload)
+    if job == "unlimited_ocr_doctor":
+        return _job_unlimited_ocr_doctor(payload)
     if job == "create_mobile_zip":
         return _job_create_mobile_zip(payload)
     if job == "create_mobile_full_sync_zip":
@@ -2298,6 +2571,7 @@ def run_job(job: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 "save_event_json",
                 "validate_mobile_json",
                 "auto_place_map_pins",
+                "unlimited_ocr_doctor",
                 "create_mobile_zip",
                 "create_mobile_full_sync_zip",
                 "load_circle_master",

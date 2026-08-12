@@ -272,6 +272,122 @@ class TestBuildMainConfig:
             "https://map.test/2.png",
         ]
 
+    def test_ocr_config_is_preserved_for_main_pipeline(self, tmp_path: Path):
+        config = _build_main_config(
+            {
+                "url": "https://example.com",
+                "output_dir": str(tmp_path / "out"),
+                "ocr_config": {
+                    "model": "org/custom-ocr",
+                    "model_path": str(tmp_path / "model"),
+                    "device": "cpu",
+                    "strategy": "single",
+                },
+            }
+        )
+        assert config["ocr_config"]["model"] == "org/custom-ocr"
+        assert config["ocr_config"]["model_path"] == str(tmp_path / "model")
+        assert config["ocr_config"]["device"] == "cpu"
+        assert config["ocr_config"]["strategy"] == "single"
+
+
+def test_unlimited_ocr_doctor_uses_project_root_for_default_cache(tmp_path: Path, monkeypatch):
+    from src.commands.desktop_bridge import _job_unlimited_ocr_doctor
+
+    cache = tmp_path / "temp" / "hf_cache" / "hub" / "models--org--model"
+    cache.mkdir(parents=True)
+    revision = "ee63731b6461c8afcdcc7b15352e7d2ffecc2ead"
+    snapshot = cache / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+    venv = tmp_path / "temp" / "unlimited_ocr_venv" / "Scripts"
+    venv.mkdir(parents=True)
+    python_path = venv / "python.exe"
+    python_path.write_text("", encoding="utf-8")
+
+    class Probe:
+        returncode = 0
+        stdout = "2.10.0\nTrue\n"
+        stderr = ""
+
+    monkeypatch.setattr("src.commands.desktop_bridge.subprocess.run", lambda *args, **kwargs: Probe())
+    result = _job_unlimited_ocr_doctor(
+        {
+            "project_root": str(tmp_path),
+            "ocr_config": {"model": "org/model", "device": "cuda"},
+        }
+    )
+    assert result["ready"] is True
+    assert result["model_cache"] == str(cache)
+
+
+def test_unlimited_ocr_doctor_rejects_empty_local_model_directory(tmp_path: Path, monkeypatch):
+    from src.commands.desktop_bridge import _job_unlimited_ocr_doctor
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    venv = tmp_path / "ocr" / "Scripts"
+    venv.mkdir(parents=True)
+    (venv / "python.exe").write_text("", encoding="utf-8")
+
+    class Probe:
+        returncode = 0
+        stdout = "2.10.0\nTrue\n"
+        stderr = ""
+
+    monkeypatch.setattr("src.commands.desktop_bridge.subprocess.run", lambda *args, **kwargs: Probe())
+    result = _job_unlimited_ocr_doctor(
+        {
+            "project_root": str(tmp_path),
+            "ocr_config": {
+                "model_path": str(model_dir),
+                "venv_path": str(tmp_path / "ocr"),
+                "device": "cuda",
+            },
+        }
+    )
+    assert result["ready"] is False
+    assert any("実ロード用ファイル" in issue for issue in result["issues"])
+
+
+def test_unlimited_ocr_doctor_fails_closed_for_cuda_only_model_on_cpu(tmp_path: Path, monkeypatch):
+    from src.commands.desktop_bridge import _job_unlimited_ocr_doctor
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_dir / "modeling_unlimitedocr.py").write_text(
+        'x.cuda(); torch.autocast("cuda")', encoding="utf-8"
+    )
+    venv = tmp_path / "ocr" / "Scripts"
+    venv.mkdir(parents=True)
+    (venv / "python.exe").write_text("", encoding="utf-8")
+
+    class Probe:
+        returncode = 0
+        stdout = "2.10.0\nFalse\n"
+        stderr = ""
+
+    monkeypatch.setattr("src.commands.desktop_bridge.subprocess.run", lambda *args, **kwargs: Probe())
+    result = _job_unlimited_ocr_doctor(
+        {
+            "project_root": str(tmp_path),
+            "ocr_config": {
+                "model_path": str(model_dir),
+                "venv_path": str(tmp_path / "ocr"),
+                "device": "cpu",
+            },
+        }
+    )
+
+    assert result["ready"] is False
+    assert result["model_requires_cuda"] is True
+    assert any("CPU実行できません" in issue for issue in result["issues"])
+
 
 def test_既存イベントのTwitter再処理は複数urlでも再マージしない(tmp_path: Path):
     event_dir = tmp_path / "event"

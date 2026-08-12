@@ -72,6 +72,14 @@ type DesktopConfig = {
   projectRoot: string;
   timeoutMs: number;
   foamDir: string;
+  unlimitedOcrModel: string;
+  unlimitedOcrModelPath: string;
+  unlimitedOcrVenv: string;
+  unlimitedOcrHfHome: string;
+  unlimitedOcrRevision: string;
+  unlimitedOcrDevice: string;
+  unlimitedOcrMode: string;
+  unlimitedOcrStrategy: string;
 };
 
 type EnvKeys = {
@@ -136,6 +144,7 @@ type HistorySearchResponse = {
 };
 
 // === テーマ切り替え ===
+// eventtrail-* localStorage key names are retained for upgrade compatibility.
 const THEME_STORAGE_KEY = "eventtrail-theme";
 function getTheme(): "dark" | "light" {
   return (
@@ -636,6 +645,15 @@ const projectRootEl = document.getElementById(
 ) as HTMLInputElement;
 const timeoutMsEl = document.getElementById("timeoutMs") as HTMLInputElement;
 const foamDirEl = document.getElementById("foamDir") as HTMLInputElement;
+const unlimitedOcrModelEl = document.getElementById("unlimitedOcrModel") as HTMLInputElement;
+const unlimitedOcrModelPathEl = document.getElementById("unlimitedOcrModelPath") as HTMLInputElement;
+const unlimitedOcrVenvEl = document.getElementById("unlimitedOcrVenv") as HTMLInputElement;
+const unlimitedOcrHfHomeEl = document.getElementById("unlimitedOcrHfHome") as HTMLInputElement;
+const unlimitedOcrRevisionEl = document.getElementById("unlimitedOcrRevision") as HTMLInputElement;
+const unlimitedOcrDeviceEl = document.getElementById("unlimitedOcrDevice") as HTMLSelectElement;
+const unlimitedOcrModeEl = document.getElementById("unlimitedOcrMode") as HTMLSelectElement;
+const unlimitedOcrStrategyEl = document.getElementById("unlimitedOcrStrategy") as HTMLSelectElement;
+const unlimitedOcrDoctorBtn = document.getElementById("unlimitedOcrDoctorBtn") as HTMLButtonElement | null;
 const openaiApiKeyEl = document.getElementById(
   "openaiApiKey",
 ) as HTMLInputElement;
@@ -1752,6 +1770,14 @@ async function loadConfig() {
   projectRootEl.value = config.projectRoot;
   timeoutMsEl.value = String(config.timeoutMs);
   foamDirEl.value = config.foamDir || "";
+  unlimitedOcrModelEl.value = config.unlimitedOcrModel || "baidu/Unlimited-OCR";
+  unlimitedOcrModelPathEl.value = config.unlimitedOcrModelPath || "";
+  unlimitedOcrVenvEl.value = config.unlimitedOcrVenv || "";
+  unlimitedOcrHfHomeEl.value = config.unlimitedOcrHfHome || "";
+  unlimitedOcrRevisionEl.value = config.unlimitedOcrRevision || "ee63731b6461c8afcdcc7b15352e7d2ffecc2ead";
+  unlimitedOcrDeviceEl.value = config.unlimitedOcrDevice || "auto";
+  unlimitedOcrModeEl.value = config.unlimitedOcrMode || "gundam";
+  unlimitedOcrStrategyEl.value = config.unlimitedOcrStrategy || "small_digits";
 
   // APIキーを.envから読み込み
   try {
@@ -1772,6 +1798,14 @@ async function saveConfig() {
     projectRoot: projectRootEl.value,
     timeoutMs: Number(timeoutMsEl.value || "10800000"),
     foamDir: foamDirEl.value,
+    unlimitedOcrModel: unlimitedOcrModelEl.value.trim(),
+    unlimitedOcrModelPath: unlimitedOcrModelPathEl.value.trim(),
+    unlimitedOcrVenv: unlimitedOcrVenvEl.value.trim(),
+    unlimitedOcrHfHome: unlimitedOcrHfHomeEl.value.trim(),
+    unlimitedOcrRevision: unlimitedOcrRevisionEl.value.trim(),
+    unlimitedOcrDevice: unlimitedOcrDeviceEl.value,
+    unlimitedOcrMode: unlimitedOcrModeEl.value,
+    unlimitedOcrStrategy: unlimitedOcrStrategyEl.value,
   };
   const res = await invoke("save_desktop_config", { config: payload });
 
@@ -1788,6 +1822,41 @@ async function saveConfig() {
   await saveProjectConfig();
   resultEl.textContent = "設定を保存しました";
   await loadModelCatalog();
+}
+
+function currentOcrConfigPayload(): Record<string, unknown> {
+  return {
+    model: unlimitedOcrModelEl?.value.trim() || "baidu/Unlimited-OCR",
+    model_path: unlimitedOcrModelPathEl?.value.trim() || "",
+    venv_path: unlimitedOcrVenvEl?.value.trim() || "",
+    hf_home: unlimitedOcrHfHomeEl?.value.trim() || "",
+    revision: unlimitedOcrRevisionEl?.value.trim() || "ee63731b6461c8afcdcc7b15352e7d2ffecc2ead",
+    device: unlimitedOcrDeviceEl?.value || "auto",
+    mode: unlimitedOcrModeEl?.value || "gundam",
+    strategy: unlimitedOcrStrategyEl?.value || "small_digits",
+  };
+}
+
+async function runUnlimitedOcrDoctor(): Promise<void> {
+  if (!unlimitedOcrDoctorBtn) return;
+  unlimitedOcrDoctorBtn.disabled = true;
+  resultEl.textContent = "Unlimited OCR環境を確認中...";
+  try {
+    const response = await runJob("unlimited_ocr_doctor", {
+      ocr_config: currentOcrConfigPayload(),
+    });
+    const bridge = response?.bridge as Record<string, any> | undefined;
+    if (bridge) {
+      const issues = Array.isArray(bridge.issues) ? bridge.issues : [];
+      resultEl.textContent =
+        `${bridge.ready ? "Unlimited OCR準備完了" : "Unlimited OCR設定に確認事項があります"}\n` +
+        `モデル: ${bridge.model_source || "-"}\n` +
+        `Python: ${bridge.python || "-"}\n` +
+        (issues.length ? `\n⚠️ ${issues.join("\n⚠️ ")}` : "\nCUDA/torch診断は正常です。");
+    }
+  } finally {
+    unlimitedOcrDoctorBtn.disabled = false;
+  }
 }
 
 function formatResult(job: string, response: Record<string, unknown>): string {
@@ -4786,6 +4855,7 @@ function attachItemPanelListeners() {
 (
   document.getElementById("saveConfigBtn") as HTMLButtonElement
 ).addEventListener("click", saveConfig);
+unlimitedOcrDoctorBtn?.addEventListener("click", runUnlimitedOcrDoctor);
 refreshModelCatalogBtn?.addEventListener("click", () => loadModelCatalog());
 (document.getElementById("pingBtn") as HTMLButtonElement).addEventListener(
   "click",
@@ -5100,6 +5170,9 @@ function buildPipelinePayload() {
     days_after: Number(
       (document.getElementById("daysAfter") as HTMLInputElement)?.value || "7",
     ),
+    // 通常の run_main_pipeline 経路でも OCR 設定を保持する。auto_place の
+    // 専用経路だけに渡すと GUIで選んだモデル/venvが座標再生成時に失われる。
+    ocr_config: currentOcrConfigPayload(),
   };
 }
 
@@ -6245,6 +6318,14 @@ const FORM_IDS = [
   "pythonExe",
   "projectRoot",
   "timeoutMs",
+  "unlimitedOcrModel",
+  "unlimitedOcrModelPath",
+  "unlimitedOcrVenv",
+  "unlimitedOcrHfHome",
+  "unlimitedOcrRevision",
+  "unlimitedOcrDevice",
+  "unlimitedOcrMode",
+  "unlimitedOcrStrategy",
 ];
 
 function saveFormValues() {
@@ -7778,6 +7859,7 @@ async function runMapAutoPlacement(useCalibration: boolean) {
       map_number: mapNumber,
       use_calibration: useCalibration,
       image_llm_model: selectedImageModel() || selectedImageFallbackModel(),
+      ocr_config: currentOcrConfigPayload(),
     });
     const bridge = response?.bridge as Record<string, any> | undefined;
     if (!response?.ok || bridge?.status !== "ok") {
@@ -10304,7 +10386,7 @@ function showUpdateBar(info: UpdateCheckResult): void {
   const dismissBtn = document.getElementById("updateDismissBtn")!;
 
   const notesText = info.releaseNotes ? ` (${info.releaseNotes})` : "";
-  msg.textContent = `新しいバージョン v${info.latestVersion} が利用可能です${notesText}`;
+  msg.textContent = `Event AutoPin の新しいバージョン v${info.latestVersion} が利用可能です${notesText}`;
   bar.classList.remove("hidden");
 
   btn.onclick = () => downloadAndApplyUpdate(info.downloadUrl!);

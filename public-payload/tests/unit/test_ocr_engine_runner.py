@@ -69,7 +69,9 @@ def test_extract_numbers_returns_empty_on_runner_failure(tmp_path, monkeypatch):
         lambda command, **kwargs: subprocess.CompletedProcess(command, 1, stderr="boom"),
     )
 
-    assert OCREngine().extract_numbers_with_coordinates(str(image_path)) == []
+    engine = OCREngine()
+    assert engine.extract_numbers_with_coordinates(str(image_path)) == []
+    assert engine.diagnostics["error"]["code"] == "runner_failed"
 
 
 def test_extract_numbers_returns_empty_on_timeout(tmp_path, monkeypatch):
@@ -82,7 +84,9 @@ def test_extract_numbers_returns_empty_on_timeout(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ocr_engine.subprocess, "run", timeout_run)
 
-    assert OCREngine().extract_numbers_with_coordinates(str(image_path)) == []
+    engine = OCREngine()
+    assert engine.extract_numbers_with_coordinates(str(image_path)) == []
+    assert engine.diagnostics["error"]["code"] == "timeout"
 
 
 def test_resolve_ocr_python_message_is_os_specific(tmp_path, monkeypatch):

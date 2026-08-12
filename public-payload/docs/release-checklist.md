@@ -1,10 +1,11 @@
 # Release Checklist
 
-APK、EXE、installer、GitHub Release asset など公開用 artifact を作る merge/release では、この checklist と既存の README、docs、scripts を先に確認する。
+Event AutoPin の APK、EXE、installer、GitHub Release asset など公開用 artifact を作る merge/release では、この checklist と既存の README、docs、scripts を先に確認する。
 
 ## Common Gate
 
 - 作業前と完了前に `git status --short --branch` を確認する。
+- 公開リポジトリを使う場合は `ttttdiva/Event-AutoPin-Publish` を対象にし、tag・asset・`latest.json` の参照先を一致させる。
 - ユーザーが明示的に `releaseなし` / `APK不要` / `upload不要` と言わない限り、公開対象の build、upload、metadata 更新を省略しない。
 - version、tag、asset 名、公開先リポジトリ、`latest.json` などの前提が不足している場合は、merge だけ先に進めない。
 - 既存の release / publish / build script がある場合は、その script と引数を優先する。

@@ -42,12 +42,19 @@ docs/public-repository-sync.md
 docs/release-checklist.md
 docs/TWITTER_RATE_LIMIT.md
 docs/unlimited-ocr-migration-plan.md
+docs/unlimited-ocr-operations.md
+docs/ocr-evaluation-reproduction.md
+docs/ocr-ground-truth.example.json
 main.py
 pytest.ini
 README.md
 requirements.txt
 scripts/public-sync-manifest.txt
 scripts/sync_public_repo.ps1
+scripts/setup_unlimited_ocr.py
+scripts/setup_unlimited_ocr.bat
+scripts/evaluate_unlimited_ocr.py
+scripts/build_unlimited_ocr_ground_truth.py
 setup.bat
 setup.py
 setup.sh
@@ -139,6 +146,7 @@ src/space_locator/coordinate_mapper.py
 src/space_locator/json_updater.py
 src/space_locator/number_validator.py
 src/space_locator/ocr_engine.py
+src/space_locator/ocr_config.py
 src/space_locator/pattern_analyzer.py
 src/space_locator/unlimited_ocr_parser.py
 src/space_locator/unlimited_ocr_runner.py
@@ -197,3 +205,13 @@ tests/unit/test_twitter_extractor_fail_fast.py
 tests/unit/test_twitter_post_processor_items.py
 tests/unit/test_twitter_processing_summary.py
 tests/unit/test_unlimited_ocr_parser.py
+tests/unit/test_main_coordinate_pipeline.py
+tests/fixtures/unlimited_ocr_pin_center/event.json
+sha256:2705e6da0181921dbc5d3529a7e9c833d9efa0ebe316c4bf77fc24ebcdd0d2ec tests/fixtures/unlimited_ocr_pin_center/map_01.png
+tests/fixtures/unlimited_ocr_pin_center/ground_truth.json
+tests/fixtures/unlimited_ocr_pin_center/predictions.json
+tests/fixtures/unlimited_ocr_pin_center/evaluation.json
+tests/unit/test_unlimited_ocr_config.py
+tests/unit/test_unlimited_ocr_evaluation.py
+tests/unit/test_ocr_runner_strategy.py
+tests/unit/test_setup_unlimited_ocr_bat.py

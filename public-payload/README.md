@@ -1,18 +1,28 @@
-# EventTrail
+# Event AutoPin
 
 イベントサイトからサークル情報を収集し、買い物リスト用の `event.json` と画像アセットを生成・編集するツールです。
 
 ## 構成
 
 - `main.py` / `src/`: クロール、LLM解析、画像取得、再処理、マップピン自動配置
-- `desktop-app/`: EventTrail Studio。クロール実行、`event.json` 編集、マップ編集、モバイル連携
-- `shopping-app/`: EventTrail Go。`event.json` と画像アセットを読み込む買い物アプリ
+- `desktop-app/`: Event AutoPin desktop app。クロール実行、`event.json` 編集、マップ編集、モバイル連携
+- `shopping-app/`: Event AutoPin mobile app。`event.json` と画像アセットを読み込む買い物アプリ
 
 ## セットアップ
 
 ```bash
 pip install -r requirements.txt
 ```
+
+マップOCRを使う場合は、本体とは別の専用環境も構築します（配布先PCごとに一度だけ）。
+
+```bat
+scripts\setup_unlimited_ocr.bat
+scripts\setup_unlimited_ocr.bat --doctor
+```
+
+モデルパス/HFキャッシュ/実行デバイス/小さい連番戦略は Event AutoPin desktop app の設定画面で変更できます。既定の固定revisionはCUDA必須で、CPU指定またはCUDAのないautoはdoctorがfail-closedします。
+詳しい運用と実マップ評価は [`docs/unlimited-ocr-operations.md`](docs/unlimited-ocr-operations.md) を参照してください。
 
 `.env` に利用するAPIキーを設定します。
 
@@ -40,7 +50,7 @@ python main.py --regenerate-coordinates
 python src/space_locator/auto_coordinate_generator.py events/example/maps/map_01.png events/example/event.json --map-number 1
 ```
 
-EventTrail Studio のマップ編集画面では、次を実行できます。
+Event AutoPin desktop app のマップ編集画面では、次を実行できます。
 
 - `自動配置`: 現在のマップ画像からピンを自動配置
 - `校正点に追加`: 手動で置いたピンを校正点として保存

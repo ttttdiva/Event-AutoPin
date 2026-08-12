@@ -3,9 +3,9 @@ import { Alert, Linking } from "react-native";
 import ApkInstaller from "../modules/apk-installer";
 
 const UPDATE_CHECK_URL =
-  "https://raw.githubusercontent.com/ttttdiva/autocircle/main/latest.json";
+  "https://raw.githubusercontent.com/ttttdiva/Event-AutoPin-Publish/main/latest.json";
 const RELEASES_URL =
-  "https://api.github.com/repos/ttttdiva/autocircle/releases?per_page=10";
+  "https://api.github.com/repos/ttttdiva/Event-AutoPin-Publish/releases?per_page=10";
 
 interface UpdateInfo {
   version: string;
@@ -93,7 +93,7 @@ async function fetchLatestReleaseInfo(): Promise<UpdateInfo> {
     if (release.draft || release.prerelease) continue;
     const match = /^mobile-v(.+)$/.exec(release.tag_name);
     if (!match) continue;
-    const asset = release.assets?.find((a) => a.name === "EventTrailGo.apk");
+    const asset = release.assets?.find((a) => a.name === "EventAutoPin.apk");
     if (!asset?.browser_download_url) continue;
     return {
       version: match[1],

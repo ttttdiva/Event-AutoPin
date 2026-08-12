@@ -16,7 +16,7 @@ import sys
 import unicodedata
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Mapping
 
 from dotenv import load_dotenv
 
@@ -691,6 +691,7 @@ def generate_coordinates_from_map(
     ocr_result_path: Optional[str] = None,
     map_number: int = 1,
     use_calibration: bool = True,
+    ocr_config: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     logger = logging.getLogger(__name__)
 
@@ -711,16 +712,41 @@ def generate_coordinates_from_map(
     logger.info(f"対象スペース数: {len(catalog_info.get('spaces', []))}")
     logger.info("=" * 60)
 
-    ocr_engine = OCREngine()
+    ocr_engine = OCREngine(dict(ocr_config) if ocr_config else None)
     if ocr_result_path:
         logger.info("[Step 1] 既存OCR結果を読み込み")
         raw_numbers = _load_ocr_result(ocr_result_path)
     else:
         logger.info("[Step 1] OCRで番号を検出")
         raw_numbers = ocr_engine.extract_numbers_with_coordinates(image_path)
+        if not raw_numbers and ocr_engine.last_error:
+            logger.error(
+                "OCR診断: %s",
+                json.dumps(ocr_engine.diagnostics, ensure_ascii=False),
+            )
     logger.info(f"検出番号数: {len(raw_numbers)}")
     if not raw_numbers:
         logger.error("番号を検出できませんでした")
+        # GUIが「原因不明の0件」と表示しないよう、出力JSONへ診断だけ残す。
+        if output_json_path and ocr_engine.last_error:
+            try:
+                Path(output_json_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(output_json_path).write_text(
+                    json.dumps(
+                        {
+                            "image_path": image_path,
+                            "event_json_path": event_json_path,
+                            "map_number": map_number,
+                            "error": "ocr_no_numbers",
+                            "ocr_diagnostics": ocr_engine.diagnostics,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
         return None
 
     logger.info("[Step 1.5] LLMでOCR番号を検証")
@@ -847,6 +873,7 @@ def generate_coordinates_from_map(
         "image_path": image_path,
         "event_json_path": event_json_path,
         "map_number": map_number,
+        "ocr_diagnostics": ocr_engine.diagnostics,
         "pattern_info": pattern_info,
         "llm_pattern": llm_pattern,
         "catalog_info": {

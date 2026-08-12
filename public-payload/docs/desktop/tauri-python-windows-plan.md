@@ -48,13 +48,20 @@ Desktop App (Tauri)
 - `desktop.config.json`（今後追加）に下記を持つ方針
   - `pythonExecutable`
   - `projectRoot`
-  - `unlimitedOcrVenvPath`（任意）
-  - `ocrModelCacheDir`（任意）
+  - `unlimitedOcrVenv`（任意。空欄は `temp/unlimited_ocr_venv`）
+  - `unlimitedOcrModel`（Hub ID、既定 `baidu/Unlimited-OCR`）
+  - `unlimitedOcrModelPath`（任意。指定時はローカルモデルを優先）
+  - `unlimitedOcrHfHome`（任意。空欄は `temp/hf_cache`）
+  - `unlimitedOcrRevision`（既定は検証済みrevisionに固定）
+  - `unlimitedOcrDevice` / `unlimitedOcrMode` / `unlimitedOcrStrategy`
 
 ### 4) マップOCR
 - マップOCRは本体 `venv` ではなく `temp/unlimited_ocr_venv` の Python 3.12 環境で `baidu/Unlimited-OCR` を実行する。
 - 初回セットアップは `scripts\setup_unlimited_ocr.bat` を使う。
 - モデルキャッシュは既定で `temp\hf_cache` を使い、`HF_HOME` で上書きできる。
+- 配布後の環境差は設定画面の「OCR環境を診断」で専用venv、torch/CUDA、モデルキャッシュを確認する。
+- OCR失敗時は空配列だけをUIへ返さず、`ocr_diagnostics` とrunner stderr末尾を
+  `coordinates_map_*.json` およびブリッジエラーへ含める。
 
 ### 5) 配布戦略（段階的）
 - Phase 1: Python同梱なし（ユーザー環境のPythonを参照）

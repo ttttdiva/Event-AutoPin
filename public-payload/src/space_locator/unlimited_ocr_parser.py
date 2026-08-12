@@ -15,6 +15,12 @@ DET_TEXT_PATTERN = re.compile(
     r"<\|det\|>[^\[]*(\[.*?\])<\|/det\|>(.*?)(?=<\|det\|>|$)",
     re.DOTALL,
 )
+# Unlimited-OCRのrevision/プロンプトによっては ``text [box]`` の順で返る。
+# refタグが無い場合でも座標付き文字列を捨てない。
+DET_PREFIX_TEXT_PATTERN = re.compile(
+    r"<\|det\|>\s*(.*?)\s*(\[[^\]]+\])\s*<\|/det\|>",
+    re.DOTALL,
+)
 
 
 def _to_pixel(value: Any, size: int) -> int:
@@ -40,6 +46,9 @@ def _append_box_elements(
         if len(box) != 4:
             continue
         try:
+            normalized = [float(value) for value in box]
+            if any(value < 0 or value > 999 for value in normalized):
+                continue
             x1 = _to_pixel(box[0], image_width)
             y1 = _to_pixel(box[1], image_height)
             x2 = _to_pixel(box[2], image_width)
@@ -82,13 +91,32 @@ def parse_grounding_output(
             continue
         _append_box_elements(elements, text, raw_boxes, image_width, image_height)
 
-    for match in DET_TEXT_PATTERN.finditer(raw_text):
+    # suffix形式はboxの後ろに実テキストがある場合だけ。前置き形式の
+    # ``text [box]</det>`` は同じ正規表現にも見えるため、空suffixを除外する。
+    suffix_matches = [
+        match for match in DET_TEXT_PATTERN.finditer(raw_text) if match.group(2).strip()
+    ]
+    for match in suffix_matches:
         det_text = match.group(1).strip()
         text = match.group(2).strip()
         if not text:
             continue
         try:
             raw_box = ast.literal_eval(det_text)
+        except (ValueError, SyntaxError):
+            continue
+        _append_box_elements(elements, text, raw_box, image_width, image_height)
+
+    for match in DET_PREFIX_TEXT_PATTERN.finditer(raw_text):
+        # ``[box]</det>text`` は上のsuffix形式ですでに処理済み。
+        if any(previous.start() == match.start() for previous in suffix_matches):
+            continue
+        text = match.group(1).strip()
+        # 既存の ``[box]</det>text`` 形式に誤マッチした場合や、空文字は除外。
+        if not text or text.startswith("["):
+            continue
+        try:
+            raw_box = ast.literal_eval(match.group(2).strip())
         except (ValueError, SyntaxError):
             continue
         _append_box_elements(elements, text, raw_box, image_width, image_height)

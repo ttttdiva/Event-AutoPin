@@ -9,7 +9,7 @@
     />
     <meta http-equiv="Pragma" content="no-cache" />
     <meta http-equiv="Expires" content="0" />
-    <title>EventTrail Studio</title>
+    <title>Event AutoPin</title>
     <script>
       // テーマをFOUC防止で即適用
       (function () {
@@ -582,6 +582,47 @@
             <label for="timeoutMs">タイムアウト（ms）</label>
             <input id="timeoutMs" type="number" value="10800000" />
 
+            <h3 class="settings-subheading">マップOCR（Unlimited OCR）</h3>
+            <span class="settings-hint">専用venv・モデルキャッシュはPCごとに異なるため、配布先で設定してください。モデルパスを指定した場合はHub IDより優先します。</span>
+
+            <label for="unlimitedOcrModel">モデル名（Hub ID）</label>
+            <input id="unlimitedOcrModel" value="baidu/Unlimited-OCR" placeholder="baidu/Unlimited-OCR" />
+
+            <label for="unlimitedOcrModelPath">モデルパス（任意）</label>
+            <input id="unlimitedOcrModelPath" placeholder="例: <model-directory>\\Unlimited-OCR" />
+
+            <label for="unlimitedOcrVenv">OCR専用venv（任意）</label>
+            <input id="unlimitedOcrVenv" placeholder="空欄: temp/unlimited_ocr_venv" />
+
+            <label for="unlimitedOcrHfHome">HFキャッシュ（任意）</label>
+            <input id="unlimitedOcrHfHome" placeholder="空欄: temp/hf_cache" />
+
+            <label for="unlimitedOcrRevision">モデルrevision</label>
+            <input id="unlimitedOcrRevision" value="ee63731b6461c8afcdcc7b15352e7d2ffecc2ead" />
+
+            <label for="unlimitedOcrDevice">実行デバイス</label>
+            <select id="unlimitedOcrDevice">
+              <option value="auto">自動（CUDA優先 / 既定モデルはCUDA必須）</option>
+              <option value="cuda">CUDA</option>
+              <option value="cpu">CPU（CPU対応モデルのみ）</option>
+            </select>
+
+            <label for="unlimitedOcrMode">画像モード</label>
+            <select id="unlimitedOcrMode">
+              <option value="gundam">gundam（高解像度マップ）</option>
+              <option value="base">base（標準）</option>
+            </select>
+
+            <label for="unlimitedOcrStrategy">小文字連番戦略</label>
+            <select id="unlimitedOcrStrategy">
+              <option value="small_digits">small_digits（推奨）</option>
+              <option value="gundam_then_base">gundam → base</option>
+              <option value="balanced">指定モードのみ</option>
+            </select>
+
+            <label></label>
+            <button id="unlimitedOcrDoctorBtn" class="btn-secondary px-3 py-1.5 rounded">OCR環境を診断</button>
+
             <label for="foamDir">感想フォルダ（Foam）</label>
             <input id="foamDir" placeholder="&lt;path-to-inbox&gt;" />
 
@@ -691,7 +732,7 @@
           <h3 class="mt-7 text-sm font-semibold">アプリ情報</h3>
           <div class="flex items-center gap-3 mt-2">
             <span class="text-sm" style="color: var(--text-muted)">
-              バージョン: <span id="appVersionLabel">0.1.9</span>
+              バージョン: <span id="appVersionLabel">0.1.10</span>
             </span>
             <button
               id="checkUpdateBtn"

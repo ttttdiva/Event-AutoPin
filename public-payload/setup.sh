@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "=== Python環境のセットアップ ==="
+echo "=== Event AutoPin Python環境のセットアップ ==="
 
 python3 -m venv venv
 source venv/bin/activate

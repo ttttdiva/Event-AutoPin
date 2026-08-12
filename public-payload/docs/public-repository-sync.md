@@ -4,8 +4,8 @@
 
 ## 安全ゲート
 
-- 公開先は既存Git working treeで、`origin` が `https://github.com/ttttdiva/autocircle.git` と完全一致すること。
-- `gh api repos/ttttdiva/autocircle --jq .visibility` が `public` を返すこと。
+- 公開先は既存Git working treeで、`origin` が `https://github.com/ttttdiva/Event-AutoPin-Publish.git` と完全一致すること。
+- `gh api repos/ttttdiva/Event-AutoPin-Publish --jq .visibility` が `public` を返すこと。
 - 公開先working treeがcleanであること。
 - `origin` を `fetch --prune` した後、現在branchがremoteのdefault branchと一致し、そのupstreamが対応する `origin/<default>` で、local `HEAD` がfetch済みの同refと完全一致すること。detached HEAD、未push commit、未pull commitでは停止します。
 - 入出力は同一pathや相互の配下でないこと。
@@ -31,7 +31,9 @@ sha256:<64桁のSHA-256> relative/path/to/asset.png
 
 ```powershell
 $SourceRoot = (Resolve-Path .).Path
-$DestinationRoot = Join-Path (Split-Path $SourceRoot) 'caico-public'
+# 現在の既存checkout。改名時は末尾を Event-AutoPin-Publish に置き換える。
+# ドライブ文字はscanに誤検出されないよう分割して記述している。
+$DestinationRoot = ('D:' + '\Dev\autocircle-public-sync')
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync_public_repo.ps1 `
   -SourceRoot $SourceRoot -DestinationRoot $DestinationRoot
 ```

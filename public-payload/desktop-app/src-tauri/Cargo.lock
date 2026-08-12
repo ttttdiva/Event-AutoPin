@@ -796,8 +796,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "eventtrail-studio"
-version = "0.1.9"
+name = "event-autopin-desktop"
+version = "0.1.10"
 dependencies = [
  "chrono",
  "local-ip-address",

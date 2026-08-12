@@ -6,7 +6,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ExpectedRemote = 'https://github.com/ttttdiva/autocircle.git'
+$ExpectedRemote = 'https://github.com/ttttdiva/Event-AutoPin-Publish.git'
 $PayloadName = 'public-payload'
 
 function Run([string]$Exe, [string[]]$Arguments) {
@@ -106,7 +106,7 @@ try {
     if ($remote -ne $ExpectedRemote) { throw "Destination origin mismatch: $remote" }
     $dirty = @(Run git @('-C',$destination,'status','--porcelain'))
     if ($dirty.Count -gt 0) { throw 'Destination working tree is not clean.' }
-    $visibility = ([string](Run gh @('api','repos/ttttdiva/autocircle','--jq','.visibility') | Select-Object -First 1)).Trim()
+    $visibility = ([string](Run gh @('api','repos/ttttdiva/Event-AutoPin-Publish','--jq','.visibility') | Select-Object -First 1)).Trim()
     if ($visibility -ne 'public') { throw "Destination repository is not confirmed public: $visibility" }
     Run git @('-C',$destination,'fetch','--prune','--quiet','origin') | Out-Null
     $currentBranch = ([string](Run git @('-C',$destination,'rev-parse','--abbrev-ref','HEAD') | Select-Object -First 1)).Trim()
@@ -145,7 +145,7 @@ try {
         if ($tracked -notcontains $path) { throw "Manifest path is not committed in HEAD: $path" }
     }
 
-    $temp = Join-Path ([IO.Path]::GetTempPath()) ('caico-public-' + [guid]::NewGuid().ToString('N'))
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ('event-autopin-public-' + [guid]::NewGuid().ToString('N'))
     $archive = "$temp.tar"; New-Item -ItemType Directory -Path $temp | Out-Null
     try {
         Run git (@('-C',$source,'archive','--format=tar','--output',$archive,'HEAD','--') + $paths) | Out-Null
@@ -173,7 +173,9 @@ try {
         try {
             if (Test-Path $current) { Move-Item $current $backup }
             Move-Item $next $current
-            if ($env:CAICO_SYNC_TEST_CORRUPT_AFTER_SWAP -eq '1') { Add-Content -LiteralPath (Get-ChildItem $current -File -Recurse | Select-Object -First 1).FullName -Value 'test-corruption' }
+            # Keep the legacy test switch for compatibility with existing harnesses while
+            # exposing the Event AutoPin name to new callers.
+            if ($env:EVENT_AUTOPIN_SYNC_TEST_CORRUPT_AFTER_SWAP -eq '1' -or $env:CAICO_SYNC_TEST_CORRUPT_AFTER_SWAP -eq '1') { Add-Content -LiteralPath (Get-ChildItem $current -File -Recurse | Select-Object -First 1).FullName -Value 'test-corruption' }
             if (-not (SameHashes (HashTree $current) $after)) { throw 'Installed payload hash verification failed.' }
             if (Test-Path $backup) { Remove-Item $backup -Recurse -Force }
         } catch {

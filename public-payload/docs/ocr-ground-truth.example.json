@@ -1,0 +1,10 @@
+{
+  "map_01.png": [
+    {
+      "number": "12",
+      "center_x": 478,
+      "center_y": 313
+    }
+  ],
+  "_metric": "pin_center (center distance only; no IoU)"
+}

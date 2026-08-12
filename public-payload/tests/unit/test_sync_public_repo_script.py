@@ -10,7 +10,7 @@ import pytest
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "sync_public_repo.ps1"
-REMOTE = "https://github.com/ttttdiva/autocircle.git"
+REMOTE = "https://github.com/ttttdiva/Event-AutoPin-Publish.git"
 REAL_GIT = shutil.which("git")
 
 
@@ -94,7 +94,7 @@ if /I "%~3"=="ls-remote" if /I "%~4"=="--symref" if /I "%~5"=="origin" (
     env = os.environ.copy()
     env["PATH"] = str(tools) + os.pathsep + env["PATH"]
     if corrupt:
-        env["CAICO_SYNC_TEST_CORRUPT_AFTER_SWAP"] = "1"
+        env["EVENT_AUTOPIN_SYNC_TEST_CORRUPT_AFTER_SWAP"] = "1"
     return subprocess.run(command, text=True, encoding="utf-8", errors="replace", capture_output=True, env=env)
 
 

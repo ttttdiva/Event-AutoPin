@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "images": [
+    "tests\\fixtures\\unlimited_ocr_pin_center\\map_01.png"
+  ],
+  "results": [
+    {
+      "label": "saved",
+      "model": "fixture/manual",
+      "revision": "fixture",
+      "device": "cpu",
+      "strategy": "fixture",
+      "images": {
+        "tests\\fixtures\\unlimited_ocr_pin_center\\map_01.png": {
+          "predicted": 2,
+          "ground_truth": 2,
+          "matched": 2,
+          "false_positive": 0,
+          "false_negative": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "mean_center_distance_px": 10.0,
+          "mean_iou": null,
+          "coordinate_metric": "pin_center",
+          "distance_threshold_px": 30.0,
+          "matches": [
+            {
+              "number": "01",
+              "distance_px": 10.0,
+              "iou": null
+            },
+            {
+              "number": "02",
+              "distance_px": 10.0,
+              "iou": null
+            }
+          ]
+        }
+      },
+      "summary": {
+        "predicted": 2,
+        "ground_truth": 2,
+        "matched": 2,
+        "precision": 1.0,
+        "recall": 1.0,
+        "mean_center_distance_px": 10.0,
+        "mean_iou": null,
+        "coordinate_metric": "pin_center",
+        "distance_threshold_px": 30.0
+      }
+    }
+  ]
+}
