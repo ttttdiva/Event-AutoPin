@@ -1,14 +1,14 @@
 {
-    "desktop":  {
-                    "version":  "0.1.7",
-                    "url":  "https://github.com/ttttdiva/autocircle/releases/download/desktop-v0.1.7/EventTrailStudio.exe",
-                    "notes":  "v0.1.7 過去イベントの曖昧検索と状態管理・非同期保存の改善",
-                    "date":  "2026-08-12"
-                },
-    "mobile":  {
-                   "version":  "1.4.48",
-                   "url":  "https://github.com/ttttdiva/autocircle/releases/download/mobile-v1.4.48/EventTrailGo.apk",
-                   "notes":  "v1.4.48 リリース",
-                   "date":  "2026-07-19"
-               }
+  "desktop": {
+    "version": "0.1.8",
+    "url": "https://github.com/ttttdiva/autocircle/releases/download/desktop-v0.1.8/EventTrailStudio.exe",
+    "notes": "v0.1.8 イベント切替・リネーム時の保存競合防止と公開同期の追加",
+    "date": "2026-08-12"
+  },
+  "mobile": {
+    "version": "1.4.48",
+    "url": "https://github.com/ttttdiva/autocircle/releases/download/mobile-v1.4.48/EventTrailGo.apk",
+    "notes": "v1.4.48 リリース",
+    "date": "2026-07-19"
+  }
 }
