@@ -683,6 +683,44 @@ def _load_ocr_result(ocr_result_path: str) -> List[Dict[str, Any]]:
     raise ValueError("OCR結果JSONは numbers キー付きオブジェクトまたは配列である必要があります")
 
 
+def _write_ocr_failure_diagnostics(
+    output_json_path: Optional[str],
+    *,
+    image_path: str,
+    event_json_path: str,
+    map_number: int,
+    ocr_engine: OCREngine,
+) -> None:
+    """OCR失敗時の機械可読診断を座標JSONへ保存する。
+
+    診断には専用venvやモデルキャッシュの設定値が含まれるため、ここでは
+    GUI向けに整形せず、bridgeの ``_summarize_ocr_diagnostics`` が既存の
+    secret/path除去経路を通してから外へ返す。ファイル保存に失敗しても、
+    呼び出し元の失敗ステータスは維持する。
+    """
+    if not output_json_path or not ocr_engine.last_error:
+        return
+    try:
+        output_path = Path(output_json_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(
+                {
+                    "image_path": image_path,
+                    "event_json_path": event_json_path,
+                    "map_number": map_number,
+                    "error": "ocr_no_numbers",
+                    "ocr_diagnostics": ocr_engine.diagnostics,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def generate_coordinates_from_map(
     image_path: str,
     event_json_path: str,
@@ -718,7 +756,30 @@ def generate_coordinates_from_map(
         raw_numbers = _load_ocr_result(ocr_result_path)
     else:
         logger.info("[Step 1] OCRで番号を検出")
-        raw_numbers = ocr_engine.extract_numbers_with_coordinates(image_path)
+        try:
+            raw_numbers = ocr_engine.extract_numbers_with_coordinates(image_path)
+        except Exception as exc:
+            # 専用venv未構築、画像読込失敗、runner起動例外などは
+            # OCREngineが保持した診断を座標JSONへ保存してからNoneで返す。
+            # bridge側はこのJSONを安全に要約してGUIへ返すため、mainの
+            # generic outer errorでcode/messageだけに潰れない。
+            if not ocr_engine.last_error:
+                ocr_engine._set_error(
+                    "runner_exception",
+                    f"Unlimited OCR runner実行中に失敗しました: {exc}",
+                )
+            logger.error(
+                "OCR診断付き例外: %s",
+                json.dumps(ocr_engine.diagnostics, ensure_ascii=False),
+            )
+            _write_ocr_failure_diagnostics(
+                output_json_path,
+                image_path=image_path,
+                event_json_path=event_json_path,
+                map_number=map_number,
+                ocr_engine=ocr_engine,
+            )
+            return None
         if not raw_numbers and ocr_engine.last_error:
             logger.error(
                 "OCR診断: %s",
@@ -728,25 +789,13 @@ def generate_coordinates_from_map(
     if not raw_numbers:
         logger.error("番号を検出できませんでした")
         # GUIが「原因不明の0件」と表示しないよう、出力JSONへ診断だけ残す。
-        if output_json_path and ocr_engine.last_error:
-            try:
-                Path(output_json_path).parent.mkdir(parents=True, exist_ok=True)
-                Path(output_json_path).write_text(
-                    json.dumps(
-                        {
-                            "image_path": image_path,
-                            "event_json_path": event_json_path,
-                            "map_number": map_number,
-                            "error": "ocr_no_numbers",
-                            "ocr_diagnostics": ocr_engine.diagnostics,
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-            except OSError:
-                pass
+        _write_ocr_failure_diagnostics(
+            output_json_path,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            ocr_engine=ocr_engine,
+        )
         return None
 
     logger.info("[Step 1.5] LLMでOCR番号を検証")

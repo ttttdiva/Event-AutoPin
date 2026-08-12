@@ -165,6 +165,90 @@ def test_safe_diagnostic_text_keeps_actionable_error_without_secrets():
     assert private_windows_path not in value
 
 
+def _write_coordinate_test_event(tmp_path: Path) -> Path:
+    event_json = tmp_path / "event.json"
+    event_json.write_text(
+        json.dumps(
+            {
+                "event": {"maps": [{"map_number": 1, "filename": "map_01.png"}]},
+                "circles": [{"name": "one", "space": "A-01"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return event_json
+
+
+def test_auto_place_map_pins_missing_venv_keeps_structured_diagnostics(
+    tmp_path: Path, monkeypatch
+):
+    event_json = _write_coordinate_test_event(tmp_path)
+    map_image = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "unlimited_ocr_pin_center"
+        / "map_01.png"
+    )
+    private_venv = "C:" + "\\private\\ocr-venv"
+
+    def fail_resolve(_venv_override=None):
+        raise RuntimeError("OCR venv missing at " + private_venv)
+
+    monkeypatch.setattr("src.space_locator.ocr_engine._resolve_ocr_python", fail_resolve)
+    result = run_job(
+        "auto_place_map_pins",
+        {
+            "event_json": str(event_json),
+            "map_image": str(map_image),
+            "map_number": 1,
+            "ocr_config": {
+                "model": "org/model",
+                "device": "cuda",
+                "venv_path": private_venv,
+            },
+        },
+    )
+
+    assert result["status"] == "error"
+    diagnostics = result["ocr_diagnostics"]
+    assert diagnostics["error_code"] == "venv_missing"
+    assert diagnostics["model"] == "org/model"
+    assert diagnostics["device"] == "cuda"
+    assert diagnostics["venv"] == {"configured": True}
+    assert "セットアップ" in diagnostics["recovery_hint"]
+    encoded = json.dumps(result, ensure_ascii=False)
+    assert private_venv not in encoded
+    assert "<path>" in encoded
+    assert (tmp_path / "coordinates_map_1.json").exists()
+
+
+def test_auto_place_map_pins_image_read_exception_reaches_gui_recovery_hint(tmp_path: Path):
+    event_json = _write_coordinate_test_event(tmp_path)
+    map_image = tmp_path / "map_01.png"
+    map_image.write_bytes(b"not-a-readable-image")
+
+    result = run_job(
+        "auto_place_map_pins",
+        {
+            "event_json": str(event_json),
+            "map_image": str(map_image),
+            "map_number": 1,
+            "ocr_config": {"model": "org/model", "device": "cuda"},
+        },
+    )
+
+    assert result["status"] == "error"
+    diagnostics = result["ocr_diagnostics"]
+    assert diagnostics["error_code"] == "image_read_failed"
+    assert "画像" in diagnostics["recovery_hint"]
+    assert diagnostics["model"] == "org/model"
+    encoded = json.dumps(result, ensure_ascii=False)
+    assert str(map_image) not in encoded
+    assert "<path>" in encoded
+    assert (tmp_path / "coordinates_map_1.json").exists()
+
+
 class TestLoadPayload:
     def test_インラインJSONをパースできる(self):
         ns = argparse.Namespace(payload=None, payload_json='{"foo": "bar"}')

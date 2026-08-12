@@ -505,6 +505,8 @@ def _summarize_ocr_diagnostics(raw: Any) -> Dict[str, Any]:
         "cpu_unsupported": "CUDA対応PCでdevice=cuda/autoを使うか、CPU対応モデルへ切り替えてください。",
         "venv_missing": "専用OCR環境をセットアップし、設定画面のPython/venvを確認してください。",
         "runner_failed": "専用OCR環境のPython、モデルファイル、device設定を確認して再実行してください。",
+        "runner_exception": "専用OCR環境のPython、モデルファイル、device設定を確認して再実行してください。",
+        "image_read_failed": "マップ画像が読み込めません。画像ファイルの存在・形式・権限を確認してください。",
         "timeout": "OCRの入力サイズやtile設定を見直し、専用OCR環境を確認して再実行してください。",
     }
     return {
