@@ -1,9 +1,9 @@
 {
   "desktop": {
-    "version": "0.1.8",
-    "url": "https://github.com/ttttdiva/autocircle/releases/download/desktop-v0.1.8/EventTrailStudio.exe",
-    "notes": "v0.1.8 イベント切替・リネーム時の保存競合防止と公開同期の追加",
-    "date": "2026-08-12"
+    "version": "0.1.9",
+    "url": "https://github.com/ttttdiva/autocircle/releases/download/desktop-v0.1.9/EventTrailStudio.exe",
+    "notes": "v0.1.9 無編集イベント切替時の保存抑止と非同期競合・データ保全の強化",
+    "date": "2026-08-13"
   },
   "mobile": {
     "version": "1.4.48",
