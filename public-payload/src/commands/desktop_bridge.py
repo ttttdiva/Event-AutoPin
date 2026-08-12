@@ -439,6 +439,94 @@ def _collect_coordinate_diagnostics(output_dir: str | Path) -> Dict[str, Any] | 
     }
 
 
+_DIAGNOSTIC_SECRET_RE = re.compile(
+    r"(?i)\b(?:api[_-]?key|token|password|passwd|secret|authorization|cookie)\b"
+    r"\s*[:=]\s*[^\s,;]+"
+)
+_DIAGNOSTIC_BEARER_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_DIAGNOSTIC_TOKEN_RE = re.compile(
+    r"(?i)\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_-]{12,}|github_pat_[A-Za-z0-9_-]{12,})"
+)
+_DIAGNOSTIC_WINDOWS_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'`;,)\]]+"
+)
+_DIAGNOSTIC_POSIX_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_:/])/(?:[^\s\"'`;,)\]]+)"
+)
+
+
+def _safe_diagnostic_text(value: Any, *, max_chars: int = 2000) -> str:
+    """stderr/stdoutをGUIへ返す前にsecretと絶対パスを除去する。"""
+    text = str(value or "")
+
+    def redact_secret(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        separator = max(raw.find("="), raw.find(":"))
+        return f"{raw[: separator + 1] if separator >= 0 else 'secret:'}<redacted>"
+
+    text = _DIAGNOSTIC_SECRET_RE.sub(redact_secret, text)
+    text = _DIAGNOSTIC_BEARER_RE.sub("Bearer <redacted>", text)
+    text = _DIAGNOSTIC_TOKEN_RE.sub("<redacted-token>", text)
+    text = _DIAGNOSTIC_WINDOWS_PATH_RE.sub("<path>", text)
+    text = _DIAGNOSTIC_POSIX_PATH_RE.sub("<path>", text)
+    text = text.strip()
+    if len(text) > max_chars:
+        return "…" + text[-(max_chars - 1) :]
+    return text
+
+
+def _configured_flag(value: Any) -> bool:
+    return bool(str(value or "").strip())
+
+
+def _summarize_ocr_diagnostics(raw: Any) -> Dict[str, Any]:
+    """OCR診断を機械可読の安全なGUI向け要約へ正規化する。
+
+    runnerのstderrにはモデルロード時のパスや環境変数が混ざる可能性があるため、
+    絶対パス/secretは除去し、復旧に必要なcode・returncode・モデル・device・
+    専用venv等の設定状態だけを残す。
+    """
+    diagnostics = raw if isinstance(raw, dict) else {}
+    error = diagnostics.get("error") if isinstance(diagnostics.get("error"), dict) else {}
+    last_run = diagnostics.get("last_run") if isinstance(diagnostics.get("last_run"), dict) else {}
+    config = diagnostics.get("config") if isinstance(diagnostics.get("config"), dict) else {}
+
+    code = str(error.get("code") or "coordinate_generation_failed")
+    message = _safe_diagnostic_text(error.get("message"))
+    returncode = error.get("returncode")
+    if not isinstance(returncode, int):
+        returncode = None
+    model = _safe_diagnostic_text(last_run.get("model") or config.get("model"))
+    revision = _safe_diagnostic_text(last_run.get("revision") or config.get("revision"))
+    device = _safe_diagnostic_text(last_run.get("device") or config.get("device"))
+    mode = _safe_diagnostic_text(last_run.get("mode") or config.get("mode"))
+    strategy = _safe_diagnostic_text(last_run.get("strategy") or config.get("strategy"))
+    hints = {
+        "cpu_unsupported": "CUDA対応PCでdevice=cuda/autoを使うか、CPU対応モデルへ切り替えてください。",
+        "venv_missing": "専用OCR環境をセットアップし、設定画面のPython/venvを確認してください。",
+        "runner_failed": "専用OCR環境のPython、モデルファイル、device設定を確認して再実行してください。",
+        "timeout": "OCRの入力サイズやtile設定を見直し、専用OCR環境を確認して再実行してください。",
+    }
+    return {
+        "schema_version": 1,
+        "error_code": code,
+        "error_message": message,
+        "returncode": returncode,
+        "stderr": _safe_diagnostic_text(error.get("stderr")),
+        "stdout": _safe_diagnostic_text(error.get("stdout"), max_chars=1000),
+        "model": model,
+        "revision": revision,
+        "device": device,
+        "mode": mode,
+        "strategy": strategy,
+        "venv": {"configured": _configured_flag(config.get("venv_path"))},
+        "model_path": {"configured": _configured_flag(config.get("model_path"))},
+        "hf_home": {"configured": _configured_flag(config.get("hf_home"))},
+        "recovery_hint": hints.get(code, "OCR設定と入力マップを確認して再実行してください。"),
+        "paths_redacted": True,
+    }
+
+
 def _job_ping(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "status": "ok",
@@ -1685,17 +1773,27 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
         generation_kwargs["ocr_config"] = ocr_config
     coord_map = generate_coordinates_from_map(**generation_kwargs)
     if coord_map is None:
-        details = ""
+        raw_diagnostics: Dict[str, Any] = {}
         try:
             failure_payload = json.loads(output_json_path.read_text(encoding="utf-8"))
             diagnostics = failure_payload.get("ocr_diagnostics")
-            if diagnostics:
-                error = diagnostics.get("error") if isinstance(diagnostics, dict) else None
-                if isinstance(error, dict):
-                    details = f"; OCR診断: {error.get('code', 'unknown')} - {error.get('message', '')}"
+            if isinstance(diagnostics, dict):
+                raw_diagnostics = diagnostics
         except (OSError, ValueError, TypeError):
             pass
-        raise RuntimeError(f"map pin coordinate generation failed{details}")
+        ocr_diagnostics = _summarize_ocr_diagnostics(raw_diagnostics)
+        error_code = ocr_diagnostics.get("error_code", "coordinate_generation_failed")
+        error_message = f"map pin coordinate generation failed ({error_code})"
+        if ocr_diagnostics.get("error_message"):
+            error_message += f": {ocr_diagnostics['error_message']}"
+        return {
+            "status": "error",
+            "job": "auto_place_map_pins",
+            "timestamp": _utc_now_iso(),
+            "error": error_message,
+            "map_number": map_number,
+            "ocr_diagnostics": ocr_diagnostics,
+        }
 
     updater = JSONUpdater()
     update_result = updater.update_event_json(

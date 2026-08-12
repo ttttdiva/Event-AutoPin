@@ -147,3 +147,27 @@ def test_model_specs_reject_unknown_keys():
         assert "未知キー" in str(exc)
     else:
         raise AssertionError("unknown model-spec key must fail closed")
+
+
+def test_canonical_repo_event_report_fixes_input_command_and_metrics():
+    report_path = Path(__file__).resolve().parents[2] / "docs" / "ocr-evaluation.repo-events.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    canonical = report["canonical"]
+    assert canonical["predictions"] == "temp/phase1_accuracy_roi_standard.json"
+    assert canonical["distance_threshold_px"] == 50
+    assert canonical["expected"] == {
+        "predicted": 76,
+        "ground_truth": 56,
+        "matched": 35,
+        "precision": 0.4605,
+        "recall": 0.625,
+        "mean_center_distance_px": 21.657,
+    }
+    comparison = next(
+        item for item in report["comparisons"] if item["label"] == "small_digits_roi_tile_standard"
+    )
+    assert comparison["evaluation"]["results"][0]["summary"] == canonical["expected"] | {
+        "mean_iou": None,
+        "coordinate_metric": "pin_center",
+        "distance_threshold_px": 50.0,
+    }

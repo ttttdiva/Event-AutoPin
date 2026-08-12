@@ -25,6 +25,8 @@ from src.commands.desktop_bridge import (
     _job_run_main_pipeline,
     _merge_multi_event_outputs,
     _payload_url_list,
+    _job_auto_place_map_pins,
+    _safe_diagnostic_text,
     _job_validate_mobile_json,
     _load_payload,
     run_job,
@@ -75,6 +77,92 @@ def test_複数イベントのTwitter失敗を集約できる():
         "invalid_url_count": 1,
         "reason": "twscrape error",
     }
+
+
+def test_ocr診断はパスとsecretを除去してbridgeエラーへ返す(tmp_path: Path, monkeypatch):
+    event_dir = tmp_path / "event"
+    event_dir.mkdir()
+    event_json = event_dir / "event.json"
+    event_json.write_text(
+        json.dumps({"event": {"name": "診断テスト"}, "circles": []}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    map_image = event_dir / "map_01.png"
+    map_image.write_bytes(b"not-an-image")
+    coordinate_json = event_dir / "coordinates_map_1.json"
+    private_windows_path = "C:" + "\\private\\model"
+    private_venv_path = "C:" + "\\private\\venv\\python.exe"
+    private_posix_path = "/" + "home/private/runner.py"
+    fake_secret = "sk-" + "abc1234567890123"
+    coordinate_json.write_text(
+        json.dumps(
+            {
+                "ocr_diagnostics": {
+                    "error": {
+                        "code": "runner_failed",
+                        "message": f"runner failed at {private_windows_path}",
+                        "returncode": 2,
+                        "stderr": f"API_KEY={fake_secret} {private_venv_path}",
+                        "stdout": f"trace {private_posix_path}",
+                    },
+                    "last_run": {
+                        "model": "org/model",
+                        "revision": "abc123",
+                        "device": "cuda",
+                        "strategy": "small_digits",
+                        "image": str(map_image),
+                    },
+                    "config": {
+                        "model": "org/model",
+                        "model_path": str(tmp_path / "private-model"),
+                        "venv_path": str(tmp_path / "private-venv"),
+                        "hf_home": str(tmp_path / "private-cache"),
+                        "device": "cuda",
+                    },
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.space_locator.generate_coordinates_from_map",
+        lambda **_kwargs: None,
+    )
+    result = _job_auto_place_map_pins(
+        {
+            "event_json": str(event_json),
+            "map_image": str(map_image),
+            "map_number": 1,
+            "ocr_config": {"model": "org/model", "device": "cuda"},
+        }
+    )
+
+    assert result["status"] == "error"
+    diagnostics = result["ocr_diagnostics"]
+    assert diagnostics["error_code"] == "runner_failed"
+    assert diagnostics["returncode"] == 2
+    assert diagnostics["model"] == "org/model"
+    assert diagnostics["device"] == "cuda"
+    assert diagnostics["venv"] == {"configured": True}
+    assert diagnostics["paths_redacted"] is True
+    encoded = json.dumps(result, ensure_ascii=False)
+    assert str(tmp_path) not in encoded
+    assert fake_secret not in encoded
+    assert "<redacted>" in encoded
+    assert "<path>" in encoded
+
+
+def test_safe_diagnostic_text_keeps_actionable_error_without_secrets():
+    fake_secret = "abc" + "123"
+    private_windows_path = "C:" + "\\ocr\\python.exe"
+    value = _safe_diagnostic_text(
+        f"CUDA unavailable; token={fake_secret}; see {private_windows_path}"
+    )
+    assert "CUDA unavailable" in value
+    assert "abc123" not in value
+    assert private_windows_path not in value
 
 
 class TestLoadPayload:

@@ -104,6 +104,8 @@ try {
 
     $remote = ([string](Run git @('-C',$destination,'remote','get-url','origin') | Select-Object -First 1)).Trim()
     if ($remote -ne $ExpectedRemote) { throw "Destination origin mismatch: $remote" }
+    $pushRemote = ([string](Run git @('-C',$destination,'remote','get-url','--push','origin') | Select-Object -First 1)).Trim()
+    if ($pushRemote -ne $ExpectedRemote) { throw "Destination push URL mismatch: $pushRemote" }
     $dirty = @(Run git @('-C',$destination,'status','--porcelain'))
     if ($dirty.Count -gt 0) { throw 'Destination working tree is not clean.' }
     $visibility = ([string](Run gh @('api','repos/ttttdiva/Event-AutoPin-Publish','--jq','.visibility') | Select-Object -First 1)).Trim()
@@ -170,17 +172,25 @@ try {
         Copy-Item -LiteralPath $temp -Destination $next -Recurse
         if (-not (SameHashes (HashTree $next) $after)) { Remove-Item $next -Recurse -Force; throw 'Staged payload hash verification failed.' }
         $current = Join-Path $destination $PayloadName
+        $oldMoved = $false
+        $newMoved = $false
         try {
+            if ($env:EVENT_AUTOPIN_SYNC_TEST_FAIL_PRE_SWAP -eq '1' -or $env:CAICO_SYNC_TEST_FAIL_PRE_SWAP -eq '1') { throw 'test pre-swap failure' }
             if (Test-Path $current) { Move-Item $current $backup }
+            $oldMoved = Test-Path $backup
             Move-Item $next $current
+            $newMoved = $true
             # Keep the legacy test switch for compatibility with existing harnesses while
             # exposing the Event AutoPin name to new callers.
             if ($env:EVENT_AUTOPIN_SYNC_TEST_CORRUPT_AFTER_SWAP -eq '1' -or $env:CAICO_SYNC_TEST_CORRUPT_AFTER_SWAP -eq '1') { Add-Content -LiteralPath (Get-ChildItem $current -File -Recurse | Select-Object -First 1).FullName -Value 'test-corruption' }
             if (-not (SameHashes (HashTree $current) $after)) { throw 'Installed payload hash verification failed.' }
             if (Test-Path $backup) { Remove-Item $backup -Recurse -Force }
         } catch {
-            if (Test-Path $current) { Remove-Item $current -Recurse -Force }
-            if (Test-Path $backup) { Move-Item $backup $current }
+            # Only remove the new payload after its move succeeded.  If the pre-swap
+            # move itself failed, the old payload remains authoritative and must not
+            # be deleted.  Restore the old tree only when it was actually moved.
+            if ($newMoved -and (Test-Path $current)) { Remove-Item $current -Recurse -Force }
+            if ($oldMoved -and (Test-Path $backup)) { Move-Item $backup $current }
             if (Test-Path $next) { Remove-Item $next -Recurse -Force }
             throw
         }

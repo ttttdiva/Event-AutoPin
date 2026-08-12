@@ -68,7 +68,15 @@ def destination_repo(tmp_path: Path, remote: str = REMOTE) -> Path:
     return root
 
 
-def run(source: Path, destination: Path, tmp_path: Path, apply: bool = False, visibility: str = "public", corrupt: bool = False):
+def run(
+    source: Path,
+    destination: Path,
+    tmp_path: Path,
+    apply: bool = False,
+    visibility: str = "public",
+    corrupt: bool = False,
+    fail_pre_swap: bool = False,
+):
     tools = tmp_path / "tools"
     tools.mkdir(exist_ok=True)
     (tools / "gh.cmd").write_text(f"@echo off\necho {visibility}\n", encoding="ascii")
@@ -95,6 +103,8 @@ if /I "%~3"=="ls-remote" if /I "%~4"=="--symref" if /I "%~5"=="origin" (
     env["PATH"] = str(tools) + os.pathsep + env["PATH"]
     if corrupt:
         env["EVENT_AUTOPIN_SYNC_TEST_CORRUPT_AFTER_SWAP"] = "1"
+    if fail_pre_swap:
+        env["EVENT_AUTOPIN_SYNC_TEST_FAIL_PRE_SWAP"] = "1"
     return subprocess.run(command, text=True, encoding="utf-8", errors="replace", capture_output=True, env=env)
 
 
@@ -136,6 +146,28 @@ def test_hash_failure_after_swap_rolls_back_old_payload(tmp_path: Path) -> None:
     assert result.returncode != 0 and "hash verification failed" in result.stderr
     assert old.read_text(encoding="utf-8") == "old"
     assert not (destination / "public-payload" / "src" / "app.py").exists()
+
+
+def test_pre_swap_failure_preserves_old_payload(tmp_path: Path) -> None:
+    source, destination = source_repo(tmp_path), destination_repo(tmp_path)
+    old = destination / "public-payload" / "old.txt"
+    old.parent.mkdir()
+    old.write_text("old", encoding="utf-8")
+    commit_all(destination)
+    publish_destination_head(destination)
+    result = run(source, destination, tmp_path, apply=True, fail_pre_swap=True)
+    assert result.returncode != 0 and "test pre-swap failure" in result.stderr
+    assert old.read_text(encoding="utf-8") == "old"
+    assert not (destination / "public-payload" / "src" / "app.py").exists()
+    assert not list(destination.glob(".public-payload.next-*"))
+
+
+def test_rejects_mismatched_push_url(tmp_path: Path) -> None:
+    source, destination = source_repo(tmp_path), destination_repo(tmp_path)
+    git(destination, "remote", "set-url", "--push", "origin", "https://github.com/example/push.git")
+    result = run(source, destination, tmp_path)
+    assert result.returncode != 0
+    assert "push URL mismatch" in result.stderr
 
 
 def test_rejects_wrong_remote_dirty_private_and_nested_destinations(tmp_path: Path) -> None:

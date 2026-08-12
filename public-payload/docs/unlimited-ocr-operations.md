@@ -134,10 +134,25 @@ Ariaers実マップ（GT 56 pin-center、番号一致+50px以内、IoU対象外�
 |---|---|---|---|---:|---:|
 | `baidu/Unlimited-OCR` (Hub ID) | `ee63731b...` | gundam→base / `small_digits` | なし | 0/56 | 0% |
 | `baidu/Unlimited-OCR` (Hub ID) | `ee63731b...` | base / `single` | なし | 0/56 | 0% |
-| 同上 | 同上 | full=`small_digits`, tile=`single/gundam` | 320/160、158枚 | **36/56** | **64.29%** |
+| 同上 | 同上 | full=`small_digits`, tile=`single/gundam` | 320/160、158枚 | **35/56** | **62.50%** |
 | 同revisionのローカルsnapshot (`--model-path`) | `ee63731b...` | gundam / `single` | なし | 0/56 | 0% |
 
-標準ROI経路のpredictedは89、precision 40.45%、平均中心距離21.68px、RTX 5090で434.6秒。
+canonical evaluatorの標準ROI経路はpredicted 76、matched 35、precision 46.05%、recall 62.50%、
+平均中心距離21.657px、RTX 5090で434.6秒。固定入力は
+`temp/phase1_accuracy_roi_standard.json`（SHA-256
+`D17ECCC1C83C943C22F525C509E511E1D511FD98EC845C7E72C5FFFA088089B2`）で、
+次のコマンドと同一条件を正とする。
+
+```powershell
+venv\Scripts\python.exe scripts\evaluate_unlimited_ocr.py `
+  --image events\Ariaers_Assort_Flowers_Fraternity_2025_20251005_000000\maps\map_01.jpg `
+  --ground-truth docs\ocr-ground-truth.repo-events.json `
+  --predictions temp\phase1_accuracy_roi_standard.json `
+  --distance-threshold 50 `
+  --output-json temp\canonical-ocr-evaluation.json
+```
+
+raw未dedupの旧集計値はcanonical結果として扱わない。
 50pxは、repo event由来pinがブース中心で、右端の印字番号中心が約45〜55pxずれることを明示して
 採用した閾値であり、文字box GTのIoUと混同しない。別のUnlimited-OCR互換モデルはローカルに無く、
 未検証モデルを自動ダウンロードして比較していない。GUI/CLIのHub ID・ローカルpath切替は維持し、

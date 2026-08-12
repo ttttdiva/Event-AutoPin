@@ -1892,6 +1892,33 @@ function formatResult(job: string, response: Record<string, unknown>): string {
   return msg;
 }
 
+function formatOcrDiagnostics(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const diagnostics = value as Record<string, unknown>;
+  const lines: string[] = [];
+  const code = String(diagnostics.error_code || "").trim();
+  const message = String(diagnostics.error_message || "").trim();
+  const returncode = diagnostics.returncode;
+  const model = String(diagnostics.model || "").trim();
+  const device = String(diagnostics.device || "").trim();
+  const venv = diagnostics.venv as Record<string, unknown> | undefined;
+  const stderr = String(diagnostics.stderr || "").trim();
+  const hint = String(diagnostics.recovery_hint || "").trim();
+  if (code) lines.push(`診断コード: ${code}`);
+  if (message) lines.push(`診断メッセージ: ${message}`);
+  if (returncode !== null && returncode !== undefined) {
+    lines.push(`OCR returncode: ${String(returncode)}`);
+  }
+  if (model) lines.push(`OCRモデル: ${model}`);
+  if (device) lines.push(`実行デバイス: ${device}`);
+  if (venv && venv.configured !== undefined) {
+    lines.push(`専用venv: ${venv.configured ? "設定済み" : "未設定（既定環境）"}`);
+  }
+  if (stderr) lines.push(`stderr要約: ${stderr}`);
+  if (hint) lines.push(`復旧方法: ${hint}`);
+  return lines.length ? `\n\n--- OCR診断（安全な要約） ---\n${lines.join("\n")}` : "";
+}
+
 function historyMatchLabel(hit: HistorySearchHit): string {
   return hit.matchedBy === "title" ? "本タイトル一致" : "サークル一致";
 }
@@ -7863,7 +7890,10 @@ async function runMapAutoPlacement(useCalibration: boolean) {
     });
     const bridge = response?.bridge as Record<string, any> | undefined;
     if (!response?.ok || bridge?.status !== "ok") {
-      resultEl.textContent = `マップピン自動配置に失敗しました: ${bridge?.error || response?.stderr || "不明なエラー"}`;
+      const ocrDiagnostics = formatOcrDiagnostics(bridge?.ocr_diagnostics);
+      resultEl.textContent =
+        `マップピン自動配置に失敗しました: ${bridge?.error || response?.stderr || "不明なエラー"}` +
+        ocrDiagnostics;
       return;
     }
 

@@ -270,10 +270,10 @@ Execution environment: RTX 5090 / Python 3.12 is available through uv or the dis
   `.ocr.json` の検出番号数・座標と `save_debug_image` の目視確認を行う。実マップpin-center GTの
   recall 60%以上（またはリリース時に合意した明示threshold）を実測できるまでM3は未完了とする。
   Ariaers実マップではfull-frame単独は0%だったが、2026-08-13に標準runnerの相対ROI tile経路で
-  **36/56（recall 64.29%）** を再現しM3を完了した。設定は320px、overlap 160px、上限160枚
+  **35/56（recall 62.50%）** を再現しM3を完了した。設定は320px、overlap 160px、上限160枚
   （実行158枚）、full-frame=`small_digits`、tile=`single/gundam + 標準grounding`、max_length=4096。
   pin-center GTは番号文字の輪郭ではなくブース中心で、右端縦番号は約45〜55px離れるため、番号一致
-  + 50px以内の一対一中心距離を受入指標とした（precision 40.45%、平均中心距離21.68px、IoU対象外）。
+  + 50px以内の一対一中心距離を受入指標とした（precision 46.05%、平均中心距離21.657px、IoU対象外）。
 - **M4: 回帰テスト**
   - `venv\Scripts\python.exe -m pytest tests/unit` 全通過。
   - 新規単体テスト: パーサ（単一box/複数box/不正det/リテラル形式）、`_elements_to_numbers`（単独数字・複数数字分割・非数字除外・重複統合・zfill）。
@@ -320,9 +320,12 @@ Execution environment: RTX 5090 / Python 3.12 is available through uv or the dis
   モデル/revision/strategyごとに比較する。repo event由来pin-center GTではIoUを使わず、手動輪郭GT時だけ併記する。
   `--model-spec` JSONを複数指定すればHub ID/ローカルpath/revision/mode/strategyを一括比較できる。
   実画像がない環境では保存済みrunner JSONを評価できる。
-- Ariaers実マップ（3035x1803、event.json由来GT 56点）の標準経路実測は、RTX 5090で434.6秒。
-  raw正規化はpredicted 89 / matched 36 / recall 64.29%、overlap重複排除後はpredicted 76 /
-  matched 35 / precision 46.05% / recall 62.50% / mean distance 21.657px。
+- Ariaers実マップ（3035x1803、event.json由来GT 56点）の**canonical evaluator**は、
+  固定runner入力 `temp/phase1_accuracy_roi_standard.json`（SHA-256
+  `D17ECCC1C83C943C22F525C509E511E1D511FD98EC845C7E72C5FFFA088089B2`）を
+  `--distance-threshold 50` で評価する。同一runの結果は predicted 76 / matched 35 /
+  precision 46.05% / recall 62.50% / mean distance 21.657px（RTX 5090、434.6秒）。
+  raw未dedupの旧集計値はcanonical結果として扱わない。
   詳細、SHA/provenance、0%ベースラインは `docs/ocr-evaluation.repo-events.json` と
   `docs/ocr-evaluation-reproduction.md` に保存する。
 - モバイルはOCRを実行せず、デスクトップが生成した正規化pin座標の表示・手動補正に責務を限定する。
