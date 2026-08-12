@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-サークルリスト生成ツール - メインエントリポイント
+Event AutoPin - メインエントリポイント
 様々なイベントサイトからサークル情報を抽出し、指定フォーマットで出力する
 """
 
@@ -32,7 +32,7 @@ from src.utils.output_cleanup import protected_output_entry_names
 
 
 class CircleListGenerator:
-    """サークルリスト生成ツールのメインクラス"""
+    """Event AutoPinのメインクラス（旧API名は互換性のため維持）。"""
 
     def __init__(self, config_path: str = "config.yaml"):
         """初期化"""
@@ -49,7 +49,7 @@ class CircleListGenerator:
             log_level=os.environ.get("LOG_LEVEL", "INFO"), log_dir=log_dir
         )
 
-        self.logger.info("サークルリスト生成ツール初期化完了")
+        self.logger.info("Event AutoPin初期化完了")
         # GUI/CLIへ返す座標生成の機械可読な診断。既存の event.json 契約には
         # 影響させず、bridge が必要に応じて結果を返せるようにする。
         self.coordinate_generation_summary: Dict[str, Any] = {
@@ -1229,7 +1229,7 @@ class CircleListGenerator:
 def main():
     """メインエントリポイント"""
     parser = argparse.ArgumentParser(
-        description="サークルリスト生成ツール - 様々なイベントサイトからサークル情報を抽出"
+        description="Event AutoPin - 様々なイベントサイトからサークル情報を抽出"
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="詳細なログを出力")
     parser.add_argument(

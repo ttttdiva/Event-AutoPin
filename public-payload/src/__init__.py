@@ -1,1 +1,1 @@
-# Circle List Generator Package
+# Event AutoPin core package

@@ -6240,7 +6240,7 @@ function buildConfigYaml(): string {
       : [];
 
   return [
-    "# サークルリスト生成ツール設定",
+    "# Event AutoPin 設定",
     "",
     ...urlYamlLines,
     ...mapYamlLines,
