@@ -33,7 +33,7 @@ sha256:<64桁のSHA-256> relative/path/to/asset.png
 $SourceRoot = (Resolve-Path .).Path
 # 現在の既存checkout。改名時は末尾を Event-AutoPin-Publish に置き換える。
 # ドライブ文字はscanに誤検出されないよう分割して記述している。
-$DestinationRoot = ('D:' + '\Dev\autocircle-public-sync')
+$DestinationRoot = ('D:' + '\Dev\Event-AutoPin-Publish')
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync_public_repo.ps1 `
   -SourceRoot $SourceRoot -DestinationRoot $DestinationRoot
 ```
