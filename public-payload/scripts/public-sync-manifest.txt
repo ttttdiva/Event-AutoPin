@@ -8,8 +8,13 @@ desktop-app/package-lock.json
 desktop-app/README.md
 desktop-app/src/bridge-job.ts
 desktop-app/src/main.ts
+desktop-app/src/state/async-mutation-guard.test.ts
+desktop-app/src/state/async-mutation-guard.ts
 desktop-app/src/state/event-document.ts
 desktop-app/src/state/event-document-ownership.test.ts
+desktop-app/src/state/event-document-save-flow.test.ts
+desktop-app/src/state/event-write-coordinator.test.ts
+desktop-app/src/state/event-write-coordinator.ts
 desktop-app/src/state/operation-state.test.ts
 desktop-app/src/state/operation-state.ts
 desktop-app/src/state/revisioned-save-queue.test.ts
@@ -18,6 +23,12 @@ desktop-app/src/styles.css
 desktop-app/src-tauri/build.rs
 desktop-app/src-tauri/Cargo.lock
 desktop-app/src-tauri/Cargo.toml
+sha256:a5c2ca56a562cea2e5aec3582ef1cbc2e1e53d252f4248913f03f122edae8be4 desktop-app/src-tauri/icons/32x32.png
+sha256:431d7b79683d3f1285795fe4f4b4b53127b3732d1c2ad676944d562e6948dc93 desktop-app/src-tauri/icons/128x128.png
+sha256:1f3a73c474f5909b2f86885838f710ee631494c84b7260ccc0ecf904af4b2786 desktop-app/src-tauri/icons/128x128@2x.png
+sha256:d24cfc79db8f8f231ae58e3c844cf4bdc513bf35f0bef0e12e21c05ddba4efda desktop-app/src-tauri/icons/icon.icns
+sha256:02180bb22e047dda6e01ac8bdf1c7edb89fd7af6a28e6fd37ce49969b40a5480 desktop-app/src-tauri/icons/icon.ico
+sha256:79aca754e54d11ef16fe7ff43751335cdc741230dbbbbbe298cff7ac9bbd113f desktop-app/src-tauri/icons/icon.png
 desktop-app/src-tauri/src/history_search.rs
 desktop-app/src-tauri/src/main.rs
 desktop-app/src-tauri/tauri.conf.json
@@ -49,6 +60,10 @@ shopping-app/app/(tabs)/index.tsx
 shopping-app/app/(tabs)/settings.tsx
 shopping-app/app/_layout.tsx
 shopping-app/app/+not-found.tsx
+shopping-app/app/event/[id].tsx
+sha256:a1fe7e92e58ab59f28c0bc26639075fe70ef1ff277aec83bfcf9fd98ca0a784f shopping-app/assets/images/adaptive-icon.png
+sha256:0d7c1c9812be9b2419351dfc9e0a13b1d72a96fda3ff788113f95bd4e6eec6c1 shopping-app/assets/images/icon.png
+sha256:974eb696f42b1fe3f242af6fd73f70daf4155b9262979003ed44e6171eab721f shopping-app/assets/images/splash-icon.png
 shopping-app/components/BottomBar.tsx
 shopping-app/components/CircleExpandedDetail.tsx
 shopping-app/components/CircleRow.tsx
@@ -87,6 +102,9 @@ shopping-app/lib/types.ts
 shopping-app/lib/update-service.ts
 shopping-app/modules/apk-installer/expo-module.config.json
 shopping-app/modules/apk-installer/index.ts
+shopping-app/modules/apk-installer/android/build.gradle
+shopping-app/modules/apk-installer/android/src/main/AndroidManifest.xml
+shopping-app/modules/apk-installer/android/src/main/java/expo/modules/apkinstaller/ApkInstallerModule.kt
 shopping-app/modules/apk-installer/src/ApkInstallerModule.ts
 shopping-app/package.json
 shopping-app/package-lock.json
@@ -131,6 +149,7 @@ src/utils/catalog_image_analyzer.py
 src/utils/catalog_updater.py
 src/utils/circle_master.py
 src/utils/cli_llm.py
+src/utils/cookie_loader.py
 src/utils/date_utils.py
 src/utils/downloader.py
 src/utils/gemini_client.py

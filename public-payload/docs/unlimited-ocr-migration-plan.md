@@ -38,7 +38,7 @@
   - `docs/desktop/tauri-python-windows-plan.md`: 「Tesseract（OCR利用時）」「tesseractPath（任意）」
   - ※ `desktop-app/` 内のコードに tesseract 参照は無い（確認済み）。
 
-### 2.2 実証済みのUnlimited OCR構成（`D:\Dev\09_test`）
+### 2.2 実証済みのUnlimited OCR構成（別checkoutのprototype repository）
 
 - 専用 venv（**Python 3.12**）+ 依存:
   - `torch==2.10.0+cu130` / `torchvision==0.25.0+cu130`（extra index: `https://download.pytorch.org/whl/cu130`）
@@ -47,11 +47,11 @@
   - ※ pymupdf はPDF用なので本リポジトリでは不要（マップは画像のみ）。
 - GPU: RTX 5090 (32GB)。cu130 ビルドが動作確認済み。CPUフォールバックも `device="cpu"` + float32 で動く（遅い）。
 - モデル: `baidu/Unlimited-OCR`、単一 safetensors 約 **6.4GB**、
-  ダウンロード済みキャッシュ: `D:\Dev\09_test\temp\hf_cache\hub\models--baidu--Unlimited-OCR`
+  ダウンロード済みキャッシュ: `<prototype-root>/temp/hf_cache/hub/models--baidu--Unlimited-OCR`
   （snapshot revision: `ee63731b6461c8afcdcc7b15352e7d2ffecc2ead`）。
-- 参照実装: `D:\Dev\09_test\src\image_processing\unlimited_ocr.py`（推論）、
-  `D:\Dev\09_test\src\utilities\setup_unlimited_ocr_env.py`（venv構築 + doctor）、
-  `D:\Dev\09_test\scripts\setup_unlimited_ocr.bat` / `unlimited_ocr.bat`（ラッパー）。
+- 参照実装: `<prototype-root>/src/image_processing/unlimited_ocr.py`（推論）、
+  `<prototype-root>/src/utilities/setup_unlimited_ocr_env.py`（venv構築 + doctor）、
+  `<prototype-root>/scripts/setup_unlimited_ocr.bat` / `unlimited_ocr.bat`（ラッパー）。
 
 ### 2.3 モデルAPI仕様（`modeling_unlimitedocr.py` 読解済み）
 
@@ -186,7 +186,7 @@ def parse_grounding_output(raw_text, image_width, image_height) -> list[dict]:
     "device": "cuda",
     "results": [
       {
-        "image": "D:/.../map_01.png",
+        "image": "<absolute-map-path>/map_01.png",
         "image_width": 2480, "image_height": 3508,
         "elapsed_sec": 3.2,
         "elements": [
@@ -243,12 +243,15 @@ def parse_grounding_output(raw_text, image_width, image_height) -> list[dict]:
 再ダウンロード(6.4GB)を避けるため、既存キャッシュをコピーする:
 
 ```powershell
-New-Item -ItemType Directory -Force D:\Dev\40_caico-list-gen\temp\hf_cache\hub
-Copy-Item -Recurse D:\Dev\09_test\temp\hf_cache\hub\models--baidu--Unlimited-OCR `
-  D:\Dev\40_caico-list-gen\temp\hf_cache\hub\
+$PrototypeRoot = Read-Host 'Prototype repository root'
+$RepositoryRoot = (Resolve-Path .).Path
+$SourceCache = Join-Path $PrototypeRoot 'temp\hf_cache\hub\models--baidu--Unlimited-OCR'
+$DestinationCache = Join-Path $RepositoryRoot 'temp\hf_cache\hub'
+New-Item -ItemType Directory -Force $DestinationCache
+Copy-Item -Recurse $SourceCache $DestinationCache
 ```
 
-（コピーしない場合は初回実行時に自動ダウンロードされる。`HF_HOME` を `D:\Dev\09_test\temp\hf_cache` に向ける運用でも可だが、リポジトリ内完結を既定とする。）
+（コピーしない場合は初回実行時に自動ダウンロードされる。`HF_HOME` をprototype側の `temp/hf_cache` に向ける運用でも可だが、リポジトリ内完結を既定とする。）
 
 ## 6. 検証計画（マイルストーン）
 

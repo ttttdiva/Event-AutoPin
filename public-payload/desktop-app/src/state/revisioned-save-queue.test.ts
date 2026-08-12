@@ -54,6 +54,39 @@ async function main(): Promise<void> {
   }
   assert(failed, "保存エラーがreceiptへ伝播していません");
 
+  const disposed: number[] = [];
+  let finishActive: () => void = () => undefined;
+  let activeStartedResolve: () => void = () => undefined;
+  const activeStarted = new Promise<void>((resolve) => {
+    activeStartedResolve = resolve;
+  });
+  const disposalQueue = new RevisionedSaveQueue<{ value: number }>(
+    async ({ snapshot }) => {
+      if (snapshot.value === 1) {
+        activeStartedResolve();
+        await new Promise<void>((resolve) => {
+          finishActive = resolve;
+        });
+      }
+    },
+    (snapshot) => disposed.push(snapshot.value),
+  );
+  const active = disposalQueue.enqueue({ value: 1 });
+  await activeStarted;
+  const superseded = disposalQueue.enqueue({ value: 2 });
+  const latest = disposalQueue.enqueue({ value: 3 });
+  finishActive();
+  await Promise.all([
+    active.completed,
+    superseded.completed,
+    latest.completed,
+    disposalQueue.flush(),
+  ]);
+  assert(
+    disposed.join(",") === "2,1,3",
+    `置換/実行済みsnapshotのdisposeが不正です: ${disposed.join(",")}`,
+  );
+
   console.log("revisioned-save-queue tests passed");
 }
 

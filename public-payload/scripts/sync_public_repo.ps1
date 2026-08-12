@@ -41,22 +41,55 @@ function SameHashes($A, $B) {
     return $true
 }
 
-function Scan([string]$Root, [string[]]$Paths) {
+function TestImageSignature([string]$Path, [byte[]]$Bytes) {
+    $extension = [IO.Path]::GetExtension($Path).ToLowerInvariant()
+    $isPng = $Bytes.Length -ge 8 -and ([BitConverter]::ToString($Bytes[0..7]) -eq '89-50-4E-47-0D-0A-1A-0A')
+    if ($extension -eq '.png') { return $isPng }
+    if ($extension -eq '.jpg' -or $extension -eq '.jpeg') { return $Bytes.Length -ge 3 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xD8 -and $Bytes[2] -eq 0xFF }
+    if ($extension -eq '.gif') {
+        if ($Bytes.Length -lt 6) { return $false }
+        $header = [Text.Encoding]::ASCII.GetString($Bytes, 0, 6)
+        return $header -eq 'GIF87a' -or $header -eq 'GIF89a'
+    }
+    if ($extension -eq '.webp') {
+        return $Bytes.Length -ge 12 -and [Text.Encoding]::ASCII.GetString($Bytes, 0, 4) -eq 'RIFF' -and
+            [Text.Encoding]::ASCII.GetString($Bytes, 8, 4) -eq 'WEBP'
+    }
+    if ($extension -eq '.ico') { return $Bytes.Length -ge 4 -and ([BitConverter]::ToString($Bytes[0..3]) -eq '00-00-01-00') }
+    if ($extension -eq '.icns') {
+        # The currently reviewed Tauri icon.icns is PNG-encoded despite its suffix; its committed hash is still mandatory.
+        return $isPng -or ($Bytes.Length -ge 8 -and [Text.Encoding]::ASCII.GetString($Bytes, 0, 4) -eq 'icns')
+    }
+    return $false
+}
+
+function Scan([string]$Root, [string[]]$Paths, $AssetHashes) {
     $rules = @(
         @{ N='personal user'; P=('ponjo'+'rapi') },
-        @{ N='home path'; P='(?i)(?:[A-Z]:[\\/]+Users[\\/]+(?!Public(?:[\\/]|$))[^\\/\s"''<>]+[\\/]|/(?:home|Users)/[^/\s"''<>]+/)' },
+        @{ N='Windows absolute path'; P='(?i)(?<![A-Za-z0-9_])(?!(?:C:[\\/]temp[\\/]result\.zip))\b[A-Z]:[\\/]' },
+        @{ N='home path'; P='(?i)/(?:home|Users)/[^/\s"''<>]+/' },
         @{ N='private key'; P=('-----BE'+'GIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----') },
         @{ N='GitHub token'; P=('(?:g'+'hp|github_pat)_[A-Za-z0-9_]{20,}') },
         @{ N='API token'; P=('(?:s'+'k-[A-Za-z0-9_-]{20,}|AI'+'za[0-9A-Za-z_-]{30,}|x'+'ox[baprs]-[A-Za-z0-9-]{10,}|AK'+'IA[0-9A-Z]{16})') },
         @{ N='JWT'; P=('ey'+'J[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}') },
-        @{ N='credential assignment'; P="(?i)\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret)\b\s*[:=]\s*[`"'][A-Za-z0-9_./+=-]{16,}[`"']" }
+        @{ N='credential assignment'; P="(?im)(?:^|[,;{])\s*(?:[`"']?)(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|bearer|session|cookie)(?:[`"']?)\s*[:=]\s*(?:[`"'](?!\s*(?:none|null|dummy|example|placeholder|changeme)(?:[_-][^`"']*)?[`"'])[^`"'\r\n]{4,}[`"']|(?!\s*(?:none|null|dummy|example|placeholder|changeme)(?:[_-][^\s,;#}\]]*)?(?:\s|[,;#}\]]|$))(?!\s*(?:actual_api_key|downloader\.session)(?:\s|[,;#}\]]|$))[A-Za-z0-9_./+=@-]{8,}(?=\s|[,;#}\]]|$))" },
+        @{ N='database URL'; P='(?i)\b(?:postgres(?:ql)?(?:\+[a-z0-9._-]+)?|mysql(?:\+[a-z0-9._-]+)?|mariadb(?:\+[a-z0-9._-]+)?|mongodb(?:\+srv)?|rediss?|mssql(?:\+[a-z0-9._-]+)?|sqlite(?:\+[a-z0-9._-]+)?):/{2,3}[^\s"''<>]+' }
     )
     $badExtensions = '(?i)\.(apk|aab|exe|dll|so|dylib|zip|7z|tar|gz|db|sqlite3?|pem|p12|pfx|key|pyc)$'
+    $imageExtensions = '(?i)\.(png|jpe?g|gif|webp|ico|icns)$'
     $findings = @()
     foreach ($relative in $Paths) {
         if ($relative -match $badExtensions) { $findings += "$relative (binary/credential filename)"; continue }
         $file = Join-Path $Root $relative
         $bytes = [IO.File]::ReadAllBytes($file)
+        if ($relative -match $imageExtensions) {
+            if (-not $AssetHashes.ContainsKey($relative)) { $findings += "$relative (image missing exact SHA256 allowlist)"; continue }
+            $actualHash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $AssetHashes[$relative]) { $findings += "$relative (image SHA256 mismatch)"; continue }
+            if (-not (TestImageSignature $relative $bytes)) { $findings += "$relative (invalid image signature)" }
+            continue
+        }
+        if ($AssetHashes.ContainsKey($relative)) { $findings += "$relative (SHA256 allowlist is restricted to image assets)"; continue }
         if ($bytes -contains 0) { $findings += "$relative (binary content)"; continue }
         $text = [Text.Encoding]::UTF8.GetString($bytes)
         foreach ($rule in $rules) { if ([regex]::IsMatch($text, $rule.P)) { $findings += "$relative ($($rule.N))" } }
@@ -75,12 +108,36 @@ try {
     if ($dirty.Count -gt 0) { throw 'Destination working tree is not clean.' }
     $visibility = ([string](Run gh @('api','repos/ttttdiva/autocircle','--jq','.visibility') | Select-Object -First 1)).Trim()
     if ($visibility -ne 'public') { throw "Destination repository is not confirmed public: $visibility" }
+    Run git @('-C',$destination,'fetch','--prune','--quiet','origin') | Out-Null
+    $currentBranch = ([string](Run git @('-C',$destination,'rev-parse','--abbrev-ref','HEAD') | Select-Object -First 1)).Trim()
+    if ($currentBranch -eq 'HEAD') { throw 'Destination HEAD is detached.' }
+    $remoteHead = @(Run git @('-C',$destination,'ls-remote','--symref','origin','HEAD')) | Where-Object { ([string]$_) -match '^ref:\s+refs/heads/([^\s]+)\s+HEAD$' } | Select-Object -First 1
+    if (-not $remoteHead -or ([string]$remoteHead) -notmatch '^ref:\s+refs/heads/([^\s]+)\s+HEAD$') { throw 'Destination origin default branch could not be verified.' }
+    $defaultBranch = $Matches[1]; $defaultRef = "origin/$defaultBranch"
+    if ($currentBranch -ne $defaultBranch) { throw "Destination current branch '$currentBranch' is not origin default branch '$defaultBranch'." }
+    $upstream = ([string](Run git @('-C',$destination,'rev-parse','--abbrev-ref','--symbolic-full-name','@{upstream}') | Select-Object -First 1)).Trim()
+    if ($upstream -ne $defaultRef) { throw "Destination upstream '$upstream' is not '$defaultRef'." }
+    $localHead = ([string](Run git @('-C',$destination,'rev-parse','HEAD') | Select-Object -First 1)).Trim()
+    $originHead = ([string](Run git @('-C',$destination,'rev-parse',$defaultRef) | Select-Object -First 1)).Trim()
+    if ($localHead -ne $originHead) { throw "Destination HEAD does not match fetched $defaultRef." }
 
     $manifestPath = 'scripts/public-sync-manifest.txt'
     $tracked = @(Run git @('-C',$source,'ls-tree','-r','--name-only','HEAD')) | ForEach-Object { ([string]$_).Replace('\','/') }
     if ($tracked -notcontains $manifestPath) { throw "$manifestPath must be committed in HEAD." }
     $manifestText = (Run git @('-C',$source,'show',"HEAD:$manifestPath")) -join "`n"
-    $paths = @($manifestText -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') } | Sort-Object -Unique)
+    $entries = @($manifestText -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+    $paths = @(); $assetHashes = @{}; $seenPaths = @{}
+    foreach ($entry in $entries) {
+        if ($entry -match '^sha256:([0-9a-fA-F]{64})\s+(.+)$') {
+            $path = $Matches[2].Trim(); $assetHashes[$path] = $Matches[1].ToLowerInvariant()
+        } elseif ($entry.StartsWith('sha256:', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Invalid SHA256 manifest entry: $entry"
+        } else { $path = $entry }
+        if ($seenPaths.ContainsKey($path)) { throw "Duplicate manifest path: $path" }
+        $seenPaths[$path] = $true
+        $paths += $path
+    }
+    $paths = @($paths | Sort-Object -Unique)
     if ($paths.Count -eq 0) { throw 'Public manifest is empty.' }
     foreach ($path in $paths) {
         if ([IO.Path]::IsPathRooted($path) -or $path.Contains('\') -or $path.Contains(':') -or
@@ -99,7 +156,7 @@ try {
         Write-Output "[candidates] $($paths.Count) committed manifest files"
         $paths | ForEach-Object { Write-Output "  INCLUDE $_" }
         Write-Output "[excluded] all uncommitted and all paths absent from exact manifest"
-        $findings = @(Scan $temp $paths); Write-Output "[scan] $($findings.Count) findings"; $findings | ForEach-Object { Write-Output "  BLOCK $_" }
+        $findings = @(Scan $temp $paths $assetHashes); Write-Output "[scan] $($findings.Count) findings"; $findings | ForEach-Object { Write-Output "  BLOCK $_" }
         if ($findings.Count) { throw 'Sensitive-data scan failed closed; destination was not changed.' }
 
         $before = HashTree (Join-Path $destination $PayloadName); $after = HashTree $temp

@@ -1,3 +1,13 @@
+import {
+  buildEventJsonSnapshot,
+  collectEventAssetReferences,
+  eventJsonDocumentsEqual,
+  runImageDeletionTransaction,
+  selectActiveMapImages,
+  type EventJsonData,
+  type TableState,
+} from "./event-document";
+
 type FixtureDocument = {
   slug: string;
   dir: string;
@@ -5,10 +15,349 @@ type FixtureDocument = {
   circleCount: number;
 };
 
-export {};
-
 function assert(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object") {
+    Object.freeze(value);
+    Object.values(value as Record<string, unknown>).forEach(deepFreeze);
+  }
+  return value;
+}
+
+function clone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function testLosslessEventDocumentSnapshot(): void {
+  const source: EventJsonData = deepFreeze({
+    schema_extension: { keep: true },
+    circles: [
+      {
+        name: "元のサークル",
+        space: "A01",
+        priority_color: 5,
+        item_images: [
+          {
+            path: "items/retained.jpg",
+            source: "catalog",
+            analysis: { confidence: 0.91 },
+          },
+        ],
+        items: [
+          {
+            name: "本",
+            genre: "漫画",
+            custom_nested: { keep: "yes" },
+          },
+        ],
+        custom_circle_field: { keep: 1 },
+      },
+    ],
+  });
+  const baseline: TableState = {
+    headers: ["サークル名", "ジャンル", "アイテム画像", "ピンX", "アイテムメモ"],
+    rows: [
+      {
+        サークル名: "元のサークル",
+        ジャンル: "雑誌",
+        アイテム画像: "items/retained.jpg",
+        ピンX: "0",
+        アイテムメモ: "",
+      },
+    ],
+  };
+
+  // circle_master由来の「雑誌」は表示baselineにも含まれるため自動永続化されない。
+  const untouched = buildEventJsonSnapshot(source, clone(baseline), baseline);
+  assert(
+    eventJsonDocumentsEqual(untouched, source),
+    "未編集snapshotが元文書をsemantic変更しました",
+  );
+  assert(
+    !Object.prototype.hasOwnProperty.call(untouched.circles?.[0], "genres"),
+    "circle_master表示overlayがgenresとして永続化されました",
+  );
+  assert(
+    !Object.prototype.hasOwnProperty.call(untouched.circles?.[0], "pin_x") &&
+      !Object.prototype.hasOwnProperty.call(untouched.circles?.[0], "memo"),
+    "未編集のoptional field absenceが失われました",
+  );
+
+  const renamedTable = clone(baseline);
+  renamedTable.rows[0]["サークル名"] = "明示編集したサークル";
+  const renamed = buildEventJsonSnapshot(source, renamedTable, baseline);
+  const expectedRenamed = clone(source);
+  expectedRenamed.circles![0].name = "明示編集したサークル";
+  assert(
+    eventJsonDocumentsEqual(renamed, expectedRenamed),
+    "単一列編集以外のフィールドまで変更されました",
+  );
+
+  const imageTable = clone(baseline);
+  imageTable.rows[0]["アイテム画像"] =
+    "items/retained.jpg\nitems/added.jpg";
+  const imageEdited = buildEventJsonSnapshot(source, imageTable, baseline);
+  assert(
+    imageEdited.circles?.[0].item_images?.[0].source === "catalog" &&
+      imageEdited.circles?.[0].item_images?.[0].analysis?.confidence === 0.91,
+    "保持画像のnested metadataが失われました",
+  );
+  assert(
+    imageEdited.circles?.[0].item_images?.[1].path === "items/added.jpg",
+    "明示追加した画像だけが追加されませんでした",
+  );
+
+  const itemImageOnlySource: EventJsonData = {
+    circles: [
+      {
+        name: "item画像のみ",
+        items: [
+          {
+            name: "本",
+            image: "items/item-only.jpg",
+            custom_nested: { keep: true },
+          },
+        ],
+        item_images: [],
+      },
+    ],
+  };
+  const itemImageBaseline: TableState = {
+    headers: ["アイテム画像"],
+    rows: [{ アイテム画像: "items/item-only.jpg" }],
+  };
+  const clearedItemImageTable = clone(itemImageBaseline);
+  clearedItemImageTable.rows[0]["アイテム画像"] = "";
+  const clearedItemImage = buildEventJsonSnapshot(
+    itemImageOnlySource,
+    clearedItemImageTable,
+    itemImageBaseline,
+  );
+  assert(
+    clearedItemImage.circles?.[0].items?.[0].image === "" &&
+      clearedItemImage.circles?.[0].item_images?.length === 0,
+    "items[].image-only画像が合成列のclear後も復活します",
+  );
+  assert(
+    clearedItemImage.circles?.[0].items?.[0].custom_nested?.keep === true,
+    "画像clear時にitemのunknown metadataが失われました",
+  );
+
+  const retainedItemImageTable = clone(itemImageBaseline);
+  retainedItemImageTable.rows[0]["アイテム画像"] =
+    "items/item-only.jpg\nitems/new.jpg";
+  const retainedItemImage = buildEventJsonSnapshot(
+    itemImageOnlySource,
+    retainedItemImageTable,
+    itemImageBaseline,
+  );
+  assert(
+    retainedItemImage.circles?.[0].items?.[0].image === "items/item-only.jpg",
+    "desired pathに残るitems[].imageが解除されました",
+  );
+  assert(
+    retainedItemImage.circles?.[0].item_images?.length === 1 &&
+      retainedItemImage.circles?.[0].item_images?.[0].path === "items/new.jpg",
+    "items[].imageとの重複を避けて新規pathだけをitem_imagesへ追加できませんでした",
+  );
+
+  const overlapSource: EventJsonData = {
+    circles: [{
+      items: [{ image: "items/shared.jpg" }],
+      item_images: [{ path: "items/shared.jpg", source: "catalog", custom: { keep: true } }],
+    }],
+  };
+  const overlapBaseline: TableState = {
+    headers: ["アイテム画像"],
+    rows: [{ アイテム画像: "items/shared.jpg" }],
+  };
+  const overlapEditedTable = clone(overlapBaseline);
+  overlapEditedTable.rows[0]["アイテム画像"] += "\nitems/new.jpg";
+  const overlapEdited = buildEventJsonSnapshot(
+    overlapSource,
+    overlapEditedTable,
+    overlapBaseline,
+  );
+  assert(
+    overlapEdited.circles?.[0].item_images?.[0]?.source === "catalog" &&
+      overlapEdited.circles?.[0].item_images?.[0]?.custom?.keep === true,
+    "items[].imageと重複するitem_images metadataが失われました",
+  );
+
+  // hydration相当の読み取りはdeep-frozen文書にも副作用を起こさない。
+  const inheritedCheckedSource: EventJsonData = deepFreeze({
+    circles: [{ checked: 1, items: [{ name: "本" }] }],
+  });
+  const effectiveChecked =
+    inheritedCheckedSource.circles![0].items[0].checked ??
+    inheritedCheckedSource.circles![0].checked ??
+    0;
+  assert(effectiveChecked === 1, "circle checkedの表示fallbackが維持されていません");
+  assert(
+    !Object.prototype.hasOwnProperty.call(
+      inheritedCheckedSource.circles![0].items[0],
+      "checked",
+    ),
+    "表示用hydrationがitem.checkedを注入しました",
+  );
+}
+
+async function testImageDeletionTransaction(): Promise<void> {
+  const sharedDocument: EventJsonData = {
+    circles: [
+      {
+        item_images: [{ path: "items/shared.jpg" }, { path: "items/only.jpg" }],
+        items: [{ image: "items/shared-by-items.jpg" }],
+      },
+      {
+        item_images: [{ path: "items/shared.jpg" }],
+        items: [
+          { image: "items/shared-by-items.jpg" },
+          { image: "items/other.jpg" },
+        ],
+      },
+    ],
+  };
+  const references = collectEventAssetReferences(sharedDocument);
+  assert(
+    references.has("items/shared.jpg") &&
+      references.has("items/shared-by-items.jpg") &&
+      references.has("items/other.jpg"),
+    "別circle/複数itemsを含むdocument全体の参照を集計できませんでした",
+  );
+
+  const order: string[] = [];
+  const deleted: string[] = [];
+  await runImageDeletionTransaction({
+    removedReferences: ["items/shared.jpg", "items/shared-by-items.jpg", "items/only.jpg"],
+    applyClear: () => {
+      order.push("clear");
+      sharedDocument.circles![0].item_images = [];
+      sharedDocument.circles![0].items[0].image = "";
+    },
+    save: async () => {
+      order.push("save");
+      return true;
+    },
+    rollbackIfCurrent: () => {
+      order.push("rollback");
+      return true;
+    },
+    currentDocument: () => sharedDocument,
+    deleteAsset: async (reference) => {
+      order.push(`delete:${reference}`);
+      deleted.push(reference);
+    },
+  });
+  assert(
+    deleted.length === 1 && deleted[0] === "items/only.jpg",
+    "document内に共有参照が残る画像を物理削除しました",
+  );
+  assert(
+    order.indexOf("save") < order.indexOf("delete:items/only.jpg"),
+    "JSON保存完了前に画像を物理削除しました",
+  );
+
+  const failedState = { table: "before", document: "before", baseline: "before", ui: "before" };
+  const failedBefore = clone(failedState);
+  let failedDeleteCalls = 0;
+  const failed = await runImageDeletionTransaction({
+    removedReferences: ["items/failure.jpg"],
+    applyClear: () => {
+      failedState.table = "cleared";
+      failedState.document = "cleared";
+      failedState.baseline = "optimistic";
+      failedState.ui = "cleared";
+    },
+    save: async () => false,
+    rollbackIfCurrent: () => {
+      Object.assign(failedState, failedBefore);
+      return true;
+    },
+    currentDocument: () => ({ circles: [] }),
+    deleteAsset: async () => {
+      failedDeleteCalls += 1;
+    },
+  });
+  assert(!failed, "保存失敗した画像削除を成功扱いしました");
+  assert(
+    JSON.stringify(failedState) === JSON.stringify(failedBefore),
+    "保存失敗時にUI/table/document/baselineをrollbackできませんでした",
+  );
+  assert(failedDeleteCalls === 0, "保存失敗時に物理削除を呼び出しました");
+
+  let switchedOwnerDeleteCalls = 0;
+  await runImageDeletionTransaction({
+    removedReferences: ["items/old-owner.jpg"],
+    applyClear: () => {},
+    save: async () => true,
+    rollbackIfCurrent: () => true,
+    currentDocument: () => null,
+    deleteAsset: async () => {
+      switchedOwnerDeleteCalls += 1;
+    },
+  });
+  assert(
+    switchedOwnerDeleteCalls === 0,
+    "保存後に所有イベントが切り替わった状態で旧assetを物理削除しました",
+  );
+
+  let caseFoldDeleteCalls = 0;
+  await runImageDeletionTransaction({
+    removedReferences: ["items/A.jpg"],
+    applyClear: () => {},
+    save: async () => true,
+    rollbackIfCurrent: () => true,
+    currentDocument: () => ({
+      circles: [{ items: [{ image: "ITEMS/a.JPG" }] }],
+    }),
+    deleteAsset: async () => {
+      caseFoldDeleteCalls += 1;
+    },
+  });
+  assert(
+    caseFoldDeleteCalls === 0,
+    "大小文字だけ異なるWindows共有参照のassetを物理削除しました",
+  );
+
+  let lexicalDeleteCalls = 0;
+  await runImageDeletionTransaction({
+    removedReferences: ["items/a.jpg"],
+    applyClear: () => {},
+    save: async () => true,
+    rollbackIfCurrent: () => true,
+    currentDocument: () => ({
+      circles: [{ item_images: [{ path: "./items//a.jpg" }] }],
+    }),
+    deleteAsset: async () => {
+      lexicalDeleteCalls += 1;
+    },
+  });
+  assert(
+    lexicalDeleteCalls === 0,
+    "Rust safe_relative_pathで同一になる共有参照を別assetとして扱いました",
+  );
+}
+
+function testActiveMapSelectionKeepsOrphanButUsesOneReferencePerNumber(): void {
+  const discovered = [
+    { name: "map_01.jpg", path: "fixture/maps/map_01.jpg", modified_ms: 100 },
+    { name: "map_01.png", path: "fixture/maps/map_01.png", modified_ms: 200 },
+    { name: "map_02.webp", path: "fixture/maps/map_02.webp", modified_ms: 150 },
+  ];
+  const latest = selectActiveMapImages(discovered);
+  assert(discovered.length === 3, "active選択が旧jpg孤児を配列から破壊しました");
+  assert(latest.length === 2, "event.maps相当がmap番号ごと1件になりませんでした");
+  assert(latest[0].name === "map_01.png", "jpg→png差替後に旧jpgがactiveになりました");
+
+  const explicit = selectActiveMapImages(discovered, ["maps/map_01.jpg"]);
+  assert(
+    explicit[0].name === "map_01.jpg",
+    "明示preferred refが最新mtimeより優先されませんでした",
+  );
 }
 
 function deferred<T>() {
@@ -20,6 +369,9 @@ function deferred<T>() {
 }
 
 async function main(): Promise<void> {
+  testLosslessEventDocumentSnapshot();
+  testActiveMapSelectionKeepsOrphanButUsesOneReferencePerNumber();
+  await testImageDeletionTransaction();
   const fixtures: Record<string, FixtureDocument> = {
     a: { slug: "a", dir: "fixture/a", path: "fixture/a/event.json", circleCount: 355 },
     b: { slug: "b", dir: "fixture/b", path: "fixture/b/event.json", circleCount: 109 },

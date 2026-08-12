@@ -29,7 +29,10 @@ export class RevisionedSaveQueue<T> {
   private lastError: unknown = null;
   private idleWaiters: Array<() => void> = [];
 
-  constructor(private readonly execute: SaveExecutor<T>) {}
+  constructor(
+    private readonly execute: SaveExecutor<T>,
+    private readonly disposeSnapshot?: (snapshot: T) => void,
+  ) {}
 
   get isRunning(): boolean {
     return this.running;
@@ -67,6 +70,7 @@ export class RevisionedSaveQueue<T> {
     });
     // pendingは最新だけを保持する。置き換えられたrevisionのreceiptは、
     // より新しいスナップショットが保存された時点で完了させる。
+    if (this.pending) this.disposeSnapshot?.(this.pending.snapshot);
     this.pending = { revision, snapshot };
     if (!this.running) void this.drain();
     return { revision, completed };
@@ -109,6 +113,8 @@ export class RevisionedSaveQueue<T> {
       } catch (error) {
         this.lastError = error;
         this.settleThrough(request.revision, true, error);
+      } finally {
+        this.disposeSnapshot?.(request.snapshot);
       }
     }
     this.running = false;

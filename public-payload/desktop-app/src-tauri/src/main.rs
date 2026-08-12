@@ -18,6 +18,48 @@ use std::time::{Duration, Instant};
 
 use history_search::search_past_participations;
 
+fn absolute_project_root(project_root: &str) -> Result<PathBuf, String> {
+    let input = if project_root.trim().is_empty() {
+        Path::new(".")
+    } else {
+        Path::new(project_root)
+    };
+    let joined = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("current directory取得失敗: {e}"))?
+            .join(input)
+    };
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err("project rootがfilesystem root外を参照しています".to_string());
+                }
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.exists() {
+        fs::canonicalize(&normalized).map_err(|e| {
+            format!(
+                "project root canonicalize失敗 {}: {e}",
+                normalized.display()
+            )
+        })
+    } else if normalized.is_absolute() {
+        Ok(normalized)
+    } else {
+        Err("project rootをabsolute pathへ正規化できません".to_string())
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod windows_process_job {
     use std::io;
@@ -1081,7 +1123,10 @@ fn register_default_cut(
     image_source_path: String,
     genre: Option<String>,
 ) -> Result<Value, String> {
-    let root = PathBuf::from(&project_root);
+    let _write_guard = circle_master_write_lock()
+        .lock()
+        .map_err(|e| format!("circle master書込ロック取得失敗: {e}"))?;
+    let root = absolute_project_root(&project_root)?;
     let cm_path = root.join("circle_master.json");
     let cuts_dir = root.join("default_cuts");
 
@@ -1615,7 +1660,7 @@ mod event_meta_tests {
         fs::write(dir.join("map_02.png"), b"legacy").unwrap();
         fs::write(dir.join("maps/map_01.jpg"), b"new").unwrap();
 
-        let result = list_event_map_images(dir.to_string_lossy().to_string()).unwrap();
+        let result = list_event_map_images(dir.to_string_lossy().to_string(), None).unwrap();
         let maps = result["maps"].as_array().unwrap();
 
         assert_eq!(maps.len(), 2);
@@ -1625,6 +1670,40 @@ mod event_meta_tests {
             .unwrap()
             .contains("/maps/map_01.jpg"));
         assert_eq!(maps[1]["name"].as_str(), Some("map_02.png"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_event_map_images_keeps_old_extension_orphan_but_returns_newest_active() {
+        let dir =
+            std::env::temp_dir().join(format!("eventtrail-map-active-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("maps")).unwrap();
+        let old = dir.join("maps/map_01.jpg");
+        let new = dir.join("maps/map_01.png");
+        fs::write(&old, b"old jpg").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        fs::write(&new, b"new png").unwrap();
+
+        let result = list_event_map_images(dir.to_string_lossy().to_string(), None).unwrap();
+        let maps = result["maps"].as_array().unwrap();
+        assert_eq!(maps.len(), 1, "同じmap番号が複数activeになりました");
+        assert_eq!(maps[0]["name"].as_str(), Some("map_01.png"));
+        assert!(maps[0]["modified_ms"].as_u64().is_some());
+
+        let preferred = list_event_map_images(
+            dir.to_string_lossy().to_string(),
+            Some(vec!["maps/map_01.jpg".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(
+            preferred["maps"][0]["name"].as_str(),
+            Some("map_01.jpg"),
+            "明示preferred refがmtime選択より優先されませんでした"
+        );
+        assert!(old.exists(), "旧jpg孤児を物理削除しました");
+        assert!(new.exists(), "新active pngが存在しません");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1842,6 +1921,455 @@ mod event_meta_tests {
     }
 
     #[test]
+    fn received_import_stage_is_invisible_until_current_lease_publish() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventtrail-staged-import-test-{}-{suffix}",
+            std::process::id()
+        ));
+        let original = root.join("events/same_event_original");
+        let duplicate = root.join("events/same_event_mobile");
+        write_test_event(&original, "Same Event", "2026-05-24", "desktop_created");
+        write_test_event(&duplicate, "Same Event", "2026-05-24", "mobile_import");
+        let zip = root.join("received.zip");
+        write_mobile_result_zip(&zip, "Same Event", "2026-05-24");
+
+        let cancelled_id = format!("{}_{}", std::process::id(), suffix);
+        let _cancelled_receiver = register_received_upload(&cancelled_id, zip.clone()).unwrap();
+        claim_received_upload(cancelled_id.clone()).unwrap();
+        let plan =
+            plan_received_result_import(cancelled_id.clone(), root.to_string_lossy().to_string())
+                .unwrap();
+        assert_eq!(plan["affectedEvents"].as_array().unwrap().len(), 2);
+        stage_received_result_import(
+            cancelled_id.clone(),
+            root.to_string_lossy().to_string(),
+            "same_event_original".to_string(),
+        )
+        .unwrap();
+        let before_publish = fs::read_to_string(original.join("event.json")).unwrap();
+        assert!(duplicate.exists(), "stage中に重複live eventを削除しました");
+        terminal_cancel_received_upload(&cancelled_id, "timeout");
+        assert!(publish_received_result_import(cancelled_id).is_err());
+        assert_eq!(
+            fs::read_to_string(original.join("event.json")).unwrap(),
+            before_publish,
+            "timeout後のstageがlive eventを書き換えました"
+        );
+        assert!(
+            duplicate.exists(),
+            "timeout後に重複live eventを削除しました"
+        );
+
+        let cas_zip = root.join("received-cas.zip");
+        fs::copy(&zip, &cas_zip).unwrap();
+        let cas_id = format!("{}_{}_1", std::process::id(), suffix);
+        let _cas_receiver = register_received_upload(&cas_id, cas_zip).unwrap();
+        claim_received_upload(cas_id.clone()).unwrap();
+        stage_received_result_import(
+            cas_id.clone(),
+            root.to_string_lossy().to_string(),
+            "same_event_original".to_string(),
+        )
+        .unwrap();
+        fs::write(original.join("concurrent-edit.txt"), b"newer").unwrap();
+        assert!(publish_received_result_import(cas_id.clone()).is_err());
+        assert_eq!(
+            fs::read(original.join("concurrent-edit.txt")).unwrap(),
+            b"newer",
+            "preimage CAS不一致時に新しいlive編集をrollbackしました"
+        );
+        terminal_cancel_received_upload(&cas_id, "cas mismatch");
+        fs::remove_file(original.join("concurrent-edit.txt")).unwrap();
+
+        let retry_zip = root.join("received-retry.zip");
+        fs::copy(&zip, &retry_zip).unwrap();
+        let retry_id = format!("{}_{}_2", std::process::id(), suffix);
+        let retry_receiver = register_received_upload(&retry_id, retry_zip.clone()).unwrap();
+        claim_received_upload(retry_id.clone()).unwrap();
+        stage_received_result_import(
+            retry_id.clone(),
+            root.to_string_lossy().to_string(),
+            "same_event_original".to_string(),
+        )
+        .unwrap();
+        publish_received_result_import(retry_id.clone()).unwrap();
+        terminal_cancel_all_received_uploads("frontend reload failed then server stopped");
+        assert!(
+            cancel_received_upload(retry_id.clone(), Some("late UI failure".to_string()),).is_err()
+        );
+        ack_received_upload(retry_id.clone(), true, None).unwrap();
+        ack_received_upload(retry_id.clone(), true, None).unwrap();
+        assert!(wait_for_received_upload_ack(
+            &retry_id,
+            &retry_receiver,
+            &AtomicBool::new(true),
+            true,
+        )
+        .is_ok());
+        let published: Value =
+            serde_json::from_str(&fs::read_to_string(original.join("event.json")).unwrap())
+                .unwrap();
+        assert_eq!(published["metadata"]["source"], "mobile_import");
+        assert!(!duplicate.exists(), "publish後も重複eventが残っています");
+        assert!(
+            !retry_zip.exists(),
+            "success ack後もretry ZIPが残っています"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_rejects_parent_traversal_and_casefold_destination_collision() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventtrail-malicious-import-test-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("circle_master.json"), b"live-master").unwrap();
+        let event_json = json!({
+            "event": {"name": "Malicious", "date": "2026-05-25"},
+            "circles": [],
+            "metadata": {}
+        });
+        let options = zip::write::FileOptions::default();
+
+        let traversal = root.join("traversal.zip");
+        {
+            let mut zip = zip::ZipWriter::new(fs::File::create(&traversal).unwrap());
+            zip.start_file("event.json", options).unwrap();
+            zip.write_all(serde_json::to_string(&event_json).unwrap().as_bytes())
+                .unwrap();
+            zip.start_file("default_cuts/../circle_master.json", options)
+                .unwrap();
+            zip.write_all(b"attacker").unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(import_result_zip(
+            traversal.to_string_lossy().to_string(),
+            root.to_string_lossy().to_string(),
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(root.join("circle_master.json")).unwrap(),
+            b"live-master"
+        );
+
+        let collision = root.join("collision.zip");
+        {
+            let mut zip = zip::ZipWriter::new(fs::File::create(&collision).unwrap());
+            zip.start_file("event.json", options).unwrap();
+            zip.write_all(serde_json::to_string(&event_json).unwrap().as_bytes())
+                .unwrap();
+            zip.start_file("items/A.jpg", options).unwrap();
+            zip.write_all(b"first").unwrap();
+            zip.start_file("items/a.jpg", options).unwrap();
+            zip.write_all(b"second").unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(import_result_zip(
+            collision.to_string_lossy().to_string(),
+            root.to_string_lossy().to_string(),
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_failure_is_reported_instead_of_silently_succeeding() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventtrail-rollback-fault-test-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("event");
+        let backup = root.join("backup");
+        fs::create_dir_all(&backup).unwrap();
+        let mut journal = vec![PublishedImportPath {
+            destination: destination.clone(),
+            backup: Some(backup.clone()),
+            installed: false,
+        }];
+        let error = rollback_published_paths_with(&mut journal, |_source, _destination| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fault injection",
+            ))
+        })
+        .unwrap_err();
+        assert!(error.contains("backup復元失敗") && error.contains("fault injection"));
+        assert!(
+            backup.exists(),
+            "rollback失敗時に唯一のbackupを削除しました"
+        );
+        let stage = root.join("stage");
+        let recovery = root.join("recovery/tx");
+        fs::create_dir_all(stage.join("publish-backup")).unwrap();
+        fs::write(stage.join("publish-backup/sole-backup"), b"sole").unwrap();
+        let manifest = PersistentPublishManifest {
+            version: 1,
+            phase: "publishing".to_string(),
+            completed_operations: 1,
+            operations: vec![PersistentPublishOperation {
+                source: None,
+                destination: PathBuf::from("events/live"),
+                backup: PathBuf::from("publish-backup/sole-backup"),
+                had_destination: true,
+            }],
+        };
+        persist_publish_manifest(&stage.join("transaction.json"), &manifest).unwrap();
+        let (preserved, mark_error) = preserve_failed_transaction_with(
+            &stage,
+            &recovery,
+            |_path, _manifest| Err("fault injected manifest persist failure".to_string()),
+            |_source, _destination| panic!("persist失敗後にrecovery moveしてはいけません"),
+        );
+        assert_eq!(preserved, stage);
+        assert!(mark_error.unwrap().contains("fault injected"));
+        assert_eq!(
+            fs::read(stage.join("publish-backup/sole-backup")).unwrap(),
+            b"sole",
+            "double faultで唯一のbackupを削除しました"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn persistent_publish_manifest_recovers_crashes_at_each_rename_phase() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        for phase in ["prepared", "backed-up", "installed", "committed"] {
+            let root = std::env::temp_dir().join(format!(
+                "eventtrail-crash-recovery-test-{}-{suffix}-{phase}",
+                std::process::id()
+            ));
+            let transaction = root.join(".eventtrail-import-stage/tx");
+            let source = transaction.join("events/staged-event");
+            let destination = root.join("events/live");
+            let backup = transaction.join("publish-backup/live");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("event.json"), b"staged").unwrap();
+            fs::create_dir_all(&destination).unwrap();
+            fs::write(destination.join("event.json"), b"original").unwrap();
+            let manifest = PersistentPublishManifest {
+                version: 1,
+                phase: if phase == "committed" {
+                    "committed".to_string()
+                } else {
+                    "publishing".to_string()
+                },
+                completed_operations: 0,
+                operations: vec![PersistentPublishOperation {
+                    source: Some(PathBuf::from("events/staged-event")),
+                    destination: PathBuf::from("events/live"),
+                    backup: PathBuf::from("publish-backup/live"),
+                    had_destination: true,
+                }],
+            };
+            let manifest_path = transaction.join("transaction.json");
+            persist_publish_manifest(&manifest_path, &manifest).unwrap();
+            if phase != "prepared" {
+                fs::create_dir_all(backup.parent().unwrap()).unwrap();
+                fs::rename(&destination, &backup).unwrap();
+            }
+            if phase == "installed" || phase == "committed" {
+                fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                fs::rename(&source, &destination).unwrap();
+            }
+            assert_eq!(recover_incomplete_import_transactions(&root).unwrap(), 1);
+            assert_eq!(
+                fs::read(destination.join("event.json")).unwrap(),
+                if phase == "committed" {
+                    b"staged".as_slice()
+                } else {
+                    b"original".as_slice()
+                },
+                "crash phase {phase}から決定的に復旧しませんでした"
+            );
+            assert!(
+                !transaction.exists(),
+                "復旧後もtransaction rootが残っています"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn relative_project_roots_work_for_mobile_import_and_recovery() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            absolute_project_root(".").unwrap(),
+            fs::canonicalize(&cwd).unwrap()
+        );
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = cwd.join("target").join(format!(
+            "relative-project-root-test-{}-{suffix}",
+            std::process::id()
+        ));
+        let relative_root = root
+            .strip_prefix(&cwd)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let missing_relative = format!(
+            "target/missing-project-root-{}-{suffix}",
+            std::process::id()
+        );
+        let missing_absolute = absolute_project_root(&missing_relative).unwrap();
+        assert!(missing_absolute.is_absolute() && !missing_absolute.exists());
+        assert_eq!(
+            list_event_dirs(missing_relative).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0,
+            "missing relative rootの従来empty behaviorを維持していません"
+        );
+        assert!(
+            !missing_absolute.exists(),
+            "listがmissing project rootを作成しました"
+        );
+        fs::create_dir_all(&root).unwrap();
+        let zip = root.join("relative.zip");
+        write_mobile_result_zip(&zip, "Relative Event", "2026-05-24");
+        let upload_id = format!("{}_{}_7", std::process::id(), suffix);
+        let receiver = register_received_upload(&upload_id, zip.clone()).unwrap();
+        claim_received_upload(upload_id.clone()).unwrap();
+        let plan = plan_received_result_import(upload_id.clone(), relative_root.clone()).unwrap();
+        stage_received_result_import(
+            upload_id.clone(),
+            relative_root.clone(),
+            plan["slug"].as_str().unwrap().to_string(),
+        )
+        .unwrap();
+        let published = publish_received_result_import(upload_id.clone()).unwrap();
+        assert!(Path::new(published["dir"].as_str().unwrap()).is_absolute());
+        assert!(
+            wait_for_received_upload_ack(&upload_id, &receiver, &AtomicBool::new(true), true,)
+                .is_ok()
+        );
+
+        let transaction = root.join(".eventtrail-import-stage/recover-relative");
+        let source = transaction.join("events/staged");
+        let destination = root.join("events/recover-live");
+        let backup = transaction.join("publish-backup/live");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("event.json"), b"staged").unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("event.json"), b"original").unwrap();
+        let manifest = PersistentPublishManifest {
+            version: 1,
+            phase: "publishing".to_string(),
+            completed_operations: 0,
+            operations: vec![PersistentPublishOperation {
+                source: Some(PathBuf::from("events/staged")),
+                destination: PathBuf::from("events/recover-live"),
+                backup: PathBuf::from("publish-backup/live"),
+                had_destination: true,
+            }],
+        };
+        persist_publish_manifest(&transaction.join("transaction.json"), &manifest).unwrap();
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        durable_rename(&destination, &backup).unwrap();
+        durable_rename(&source, &destination).unwrap();
+        list_event_dirs(relative_root).unwrap();
+        assert_eq!(
+            fs::read(destination.join("event.json")).unwrap(),
+            b"original"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_rejects_absolute_parent_and_project_escape_manifest_paths() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventtrail-malicious-manifest-test-{}-{suffix}",
+            std::process::id()
+        ));
+        let transaction = root.join(".eventtrail-import-stage/evil");
+        fs::create_dir_all(&transaction).unwrap();
+        let victim = root.with_extension("victim");
+        fs::write(&victim, b"keep").unwrap();
+        for (index, operation) in [
+            PersistentPublishOperation {
+                source: None,
+                destination: victim.clone(),
+                backup: PathBuf::from("publish-backup/victim"),
+                had_destination: true,
+            },
+            PersistentPublishOperation {
+                source: Some(PathBuf::from("../escape")),
+                destination: PathBuf::from("events/live"),
+                backup: PathBuf::from("../../victim"),
+                had_destination: true,
+            },
+            PersistentPublishOperation {
+                source: None,
+                destination: PathBuf::from("settings.json"),
+                backup: PathBuf::from("publish-backup/settings"),
+                had_destination: true,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let manifest = PersistentPublishManifest {
+                version: 1,
+                phase: "publishing".to_string(),
+                completed_operations: 0,
+                operations: vec![operation],
+            };
+            persist_publish_manifest(&transaction.join("transaction.json"), &manifest).unwrap();
+            assert!(
+                recover_incomplete_import_transactions(&root).is_err(),
+                "malicious manifest #{index}を受理しました"
+            );
+            assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        }
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&victim);
+    }
+
+    #[test]
+    fn default_cut_write_and_import_publish_share_circle_master_lock() {
+        let guard = circle_master_write_lock().lock().unwrap();
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_worker = entered.clone();
+        let worker = thread::spawn(move || {
+            let _guard = circle_master_write_lock().lock().unwrap();
+            entered_worker.store(true, Ordering::SeqCst);
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "circle master mutationがimport publish lockを迂回しました"
+        );
+        drop(guard);
+        worker.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn normalize_imported_circle_asset_refs_prefers_zip_asset_paths() {
         let root = std::env::temp_dir().join(format!(
             "eventtrail-import-asset-test-{}",
@@ -1884,11 +2412,236 @@ mod event_meta_tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn received_upload_payload_defers_import_to_frontend() {
+        let payload = received_upload_payload("upload-1", "C:/temp/result.zip", 42);
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["uploadId"], "upload-1");
+        assert_eq!(payload["zipPath"], "C:/temp/result.zip");
+        assert_eq!(payload["size"], 42);
+        assert!(payload.get("importResult").is_none());
+        assert!(payload.get("projectRoot").is_none());
+    }
+
+    #[test]
+    fn write_event_meta_does_not_recreate_missing_event_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "eventtrail-missing-meta-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        assert!(write_event_meta(
+            root.to_string_lossy().to_string(),
+            json!({"name": "late blur"}),
+        )
+        .is_err());
+        assert!(
+            !root.exists(),
+            "late metadata writeが削除済みdirを再作成しました"
+        );
+    }
+
+    #[test]
+    fn received_upload_ack_success_deletes_zip_and_failure_retains_it() {
+        let root =
+            std::env::temp_dir().join(format!("eventtrail-upload-ack-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let success_zip = root.join("success.zip");
+        fs::write(&success_zip, b"zip").unwrap();
+        let success_id = format!("ack-success-{}", std::process::id());
+        let success_receiver = register_received_upload(&success_id, success_zip.clone()).unwrap();
+        claim_received_upload(success_id.clone()).unwrap();
+        heartbeat_received_upload(success_id.clone()).unwrap();
+        ack_received_upload(success_id.clone(), true, None).unwrap();
+        assert!(wait_for_received_upload_ack(
+            &success_id,
+            &success_receiver,
+            &AtomicBool::new(true),
+            true,
+        )
+        .is_ok());
+        assert!(
+            !success_zip.exists(),
+            "success ack後もtemp ZIPが残っています"
+        );
+
+        let failure_zip = root.join("failure.zip");
+        fs::write(&failure_zip, b"zip").unwrap();
+        let failure_id = format!("ack-failure-{}", std::process::id());
+        let failure_receiver = register_received_upload(&failure_id, failure_zip.clone()).unwrap();
+        claim_received_upload(failure_id.clone()).unwrap();
+        assert!(
+            cancel_received_upload(failure_id.clone(), Some("import failed".to_string())).is_err()
+        );
+        let failure = wait_for_received_upload_ack(
+            &failure_id,
+            &failure_receiver,
+            &AtomicBool::new(true),
+            true,
+        )
+        .unwrap_err();
+        assert!(!failure.1 && failure.0 == "import failed");
+        assert!(
+            failure_zip.exists(),
+            "failure ackでretry用ZIPを削除しました"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn received_upload_without_listener_or_ack_times_out_and_retains_zip() {
+        let root = std::env::temp_dir().join(format!(
+            "eventtrail-upload-timeout-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let listener_zip = root.join("listener.zip");
+        fs::write(&listener_zip, b"listener retry").unwrap();
+        let listener_id = format!("ack-listener-{}", std::process::id());
+        let listener_receiver = register_received_upload_with_timeout(
+            &listener_id,
+            listener_zip.clone(),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let running = AtomicBool::new(true);
+        let listener_error =
+            wait_for_received_upload_ack(&listener_id, &listener_receiver, &running, false)
+                .unwrap_err();
+        assert!(!listener_error.1 && listener_error.0.contains("listener"));
+
+        let zip = root.join("timeout.zip");
+        fs::write(&zip, b"retry").unwrap();
+        let upload_id = format!("ack-timeout-{}", std::process::id());
+        let receiver = register_received_upload_with_timeout(
+            &upload_id,
+            zip.clone(),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(12));
+        let timeout_error =
+            wait_for_received_upload_ack(&upload_id, &receiver, &running, true).unwrap_err();
+        assert!(timeout_error.1 && timeout_error.0.contains("タイムアウト"));
+        assert!(
+            heartbeat_received_upload(upload_id.clone()).is_err(),
+            "timeout後も旧upload leaseがcurrentです"
+        );
+        let retry_receiver = register_received_upload(&upload_id, zip.clone()).unwrap();
+        claim_received_upload(upload_id.clone()).unwrap();
+        assert!(cancel_received_upload(
+            upload_id.clone(),
+            Some("retry fixture cleanup".to_string()),
+        )
+        .is_err());
+        let retry_error =
+            wait_for_received_upload_ack(&upload_id, &retry_receiver, &running, true).unwrap_err();
+        assert_eq!(retry_error.0, "retry fixture cleanup");
+        assert!(
+            zip.exists(),
+            "listenerなし/timeoutでretry用ZIPを削除しました"
+        );
+        assert!(
+            listener_zip.exists(),
+            "listenerなしでretry用ZIPを削除しました"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn premature_or_expired_ack_keeps_pending_stage_for_terminal_cleanup() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventtrail-invalid-ack-test-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let zip = root.join("pending.zip");
+        fs::write(&zip, b"zip").unwrap();
+        let stage_root = root.join("stage");
+        fs::create_dir_all(&stage_root).unwrap();
+        let id = format!("{}_{}_9", std::process::id(), suffix);
+        let _receiver = register_received_upload(&id, zip).unwrap();
+        claim_received_upload(id.clone()).unwrap();
+        pending_received_uploads()
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .import_stage = Some(ReceivedImportStage {
+            stage_root: stage_root.clone(),
+            project_root: root.clone(),
+            plan: ReceivedImportPlan {
+                slug: "fixture".to_string(),
+                event_dir: root.join("events/fixture"),
+                event_name: "fixture".to_string(),
+                event_date: None,
+                redundant_events: Vec::new(),
+            },
+            live_preimages: Vec::new(),
+        });
+        assert!(ack_received_upload(id.clone(), true, None).is_err());
+        assert!(pending_received_uploads().lock().unwrap().contains_key(&id));
+        assert!(stage_root.exists(), "premature ackがstageを孤児化しました");
+        pending_received_uploads()
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .lease_deadline = Instant::now();
+        assert!(ack_received_upload(id.clone(), false, None).is_err());
+        assert!(pending_received_uploads().lock().unwrap().contains_key(&id));
+        terminal_cancel_received_upload(&id, "expired cleanup");
+        assert!(
+            !stage_root.exists(),
+            "terminal cancelがinvalid ack後のstageをcleanupしませんでした"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_received_upload_cleanup_is_scoped_and_handles_multiple_files() {
+        let root = std::env::temp_dir().join(format!(
+            "eventtrail-upload-cleanup-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let stale_a = root.join("eventtrail_received_a.zip");
+        let stale_b = root.join("eventtrail_received_b.zip");
+        let unrelated = root.join("keep.zip");
+        fs::write(&stale_a, b"a").unwrap();
+        fs::write(&stale_b, b"b").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+
+        let removed_recent = cleanup_stale_received_uploads(&root, std::time::SystemTime::now());
+        assert_eq!(removed_recent, 0, "期限前の受信ZIPを削除しました");
+        let future =
+            std::time::SystemTime::now() + RECEIVED_UPLOAD_STALE_AGE + Duration::from_secs(1);
+        let removed = cleanup_stale_received_uploads(&root, future);
+        assert_eq!(removed, 2, "複数stale ZIPを安全にcleanupできませんでした");
+        assert!(!stale_a.exists() && !stale_b.exists());
+        assert!(unrelated.exists(), "命名規則外のZIPを削除しました");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 #[tauri::command]
 fn list_event_dirs(project_root: String) -> Result<Value, String> {
-    let events_dir = PathBuf::from(&project_root).join("events");
+    let project_root = absolute_project_root(&project_root)?;
+    let _recovery_guard = circle_master_write_lock()
+        .lock()
+        .map_err(|e| format!("import recoveryロック取得失敗: {e}"))?;
+    recover_incomplete_import_transactions(&project_root)?;
+    let events_dir = project_root.join("events");
     let mut events: Vec<Value> = Vec::new();
     if !events_dir.exists() {
         return Ok(json!({"status": "ok", "events": events}));
@@ -1947,16 +2700,17 @@ fn read_event_meta(event_dir: String) -> Result<Value, String> {
 #[tauri::command]
 fn write_event_meta(event_dir: String, meta: Value) -> Result<Value, String> {
     let dir = PathBuf::from(&event_dir);
-    fs::create_dir_all(&dir).ok();
+    if !dir.is_dir() {
+        return Err("イベントディレクトリが存在しません".to_string());
+    }
     let ej_path = dir.join("event.json");
+    if !ej_path.is_file() {
+        return Err("event.jsonが存在しません".to_string());
+    }
 
-    // 既存のevent.jsonがあれば読み込み、eventセクションだけ更新
-    let mut full: Value = if ej_path.exists() {
-        let text = fs::read_to_string(&ej_path).unwrap_or_default();
-        serde_json::from_str(&text).unwrap_or(json!({}))
-    } else {
-        json!({"circles": [], "metadata": {"format_version": "3.0", "source": "desktop_created"}})
-    };
+    let text = fs::read_to_string(&ej_path).map_err(|e| format!("event.json読み込み失敗: {e}"))?;
+    let mut full: Value =
+        serde_json::from_str(&text).map_err(|e| format!("event.json解析失敗: {e}"))?;
 
     full["event"] = normalize_event_meta_aliases(meta);
 
@@ -2026,41 +2780,109 @@ fn rename_event_dir(
 }
 
 #[tauri::command]
-fn list_event_map_images(event_dir: String) -> Result<Value, String> {
+fn list_event_map_images(
+    event_dir: String,
+    preferred_refs: Option<Vec<String>>,
+) -> Result<Value, String> {
     let dir = PathBuf::from(&event_dir);
-    let mut maps: Vec<Value> = Vec::new();
-    let mut seen_names = HashSet::new();
-    let mut scan_dir = |scan_path: PathBuf| {
+    let preferred_names: HashSet<String> = preferred_refs
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|reference| {
+            let components: Vec<String> = reference
+                .replace('\\', "/")
+                .split('/')
+                .filter(|component| !component.is_empty() && *component != ".")
+                .map(|component| component.to_ascii_lowercase())
+                .collect();
+            if components.is_empty() || components.iter().any(|component| component == "..") {
+                None
+            } else {
+                Some(components.join("/"))
+            }
+        })
+        .collect();
+    // 同じmap番号の孤児ファイルが複数extensionで残っていても、最新mtimeの
+    // 1件だけをactiveとして返す。明示preferredを最優先し、物理ファイル自体は保持する。
+    let mut active_by_number: HashMap<u32, (bool, std::time::SystemTime, bool, String, PathBuf)> =
+        HashMap::new();
+    let mut scan_dir = |scan_path: PathBuf, preferred_dir: bool| {
         if scan_path.exists() {
             if let Ok(entries) = fs::read_dir(&scan_path) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with("map_")
-                        && (name.ends_with(".jpg")
-                            || name.ends_with(".jpeg")
-                            || name.ends_with(".png")
-                            || name.ends_with(".webp"))
-                        && seen_names.insert(name.clone())
+                    let lower = name.to_ascii_lowercase();
+                    if !lower.starts_with("map_")
+                        || !(lower.ends_with(".jpg")
+                            || lower.ends_with(".jpeg")
+                            || lower.ends_with(".png")
+                            || lower.ends_with(".webp"))
                     {
-                        let full = entry
-                            .path()
-                            .to_string_lossy()
-                            .to_string()
-                            .replace("\\", "/");
-                        maps.push(json!({"name": name, "path": full}));
+                        continue;
+                    }
+                    let Some(number) = lower
+                        .strip_prefix("map_")
+                        .and_then(|tail| tail.split('.').next())
+                        .and_then(|digits| digits.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    let modified = entry
+                        .metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    let reference = if preferred_dir {
+                        format!("maps/{lower}")
+                    } else {
+                        lower.clone()
+                    };
+                    let explicitly_preferred = preferred_names.contains(&reference);
+                    let replace = active_by_number.get(&number).map_or(true, |current| {
+                        explicitly_preferred > current.0
+                            || (explicitly_preferred == current.0
+                                && (modified > current.1
+                                    || (modified == current.1
+                                        && (preferred_dir > current.2
+                                            || (preferred_dir == current.2
+                                                && name.as_str() > current.3.as_str())))))
+                    });
+                    if replace {
+                        active_by_number.insert(
+                            number,
+                            (
+                                explicitly_preferred,
+                                modified,
+                                preferred_dir,
+                                name,
+                                entry.path(),
+                            ),
+                        );
                     }
                 }
             }
         }
     };
-    scan_dir(dir.join("maps"));
-    scan_dir(dir);
-    maps.sort_by(|a, b| {
-        a["name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["name"].as_str().unwrap_or(""))
-    });
+    scan_dir(dir.clone(), false);
+    scan_dir(dir.join("maps"), true);
+    let mut active: Vec<(u32, std::time::SystemTime, String, PathBuf)> = active_by_number
+        .into_iter()
+        .map(|(number, (_, modified, _, name, path))| (number, modified, name, path))
+        .collect();
+    active.sort_by_key(|entry| entry.0);
+    let maps: Vec<Value> = active
+        .into_iter()
+        .map(|(_, modified, name, path)| {
+            let modified_ms = modified
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            json!({
+                "name": name,
+                "path": path.to_string_lossy().to_string().replace("\\", "/"),
+                "modified_ms": modified_ms
+            })
+        })
+        .collect();
     Ok(json!({"status": "ok", "maps": maps}))
 }
 
@@ -2149,17 +2971,17 @@ fn find_existing_event_dir(
         .map(|(_, slug, path)| (slug, path))
 }
 
-fn remove_redundant_mobile_import_dirs(
+fn redundant_mobile_import_dirs(
     project_root: &Path,
     event_name: &str,
     event_date: Option<&str>,
     keep_slug: &str,
-) -> Result<usize, String> {
+) -> Vec<(String, PathBuf)> {
     let events_dir = project_root.join("events");
-    let mut remove_targets: Vec<PathBuf> = Vec::new();
+    let mut remove_targets: Vec<(String, PathBuf)> = Vec::new();
     let entries = match fs::read_dir(&events_dir) {
         Ok(entries) => entries,
-        Err(_) => return Ok(0),
+        Err(_) => return remove_targets,
     };
 
     for entry in entries.flatten() {
@@ -2194,12 +3016,24 @@ fn remove_redundant_mobile_import_dirs(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if source == "mobile_import" {
-            remove_targets.push(entry.path());
+            remove_targets.push((slug, entry.path()));
         }
     }
 
+    remove_targets
+}
+
+fn remove_redundant_mobile_import_dirs(
+    project_root: &Path,
+    event_name: &str,
+    event_date: Option<&str>,
+    keep_slug: &str,
+) -> Result<usize, String> {
+    let remove_targets =
+        redundant_mobile_import_dirs(project_root, event_name, event_date, keep_slug);
+
     let removed = remove_targets.len();
-    for path in remove_targets {
+    for (_, path) in remove_targets {
         fs::remove_dir_all(&path).map_err(|e| {
             format!(
                 "重複モバイル受信イベントの削除失敗: {}: {e}",
@@ -2210,25 +3044,20 @@ fn remove_redundant_mobile_import_dirs(
     Ok(removed)
 }
 
-fn safe_relative_path(name: &str) -> Option<PathBuf> {
+fn strict_archive_relative_path(name: &str) -> Option<PathBuf> {
     let normalized = name.replace('\\', "/");
-    let path = Path::new(&normalized);
-    if path.is_absolute() {
+    if normalized.is_empty() || normalized.starts_with('/') || normalized.ends_with('/') {
         return None;
     }
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(part) => out.push(part),
-            std::path::Component::CurDir => {}
-            _ => return None,
+    let mut output = PathBuf::new();
+    for component in normalized.split('/') {
+        if component.is_empty() || component == "." || component == ".." || component.contains(':')
+        {
+            return None;
         }
+        output.push(component);
     }
-    if out.as_os_str().is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    (!output.as_os_str().is_empty()).then_some(output)
 }
 
 fn read_asset_manifest_aliases(archive: &mut zip::ZipArchive<fs::File>) -> HashMap<String, String> {
@@ -2258,8 +3087,62 @@ fn read_asset_manifest_aliases(archive: &mut zip::ZipArchive<fs::File>) -> HashM
         .unwrap_or_default()
 }
 
-#[tauri::command]
-fn import_result_zip(zip_path: String, project_root: String) -> Result<Value, String> {
+#[derive(Clone, Debug)]
+struct ReceivedImportPlan {
+    slug: String,
+    event_dir: PathBuf,
+    event_name: String,
+    event_date: Option<String>,
+    redundant_events: Vec<(String, PathBuf)>,
+}
+
+fn read_import_event_data(zip_path: &Path) -> Result<Value, String> {
+    let zip_file = fs::File::open(zip_path).map_err(|e| format!("ZIPファイル読み込み失敗: {e}"))?;
+    let mut archive = zip::ZipArchive::new(zip_file).map_err(|e| format!("ZIP展開失敗: {e}"))?;
+    let mut file = archive
+        .by_name("event.json")
+        .map_err(|e| format!("event.jsonが見つかりません: {e}"))?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)
+        .map_err(|e| format!("event.json読み込み失敗: {e}"))?;
+    serde_json::from_str(&buf).map_err(|e| format!("event.json解析失敗: {e}"))
+}
+
+fn plan_received_import(
+    zip_path: &Path,
+    project_root: &Path,
+) -> Result<ReceivedImportPlan, String> {
+    let event_data = read_import_event_data(zip_path)?;
+    let event_obj = event_data.get("event").unwrap_or(&Value::Null);
+    let event_name = event_field_string(event_obj, "name").unwrap_or_else(|| "unknown".to_string());
+    let event_date = normalized_event_date(event_obj);
+    let (slug, event_dir) = if let Some((slug, dir)) =
+        find_existing_event_dir(project_root, &event_name, event_date.as_deref())
+    {
+        (slug, dir)
+    } else {
+        let now = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let safe_name = sanitize_event_slug_name(&event_name);
+        let slug = format!("{}_{}", safe_name, now);
+        let dir = project_root.join("events").join(&slug);
+        (slug, dir)
+    };
+    let redundant_events =
+        redundant_mobile_import_dirs(project_root, &event_name, event_date.as_deref(), &slug);
+    Ok(ReceivedImportPlan {
+        slug,
+        event_dir,
+        event_name,
+        event_date,
+        redundant_events,
+    })
+}
+
+fn import_result_zip_into_root(
+    zip_path: String,
+    project_root: String,
+    forced_slug: Option<String>,
+) -> Result<Value, String> {
     let zip_file =
         fs::File::open(&zip_path).map_err(|e| format!("ZIPファイル読み込み失敗: {e}"))?;
     let mut archive = zip::ZipArchive::new(zip_file).map_err(|e| format!("ZIP展開失敗: {e}"))?;
@@ -2276,11 +3159,14 @@ fn import_result_zip(zip_path: String, project_root: String) -> Result<Value, St
     };
 
     // イベント名からslugを生成
-    let project_root_path = PathBuf::from(&project_root);
+    let project_root_path = absolute_project_root(&project_root)?;
     let event_obj = event_data.get("event").unwrap_or(&Value::Null);
     let event_name = event_field_string(event_obj, "name").unwrap_or_else(|| "unknown".to_string());
     let event_date = normalized_event_date(event_obj);
-    let (slug, event_dir) = if let Some((slug, dir)) =
+    let (slug, event_dir) = if let Some(slug) = forced_slug {
+        let dir = project_root_path.join("events").join(&slug);
+        (slug, dir)
+    } else if let Some((slug, dir)) =
         find_existing_event_dir(&project_root_path, &event_name, event_date.as_deref())
     {
         (slug, dir)
@@ -2438,6 +3324,7 @@ fn import_result_zip(zip_path: String, project_root: String) -> Result<Value, St
 
     // ZIPからファイルを展開（event.json, circle_master.json以外）
     let asset_aliases = read_asset_manifest_aliases(&mut archive);
+    let mut extracted_destinations: HashSet<String> = HashSet::new();
 
     for i in 0..archive.len() {
         let mut file = archive
@@ -2452,13 +3339,28 @@ fn import_result_zip(zip_path: String, project_root: String) -> Result<Value, St
         {
             continue;
         }
-        let Some(enclosed_name) = file.enclosed_name().map(|p| p.to_owned()) else {
-            continue;
-        };
-        let dest_path = if name.starts_with("default_cuts/") {
-            project_root_path.join(enclosed_name)
+        let enclosed_name = strict_archive_relative_path(&name)
+            .ok_or_else(|| format!("安全でないZIP entry pathです: {name}"))?;
+        let identity = enclosed_name
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase();
+        if !extracted_destinations.insert(identity) {
+            return Err(format!("ZIP entryの保存先が重複しています: {name}"));
+        }
+        let is_default_cut =
+            enclosed_name
+                .components()
+                .next()
+                .and_then(|component| match component {
+                    std::path::Component::Normal(part) => part.to_str(),
+                    _ => None,
+                })
+                == Some("default_cuts");
+        let dest_path = if is_default_cut {
+            project_root_path.join(&enclosed_name)
         } else {
-            event_dir.join(enclosed_name)
+            event_dir.join(&enclosed_name)
         };
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent).ok();
@@ -2474,11 +3376,18 @@ fn import_result_zip(zip_path: String, project_root: String) -> Result<Value, St
         if !expanded_aliases.insert(logical_name.clone()) {
             continue;
         }
-        let Some(enclosed_name) = safe_relative_path(&logical_name) else {
-            continue;
-        };
-        if safe_relative_path(&asset_name).is_none() {
-            continue;
+        let enclosed_name = strict_archive_relative_path(&logical_name)
+            .ok_or_else(|| format!("安全でないasset logical pathです: {logical_name}"))?;
+        strict_archive_relative_path(&asset_name)
+            .ok_or_else(|| format!("安全でないasset archive pathです: {asset_name}"))?;
+        let identity = enclosed_name
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase();
+        if !extracted_destinations.insert(identity) {
+            return Err(format!(
+                "asset manifestの保存先が重複しています: {logical_name}"
+            ));
         }
         let mut file = archive
             .by_name(&asset_name)
@@ -2486,10 +3395,19 @@ fn import_result_zip(zip_path: String, project_root: String) -> Result<Value, St
         if file.name().ends_with('/') {
             continue;
         }
-        let dest_path = if logical_name.starts_with("default_cuts/") {
-            project_root_path.join(enclosed_name)
+        let is_default_cut =
+            enclosed_name
+                .components()
+                .next()
+                .and_then(|component| match component {
+                    std::path::Component::Normal(part) => part.to_str(),
+                    _ => None,
+                })
+                == Some("default_cuts");
+        let dest_path = if is_default_cut {
+            project_root_path.join(&enclosed_name)
         } else {
-            event_dir.join(enclosed_name)
+            event_dir.join(&enclosed_name)
         };
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent).ok();
@@ -2525,6 +3443,11 @@ fn import_result_zip(zip_path: String, project_root: String) -> Result<Value, St
         "circle_master_merged": has_circle_master,
         "duplicate_mobile_imports_removed": duplicate_mobile_imports_removed
     }))
+}
+
+#[cfg(test)]
+fn import_result_zip(zip_path: String, project_root: String) -> Result<Value, String> {
+    import_result_zip_into_root(zip_path, project_root, None)
 }
 
 // ── 感想ファイル連携 ──
@@ -2663,8 +3586,1232 @@ fn receive_server_running() -> &'static Mutex<Option<Arc<AtomicBool>>> {
     FLAG.get_or_init(|| Mutex::new(None))
 }
 
+#[derive(Debug)]
+enum ReceivedUploadAck {
+    Success,
+    Failure(String),
+}
+
+struct PendingReceivedUpload {
+    sender: std::sync::mpsc::SyncSender<ReceivedUploadAck>,
+    zip_path: PathBuf,
+    claimed: bool,
+    lease_deadline: Instant,
+    import_stage: Option<ReceivedImportStage>,
+    recovery_required: bool,
+    published: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ReceivedImportStage {
+    stage_root: PathBuf,
+    project_root: PathBuf,
+    plan: ReceivedImportPlan,
+    live_preimages: Vec<(PathBuf, Option<u64>)>,
+}
+
+struct RemoveDirOnDrop {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+const RECEIVED_UPLOAD_LEASE_DURATION: Duration = Duration::from_secs(120);
+
+fn pending_received_uploads() -> &'static Mutex<HashMap<String, PendingReceivedUpload>> {
+    static PENDING: OnceLock<Mutex<HashMap<String, PendingReceivedUpload>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn published_received_uploads() -> &'static Mutex<HashSet<String>> {
+    static PUBLISHED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    PUBLISHED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn circle_master_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn register_received_upload_with_timeout(
+    upload_id: &str,
+    zip_path: PathBuf,
+    timeout: Duration,
+) -> Result<std::sync::mpsc::Receiver<ReceivedUploadAck>, String> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let mut pending = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("受信ackロック取得失敗: {e}"))?;
+    if pending.contains_key(upload_id) {
+        return Err("同じuploadIdが既に待機中です".to_string());
+    }
+    pending.insert(
+        upload_id.to_string(),
+        PendingReceivedUpload {
+            sender,
+            zip_path,
+            claimed: false,
+            lease_deadline: Instant::now() + timeout,
+            import_stage: None,
+            recovery_required: false,
+            published: false,
+        },
+    );
+    Ok(receiver)
+}
+
+fn register_received_upload(
+    upload_id: &str,
+    zip_path: PathBuf,
+) -> Result<std::sync::mpsc::Receiver<ReceivedUploadAck>, String> {
+    register_received_upload_with_timeout(upload_id, zip_path, RECEIVED_UPLOAD_LEASE_DURATION)
+}
+
+#[tauri::command]
+fn claim_received_upload(upload_id: String) -> Result<Value, String> {
+    let mut pending = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("受信claimロック取得失敗: {e}"))?;
+    let upload = pending
+        .get_mut(&upload_id)
+        .ok_or_else(|| "claim対象のuploadIdは期限切れまたは取消済みです".to_string())?;
+    if Instant::now() >= upload.lease_deadline {
+        return Err("upload leaseは期限切れです".to_string());
+    }
+    if upload.claimed {
+        return Err("uploadは既にclaim済みです".to_string());
+    }
+    upload.claimed = true;
+    upload.lease_deadline = Instant::now() + RECEIVED_UPLOAD_LEASE_DURATION;
+    Ok(json!({"status": "ok"}))
+}
+
+#[tauri::command]
+fn heartbeat_received_upload(upload_id: String) -> Result<Value, String> {
+    let mut pending = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("受信leaseロック取得失敗: {e}"))?;
+    let upload = pending
+        .get_mut(&upload_id)
+        .ok_or_else(|| "upload leaseは期限切れまたは取消済みです".to_string())?;
+    if !upload.claimed || Instant::now() >= upload.lease_deadline {
+        return Err("upload leaseはcurrentではありません".to_string());
+    }
+    upload.lease_deadline = Instant::now() + RECEIVED_UPLOAD_LEASE_DURATION;
+    Ok(json!({"status": "ok"}))
+}
+
+fn current_received_upload_zip(upload_id: &str) -> Result<PathBuf, String> {
+    let pending = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("受信leaseロック取得失敗: {e}"))?;
+    let upload = pending
+        .get(upload_id)
+        .ok_or_else(|| "upload leaseは期限切れまたは取消済みです".to_string())?;
+    if !upload.claimed || Instant::now() >= upload.lease_deadline {
+        return Err("upload leaseはcurrentではありません".to_string());
+    }
+    Ok(upload.zip_path.clone())
+}
+
+fn copy_directory_without_links(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|e| format!("stage directory作成失敗: {e}"))?;
+    for entry in fs::read_dir(source).map_err(|e| format!("stage source読込失敗: {e}"))? {
+        let entry = entry.map_err(|e| format!("stage entry読込失敗: {e}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("stage entry種別取得失敗: {e}"))?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "stage対象にsymlinkを含められません: {}",
+                entry.path().display()
+            ));
+        }
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_directory_without_links(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target).map_err(|e| format!("stage file copy失敗: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn path_content_fingerprint(path: &Path) -> Result<Option<u64>, String> {
+    use std::hash::{Hash, Hasher};
+    if !path.exists() {
+        return Ok(None);
+    }
+    fn hash_path(
+        path: &Path,
+        relative: &Path,
+        hasher: &mut std::collections::hash_map::DefaultHasher,
+    ) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|e| format!("preimage metadata取得失敗 {}: {e}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "preimageにsymlinkを含められません: {}",
+                path.display()
+            ));
+        }
+        relative.to_string_lossy().replace('\\', "/").hash(hasher);
+        if metadata.is_dir() {
+            1u8.hash(hasher);
+            let mut entries = fs::read_dir(path)
+                .map_err(|e| format!("preimage directory読込失敗 {}: {e}", path.display()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("preimage entry読込失敗: {e}"))?;
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                hash_path(&entry.path(), &relative.join(entry.file_name()), hasher)?;
+            }
+        } else if metadata.is_file() {
+            2u8.hash(hasher);
+            fs::read(path)
+                .map_err(|e| format!("preimage file読込失敗 {}: {e}", path.display()))?
+                .hash(hasher);
+        } else {
+            return Err(format!("preimage対象種別が不正です: {}", path.display()));
+        }
+        Ok(())
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_path(path, Path::new(""), &mut hasher)?;
+    Ok(Some(hasher.finish()))
+}
+
+fn received_import_plan_value(plan: &ReceivedImportPlan) -> Value {
+    let mut affected = vec![json!({
+        "slug": plan.slug,
+        "dir": plan.event_dir.to_string_lossy().to_string().replace("\\", "/"),
+        "survives": true,
+    })];
+    affected.extend(plan.redundant_events.iter().map(|(slug, dir)| {
+        json!({
+            "slug": slug,
+            "dir": dir.to_string_lossy().to_string().replace("\\", "/"),
+            "survives": false,
+        })
+    }));
+    json!({
+        "status": "ok",
+        "slug": plan.slug,
+        "dir": plan.event_dir.to_string_lossy().to_string().replace("\\", "/"),
+        "affectedEvents": affected,
+    })
+}
+
+#[tauri::command]
+fn plan_received_result_import(upload_id: String, project_root: String) -> Result<Value, String> {
+    let zip_path = current_received_upload_zip(&upload_id)?;
+    let project_root = absolute_project_root(&project_root)?;
+    let plan = plan_received_import(&zip_path, &project_root)?;
+    current_received_upload_zip(&upload_id)?;
+    Ok(received_import_plan_value(&plan))
+}
+
+#[tauri::command]
+fn stage_received_result_import(
+    upload_id: String,
+    project_root: String,
+    expected_slug: String,
+) -> Result<Value, String> {
+    if !upload_id
+        .chars()
+        .all(|character| character.is_ascii_digit() || character == '_' || character == '-')
+    {
+        return Err("uploadIdが不正です".to_string());
+    }
+    let zip_path = current_received_upload_zip(&upload_id)?;
+    let project_root_path = absolute_project_root(&project_root)?;
+    let plan = plan_received_import(&zip_path, &project_root_path)?;
+    if plan.slug != expected_slug {
+        return Err("import planが変更されました".to_string());
+    }
+    let stage_root = project_root_path
+        .join(".eventtrail-import-stage")
+        .join(&upload_id);
+    let _ = fs::remove_dir_all(&stage_root);
+    let mut cleanup = RemoveDirOnDrop {
+        path: stage_root.clone(),
+        armed: true,
+    };
+    fs::create_dir_all(stage_root.join("events"))
+        .map_err(|e| format!("import stage作成失敗: {e}"))?;
+    let mut live_preimages = vec![
+        (
+            plan.event_dir.clone(),
+            path_content_fingerprint(&plan.event_dir)?,
+        ),
+        (
+            project_root_path.join("circle_master.json"),
+            path_content_fingerprint(&project_root_path.join("circle_master.json"))?,
+        ),
+    ];
+    for (_, redundant) in &plan.redundant_events {
+        live_preimages.push((redundant.clone(), path_content_fingerprint(redundant)?));
+    }
+    if plan.event_dir.is_dir() {
+        copy_directory_without_links(&plan.event_dir, &stage_root.join("events").join(&plan.slug))?;
+    }
+    let circle_master = project_root_path.join("circle_master.json");
+    if circle_master.is_file() {
+        fs::copy(&circle_master, stage_root.join("circle_master.json"))
+            .map_err(|e| format!("circle_master stage copy失敗: {e}"))?;
+    }
+    let staged = import_result_zip_into_root(
+        zip_path.to_string_lossy().to_string(),
+        stage_root.to_string_lossy().to_string(),
+        Some(plan.slug.clone()),
+    );
+    let result = staged?;
+    let staged_cuts = stage_root.join("default_cuts");
+    for relative in staged_files(&staged_cuts)? {
+        let live = project_root_path.join("default_cuts").join(relative);
+        live_preimages.push((live.clone(), path_content_fingerprint(&live)?));
+    }
+    let mut pending = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("受信stageロック取得失敗: {e}"))?;
+    let upload = pending
+        .get_mut(&upload_id)
+        .ok_or_else(|| "upload leaseは期限切れまたは取消済みです".to_string())?;
+    if !upload.claimed || Instant::now() >= upload.lease_deadline {
+        return Err("upload leaseはcurrentではありません".to_string());
+    }
+    upload.import_stage = Some(ReceivedImportStage {
+        stage_root: stage_root.clone(),
+        project_root: project_root_path,
+        plan: plan.clone(),
+        live_preimages,
+    });
+    cleanup.armed = false;
+    let mut response = received_import_plan_value(&plan);
+    response["meta"] = result.get("meta").cloned().unwrap_or(json!({}));
+    response["circle_master_merged"] = result
+        .get("circle_master_merged")
+        .cloned()
+        .unwrap_or(json!(false));
+    Ok(response)
+}
+
+#[derive(Debug)]
+struct PublishedImportPath {
+    destination: PathBuf,
+    backup: Option<PathBuf>,
+    installed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistentPublishOperation {
+    source: Option<PathBuf>,
+    destination: PathBuf,
+    backup: PathBuf,
+    had_destination: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistentPublishManifest {
+    version: u32,
+    phase: String,
+    completed_operations: usize,
+    operations: Vec<PersistentPublishOperation>,
+}
+
+fn path_has_parent_or_curdir(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    })
+}
+
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(target_os = "windows"))]
+    false
+}
+
+fn validate_contained_path(path: &Path, root: &Path, label: &str) -> Result<(), String> {
+    if !path.is_absolute() || path_has_parent_or_curdir(path) || !path.starts_with(root) {
+        return Err(format!("{label}が許可root外です: {}", path.display()));
+    }
+    let root_metadata = fs::symlink_metadata(root)
+        .map_err(|e| format!("{label} root metadata取得失敗 {}: {e}", root.display()))?;
+    if metadata_is_link_or_reparse(&root_metadata) {
+        return Err(format!(
+            "{label} rootがlink/reparseです: {}",
+            root.display()
+        ));
+    }
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|e| format!("{label} root canonicalize失敗 {}: {e}", root.display()))?;
+    let mut current = root.to_path_buf();
+    for component in path
+        .strip_prefix(root)
+        .unwrap_or(Path::new(""))
+        .components()
+    {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata_is_link_or_reparse(&metadata) {
+                    return Err(format!(
+                        "{label}にlink/reparseを含みます: {}",
+                        current.display()
+                    ));
+                }
+                let canonical = fs::canonicalize(&current)
+                    .map_err(|e| format!("{label} canonicalize失敗 {}: {e}", current.display()))?;
+                if !canonical.starts_with(&canonical_root) {
+                    return Err(format!(
+                        "{label} canonical pathがroot外です: {}",
+                        current.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(format!("{label} metadata取得失敗: {error}")),
+        }
+    }
+    Ok(())
+}
+
+fn validate_publish_manifest_paths(
+    project_root: &Path,
+    transaction_root: &Path,
+    manifest: &PersistentPublishManifest,
+) -> Result<(), String> {
+    validate_contained_path(
+        transaction_root,
+        &project_root.join(".eventtrail-import-stage"),
+        "transaction root",
+    )
+    .or_else(|_| {
+        validate_contained_path(
+            transaction_root,
+            &project_root.join(".eventtrail-import-recovery"),
+            "transaction recovery root",
+        )
+    })?;
+    for operation in &manifest.operations {
+        resolve_manifest_operation(project_root, transaction_root, operation)?;
+    }
+    Ok(())
+}
+
+fn safe_manifest_relative(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn resolve_manifest_operation(
+    project_root: &Path,
+    transaction_root: &Path,
+    operation: &PersistentPublishOperation,
+) -> Result<(Option<PathBuf>, PathBuf, PathBuf), String> {
+    if !safe_manifest_relative(&operation.destination)
+        || !safe_manifest_relative(&operation.backup)
+        || operation
+            .source
+            .as_deref()
+            .is_some_and(|source| !safe_manifest_relative(source))
+    {
+        return Err("transaction manifestにunsafe/absolute pathが含まれます".to_string());
+    }
+    let first_destination = operation.destination.components().next();
+    let destination_depth = operation.destination.components().count();
+    let destination_allowed = operation.destination == Path::new("circle_master.json")
+        || (destination_depth > 1
+            && matches!(first_destination, Some(std::path::Component::Normal(part)) if part == "events" || part == "default_cuts"));
+    if !destination_allowed {
+        return Err(format!(
+            "manifest destinationが許可対象外です: {}",
+            operation.destination.display()
+        ));
+    }
+    if !operation.backup.starts_with("publish-backup") || operation.backup.components().count() < 2
+    {
+        return Err("manifest backupがpublish-backup外です".to_string());
+    }
+    if let Some(source) = &operation.source {
+        let first = source.components().next();
+        let allowed = source == Path::new("circle_master.json")
+            || (source.components().count() > 1
+                && matches!(first, Some(std::path::Component::Normal(part)) if part == "events" || part == "default_cuts"));
+        if !allowed {
+            return Err("manifest sourceがstaged asset root外です".to_string());
+        }
+    }
+    let source = operation
+        .source
+        .as_ref()
+        .map(|path| transaction_root.join(path));
+    let destination = project_root.join(&operation.destination);
+    let backup = transaction_root.join(&operation.backup);
+    if let Some(source) = &source {
+        validate_contained_path(source, transaction_root, "manifest source")?;
+    }
+    validate_contained_path(&backup, transaction_root, "manifest backup")?;
+    validate_contained_path(&destination, project_root, "manifest destination")?;
+    Ok((source, destination, backup))
+}
+
+fn sync_path_tree(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| format!("durable sync metadata失敗 {}: {e}", path.display()))?;
+    if metadata_is_link_or_reparse(&metadata) {
+        return Err(format!(
+            "durable sync対象にlink/reparseを含みます: {}",
+            path.display()
+        ));
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).map_err(|e| format!("durable sync dir失敗: {e}"))? {
+            sync_path_tree(
+                &entry
+                    .map_err(|e| format!("durable sync entry失敗: {e}"))?
+                    .path(),
+            )?;
+        }
+        #[cfg(not(target_os = "windows"))]
+        fs::File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("durable sync directory失敗 {}: {e}", path.display()))?;
+    } else if metadata.is_file() {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| format!("durable sync file失敗 {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn durable_rename(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new_name: *const u16, flags: u32) -> i32;
+    }
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(format!(
+            "durable rename失敗: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn durable_rename(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::rename(source, destination).map_err(|e| format!("durable rename失敗: {e}"))?;
+    if let Some(parent) = destination.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("durable rename parent sync失敗: {e}"))?;
+    }
+    Ok(())
+}
+
+fn persist_publish_manifest(
+    path: &Path,
+    manifest: &PersistentPublishManifest,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("transaction manifest directory作成失敗: {e}"))?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(manifest)
+        .map_err(|e| format!("transaction manifest serialize失敗: {e}"))?;
+    let mut file =
+        fs::File::create(&temporary).map_err(|e| format!("transaction manifest作成失敗: {e}"))?;
+    file.write_all(&bytes)
+        .map_err(|e| format!("transaction manifest書込失敗: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("transaction manifest fsync失敗: {e}"))?;
+    durable_rename(&temporary, path)
+        .map_err(|e| format!("transaction manifest publish失敗: {e}"))?;
+    #[cfg(not(target_os = "windows"))]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("transaction manifest directory fsync失敗: {e}"))?;
+    }
+    Ok(())
+}
+
+fn recover_publish_manifest(project_root: &Path, manifest_path: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(manifest_path)
+        .map_err(|e| format!("recovery manifest読込失敗 {}: {e}", manifest_path.display()))?;
+    let manifest: PersistentPublishManifest = serde_json::from_str(&text)
+        .map_err(|e| format!("recovery manifest解析失敗 {}: {e}", manifest_path.display()))?;
+    let transaction_root = manifest_path
+        .parent()
+        .ok_or_else(|| "recovery manifest parentがありません".to_string())?;
+    validate_publish_manifest_paths(project_root, transaction_root, &manifest)?;
+    if manifest.phase == "committed" {
+        fs::remove_dir_all(transaction_root)
+            .map_err(|e| format!("committed transaction cleanup失敗: {e}"))?;
+        return Ok(());
+    }
+    for operation in manifest.operations.iter().rev() {
+        let (source, destination, backup) =
+            resolve_manifest_operation(project_root, transaction_root, operation)?;
+        if backup.exists() {
+            if destination.exists() {
+                if destination.is_dir() {
+                    fs::remove_dir_all(&destination)
+                } else {
+                    fs::remove_file(&destination)
+                }
+                .map_err(|e| format!("crash recovery destination除去失敗: {e}"))?;
+            }
+            sync_path_tree(&backup)?;
+            durable_rename(&backup, &destination)?;
+        } else if !operation.had_destination
+            && source.is_some()
+            && destination.exists()
+            && source.as_ref().is_some_and(|source| !source.exists())
+        {
+            if destination.is_dir() {
+                fs::remove_dir_all(&destination)
+            } else {
+                fs::remove_file(&destination)
+            }
+            .map_err(|e| format!("crash recovery新規install除去失敗: {e}"))?;
+        }
+    }
+    fs::remove_dir_all(transaction_root)
+        .map_err(|e| format!("recovery transaction cleanup失敗: {e}"))?;
+    Ok(())
+}
+
+fn recover_incomplete_import_transactions(project_root: &Path) -> Result<usize, String> {
+    let mut recovered = 0;
+    for root_name in [".eventtrail-import-stage", ".eventtrail-import-recovery"] {
+        let root = project_root.join(root_name);
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("import recovery scan失敗: {error}")),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("import recovery entry失敗: {e}"))?;
+            let manifest = entry.path().join("transaction.json");
+            if manifest.is_file() {
+                recover_publish_manifest(project_root, &manifest)?;
+                recovered += 1;
+            }
+        }
+    }
+    Ok(recovered)
+}
+
+fn preserve_failed_transaction_with(
+    stage_root: &Path,
+    recovery_root: &Path,
+    mut persist: impl FnMut(&Path, &PersistentPublishManifest) -> Result<(), String>,
+    mut rename: impl FnMut(&Path, &Path) -> Result<(), String>,
+) -> (PathBuf, Option<String>) {
+    let manifest_path = stage_root.join("transaction.json");
+    let marked = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("recovery-required manifest読込失敗: {e}"))
+        .and_then(|text| {
+            serde_json::from_str::<PersistentPublishManifest>(&text)
+                .map_err(|e| format!("recovery-required manifest解析失敗: {e}"))
+        })
+        .and_then(|mut manifest| {
+            manifest.phase = "recovery-required".to_string();
+            persist(&manifest_path, &manifest)
+        });
+    if let Err(error) = marked {
+        return (stage_root.to_path_buf(), Some(error));
+    }
+    if let Some(parent) = recovery_root.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return (
+                stage_root.to_path_buf(),
+                Some(format!("recovery directory作成失敗: {error}")),
+            );
+        }
+    }
+    match rename(stage_root, recovery_root) {
+        Ok(()) => (recovery_root.to_path_buf(), None),
+        Err(error) => (stage_root.to_path_buf(), Some(error)),
+    }
+}
+
+fn install_staged_path(
+    source: Option<&Path>,
+    destination: &Path,
+    backup: &Path,
+    journal: &mut Vec<PublishedImportPath>,
+) -> Result<(), String> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("publish parent作成失敗: {e}"))?;
+    }
+    let saved_backup = if destination.exists() {
+        if let Some(parent) = backup.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("publish backup作成失敗: {e}"))?;
+        }
+        sync_path_tree(destination)?;
+        durable_rename(destination, backup).map_err(|e| format!("publish backup失敗: {e}"))?;
+        Some(backup.to_path_buf())
+    } else {
+        None
+    };
+    journal.push(PublishedImportPath {
+        destination: destination.to_path_buf(),
+        backup: saved_backup,
+        installed: false,
+    });
+    if let Some(source) = source {
+        sync_path_tree(source)?;
+        durable_rename(source, destination)
+            .map_err(|error| format!("staged import publish失敗: {error}"))?;
+        journal.last_mut().unwrap().installed = true;
+    }
+    Ok(())
+}
+
+fn rollback_published_paths_with(
+    paths: &mut Vec<PublishedImportPath>,
+    mut rename_backup: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    while let Some(path) = paths.pop() {
+        if path.installed {
+            let result = if path.destination.is_dir() {
+                fs::remove_dir_all(&path.destination)
+            } else {
+                fs::remove_file(&path.destination)
+            };
+            if let Err(error) = result {
+                errors.push(format!(
+                    "install除去失敗 {}: {error}",
+                    path.destination.display()
+                ));
+            }
+        }
+        if let Some(backup) = path.backup {
+            if let Err(error) = rename_backup(&backup, &path.destination) {
+                errors.push(format!(
+                    "backup復元失敗 {} -> {}: {error}",
+                    backup.display(),
+                    path.destination.display()
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn rollback_published_paths(paths: &mut Vec<PublishedImportPath>) -> Result<(), String> {
+    rollback_published_paths_with(paths, |source, destination| {
+        durable_rename(source, destination).map_err(std::io::Error::other)
+    })
+}
+
+fn staged_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    fn collect(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
+        if !current.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(current).map_err(|e| format!("staged files読込失敗: {e}"))? {
+            let entry = entry.map_err(|e| format!("staged file読込失敗: {e}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("staged file種別失敗: {e}"))?;
+            if file_type.is_symlink() {
+                return Err("staged default_cutにsymlinkを含められません".to_string());
+            }
+            if file_type.is_dir() {
+                collect(root, &entry.path(), output)?;
+            } else if file_type.is_file() {
+                output.push(
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap_or(&entry.path())
+                        .to_path_buf(),
+                );
+            }
+        }
+        Ok(())
+    }
+    let mut output = Vec::new();
+    collect(root, root, &mut output)?;
+    Ok(output)
+}
+
+#[tauri::command]
+fn publish_received_result_import(upload_id: String) -> Result<Value, String> {
+    let _circle_master_guard = circle_master_write_lock()
+        .lock()
+        .map_err(|e| format!("circle master publishロック取得失敗: {e}"))?;
+    // pending registry lockがpublishのlinearization point。timeout/stopが先ならentryは消え、
+    // publishが先ならcurrent lease確認直後からtransaction完了までcancel側を待たせる。
+    let mut pending = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("受信publishロック取得失敗: {e}"))?;
+    let upload = pending
+        .get_mut(&upload_id)
+        .ok_or_else(|| "upload leaseは期限切れまたは取消済みです".to_string())?;
+    if !upload.claimed || Instant::now() >= upload.lease_deadline {
+        return Err("upload leaseはcurrentではありません".to_string());
+    }
+    let stage = upload
+        .import_stage
+        .take()
+        .ok_or_else(|| "publish対象のimport stageがありません".to_string())?;
+    let manifest_path = stage.stage_root.join("transaction.json");
+    let mut published = Vec::new();
+    let publish_result = (|| -> Result<(), String> {
+        for (path, expected) in &stage.live_preimages {
+            let current = path_content_fingerprint(path)?;
+            if &current != expected {
+                return Err(format!(
+                    "import stage作成後にlive pathが変更されました: {}",
+                    path.display()
+                ));
+            }
+        }
+        let staged_event = stage.stage_root.join("events").join(&stage.plan.slug);
+        let mut operations = vec![PersistentPublishOperation {
+            source: Some(
+                staged_event
+                    .strip_prefix(&stage.stage_root)
+                    .unwrap()
+                    .to_path_buf(),
+            ),
+            destination: stage
+                .plan
+                .event_dir
+                .strip_prefix(&stage.project_root)
+                .map_err(|_| "event destinationがproject root外です".to_string())?
+                .to_path_buf(),
+            backup: PathBuf::from("publish-backup/target-event"),
+            had_destination: stage.plan.event_dir.exists(),
+        }];
+        for (slug, redundant) in &stage.plan.redundant_events {
+            if redundant.exists() {
+                operations.push(PersistentPublishOperation {
+                    source: None,
+                    destination: redundant
+                        .strip_prefix(&stage.project_root)
+                        .map_err(|_| "redundant destinationがproject root外です".to_string())?
+                        .to_path_buf(),
+                    backup: PathBuf::from("publish-backup/redundant-events").join(slug),
+                    had_destination: true,
+                });
+            }
+        }
+        let staged_master = stage.stage_root.join("circle_master.json");
+        if staged_master.is_file() {
+            let staged_master_value: Value = serde_json::from_str(
+                &fs::read_to_string(&staged_master)
+                    .map_err(|e| format!("staged circle_master読込失敗: {e}"))?,
+            )
+            .map_err(|e| format!("staged circle_master解析失敗: {e}"))?;
+            if !staged_master_value.is_object()
+                || !staged_master_value
+                    .get("circles")
+                    .is_some_and(Value::is_object)
+            {
+                return Err("staged circle_masterのcirclesが不正です".to_string());
+            }
+            let destination = stage.project_root.join("circle_master.json");
+            operations.push(PersistentPublishOperation {
+                source: Some(PathBuf::from("circle_master.json")),
+                destination: PathBuf::from("circle_master.json"),
+                backup: PathBuf::from("publish-backup/circle_master.json"),
+                had_destination: destination.exists(),
+            });
+        }
+        let staged_cuts = stage.stage_root.join("default_cuts");
+        for relative in staged_files(&staged_cuts)? {
+            let destination = stage.project_root.join("default_cuts").join(&relative);
+            operations.push(PersistentPublishOperation {
+                source: Some(PathBuf::from("default_cuts").join(&relative)),
+                destination: PathBuf::from("default_cuts").join(&relative),
+                backup: PathBuf::from("publish-backup/default_cuts").join(&relative),
+                had_destination: destination.exists(),
+            });
+        }
+        let mut manifest = PersistentPublishManifest {
+            version: 1,
+            phase: "publishing".to_string(),
+            completed_operations: 0,
+            operations,
+        };
+        persist_publish_manifest(&manifest_path, &manifest)?;
+        for (index, operation) in manifest.operations.iter().enumerate() {
+            let (source, destination, backup) =
+                resolve_manifest_operation(&stage.project_root, &stage.stage_root, operation)?;
+            install_staged_path(source.as_deref(), &destination, &backup, &mut published)?;
+            manifest.completed_operations = index + 1;
+            persist_publish_manifest(&manifest_path, &manifest)?;
+        }
+        manifest.phase = "committed".to_string();
+        persist_publish_manifest(&manifest_path, &manifest)?;
+        Ok(())
+    })();
+    if let Err(error) = publish_result {
+        let rollback = rollback_published_paths(&mut published);
+        return match rollback {
+            Ok(()) => {
+                upload.import_stage = Some(stage);
+                Err(error)
+            }
+            Err(rollback_error) => {
+                upload.recovery_required = true;
+                let recovery_root = stage
+                    .project_root
+                    .join(".eventtrail-import-recovery")
+                    .join(&upload_id);
+                let (preserved_root, preserve_error) = preserve_failed_transaction_with(
+                    &stage.stage_root,
+                    &recovery_root,
+                    persist_publish_manifest,
+                    durable_rename,
+                );
+                upload.import_stage = Some(ReceivedImportStage {
+                    stage_root: preserved_root.clone(),
+                    ..stage
+                });
+                Err(format!(
+                    "publish失敗: {error}; rollback失敗（手動復旧が必要）: {rollback_error}; recovery={}; recovery-mark={}",
+                    preserved_root.display(),
+                    preserve_error.unwrap_or_else(|| "ok".to_string())
+                ))
+            }
+        };
+    }
+    upload.lease_deadline = Instant::now() + RECEIVED_UPLOAD_LEASE_DURATION;
+    let _ = fs::remove_dir_all(&stage.stage_root);
+    upload.published = true;
+    published_received_uploads()
+        .lock()
+        .map_err(|e| format!("published uploadロック取得失敗: {e}"))?
+        .insert(upload_id.clone());
+    // live mutation commitとmobile成功通知を同じregistry critical sectionで確定する。
+    // この後のUI reload/select失敗やserver stopは成功結果を上書きできない。
+    let _ = fs::remove_file(&upload.zip_path);
+    let _ = upload.sender.try_send(ReceivedUploadAck::Success);
+    Ok(json!({
+        "status": "ok",
+        "slug": stage.plan.slug,
+        "dir": stage.plan.event_dir.to_string_lossy().to_string().replace("\\", "/"),
+        "event_name": stage.plan.event_name,
+        "event_date": stage.plan.event_date,
+        "duplicate_mobile_imports_removed": stage.plan.redundant_events.len(),
+    }))
+}
+
+fn remove_pending_received_upload(upload_id: &str) {
+    let removed = pending_received_uploads()
+        .lock()
+        .ok()
+        .and_then(|mut pending| {
+            if pending
+                .get(upload_id)
+                .map(|upload| upload.recovery_required)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            pending.remove(upload_id)
+        });
+    if let Some(stage) = removed.and_then(|upload| upload.import_stage) {
+        let _ = fs::remove_dir_all(stage.stage_root);
+    }
+}
+
+fn terminal_cancel_received_upload(upload_id: &str, error: &str) {
+    let upload = pending_received_uploads()
+        .lock()
+        .ok()
+        .and_then(|mut pending| {
+            if pending
+                .get(upload_id)
+                .map(|upload| upload.recovery_required || upload.published)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            pending.remove(upload_id)
+        });
+    if let Some(upload) = upload {
+        if let Some(stage) = &upload.import_stage {
+            let _ = fs::remove_dir_all(&stage.stage_root);
+        }
+        let _ = upload
+            .sender
+            .try_send(ReceivedUploadAck::Failure(error.to_string()));
+    }
+}
+
+fn terminal_cancel_all_received_uploads(error: &str) {
+    let uploads = pending_received_uploads()
+        .lock()
+        .map(|mut pending| {
+            let cancellable = pending
+                .iter()
+                .filter_map(|(id, upload)| {
+                    (!upload.recovery_required && !upload.published).then_some(id.clone())
+                })
+                .collect::<Vec<_>>();
+            cancellable
+                .into_iter()
+                .filter_map(|id| pending.remove(&id))
+                .collect()
+        })
+        .unwrap_or_else(|_| Vec::<PendingReceivedUpload>::new());
+    for upload in uploads {
+        if let Some(stage) = &upload.import_stage {
+            let _ = fs::remove_dir_all(&stage.stage_root);
+        }
+        let _ = upload
+            .sender
+            .try_send(ReceivedUploadAck::Failure(error.to_string()));
+    }
+}
+
+fn wait_for_received_upload_ack(
+    upload_id: &str,
+    receiver: &std::sync::mpsc::Receiver<ReceivedUploadAck>,
+    running: &AtomicBool,
+    listener_emitted: bool,
+) -> Result<(), (String, bool)> {
+    if !listener_emitted {
+        let error = "frontend listenerへ通知できませんでした";
+        terminal_cancel_received_upload(upload_id, error);
+        return Err((error.to_string(), false));
+    }
+    loop {
+        match receiver.try_recv() {
+            Ok(ReceivedUploadAck::Success) => return Ok(()),
+            Ok(ReceivedUploadAck::Failure(error)) => return Err((error, false)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                remove_pending_received_upload(upload_id);
+                return Err((
+                    "frontend import応答channelが切断されました".to_string(),
+                    false,
+                ));
+            }
+        }
+        if !running.load(Ordering::Relaxed) {
+            let error = "受信サーバーが停止されました";
+            terminal_cancel_received_upload(upload_id, error);
+            return Err((error.to_string(), false));
+        }
+        let deadline = pending_received_uploads()
+            .lock()
+            .ok()
+            .and_then(|pending| pending.get(upload_id).map(|upload| upload.lease_deadline))
+            .ok_or_else(|| ("upload leaseは取消済みです".to_string(), false))?;
+        let now = Instant::now();
+        if now >= deadline {
+            let error = "frontend import応答がタイムアウトしました";
+            terminal_cancel_received_upload(upload_id, error);
+            return Err((error.to_string(), true));
+        }
+        let wait = std::cmp::min(
+            Duration::from_millis(500),
+            deadline.saturating_duration_since(now),
+        );
+        match receiver.recv_timeout(wait) {
+            Ok(ReceivedUploadAck::Success) => return Ok(()),
+            Ok(ReceivedUploadAck::Failure(error)) => return Err((error, false)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err((
+                    "frontend import応答channelが切断されました".to_string(),
+                    false,
+                ))
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn ack_received_upload(
+    upload_id: String,
+    success: bool,
+    error: Option<String>,
+) -> Result<Value, String> {
+    let mut registry = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("受信ackロック取得失敗: {e}"))?;
+    if registry
+        .get(&upload_id)
+        .map(|upload| upload.published)
+        .unwrap_or(false)
+        || published_received_uploads()
+            .lock()
+            .map_err(|e| format!("published uploadロック取得失敗: {e}"))?
+            .contains(&upload_id)
+    {
+        return if success {
+            Ok(json!({"status": "ok", "published": true}))
+        } else {
+            Err("uploadは既にpublish済みのためfailureへ変更できません".to_string())
+        };
+    }
+    {
+        let pending = registry
+            .get(&upload_id)
+            .ok_or_else(|| "ack対象のuploadIdが見つかりません".to_string())?;
+        if pending.recovery_required {
+            return Err("手動復旧が必要なためack/cancelできません".to_string());
+        }
+        if !pending.claimed || Instant::now() >= pending.lease_deadline {
+            return Err("upload leaseはcurrentではありません".to_string());
+        }
+        if success && pending.import_stage.is_some() {
+            return Err("staged importがpublishされていません".to_string());
+        }
+    }
+    let pending = registry
+        .remove(&upload_id)
+        .ok_or_else(|| "ack対象のuploadIdが見つかりません".to_string())?;
+    drop(registry);
+    if !success {
+        if let Some(stage) = &pending.import_stage {
+            let _ = fs::remove_dir_all(&stage.stage_root);
+        }
+    }
+
+    let ack = if success {
+        match fs::remove_file(&pending.zip_path) {
+            Ok(()) => ReceivedUploadAck::Success,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReceivedUploadAck::Success,
+            Err(e) => ReceivedUploadAck::Failure(format!("受信ZIP削除失敗: {e}")),
+        }
+    } else {
+        ReceivedUploadAck::Failure(error.unwrap_or_else(|| "frontend import失敗".to_string()))
+    };
+    let failed_message = match &ack {
+        ReceivedUploadAck::Failure(message) => Some(message.clone()),
+        ReceivedUploadAck::Success => None,
+    };
+    pending
+        .sender
+        .send(ack)
+        .map_err(|_| "upload response待機が終了しています".to_string())?;
+    if let Some(message) = failed_message {
+        return Err(message);
+    }
+    Ok(json!({"status": "ok"}))
+}
+
+#[tauri::command]
+fn cancel_received_upload(upload_id: String, error: Option<String>) -> Result<Value, String> {
+    ack_received_upload(upload_id, false, error)
+}
+
+const RECEIVED_UPLOAD_STALE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn cleanup_stale_received_uploads(temp_dir: &Path, now: std::time::SystemTime) -> usize {
+    let Ok(entries) = fs::read_dir(temp_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("eventtrail_received_") || !name.ends_with(".zip") {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age >= RECEIVED_UPLOAD_STALE_AGE && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn received_upload_payload(upload_id: &str, zip_path: &str, size: usize) -> Value {
+    json!({
+        "status": "ok",
+        "uploadId": upload_id,
+        "zipPath": zip_path,
+        "size": size
+    })
+}
+
 #[tauri::command]
 fn start_receive_server(window: tauri::Window, project_root: String) -> Result<Value, String> {
+    let project_root = absolute_project_root(&project_root)?;
+    {
+        let _recovery_guard = circle_master_write_lock()
+            .lock()
+            .map_err(|e| format!("import recoveryロック取得失敗: {e}"))?;
+        recover_incomplete_import_transactions(&project_root)?;
+    }
+    cleanup_stale_received_uploads(&std::env::temp_dir(), std::time::SystemTime::now());
     let mut guard = receive_server_running()
         .lock()
         .map_err(|e| format!("ロック取得失敗: {e}"))?;
@@ -2689,7 +4836,6 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
 
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
-    let project_root_for_import = project_root.clone();
 
     thread::spawn(move || {
         while running_clone.load(Ordering::Relaxed) {
@@ -2741,8 +4887,13 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
                     }
 
                     // 一時ファイルに保存
-                    let tmp_path = std::env::temp_dir()
-                        .join(format!("eventtrail_received_{}.zip", std::process::id()));
+                    let upload_id = format!(
+                        "{}_{}",
+                        std::process::id(),
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                    );
+                    let tmp_path =
+                        std::env::temp_dir().join(format!("eventtrail_received_{upload_id}.zip"));
                     if let Err(e) = fs::write(&tmp_path, &body) {
                         let resp = tiny_http::Response::from_string(format!("保存エラー: {e}"))
                             .with_status_code(tiny_http::StatusCode(500));
@@ -2752,60 +4903,47 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
 
                     let zip_path = tmp_path.to_string_lossy().to_string().replace("\\", "/");
                     let size = body.len();
+                    let ack_receiver = match register_received_upload(&upload_id, tmp_path.clone())
+                    {
+                        Ok(receiver) => receiver,
+                        Err(e) => {
+                            let resp = tiny_http::Response::from_string(
+                                json!({"status": "error", "error": e}).to_string(),
+                            )
+                            .with_status_code(tiny_http::StatusCode(500));
+                            let _ = request.respond(resp);
+                            continue;
+                        }
+                    };
                     let _ = window.emit(
                         "result-uploaded",
                         json!({
+                            "uploadId": upload_id.clone(),
                             "zipPath": zip_path.clone(),
                             "size": size
                         }),
                     );
 
-                    let import_result = match import_result_zip(
-                        zip_path.clone(),
-                        project_root_for_import.clone(),
-                    ) {
-                        Ok(value) => value,
-                        Err(e) => {
-                            let error = e.clone();
-                            let _ = window.emit(
-                                "result-receive-error",
-                                json!({
-                                    "zipPath": zip_path.clone(),
-                                    "size": size,
-                                    "error": error
-                                }),
-                            );
-                            let resp = tiny_http::Response::from_string(
-                                json!({"status": "error", "error": e}).to_string(),
-                            )
-                            .with_status_code(tiny_http::StatusCode(500))
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Access-Control-Allow-Origin"[..],
-                                    &b"*"[..],
-                                )
-                                .unwrap(),
-                            )
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Content-Type"[..],
-                                    &b"application/json"[..],
-                                )
-                                .unwrap(),
-                            );
-                            let _ = request.respond(resp);
-                            running_clone.store(false, Ordering::Relaxed);
-                            break;
-                        }
+                    // receive threadはtemp ZIPの保存と通知だけを担当する。
+                    // event.jsonへのimportはfrontendのdocument排他区間で実行する。
+                    let payload = received_upload_payload(&upload_id, &zip_path, size);
+                    let emitted = window.emit("result-received", payload.clone()).is_ok();
+                    let ack = wait_for_received_upload_ack(
+                        &upload_id,
+                        &ack_receiver,
+                        &running_clone,
+                        emitted,
+                    );
+                    remove_pending_received_upload(&upload_id);
+                    let (status, response_payload) = match ack {
+                        Ok(()) => (200, json!({"status": "ok", "uploadId": upload_id})),
+                        Err((error, timed_out)) => (
+                            if timed_out { 504 } else { 500 },
+                            json!({"status": "error", "uploadId": upload_id, "error": error}),
+                        ),
                     };
-
-                    let payload = json!({
-                        "status": "ok",
-                        "zipPath": zip_path.clone(),
-                        "size": size,
-                        "importResult": import_result
-                    });
-                    let resp = tiny_http::Response::from_string(payload.to_string())
+                    let resp = tiny_http::Response::from_string(response_payload.to_string())
+                        .with_status_code(tiny_http::StatusCode(status))
                         .with_header(
                             tiny_http::Header::from_bytes(
                                 &b"Access-Control-Allow-Origin"[..],
@@ -2821,9 +4959,6 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
                             .unwrap(),
                         );
                     let _ = request.respond(resp);
-
-                    // Tauriイベントで通知
-                    let _ = window.emit("result-received", payload);
 
                     // 受信後サーバー停止
                     running_clone.store(false, Ordering::Relaxed);
@@ -2853,6 +4988,7 @@ fn stop_receive_server() -> Result<Value, String> {
     if let Some(flag) = guard.take() {
         flag.store(false, Ordering::Relaxed);
     }
+    terminal_cancel_all_received_uploads("受信サーバーが停止されました");
     Ok(json!({"status": "ok"}))
 }
 
@@ -3411,9 +5547,15 @@ fn main() {
             create_event_dir,
             delete_event_dir,
             rename_event_dir,
-            import_result_zip,
+            plan_received_result_import,
+            stage_received_result_import,
+            publish_received_result_import,
             start_receive_server,
             stop_receive_server,
+            ack_received_upload,
+            claim_received_upload,
+            heartbeat_received_upload,
+            cancel_received_upload,
             register_default_cut,
             append_review_entry,
             open_file_default,

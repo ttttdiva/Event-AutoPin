@@ -8,17 +8,36 @@ import {
 } from "./bridge-job";
 import {
   buildEventJsonSnapshot,
+  eventJsonDocumentsEqual,
+  imageColumnAssetReferences,
+  runImageDeletionTransaction,
+  selectActiveMapImages,
+  type EventMapImage,
   type EventJsonData,
   type TableState,
 } from "./state/event-document";
 import {
+  createAsyncMutationGuard,
+  KeyedSerialExecutor,
+  retryUntilValue,
+  type AsyncMutationGuard,
+} from "./state/async-mutation-guard";
+import {
+  EventLifecycleGate,
+  EventWriteCoordinator,
+  type EventLifecycleLease,
+} from "./state/event-write-coordinator";
+import {
   canAutoSave,
   canEnqueueReprocess,
+  canStartEventDocumentMutation,
   canStartPipeline,
+  canStartMapAuto,
   canStartReprocess,
   createOperationState,
   isOperationBusy,
   isPipelineOperation,
+  isMapAutoOperation,
   isReprocessOperation,
   transitionOperationState,
   type OperationEvent,
@@ -27,6 +46,7 @@ import {
 import {
   cloneJsonSnapshot,
   RevisionedSaveQueue,
+  type SaveReceipt,
 } from "./state/revisioned-save-queue";
 
 // 画像読み込みエラーのグローバルハンドラ（CSP対策: インラインonerror不使用）
@@ -199,8 +219,10 @@ type CircleMasterData = {
 
 let circleMasterData: CircleMasterData = { circles: {} };
 let circleMasterSaveTimer: number | null = null;
+const circleMasterWriteSerial = new KeyedSerialExecutor();
+const CIRCLE_MASTER_WRITE_KEY = "circle-master";
 const circleMasterSaveQueue = new RevisionedSaveQueue<CircleMasterData>(
-  async ({ snapshot }) => {
+  ({ snapshot }) => circleMasterWriteSerial.run(CIRCLE_MASTER_WRITE_KEY, async () => {
     const response = await invokeBridgeJob<Record<string, unknown>>(
       "save_circle_master",
       { data: snapshot },
@@ -210,8 +232,22 @@ const circleMasterSaveQueue = new RevisionedSaveQueue<CircleMasterData>(
     if (response.ok === false || bridge?.status === "error") {
       throw new Error(String(bridge?.error || "circle_masterの保存に失敗しました"));
     }
-  },
+  }),
 );
+
+async function flushCircleMasterSaves(): Promise<void> {
+  if (circleMasterSaveTimer) {
+    clearTimeout(circleMasterSaveTimer);
+    circleMasterSaveTimer = null;
+    const receipt = circleMasterSaveQueue.enqueue(
+      cloneJsonSnapshot(circleMasterData),
+    );
+    await receipt.completed;
+  }
+  await circleMasterSaveQueue.flush();
+  if (circleMasterSaveQueue.error) throw circleMasterSaveQueue.error;
+  await circleMasterWriteSerial.run(CIRCLE_MASTER_WRITE_KEY, async () => undefined);
+}
 
 function scheduleSaveCircleMaster() {
   if (circleMasterSaveTimer) clearTimeout(circleMasterSaveTimer);
@@ -229,16 +265,21 @@ function scheduleSaveCircleMaster() {
   }, 1500);
 }
 
+async function loadCircleMasterStrict(): Promise<void> {
+  const res = await invokeBridgeJob<Record<string, unknown>>(
+    "load_circle_master",
+    {},
+    currentBridgeJobOptions(),
+  );
+  if (!res?.ok || (res.bridge as any)?.status === "error") {
+    throw new Error(String((res.bridge as any)?.error || "circle_master読込失敗"));
+  }
+  circleMasterData = (res.bridge as any).data || { circles: {} };
+}
+
 async function loadCircleMaster() {
   try {
-    const res = await invokeBridgeJob<Record<string, unknown>>(
-      "load_circle_master",
-      {},
-      currentBridgeJobOptions(),
-    );
-    if (res?.ok) {
-      circleMasterData = (res.bridge as any).data || { circles: {} };
-    }
+    await loadCircleMasterStrict();
   } catch (error) {
     logToFile(`circle_master読込エラー: ${String(error)}`);
   }
@@ -312,6 +353,8 @@ function applyCircleMasterGenres(state: TableState = tableState) {
 
 // event.json全体を保持
 let eventJsonData: any = null;
+// 最後にディスクから読み込むか保存完了した文書。no-op保存判定に使う。
+let persistedEventJsonData: EventJsonData | null = null;
 
 // 展開中のサークル行インデックス（-1 = なし）
 let expandedCircleIdx = -1;
@@ -464,8 +507,21 @@ function applyPurchasedItemIndex(next: Set<string>): void {
   next.forEach((key) => purchasedItemKeys.add(key));
 }
 
+let purchasedItemIndexGeneration = 0;
+
 async function rebuildPurchasedItemIndex() {
-  applyPurchasedItemIndex(await buildPurchasedItemIndex());
+  const generation = ++purchasedItemIndexGeneration;
+  const owner = captureActiveEventDocumentOwner();
+  const revision = eventDocumentStateRevision;
+  const next = await buildPurchasedItemIndex();
+  if (
+    generation !== purchasedItemIndexGeneration ||
+    !isActiveEventDocumentOwner(owner) ||
+    revision !== eventDocumentStateRevision
+  ) {
+    return;
+  }
+  applyPurchasedItemIndex(next);
 }
 
 function catalogImagePathsForCircle(circle: any): string[] {
@@ -507,18 +563,6 @@ function circlesToTableState(data: any): TableState {
     "アイテムタグ",
     "チェック",
   ];
-
-  // アイテムにcheckedがない場合、サークルのcheckedを初期値として引き継ぐ
-  for (const c of circles) {
-    const circleChecked = c.checked ?? 0;
-    if (circleChecked !== 0 && c.items) {
-      for (const item of c.items) {
-        if (item.checked === undefined || item.checked === null) {
-          item.checked = circleChecked;
-        }
-      }
-    }
-  }
 
   const rows: Record<string, string>[] = circles.map((c: any) => {
     const tags = [...(c.genres || []), ...(c.tags || [])];
@@ -690,6 +734,98 @@ const CLAUDE_CODE_EFFORTS = ["auto", "low", "medium", "high", "xhigh", "max"];
 const NO_REASONING_EFFORTS = ["none"];
 
 let tableState: TableState = { headers: [], rows: [] };
+// 自動表示補完を含む、最後に読み込み/保存確定したテーブル表示。
+// このbaselineとの差分だけをevent.jsonへ反映する。
+let eventTableBaseline: TableState = { headers: [], rows: [] };
+// save snapshot/選択commitごとのCAS revision。古い非同期失敗による
+// 新しい編集stateのwhole rollbackを防ぐ。
+let eventDocumentStateRevision = 0;
+function markEventDocumentMutated(): void {
+  eventDocumentStateRevision += 1;
+}
+
+type ActiveEventDocumentOwner = { slug: string | null; path: string };
+function captureActiveEventDocumentOwner(): ActiveEventDocumentOwner {
+  return {
+    slug: activeEventSlug,
+    path: normalizeEventPath(editorJsonPathValue()),
+  };
+}
+function isActiveEventDocumentOwner(owner: ActiveEventDocumentOwner): boolean {
+  return (
+    activeEventSlug === owner.slug &&
+    normalizeEventPath(editorJsonPathValue()) === owner.path
+  );
+}
+
+function activeEventDocumentOwnerKey(): string {
+  return `${activeEventSlug ?? ""}\n${normalizeEventPath(editorJsonPathValue())}`;
+}
+
+function invokeEventAssetWrite<T>(
+  event: Pick<EventEntry, "slug" | "dir">,
+  command: string,
+  args: Record<string, unknown>,
+): Promise<T> {
+  return eventLifecycleGate.run(eventMetaOwnerKey(event.slug, event.dir), () =>
+    invoke<T>(command, args),
+  );
+}
+
+function invokeActiveEventAssetWrite<T>(
+  command: string,
+  args: Record<string, unknown>,
+): Promise<T> {
+  const event = activeEventSlug
+    ? eventList.find((entry) => entry.slug === activeEventSlug)
+    : null;
+  if (!event) return Promise.reject(new Error("アクティブイベントがありません"));
+  return invokeEventAssetWrite<T>(event, command, args);
+}
+
+/** first await前にowner/revisionと対象object identityを固定する。 */
+function captureEventAsyncMutationGuard(
+  circleIdx?: number,
+  itemIdx?: number,
+): AsyncMutationGuard | null {
+  const document = eventJsonData as object | null;
+  if (!document) return null;
+  const circle =
+    circleIdx === undefined ? null : eventJsonData?.circles?.[circleIdx] ?? null;
+  const item =
+    itemIdx === undefined ? null : circle?.items?.[itemIdx] ?? null;
+  if (circleIdx !== undefined && !circle) return null;
+  if (itemIdx !== undefined && !item) return null;
+  markEventDocumentMutated();
+  const revision = eventDocumentStateRevision;
+  const targets = [circle, item].filter((target) => target !== null) as object[];
+  return createAsyncMutationGuard(
+    {
+      owner: activeEventDocumentOwnerKey(),
+      revision,
+      document,
+      targets,
+    },
+    () => {
+      const currentCircle =
+        circleIdx === undefined
+          ? null
+          : eventJsonData?.circles?.[circleIdx] ?? null;
+      const currentItem =
+        itemIdx === undefined
+          ? null
+          : currentCircle?.items?.[itemIdx] ?? null;
+      return {
+        owner: activeEventDocumentOwnerKey(),
+        revision: eventDocumentStateRevision,
+        document: eventJsonData as object | null,
+        targets: [currentCircle, currentItem].filter(
+          (target) => target !== null,
+        ) as object[],
+      };
+    },
+  );
+}
 let operationState: OperationState = createOperationState();
 const operationIdleWaiters: (() => void)[] = [];
 let operationIdlePromise: Promise<void> | null = null;
@@ -1561,7 +1697,7 @@ function renderItemPanel(circleIdx: number): string {
 
   const itemRows = items
     .map((item: any, itemIdx: number) => {
-      const checkedVal = normalizePurchaseStatus(item.checked);
+      const checkedVal = getEffectiveItemStatus(item, c);
       const checkedView = PURCHASE_STATUS_VIEWS[checkedVal];
       const boughtView = PURCHASE_STATUS_VIEWS[PURCHASE_STATUS.BOUGHT];
       const knownPurchased = isPurchasedItemKnown(c, item);
@@ -1913,6 +2049,7 @@ type EventSaveRequest = {
   ownerDir: string;
   eventJsonPath: string;
   data: EventJsonData;
+  lifecycleLease: EventLifecycleLease;
 };
 
 function normalizeEventPath(path: string): string {
@@ -1923,7 +2060,9 @@ function eventJsonPathForDir(eventDir: string): string {
   return `${normalizeEventPath(eventDir)}/event.json`;
 }
 
-function assertCurrentSaveOwnership(snapshot: EventSaveRequest): void {
+function assertCurrentSaveOwnership(
+  snapshot: Pick<EventSaveRequest, "ownerSlug" | "ownerDir" | "eventJsonPath">,
+): void {
   const activeEvent = eventList.find((event) => event.slug === activeEventSlug);
   const expectedPath = activeEvent ? eventJsonPathForDir(activeEvent.dir) : "";
   const editorPath = normalizeEventPath(editorJsonPathValue());
@@ -1951,34 +2090,50 @@ function isActiveEventDocumentOwned(ownerSlug: string): boolean {
   );
 }
 
+const eventLifecycleGate = new EventLifecycleGate();
+const eventMetaWriteCoordinator = new EventWriteCoordinator(eventLifecycleGate);
+
 const eventSaveQueue = new RevisionedSaveQueue<EventSaveRequest>(
   async ({ snapshot }) => {
     // キュー投入後にイベントが切り替わっていたら送信せずfail closedにする。
     assertCurrentSaveOwnership(snapshot);
-    const response = await invokeBridgeJob<{
-      status?: string;
-      error?: string;
-    }>(
-      "save_event_json",
-      {
-        event_json: snapshot.eventJsonPath,
-        data: snapshot.data,
-      },
-      currentBridgeJobOptions(10_000),
-    );
-    if (response.ok === false || response.bridge?.status === "error") {
-      throw new Error(
-        response.bridge?.error || "event.jsonの保存に失敗しました",
+    const writeKey = eventMetaOwnerKey(snapshot.ownerSlug, snapshot.ownerDir);
+    await eventMetaWriteCoordinator.runExclusiveAccepted(writeKey, async () => {
+      assertCurrentSaveOwnership(snapshot);
+      const data = cloneJsonSnapshot(snapshot.data);
+      const committedMeta = eventMetaWriteCoordinator.committedSnapshot<EventMeta>(
+        writeKey,
       );
-    }
-    // 非同期応答を現在のイベントへ適用してよい所有権が残っていることを確認する。
-    assertCurrentSaveOwnership(snapshot);
+      if (committedMeta) data.event = committedMeta;
+      const response = await invokeBridgeJob<{
+        status?: string;
+        error?: string;
+      }>(
+        "save_event_json",
+        {
+          event_json: snapshot.eventJsonPath,
+          data,
+        },
+        currentBridgeJobOptions(10_000),
+      );
+      if (response.ok === false || response.bridge?.status === "error") {
+        throw new Error(
+          response.bridge?.error || "event.jsonの保存に失敗しました",
+        );
+      }
+      assertCurrentSaveOwnership(snapshot);
+      if (data.event) eventMetaWriteCoordinator.recordCommitted(writeKey, data.event);
+    });
   },
+  (snapshot) => snapshot.lifecycleLease.release(),
 );
 
 type SaveNowResult =
   | { ok: true; revision: number | null }
   | { ok: false; revision: number | null; error: unknown };
+
+const INTERNAL_OPERATION_SAVE = Symbol("internal-operation-save");
+type InternalOperationSavePermit = typeof INTERNAL_OPERATION_SAVE;
 
 function editorJsonPathValue(): string {
   return (
@@ -1986,8 +2141,17 @@ function editorJsonPathValue(): string {
   )?.value.trim() || "";
 }
 
-async function saveNow(allowDuringRename = false): Promise<SaveNowResult> {
-  if (renameInProgress && !allowDuringRename) {
+async function saveNow(
+  permit?: InternalOperationSavePermit,
+): Promise<SaveNowResult> {
+  if (isOperationBusy(operationState) && permit !== INTERNAL_OPERATION_SAVE) {
+    return {
+      ok: false,
+      revision: null,
+      error: new Error("イベント処理中はevent.jsonを保存できません"),
+    };
+  }
+  if (renameInProgress && permit !== INTERNAL_OPERATION_SAVE) {
     return {
       ok: false,
       revision: null,
@@ -2017,27 +2181,68 @@ async function saveNow(allowDuringRename = false): Promise<SaveNowResult> {
       ),
     };
   }
+  const lifecycleLease = eventLifecycleGate.acquire(
+    eventMetaOwnerKey(ownerSlug, ownerDir),
+  );
+  if (!lifecycleLease) {
+    return {
+      ok: false,
+      revision: null,
+      error: new Error("保存対象のイベントは削除処理中または削除済みです"),
+    };
+  }
 
-  // 二重管理の境界で現在のtableStateを保存用スナップショットへ反映する。
-  const syncedEventJsonData = buildEventJsonSnapshot(eventJsonData, tableState);
-  eventJsonData = syncedEventJsonData;
-  // 予算パネルも更新
-  updateBudgetPanel();
-  // キュー中のpayloadが後続編集で書き換わらないように、もう一度固定する。
-  const receipt = eventSaveQueue.enqueue({
-    ownerSlug,
-    ownerDir,
-    eventJsonPath,
-    data: cloneJsonSnapshot(syncedEventJsonData),
-  });
+  let syncedEventJsonData: EventJsonData;
+  let receipt: SaveReceipt;
+  try {
+    // 二重管理の境界で、baselineから明示的に変わったセルだけを反映する。
+    const tableSnapshot = cloneJsonSnapshot(tableState);
+    syncedEventJsonData = buildEventJsonSnapshot(
+      eventJsonData,
+      tableSnapshot,
+      eventTableBaseline,
+    );
+    eventJsonData = syncedEventJsonData;
+    // 後続のsaveNowは、この呼び出し後に発生したUI差分だけをsnapshot化する。
+    // 保存中の編集→取り消しも旧baselineに吸収されず、revert payloadとして残る。
+    eventTableBaseline = tableSnapshot;
+    markEventDocumentMutated();
+    // 予算パネルも更新
+    updateBudgetPanel();
+    // 選択・beforeunload等から呼ばれても、未編集ならディスクへ書かない。
+    if (
+      eventJsonDocumentsEqual(syncedEventJsonData, persistedEventJsonData) &&
+      !eventSaveQueue.isRunning &&
+      !eventSaveQueue.hasPending
+    ) {
+      lifecycleLease.release();
+      return { ok: true, revision: null };
+    }
+    // キュー中のpayloadが後続編集で書き換わらないように、もう一度固定する。
+    receipt = eventSaveQueue.enqueue({
+      ownerSlug,
+      ownerDir,
+      eventJsonPath,
+      data: cloneJsonSnapshot(syncedEventJsonData),
+      lifecycleLease,
+    });
+  } catch (error) {
+    lifecycleLease.release();
+    return { ok: false, revision: null, error };
+  }
   try {
     await receipt.completed;
     assertCurrentSaveOwnership({
       ownerSlug,
       ownerDir,
       eventJsonPath,
-      data: syncedEventJsonData,
     });
+    const persistedSnapshot = cloneJsonSnapshot(syncedEventJsonData);
+    const committedMeta = eventMetaWriteCoordinator.committedSnapshot<EventMeta>(
+      eventMetaOwnerKey(ownerSlug, ownerDir),
+    );
+    if (committedMeta) persistedSnapshot.event = committedMeta;
+    persistedEventJsonData = persistedSnapshot;
     return { ok: true, revision: receipt.revision };
   } catch (error) {
     const msg = `event.json保存エラー: ${String(error)}`;
@@ -2278,21 +2483,28 @@ async function pickAndSetImage(
   row: number,
   col: string,
 ) {
+  const guard = captureEventAsyncMutationGuard(row);
+  if (!guard) return;
+  const activeEv = activeEventSlug
+    ? eventList.find((e) => e.slug === activeEventSlug)
+    : null;
+  const subdir = imageColumnAssetSubdir(col);
+  const destDir = activeEv?.dir ? eventAssetDir(activeEv.dir, subdir) : "";
   const selected = await dialogOpen({
     multiple: false,
     filters: [{ name: "画像ファイル", extensions: IMAGE_EXTENSIONS }],
   });
+  if (!guard.isCurrent()) return;
   if (selected && typeof selected === "string") {
     const fileName = selected.replace(/\\/g, "/").split("/").pop() || selected;
-    const activeEv = activeEventSlug
-      ? eventList.find((e) => e.slug === activeEventSlug)
-      : null;
-    const subdir = imageColumnAssetSubdir(col);
-    const destDir = activeEv?.dir ? eventAssetDir(activeEv.dir, subdir) : "";
     const relativeFileName = eventRelativeAssetPath(subdir, fileName);
     try {
-      await invoke("copy_file_to_dir", { sourcePath: selected, destDir });
-    } catch {}
+      await invokeActiveEventAssetWrite("copy_file_to_dir", { sourcePath: selected, destDir });
+    } catch (error) {
+      resultEl.textContent = `画像コピー失敗: ${String(error)}`;
+      return;
+    }
+    if (!guard.isCurrent()) return;
     applyImageToCell(cell, row, col, relativeFileName);
   }
 }
@@ -2316,28 +2528,8 @@ function applyImageToCell(
   const oldImagePath = firstImagePathFromValue(oldVal);
   const isOldImage = Boolean(oldImagePath);
 
-  // Undoバッファに退避（前のバッファは破棄 = 古いファイルを削除）
+  // Undoバッファに退避（前のバッファは参照だけ破棄し、assetは孤児として保持）
   if (imageUndoBuffer) {
-    // 前のバッファの画像ファイルを削除（もう戻せない）
-    const prev = imageUndoBuffer;
-    const prevOtherCol =
-      prev.col === "サークル画像" ? "アイテム画像" : "サークル画像";
-    const prevOtherVal = String(
-      tableState.rows[prev.row]?.[prevOtherCol] ?? "",
-    ).trim();
-    if (
-      prev.oldFileName &&
-      prev.oldFileName !== prevOtherVal &&
-      !prev.oldFileName.startsWith("http")
-    ) {
-      const root = projectRootEl.value.replace(/\\/g, "/");
-      const activeEvPrev = activeEventSlug
-        ? eventList.find((e) => e.slug === activeEventSlug)
-        : null;
-      const imgDirPrev = activeEvPrev?.dir ?? "";
-      const prevPath = resolveEventAssetFilePath(imgDirPrev || root, prev.oldFileName);
-      invoke("delete_file", { filePath: prevPath }).catch(() => {});
-    }
     imageUndoBuffer = null;
   }
 
@@ -2361,13 +2553,19 @@ function applyImageToCell(
       const fullPath = resolveEventAssetFilePath(imgDir, fileName);
       const genre =
         String(tableState.rows[row]["ジャンル"] ?? "").trim() || undefined;
-      invoke("register_default_cut", {
-        projectRoot: projectRootEl.value,
-        circleName,
-        penname,
-        imageSourcePath: fullPath,
-        genre: genre || null,
-      }).catch(() => {});
+      void circleMasterWriteSerial
+        .run(CIRCLE_MASTER_WRITE_KEY, () =>
+          invoke("register_default_cut", {
+            projectRoot: projectRootEl.value,
+            circleName,
+            penname,
+            imageSourcePath: fullPath,
+            genre: genre || null,
+          }),
+        )
+        .catch((error) => {
+          logToFile(`default cut登録エラー: ${String(error)}`);
+        });
     }
   }
 }
@@ -2415,32 +2613,67 @@ function showImageContextMenu(
   if (hasImage) {
     const deleteItem = document.createElement("div");
     deleteItem.className = "ctx-menu-item danger";
-    deleteItem.textContent = "画像を削除";
+    deleteItem.textContent = "画像参照を削除（ファイルは保持）";
     deleteItem.addEventListener("click", async () => {
       menu.remove();
       const currentVal = String(tableState.rows[row][col] ?? "").trim();
-      const currentPath = firstImagePathFromValue(currentVal) || "";
-      // もう片方の画像列が同じファイルを参照している場合は物理削除しない
-      const otherCol = col === "サークル画像" ? "アイテム画像" : "サークル画像";
-      const otherVal = String(tableState.rows[row][otherCol] ?? "").trim();
-      const otherPath = firstImagePathFromValue(otherVal) || "";
-      if (currentPath && currentPath !== otherPath) {
-        const root = projectRootEl.value.replace(/\\/g, "/");
-        const activeEvDel = activeEventSlug
-          ? eventList.find((e) => e.slug === activeEventSlug)
-          : null;
-        const imgDirDel = activeEvDel?.dir ?? "";
-        const filePath =
-          currentPath.includes("/") || currentPath.includes("\\")
-            ? `${root}/${currentPath}`
-            : `${imgDirDel}/${currentPath}`;
-        try {
-          await invoke("delete_file", { filePath });
-        } catch {}
+      const ownerSlug = activeEventSlug;
+      if (!ownerSlug || !eventJsonData) return;
+      const tableBefore = cloneJsonSnapshot(tableState);
+      const documentBefore = cloneJsonSnapshot(eventJsonData);
+      const baselineBefore = cloneJsonSnapshot(eventTableBaseline);
+      let deletionRevision = eventDocumentStateRevision;
+      let expectedTable: TableState | null = null;
+      let expectedDocument: EventJsonData | null = null;
+      let expectedBaseline: TableState | null = null;
+      try {
+        await runImageDeletionTransaction({
+          removedReferences: imageColumnAssetReferences(currentVal),
+          applyClear: () => {
+            tableState.rows[row][col] = "";
+            cell.innerHTML = renderImageCellContents("");
+          },
+          save: async () => {
+            // async関数は最初のawaitまで同期実行されるため、saveNowが作った
+            // optimistic snapshotとrevisionを直後にCAS対象として固定できる。
+            const pending = saveNow();
+            deletionRevision = eventDocumentStateRevision;
+            expectedTable = cloneJsonSnapshot(tableState);
+            expectedDocument = eventJsonData
+              ? cloneJsonSnapshot(eventJsonData)
+              : null;
+            expectedBaseline = cloneJsonSnapshot(eventTableBaseline);
+            return (await pending).ok;
+          },
+          rollbackIfCurrent: () => {
+            // 切替・新しい編集・後続saveがあれば古いsnapshotで上書きしない。
+            if (
+              activeEventSlug !== ownerSlug ||
+              eventDocumentStateRevision !== deletionRevision ||
+              JSON.stringify(tableState) !== JSON.stringify(expectedTable) ||
+              !eventJsonDocumentsEqual(eventJsonData, expectedDocument) ||
+              JSON.stringify(eventTableBaseline) !==
+                JSON.stringify(expectedBaseline)
+            ) {
+              return false;
+            }
+            tableState = tableBefore;
+            eventJsonData = documentBefore;
+            eventTableBaseline = baselineBefore;
+            eventDocumentStateRevision += 1;
+            cell.innerHTML = renderImageCellContents(currentVal);
+            updateBudgetPanel();
+            return true;
+          },
+          currentDocument: () =>
+            activeEventSlug === ownerSlug ? eventJsonData : null,
+          // UIによる参照削除ではassetを自動削除しない。共有・Undo・回復のため
+          // 孤児ファイルとしてイベント配下に保持する。
+          deleteAsset: async () => {},
+        });
+      } catch (error) {
+        logToFile(`画像参照削除エラー: ${String(error)}`);
       }
-      tableState.rows[row][col] = "";
-      saveNow();
-      cell.innerHTML = renderImageCellContents("");
     });
     menu.appendChild(deleteItem);
   }
@@ -2516,7 +2749,8 @@ async function applyDroppedImageToItemCell(
 ) {
   const circleIdx = Number(cell.dataset.circle);
   const itemIdx = Number(cell.dataset.item);
-  if (!eventJsonData?.circles?.[circleIdx]?.items?.[itemIdx]) return;
+  const guard = captureEventAsyncMutationGuard(circleIdx, itemIdx);
+  if (!guard) return;
   const activeDir = getActiveEventDir();
   const destDir = activeDir ? eventAssetDir(activeDir, "items") : "";
 
@@ -2525,15 +2759,20 @@ async function applyDroppedImageToItemCell(
     const ext = file.name.split(".").pop()?.toLowerCase() || "";
     if (!IMAGE_EXTENSIONS.includes(ext)) return;
     const buf = await file.arrayBuffer();
+    if (!guard.isCurrent()) return;
     const bytes = Array.from(new Uint8Array(buf));
     const uniqueFileName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${file.name}`;
     try {
-      await invoke("save_image_bytes", {
+      await invokeActiveEventAssetWrite("save_image_bytes", {
         destDir,
         fileName: uniqueFileName,
         bytes,
       });
-    } catch {}
+    } catch (error) {
+      resultEl.textContent = `画像保存失敗: ${String(error)}`;
+      return;
+    }
+    if (!guard.isCurrent()) return;
     applyImageToItemCell(
       cell,
       circleIdx,
@@ -2550,13 +2789,14 @@ async function applyDroppedImageToItemCell(
   const rawFileName = fileNameFromUrl(imageUrl);
   const fileName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${rawFileName}`;
   try {
-    await invoke("download_image", { url: imageUrl, destDir, fileName });
+    await invokeActiveEventAssetWrite("download_image", { url: imageUrl, destDir, fileName });
   } catch (err) {
     const msg = `アイテム画像のダウンロード失敗: ${String(err)} (URL: ${imageUrl})`;
     resultEl.textContent = msg;
     logToFile(msg);
     return;
   }
+  if (!guard.isCurrent()) return;
   applyImageToItemCell(
     cell,
     circleIdx,
@@ -2596,12 +2836,16 @@ function catalogDropFileName(rawName: string): string {
   return `catalog_drop_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${base}.${ext}`;
 }
 
-async function saveCatalogImageFromPath(sourcePath: string) {
-  const activeDir = getActiveEventDir();
+async function saveCatalogImageFromPath(
+  sourcePath: string,
+  activeDir: string,
+  guard: AsyncMutationGuard,
+) {
   const destDir = activeDir ? eventAssetDir(activeDir, "items") : "";
   if (!destDir) throw new Error("アクティブなイベントが選択されていません");
   const fileName = catalogDropFileName(sourcePath);
-  await invoke("copy_file_as", { sourcePath, destDir, fileName });
+  await invokeActiveEventAssetWrite("copy_file_as", { sourcePath, destDir, fileName });
+  if (!guard.isCurrent()) return null;
   const relativeFileName = eventRelativeAssetPath("items", fileName);
   return {
     fileName: relativeFileName,
@@ -2609,8 +2853,11 @@ async function saveCatalogImageFromPath(sourcePath: string) {
   };
 }
 
-async function saveCatalogImageFromDataTransfer(dt: DataTransfer) {
-  const activeDir = getActiveEventDir();
+async function saveCatalogImageFromDataTransfer(
+  dt: DataTransfer,
+  activeDir: string,
+  guard: AsyncMutationGuard,
+) {
   const destDir = activeDir ? eventAssetDir(activeDir, "items") : "";
   if (!destDir) throw new Error("アクティブなイベントが選択されていません");
 
@@ -2620,8 +2867,10 @@ async function saveCatalogImageFromDataTransfer(dt: DataTransfer) {
     if (!IMAGE_EXTENSIONS.includes(ext)) return null;
     const fileName = catalogDropFileName(file.name);
     const buf = await file.arrayBuffer();
+    if (!guard.isCurrent()) return null;
     const bytes = Array.from(new Uint8Array(buf));
-    await invoke("save_image_bytes", { destDir, fileName, bytes });
+    await invokeActiveEventAssetWrite("save_image_bytes", { destDir, fileName, bytes });
+    if (!guard.isCurrent()) return null;
     const relativeFileName = eventRelativeAssetPath("items", fileName);
     return {
       fileName: relativeFileName,
@@ -2634,7 +2883,8 @@ async function saveCatalogImageFromDataTransfer(dt: DataTransfer) {
   if (isInternalAppImageUrl(imageUrl)) return null;
 
   const fileName = catalogDropFileName(fileNameFromUrl(imageUrl));
-  await invoke("download_image", { url: imageUrl, destDir, fileName });
+  await invokeActiveEventAssetWrite("download_image", { url: imageUrl, destDir, fileName });
+  if (!guard.isCurrent()) return null;
   const relativeFileName = eventRelativeAssetPath("items", fileName);
   return {
     fileName: relativeFileName,
@@ -3598,40 +3848,25 @@ function addCircleRow(insertIdx: number) {
   // tableStateも再構築
   tableState = circlesToTableState(eventJsonData);
   applyCircleMasterGenres();
+  eventTableBaseline = cloneJsonSnapshot(tableState);
   saveNow();
   renderCircleEditor();
 }
 
-/** サークルを削除（確認ダイアログ + 画像ファイル削除、circle_masterは残す） */
+/** サークルを削除（assetファイルとcircle_masterは保持） */
 async function deleteCircleRow(rowIdx: number) {
   if (!eventJsonData?.circles || rowIdx < 0 || rowIdx >= eventJsonData.circles.length)
     return;
   const c = eventJsonData.circles[rowIdx];
   const name = c.name || "(無題)";
-  if (!window.confirm(`サークル「${name}」を削除します。よろしいですか？\n\n(画像ファイルも削除されます。circle_masterのデータは残ります)`))
+  if (!window.confirm(`サークル「${name}」を削除します。よろしいですか？\n\n(画像ファイルとcircle_masterのデータは保持されます)`))
     return;
 
-  // 関連画像の物理削除
-  const root = projectRootEl.value.replace(/\\/g, "/");
-  const eventDir = getActiveEventDir();
-  const filesToDelete: string[] = [];
-  if (c.circle_cut_filename) filesToDelete.push(c.circle_cut_filename);
-  for (const img of c.item_images || []) {
-    if (img?.path) filesToDelete.push(img.path);
-  }
-  for (const fname of filesToDelete) {
-    // default_cut_* はデフォルトカット参照なので削除しない
-    if (fname.startsWith("default_cut_") || fname.includes("/default_cuts/")) continue;
-    const filePath =
-      fname.includes("/") || fname.includes("\\")
-        ? `${root}/${fname}`
-        : `${eventDir}/${fname}`;
-    try {
-      await invoke("delete_file", { filePath });
-    } catch {
-      /* 画像が既にない等は無視 */
-    }
-  }
+  const ownerSlug = activeEventSlug;
+  const documentBefore = cloneJsonSnapshot(eventJsonData);
+  const tableBefore = cloneJsonSnapshot(tableState);
+  const baselineBefore = cloneJsonSnapshot(eventTableBaseline);
+  const expandedBefore = expandedCircleIdx;
 
   // 配列から削除
   eventJsonData.circles.splice(rowIdx, 1);
@@ -3641,7 +3876,28 @@ async function deleteCircleRow(rowIdx: number) {
 
   tableState = circlesToTableState(eventJsonData);
   applyCircleMasterGenres();
-  saveNow();
+  eventTableBaseline = cloneJsonSnapshot(tableState);
+  const pendingSave = saveNow();
+  const deletionRevision = eventDocumentStateRevision;
+  const expectedDocument = cloneJsonSnapshot(eventJsonData);
+  const expectedTable = cloneJsonSnapshot(tableState);
+  const expectedBaseline = cloneJsonSnapshot(eventTableBaseline);
+  const saveResult = await pendingSave;
+  if (!saveResult.ok) {
+    if (
+      activeEventSlug === ownerSlug &&
+      eventDocumentStateRevision === deletionRevision &&
+      eventJsonDocumentsEqual(eventJsonData, expectedDocument) &&
+      JSON.stringify(tableState) === JSON.stringify(expectedTable) &&
+      JSON.stringify(eventTableBaseline) === JSON.stringify(expectedBaseline)
+    ) {
+      eventJsonData = documentBefore;
+      tableState = tableBefore;
+      eventTableBaseline = baselineBefore;
+      expandedCircleIdx = expandedBefore;
+      eventDocumentStateRevision += 1;
+    }
+  }
   renderCircleEditor();
 }
 
@@ -3806,7 +4062,10 @@ async function drainReprocessCircleQueue() {
   applyOperationEvent({ type: "start-reprocess" });
   setEventPipelineButtonsDisabled(true);
   try {
-    const initialSave = await saveNow();
+    const pendingCrawlMeta = captureCrawlMetaSnapshot();
+    cancelCrawlMetaSave();
+    await flushCrawlMetaSnapshot(pendingCrawlMeta, INTERNAL_OPERATION_SAVE);
+    const initialSave = await saveNow(INTERNAL_OPERATION_SAVE);
     if (!initialSave.ok) {
       resultEl.textContent = `1サークル再処理前の保存に失敗しました: ${String(initialSave.error)}`;
       reprocessCircleQueue.length = 0;
@@ -3819,7 +4078,7 @@ async function drainReprocessCircleQueue() {
         applyOperationEvent({ type: "dequeue-reprocess" });
         await runReprocessCircleJob(job);
       }
-      const finalSave = await saveNow();
+      const finalSave = await saveNow(INTERNAL_OPERATION_SAVE);
       if (!finalSave.ok) {
         resultEl.textContent = `1サークル再処理後の保存に失敗しました: ${String(finalSave.error)}`;
       }
@@ -3857,7 +4116,7 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
   }
 
   resultEl.textContent = `「${job.circleName}」の変更を保存中...`;
-  const saveResult = await saveNow();
+  const saveResult = await saveNow(INTERNAL_OPERATION_SAVE);
   if (!saveResult.ok) {
     resultEl.textContent = `「${job.circleName}」の変更保存に失敗しました: ${String(saveResult.error)}`;
     return;
@@ -3949,6 +4208,8 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
 async function reprocessCircleFromPostInteractive(rowIdx: number) {
   if (!eventJsonData?.circles || rowIdx < 0 || rowIdx >= eventJsonData.circles.length)
     return;
+  const guard = captureEventAsyncMutationGuard(rowIdx);
+  if (!guard) return;
   const c = eventJsonData.circles[rowIdx];
   const name = c.name || "(無題)";
 
@@ -3956,6 +4217,7 @@ async function reprocessCircleFromPostInteractive(rowIdx: number) {
   let defaultUrl = "";
   try {
     const text = await navigator.clipboard.readText();
+    if (!guard.isCurrent()) return;
     if (/(?:twitter\.com|x\.com)\/[^/]+\/status(?:es)?\/\d+/.test(text)) {
       defaultUrl = text.trim();
     }
@@ -3963,11 +4225,12 @@ async function reprocessCircleFromPostInteractive(rowIdx: number) {
     /* 権限エラー等は無視 */
   }
 
+  if (!guard.isCurrent()) return;
   const input = window.prompt(
     `「${name}」を再処理するXポストのURLを入力してください\n例: https://x.com/user/status/1234567890`,
     defaultUrl,
   );
-  if (!input) return;
+  if (!input || !guard.isCurrent()) return;
   const postUrl = input.trim();
   if (!/(?:twitter\.com|x\.com)\/[^/]+\/status(?:es)?\/\d+/.test(postUrl)) {
     alert("Xのポスト(ステータス)URLではありません。\n例: https://x.com/user/status/1234567890");
@@ -4002,14 +4265,19 @@ function enqueueReprocessCircleFromImage(
 }
 
 async function reprocessCircleFromImagePicker(rowIdx: number) {
+  const guard = captureEventAsyncMutationGuard(rowIdx);
+  if (!guard) return;
+  const activeDir = getActiveEventDir();
   const selected = await dialogOpen({
     multiple: false,
     filters: [{ name: "画像ファイル", extensions: IMAGE_EXTENSIONS }],
   });
+  if (!guard.isCurrent()) return;
   if (!selected || typeof selected !== "string") return;
 
   try {
-    const saved = await saveCatalogImageFromPath(selected);
+    const saved = await saveCatalogImageFromPath(selected, activeDir, guard);
+    if (!saved || !guard.isCurrent()) return;
     enqueueReprocessCircleFromImage(rowIdx, saved.fileName, saved.filePath);
   } catch (err) {
     const msg = `画像からの再処理準備に失敗: ${String(err)}`;
@@ -4019,9 +4287,12 @@ async function reprocessCircleFromImagePicker(rowIdx: number) {
 }
 
 async function reprocessCircleFromDroppedImage(rowIdx: number, dt: DataTransfer) {
+  const guard = captureEventAsyncMutationGuard(rowIdx);
+  if (!guard) return;
+  const activeDir = getActiveEventDir();
   try {
-    const saved = await saveCatalogImageFromDataTransfer(dt);
-    if (!saved) return;
+    const saved = await saveCatalogImageFromDataTransfer(dt, activeDir, guard);
+    if (!saved || !guard.isCurrent()) return;
     enqueueReprocessCircleFromImage(rowIdx, saved.fileName, saved.filePath);
   } catch (err) {
     const msg = `画像からの再処理準備に失敗: ${String(err)}`;
@@ -4222,23 +4493,32 @@ function attachItemPanelListeners() {
           showImageModal(resolveImageSrc(currentImg));
         } else {
           // 画像なし → ファイル選択
+          const guard = captureEventAsyncMutationGuard(ci, ii);
+          if (!guard) return;
+          const activeEv = activeEventSlug
+            ? eventList.find((ev) => ev.slug === activeEventSlug)
+            : null;
+          const destDir = activeEv?.dir
+            ? eventAssetDir(activeEv.dir, "items")
+            : "";
           const selected = await dialogOpen({
             multiple: false,
             filters: [{ name: "画像ファイル", extensions: IMAGE_EXTENSIONS }],
           });
+          if (!guard.isCurrent()) return;
           if (selected && typeof selected === "string") {
             const fileName =
               selected.replace(/\\/g, "/").split("/").pop() || selected;
-            const activeEv = activeEventSlug
-              ? eventList.find((ev) => ev.slug === activeEventSlug)
-              : null;
-            const destDir = activeEv?.dir ? eventAssetDir(activeEv.dir, "items") : "";
             try {
-              await invoke("copy_file_to_dir", {
+              await invokeActiveEventAssetWrite("copy_file_to_dir", {
                 sourcePath: selected,
                 destDir,
               });
-            } catch {}
+            } catch (error) {
+              resultEl.textContent = `画像コピー失敗: ${String(error)}`;
+              return;
+            }
+            if (!guard.isCurrent()) return;
             c.items[ii].image = eventRelativeAssetPath("items", fileName);
             saveNow();
             toggleItemPanelInPlace();
@@ -4290,25 +4570,32 @@ function attachItemPanelListeners() {
           replaceItem.textContent = "差し替え";
           replaceItem.addEventListener("click", async () => {
             menu.remove();
+            const guard = captureEventAsyncMutationGuard(ci, ii);
+            if (!guard) return;
+            const activeEv = activeEventSlug
+              ? eventList.find((ev) => ev.slug === activeEventSlug)
+              : null;
+            const destDir = activeEv?.dir
+              ? eventAssetDir(activeEv.dir, "items")
+              : "";
             const selected = await dialogOpen({
               multiple: false,
               filters: [{ name: "画像ファイル", extensions: IMAGE_EXTENSIONS }],
             });
+            if (!guard.isCurrent()) return;
             if (selected && typeof selected === "string") {
               const fileName =
                 selected.replace(/\\/g, "/").split("/").pop() || selected;
-              const activeEv = activeEventSlug
-                ? eventList.find((ev) => ev.slug === activeEventSlug)
-                : null;
-              const destDir = activeEv?.dir
-                ? eventAssetDir(activeEv.dir, "items")
-                : "";
               try {
-                await invoke("copy_file_to_dir", {
+                await invokeActiveEventAssetWrite("copy_file_to_dir", {
                   sourcePath: selected,
                   destDir,
                 });
-              } catch {}
+              } catch (error) {
+                resultEl.textContent = `画像コピー失敗: ${String(error)}`;
+                return;
+              }
+              if (!guard.isCurrent()) return;
               c.items[ii].image = eventRelativeAssetPath("items", fileName);
               saveNow();
               toggleItemPanelInPlace();
@@ -4530,6 +4817,9 @@ function setEventPipelineButtonsDisabled(disabled: boolean): void {
   applyOperationEvent({ type: "request-pipeline" });
   setEventPipelineButtonsDisabled(true);
   try {
+  const pendingCrawlMeta = captureCrawlMetaSnapshot();
+  cancelCrawlMetaSave();
+  await flushCrawlMetaSnapshot(pendingCrawlMeta, INTERNAL_OPERATION_SAVE);
   const eventSlug = activeEventSlug;
   const outputDir = getActiveEventDir();
   const eventFile = (
@@ -4551,7 +4841,7 @@ function setEventPipelineButtonsDisabled(disabled: boolean): void {
   }
 
   // 画面上の編集内容をevent.jsonへ反映してから、未取得サークルだけを再処理する。
-  const initialSave = await saveNow();
+  const initialSave = await saveNow(INTERNAL_OPERATION_SAVE);
   if (!initialSave.ok) {
     resultEl.textContent = `実行前のevent.json保存に失敗しました: ${String(initialSave.error)}`;
     return;
@@ -4578,7 +4868,9 @@ function setEventPipelineButtonsDisabled(disabled: boolean): void {
   const processingLog = resultEl.textContent;
   const shouldReloadSelectedEvent = activeEventSlug === eventSlug;
   await loadEventList();
-  if (shouldReloadSelectedEvent) await selectEvent(eventSlug);
+  if (shouldReloadSelectedEvent) {
+    await selectEvent(eventSlug, INTERNAL_OPERATION_SAVE);
+  }
   resultEl.textContent = processingLog;
   } finally {
     if (isPipelineOperation(operationState)) {
@@ -4836,7 +5128,10 @@ function isValidEventDate(value: unknown): value is string {
   applyOperationEvent({ type: "request-pipeline" });
   setEventPipelineButtonsDisabled(true);
   try {
-  const initialSave = await saveNow();
+  const pendingCrawlMeta = captureCrawlMetaSnapshot();
+  cancelCrawlMetaSave();
+  await flushCrawlMetaSnapshot(pendingCrawlMeta, INTERNAL_OPERATION_SAVE);
+  const initialSave = await saveNow(INTERNAL_OPERATION_SAVE);
   if (!initialSave.ok) {
     resultEl.textContent = `実行前のevent.json保存に失敗しました: ${String(initialSave.error)}`;
     return;
@@ -4877,13 +5172,15 @@ function isValidEventDate(value: unknown): value is string {
           ? generateSlugFromName(payload.event_name, payload.event_date)
           : `new_event_${ts}`;
         try {
-          const res = await invoke<{ status: string; dir: string }>(
-            "create_event_dir",
-            { projectRoot: projectRootEl.value, slug: newSlug },
-          );
-          await invoke("write_event_meta", {
-            eventDir: res.dir,
-            meta: {
+          const res = await runEventDocumentSerial(async () => {
+            const created = await invoke<{ status: string; dir: string }>(
+              "create_event_dir",
+              { projectRoot: projectRootEl.value, slug: newSlug },
+            );
+            eventLifecycleGate.open(eventMetaOwnerKey(newSlug, created.dir));
+            await writeEventMetaSnapshot(
+              { slug: newSlug, dir: created.dir },
+              {
               name: isPlaceholderEventName(payload.event_name)
                 ? NEW_EVENT_NAME
                 : payload.event_name,
@@ -4892,10 +5189,13 @@ function isValidEventDate(value: unknown): value is string {
               event_urls: formUrls,
               created_at: new Date().toISOString(),
               source: "desktop_created",
-            },
+              },
+              { requireListedOwner: false, commitToEventList: false },
+            );
+            await loadEventList();
+            return created;
           });
-          await loadEventList();
-          await selectEvent(newSlug);
+          await selectEvent(newSlug, INTERNAL_OPERATION_SAVE);
           payload.output_dir = res.dir;
         } catch (e) {
           resultEl.textContent = `新規イベント作成エラー: ${String(e)}`;
@@ -4903,14 +5203,17 @@ function isValidEventDate(value: unknown): value is string {
         }
       }
       if (choice === "overwrite" && ev) {
-        ev.meta.event_url = formUrls[0];
-        ev.meta.event_urls = formUrls;
+        const nextMeta = {
+          ...cloneJsonSnapshot(ev.meta),
+          event_url: formUrls[0],
+          event_urls: formUrls,
+        };
         try {
-          await invoke("write_event_meta", {
-            eventDir: ev.dir,
-            meta: ev.meta,
-          });
-        } catch {}
+          await writeEventMetaSnapshot(ev, nextMeta);
+        } catch (error) {
+          resultEl.textContent = `イベントURL保存エラー: ${String(error)}`;
+          return;
+        }
       }
     }
   }
@@ -4925,19 +5228,21 @@ function isValidEventDate(value: unknown): value is string {
     if (ev) {
       const mapInput = (document.getElementById("mapUrl") as HTMLTextAreaElement).value;
       const mapConfig = parseEventMapConfig(mapInput, payload.urls || []);
-      ev.meta.event_url = payload.url || undefined;
-      ev.meta.event_urls = payload.urls?.length ? payload.urls : undefined;
-      ev.meta.map_config =
-        (payload.urls?.length || 0) > 1 ? mapInput || undefined : undefined;
-      ev.meta.map_url = mapConfig.allMapUrls[0] || mapInput || undefined;
-      ev.meta.additional_prompt =
-        payload.catalog_additional_prompt || undefined;
+      const nextMeta = {
+        ...cloneJsonSnapshot(ev.meta),
+        event_url: payload.url || undefined,
+        event_urls: payload.urls?.length ? payload.urls : undefined,
+        map_config:
+          (payload.urls?.length || 0) > 1 ? mapInput || undefined : undefined,
+        map_url: mapConfig.allMapUrls[0] || mapInput || undefined,
+        additional_prompt: payload.catalog_additional_prompt || undefined,
+      };
       try {
-        await invoke("write_event_meta", {
-          eventDir: ev.dir,
-          meta: ev.meta,
-        });
-      } catch {}
+        await writeEventMetaSnapshot(ev, nextMeta);
+      } catch (error) {
+        resultEl.textContent = `クロール情報保存エラー: ${String(error)}`;
+        return;
+      }
     }
   }
 
@@ -4947,7 +5252,10 @@ function isValidEventDate(value: unknown): value is string {
     await loadEventList();
     if (activeEventSlug) {
       const completedEventSlug = activeEventSlug;
-      const reloadSucceeded = await selectEvent(completedEventSlug);
+      const reloadSucceeded = await selectEvent(
+        completedEventSlug,
+        INTERNAL_OPERATION_SAVE,
+      );
       if (
         !reloadSucceeded ||
         !isActiveEventDocumentOwned(completedEventSlug)
@@ -5018,7 +5326,10 @@ function isValidEventDate(value: unknown): value is string {
   await loadEventList();
   if (activeEventSlug) {
     const completedEventSlug = activeEventSlug;
-    const reloadSucceeded = await selectEvent(completedEventSlug);
+    const reloadSucceeded = await selectEvent(
+      completedEventSlug,
+      INTERNAL_OPERATION_SAVE,
+    );
     if (
       !reloadSucceeded ||
       !isActiveEventDocumentOwned(completedEventSlug)
@@ -5040,7 +5351,7 @@ function isValidEventDate(value: unknown): value is string {
       );
       if (newSlug) {
         await loadEventList();
-        await selectEvent(newSlug);
+        await selectEvent(newSlug, INTERNAL_OPERATION_SAVE);
       }
     }
   }
@@ -5233,6 +5544,9 @@ function cancelAutoSave(): void {
 }
 
 function scheduleAutoSave() {
+  if (isMapAutoOperation(operationState)) return;
+  // input/change時点でrevisionを進め、同時進行中のload commitを拒否する。
+  markEventDocumentMutated();
   const generation = ++autoSaveRequestGeneration;
   if (autoSaveTimer) clearTimeout(autoSaveTimer);
   const scheduledEventSlug = activeEventSlug;
@@ -6072,6 +6386,10 @@ function initShortcuts() {
     }
     // Ctrl+Z: 画像Undo（1段階バッファ）
     if (e.ctrlKey && e.key === "z" && !e.altKey && !e.shiftKey && !e.metaKey) {
+      if (isMapAutoOperation(operationState)) {
+        e.preventDefault();
+        return;
+      }
       // inputにフォーカス中はブラウザのUndoを優先
       const ae = document.activeElement;
       if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) return;
@@ -6079,32 +6397,12 @@ function initShortcuts() {
         e.preventDefault();
         const undo = imageUndoBuffer;
         imageUndoBuffer = null;
-        // 現在の画像（新しく設定されたもの）を取得
-        const currentVal = String(
-          tableState.rows[undo.row][undo.col] ?? "",
-        ).trim();
         // 元の画像を復元
         tableState.rows[undo.row][undo.col] = undo.oldFileName;
         saveNow();
         const src = resolveImageSrc(undo.oldFileName);
         undo.cell.innerHTML = `<img src="${escapeHtml(src)}" alt="" class="img-block" data-fallback="outerhtml" data-fallback-html="<span class='text-red-500 text-xs cursor-pointer'>読込失敗</span>" />`;
-        // 新しい画像ファイルを削除
-        if (
-          currentVal &&
-          currentVal !== undo.oldFileName &&
-          !currentVal.startsWith("http")
-        ) {
-          const root = projectRootEl.value.replace(/\\/g, "/");
-          const activeEvUndo = activeEventSlug
-            ? eventList.find((ev) => ev.slug === activeEventSlug)
-            : null;
-          const imgDirUndo = activeEvUndo?.dir ?? "";
-          const undoPath =
-            currentVal.includes("/") || currentVal.includes("\\")
-              ? `${root}/${currentVal}`
-              : `${imgDirUndo}/${currentVal}`;
-          invoke("delete_file", { filePath: undoPath }).catch(() => {});
-        }
+        // 新しい画像の参照だけを解除し、assetファイルは回復用に保持する。
         return;
       }
     }
@@ -6303,7 +6601,14 @@ let mapColorFilter: Record<string, boolean> = {
   "15": true,
   none: true,
 };
-let mapImagePaths: { name: string; path: string }[] = [];
+let mapImagePaths: EventMapImage[] = [];
+// 同一owner/mapへの物理writeを要求順に完了させ、後発bytesを必ず最後にする。
+const mapImageMutationSerial = new KeyedSerialExecutor();
+const eventImageMutationSerial = new KeyedSerialExecutor();
+// Image.onload/onerrorの後着完了を無効化する世代。
+let mapImageLoadGeneration = 0;
+let mapImageRefreshGeneration = 0;
+let mapAutoPlacementGeneration = 0;
 let mapPlacingRow = -1; // 配置モード中のサークル行番号（-1=非配置モード）
 let mapPinWidth = 77;
 let mapPinHeight = 24;
@@ -6335,6 +6640,33 @@ function mapNumberFromName(name: string): number | null {
   if (!match) return null;
   const num = Number.parseInt(match[1], 10);
   return Number.isFinite(num) && num > 0 ? num : null;
+}
+
+function preferredEventMapReferences(
+  data: EventJsonData | null = eventJsonData,
+  explicitReference = "",
+): string[] {
+  const byNumber = new Map<number, string>();
+  const maps = Array.isArray(data?.event?.maps) ? data.event.maps : [];
+  for (const entry of maps) {
+    const reference =
+      typeof entry === "string"
+        ? entry
+        : typeof entry?.filename === "string"
+          ? entry.filename
+          : "";
+    const number = mapNumberFromName(
+      reference.replace(/\\/g, "/").split("/").pop() || "",
+    );
+    if (number && reference) byNumber.set(number, reference);
+  }
+  if (explicitReference) {
+    const number = mapNumberFromName(
+      explicitReference.replace(/\\/g, "/").split("/").pop() || "",
+    );
+    if (number) byNumber.set(number, explicitReference);
+  }
+  return Array.from(byNumber.values());
 }
 
 function getMapNumbers(): number[] {
@@ -6404,6 +6736,10 @@ function rebuildMapNumberSelect(preferred?: number) {
 function syncEventMapMetadata() {
   if (!eventJsonData) return;
   if (!eventJsonData.event) eventJsonData.event = {};
+  mapImagePaths = selectActiveMapImages(
+    mapImagePaths,
+    preferredEventMapReferences(eventJsonData),
+  );
   eventJsonData.event.maps = mapImagePaths
     .map((m) => ({
       filename: eventRelativeAssetPath("maps", m.name),
@@ -6412,20 +6748,34 @@ function syncEventMapMetadata() {
     .sort((a, b) => a.map_number - b.map_number);
 }
 
-async function refreshMapImages(preferred?: number) {
+async function refreshMapImages(
+  preferred?: number,
+  explicitReference = "",
+) {
+  const generation = ++mapImageRefreshGeneration;
+  const owner = captureActiveEventDocumentOwner();
+  const isCurrentRequest = () =>
+    generation === mapImageRefreshGeneration &&
+    isActiveEventDocumentOwner(owner);
   try {
     const activeDir = getActiveEventDir();
+    const preferredRefs = preferredEventMapReferences(
+      eventJsonData,
+      explicitReference,
+    );
     const res = activeDir
       ? await invoke<{
           status: string;
-          maps: { name: string; path: string }[];
-        }>("list_event_map_images", { eventDir: activeDir })
+          maps: EventMapImage[];
+        }>("list_event_map_images", { eventDir: activeDir, preferredRefs })
       : await invoke<{
           status: string;
-          maps: { name: string; path: string }[];
+          maps: EventMapImage[];
         }>("list_map_images", { projectRoot: projectRootEl.value });
-    mapImagePaths = res.maps || [];
+    if (!isCurrentRequest()) return;
+    mapImagePaths = selectActiveMapImages(res.maps || [], preferredRefs);
   } catch {
+    if (!isCurrentRequest()) return;
     mapImagePaths = [];
   }
   rebuildMapNumberSelect(preferred);
@@ -6978,6 +7328,7 @@ function renderMapCircleList() {
 }
 
 async function initMapEditor() {
+  const owner = captureActiveEventDocumentOwner();
   // マップ画像一覧を取得
   try {
     const activeEvInit = activeEventSlug
@@ -6986,14 +7337,22 @@ async function initMapEditor() {
     const res = activeEvInit
       ? await invoke<{
           status: string;
-          maps: { name: string; path: string }[];
-        }>("list_event_map_images", { eventDir: activeEvInit.dir })
+          maps: EventMapImage[];
+        }>("list_event_map_images", {
+          eventDir: activeEvInit.dir,
+          preferredRefs: preferredEventMapReferences(),
+        })
       : await invoke<{
           status: string;
-          maps: { name: string; path: string }[];
+          maps: EventMapImage[];
         }>("list_map_images", { projectRoot: projectRootEl.value });
-    mapImagePaths = res.maps || [];
+    if (!isActiveEventDocumentOwner(owner)) return;
+    mapImagePaths = selectActiveMapImages(
+      res.maps || [],
+      preferredEventMapReferences(),
+    );
   } catch {
+    if (!isActiveEventDocumentOwner(owner)) return;
     mapImagePaths = [];
   }
 
@@ -7094,8 +7453,16 @@ async function initMapEditor() {
 }
 
 function loadMapImage() {
+  const generation = ++mapImageLoadGeneration;
+  const owner = captureActiveEventDocumentOwner();
+  const selectedMapNumber = currentMapNumber();
   const imgPath = getMapImagePath();
   const src = convertFileSrc(imgPath);
+  const isCurrentLoad = () =>
+    generation === mapImageLoadGeneration &&
+    isActiveEventDocumentOwner(owner) &&
+    currentMapNumber() === selectedMapNumber &&
+    normalizeEventPath(getMapImagePath()) === normalizeEventPath(imgPath);
   logToFile(
     `マップ画像読み込み: path=${imgPath}, src=${src}, mapImages=${JSON.stringify(mapImagePaths)}`,
   );
@@ -7106,6 +7473,7 @@ function loadMapImage() {
 
   const img = new Image();
   img.onload = () => {
+    if (!isCurrentLoad()) return;
     mapImgWidth = img.naturalWidth;
     mapImgHeight = img.naturalHeight;
     // 高DPIでもCSS上で正確なサイズで表示されるよう明示指定
@@ -7119,6 +7487,7 @@ function loadMapImage() {
     renderMapPins();
   };
   img.onerror = () => {
+    if (!isCurrentLoad()) return;
     logToFile(`マップ画像読み込み失敗: path=${imgPath}, src=${src}`);
     mapImgWidth = 0;
     mapImgHeight = 0;
@@ -7272,88 +7641,137 @@ function resolveEventAssetFilePath(eventDir: string, ref: string): string {
   return baseDir ? `${baseDir}/${normalized}` : normalized;
 }
 
-async function deleteOtherMapFiles(num: number, keepName: string) {
-  const existing = mapImagePaths.filter(
-    (m) => mapNumberFromName(m.name) === num && m.name !== keepName,
-  );
-  await Promise.all(
-    existing.map((m) =>
-      invoke("delete_file", { filePath: m.path }).catch(() => undefined),
-    ),
-  );
-}
-
-async function saveMapImageFromPath(sourcePath: string, num: number) {
-  const activeDir = getActiveEventDir();
+async function saveMapImageFromPath(
+  sourcePath: string,
+  num: number,
+  capturedEventDir = getActiveEventDir(),
+) {
+  markEventDocumentMutated();
+  const owner = captureActiveEventDocumentOwner();
+  const activeDir = capturedEventDir;
   const destDir = activeDir ? eventAssetDir(activeDir, "maps") : "";
   if (!destDir) throw new Error("イベントフォルダが選択されていません");
   const destName = mapFileNameFor(num, imageExtFromName(sourcePath));
-  await invoke("copy_file_as", {
-    sourcePath,
-    destDir,
-    fileName: destName,
+  const serialKey = `${owner.slug ?? ""}\n${owner.path}\n${num}`;
+  await mapImageMutationSerial.run(serialKey, async () => {
+    if (!isActiveEventDocumentOwner(owner)) return;
+    await invokeActiveEventAssetWrite("copy_file_as", {
+      sourcePath,
+      destDir,
+      fileName: destName,
+    });
+    if (!isActiveEventDocumentOwner(owner)) return;
+    await refreshMapImages(num, eventRelativeAssetPath("maps", destName));
+    if (!isActiveEventDocumentOwner(owner)) return;
+    syncEventMapMetadata();
+    await saveNow();
+    if (!isActiveEventDocumentOwner(owner)) return;
+    loadMapImage();
   });
-  await deleteOtherMapFiles(num, destName);
-  await refreshMapImages(num);
-  syncEventMapMetadata();
-  saveNow();
-  loadMapImage();
 }
 
 async function saveMapImageFromDataTransfer(dt: DataTransfer, num: number) {
+  markEventDocumentMutated();
+  const owner = captureActiveEventDocumentOwner();
   const activeDir = getActiveEventDir();
   const destDir = activeDir ? eventAssetDir(activeDir, "maps") : "";
   if (!destDir) throw new Error("イベントフォルダが選択されていません");
-
-  if (dt.files && dt.files.length > 0) {
-    const file = dt.files[0];
-    const ext = imageExtFromName(file.name);
-    const destName = mapFileNameFor(num, ext);
-    const buf = await file.arrayBuffer();
-    const bytes = Array.from(new Uint8Array(buf));
-    await invoke("save_image_bytes", { destDir, fileName: destName, bytes });
-    await deleteOtherMapFiles(num, destName);
-    await refreshMapImages(num);
+  const droppedFile = dt.files && dt.files.length > 0 ? dt.files[0] : null;
+  const droppedUrl = droppedFile ? "" : imageUrlFromDataTransfer(dt);
+  const serialKey = `${owner.slug ?? ""}\n${owner.path}\n${num}`;
+  await mapImageMutationSerial.run(serialKey, async () => {
+    if (!isActiveEventDocumentOwner(owner)) return;
+    let destName = "";
+    if (droppedFile) {
+      destName = mapFileNameFor(num, imageExtFromName(droppedFile.name));
+      const buf = await droppedFile.arrayBuffer();
+      if (!isActiveEventDocumentOwner(owner)) return;
+      const bytes = Array.from(new Uint8Array(buf));
+      await invokeActiveEventAssetWrite("save_image_bytes", { destDir, fileName: destName, bytes });
+    } else {
+      const imageUrl = droppedUrl;
+      if (!imageUrl || isInternalAppImageUrl(imageUrl)) return;
+      destName = mapFileNameFor(
+        num,
+        imageExtFromName(fileNameFromUrl(imageUrl)),
+      );
+      await invokeActiveEventAssetWrite("download_image", { url: imageUrl, destDir, fileName: destName });
+    }
+    if (!isActiveEventDocumentOwner(owner)) return;
+    await refreshMapImages(num, eventRelativeAssetPath("maps", destName));
+    if (!isActiveEventDocumentOwner(owner)) return;
     syncEventMapMetadata();
-    saveNow();
+    await saveNow();
+    if (!isActiveEventDocumentOwner(owner)) return;
     loadMapImage();
-    return;
-  }
-
-  const imageUrl = imageUrlFromDataTransfer(dt);
-  if (!imageUrl || isInternalAppImageUrl(imageUrl)) return;
-  const destName = mapFileNameFor(num, imageExtFromName(fileNameFromUrl(imageUrl)));
-  await invoke("download_image", { url: imageUrl, destDir, fileName: destName });
-  await deleteOtherMapFiles(num, destName);
-  await refreshMapImages(num);
-  syncEventMapMetadata();
-  saveNow();
-  loadMapImage();
+  });
 }
 
 async function runMapAutoPlacement(useCalibration: boolean) {
+  const generation = ++mapAutoPlacementGeneration;
+  if (!canStartMapAuto(operationState)) {
+    resultEl.textContent =
+      "別のイベント処理を実行中です。完了後にマップ自動配置を再実行してください。";
+    return;
+  }
   const eventDir = getActiveEventDir();
   const eventJsonPath = getActiveEventJsonPath();
   if (!eventDir || !eventJsonPath) {
     resultEl.textContent = "サイドバーでイベントを選択してください";
     return;
   }
-  const saveResult = await saveNow();
-  if (!saveResult.ok) {
-    resultEl.textContent = `マップ処理前のevent.json保存に失敗しました: ${String(saveResult.error)}`;
-    return;
-  }
-  const mapNumber = currentMapNumber();
   const autoBtn = document.getElementById("mapAutoPlaceBtn") as HTMLButtonElement;
   const calibrationBtn = document.getElementById(
     "mapReprocessWithCalibrationBtn",
   ) as HTMLButtonElement;
+  applyOperationEvent({ type: "request-map-auto" });
+  markEventDocumentMutated();
+  const mutationTabs = ["sidebar", "tab-crawl", "tab-edit", "tab-map"]
+    .map((id) => document.getElementById(id) as HTMLElement | null)
+    .filter((tab): tab is HTMLElement => Boolean(tab));
+  mutationTabs.forEach((tab) => {
+    tab.inert = true;
+  });
   autoBtn.disabled = true;
   calibrationBtn.disabled = true;
-  resultEl.textContent = useCalibration
-    ? `マップ ${mapNumber} を校正点で再処理中...`
-    : `マップ ${mapNumber} のピンを自動配置中...`;
+  let backendSucceeded = false;
+  let reloadCommitted = false;
   try {
+    const crawlSnapshot = captureCrawlMetaSnapshot();
+    cancelCrawlMetaSave();
+    await flushCrawlMetaSnapshot(crawlSnapshot, INTERNAL_OPERATION_SAVE);
+    const pendingSave = saveNow(INTERNAL_OPERATION_SAVE);
+    // saveNowは最初のawaitまでにsnapshot/revisionを確定する。
+    const saveRevision = eventDocumentStateRevision;
+    const saveResult = await pendingSave;
+    if (!saveResult.ok) {
+      resultEl.textContent = `マップ処理前のevent.json保存に失敗しました: ${String(saveResult.error)}`;
+      return;
+    }
+    await eventSaveQueue.flush();
+    if (eventDocumentStateRevision !== saveRevision) {
+      resultEl.textContent =
+        "マップ処理前の保存中に編集されたため、自動配置を中止しました。もう一度実行してください。";
+      return;
+    }
+    const owner = captureActiveEventDocumentOwner();
+    const ownerRevision = eventDocumentStateRevision;
+    const isCurrentOperation = () =>
+      generation === mapAutoPlacementGeneration &&
+      isActiveEventDocumentOwner(owner) &&
+      eventDocumentStateRevision === ownerRevision &&
+      isMapAutoOperation(operationState);
+    const reportDiscarded = () => {
+      if (generation === mapAutoPlacementGeneration) {
+        resultEl.textContent =
+          "自動配置中にイベント切替または編集があったため、取得結果を画面へ反映しませんでした。";
+      }
+    };
+    const mapNumber = currentMapNumber();
+    resultEl.textContent = useCalibration
+      ? `マップ ${mapNumber} を校正点で再処理中...`
+      : `マップ ${mapNumber} のピンを自動配置中...`;
+    applyOperationEvent({ type: "map-auto-started" });
     const response = await runJob("auto_place_map_pins", {
       event_dir: eventDir,
       event_json: eventJsonPath,
@@ -7367,19 +7785,54 @@ async function runMapAutoPlacement(useCalibration: boolean) {
       return;
     }
 
-    const reload = await invokeBridgeJob<Record<string, unknown>>(
-      "load_event_json",
-      { event_json: eventJsonPath },
-      currentBridgeJobOptions(),
-    );
-    const reloadBridge = reload?.bridge as Record<string, any> | undefined;
-    if (reload?.ok && reloadBridge?.status === "ok") {
-      eventJsonData = reloadBridge.data || null;
-      tableState = eventJsonData
-        ? circlesToTableState(eventJsonData)
-        : { headers: [], rows: [] };
-      renderCircleEditorAndMap();
+    const reloadBridge = await retryUntilValue<Record<string, any>>({
+      attempt: async () => {
+        try {
+          const reload = await invokeBridgeJob<Record<string, unknown>>(
+            "load_event_json",
+            { event_json: eventJsonPath },
+            currentBridgeJobOptions(),
+          );
+          const candidate = reload?.bridge as Record<string, any> | undefined;
+          return reload?.ok && candidate?.status === "ok" && candidate.data
+            ? candidate
+            : null;
+        } catch {
+          return null;
+        }
+      },
+      onFailure: (retryCount) => {
+        if (operationState.kind === "map-auto-running") {
+          applyOperationEvent({ type: "map-auto-reload-failed" });
+        }
+        resultEl.textContent =
+          `自動配置結果の再読み込みに失敗しました。編集と保存をロックしたまま再試行します (${retryCount})...`;
+      },
+      wait: async () => {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 1500));
+        if (operationState.kind === "map-auto-recovery") {
+          applyOperationEvent({ type: "retry-map-auto-reload" });
+        }
+      },
+    });
+    if (!isCurrentOperation()) {
+      reportDiscarded();
+      return;
     }
+    backendSucceeded = true;
+    if (!isCurrentOperation()) {
+      resultEl.textContent =
+        "自動配置後の所有状態が一致しません。編集と保存をロックしたまま再読み込みが必要です。";
+      return;
+    }
+    eventJsonData = reloadBridge.data;
+    tableState = circlesToTableState(eventJsonData);
+    persistedEventJsonData = cloneJsonSnapshot(eventJsonData);
+    eventTableBaseline = cloneJsonSnapshot(tableState);
+    markEventDocumentMutated();
+    renderCircleEditorAndMap();
+    await eventSaveQueue.flush();
+    reloadCommitted = true;
     const calibration = bridge.calibration as Record<string, any> | undefined;
     const calibrationText = calibration?.applied
       ? ` / 校正: ${calibration.mode} ${calibration.points}点`
@@ -7388,22 +7841,35 @@ async function runMapAutoPlacement(useCalibration: boolean) {
   } catch (err) {
     resultEl.textContent = `マップピン自動配置エラー: ${String(err)}`;
   } finally {
-    autoBtn.disabled = false;
-    calibrationBtn.disabled = false;
+    const mayUnlock = !backendSucceeded || reloadCommitted;
+    if (mayUnlock && isMapAutoOperation(operationState)) {
+      applyOperationEvent({ type: "finish-map-auto" });
+    }
+    if (mayUnlock) {
+      mutationTabs.forEach((tab) => {
+        tab.inert = false;
+      });
+      autoBtn.disabled = false;
+      calibrationBtn.disabled = false;
+    }
   }
 }
 
 (
   document.getElementById("mapChangeImgBtn") as HTMLButtonElement
 ).addEventListener("click", async () => {
+  const guard = captureEventAsyncMutationGuard();
+  if (!guard) return;
+  const capturedEventDir = getActiveEventDir();
+  const num = currentMapNumber() || 1;
   const selected = await dialogOpen({
     multiple: false,
     filters: [{ name: "画像ファイル", extensions: IMAGE_EXTENSIONS }],
   });
+  if (!guard.isCurrent()) return;
   if (selected && typeof selected === "string") {
-    const num = currentMapNumber() || 1;
     try {
-      await saveMapImageFromPath(selected, num);
+      await saveMapImageFromPath(selected, num, capturedEventDir);
     } catch (err) {
       resultEl.textContent = `マップ画像コピー失敗: ${String(err)}`;
       return;
@@ -7416,14 +7882,18 @@ async function runMapAutoPlacement(useCalibration: boolean) {
 (
   document.getElementById("mapAddImgBtn") as HTMLButtonElement
 ).addEventListener("click", async () => {
+  const guard = captureEventAsyncMutationGuard();
+  if (!guard) return;
+  const capturedEventDir = getActiveEventDir();
+  const num = nextMapNumber();
   const selected = await dialogOpen({
     multiple: false,
     filters: [{ name: "画像ファイル", extensions: IMAGE_EXTENSIONS }],
   });
+  if (!guard.isCurrent()) return;
   if (selected && typeof selected === "string") {
-    const num = nextMapNumber();
     try {
-      await saveMapImageFromPath(selected, num);
+      await saveMapImageFromPath(selected, num, capturedEventDir);
     } catch (err) {
       resultEl.textContent = `マップ画像追加失敗: ${String(err)}`;
     }
@@ -7503,22 +7973,29 @@ document.addEventListener("paste", async (e) => {
       e.preventDefault();
       const blob = items[i].getAsFile();
       if (!blob) continue;
-      const ext = blob.type.split("/")[1] || "png";
-      const fileName = `paste_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      const buf = await blob.arrayBuffer();
-      const bytes = Array.from(new Uint8Array(buf));
+      const row = Number(focusedCell.dataset.row);
+      const col = String(focusedCell.dataset.col);
+      const guard = captureEventAsyncMutationGuard(row);
+      if (!guard) return;
       const activeEvPaste = activeEventSlug
         ? eventList.find((ev) => ev.slug === activeEventSlug)
         : null;
-      const col = String(focusedCell.dataset.col);
       const subdir = imageColumnAssetSubdir(col);
       const destDir = activeEvPaste?.dir
         ? eventAssetDir(activeEvPaste.dir, subdir)
         : "";
+      const ext = blob.type.split("/")[1] || "png";
+      const fileName = `paste_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const buf = await blob.arrayBuffer();
+      if (!guard.isCurrent()) return;
+      const bytes = Array.from(new Uint8Array(buf));
       try {
-        await invoke("save_image_bytes", { destDir, fileName, bytes });
-      } catch {}
-      const row = Number(focusedCell.dataset.row);
+        await invokeActiveEventAssetWrite("save_image_bytes", { destDir, fileName, bytes });
+      } catch (error) {
+        resultEl.textContent = `画像保存失敗: ${String(error)}`;
+        return;
+      }
+      if (!guard.isCurrent()) return;
       applyImageToCell(
         focusedCell,
         row,
@@ -7587,6 +8064,8 @@ document.addEventListener("drop", async (e) => {
   if (!dt) return;
   const row = Number(cell.dataset.row);
   const col = String(cell.dataset.col);
+  const guard = captureEventAsyncMutationGuard(row);
+  if (!guard) return;
   const activeEvDrop = activeEventSlug
     ? eventList.find((e) => e.slug === activeEventSlug)
     : null;
@@ -7599,15 +8078,20 @@ document.addEventListener("drop", async (e) => {
     const ext = file.name.split(".").pop()?.toLowerCase() || "";
     if (!IMAGE_EXTENSIONS.includes(ext)) return;
     const buf = await file.arrayBuffer();
+    if (!guard.isCurrent()) return;
     const bytes = Array.from(new Uint8Array(buf));
     const uniqueFileName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${file.name}`;
     try {
-      await invoke("save_image_bytes", {
+      await invokeActiveEventAssetWrite("save_image_bytes", {
         destDir,
         fileName: uniqueFileName,
         bytes,
       });
-    } catch {}
+    } catch (error) {
+      resultEl.textContent = `画像保存失敗: ${String(error)}`;
+      return;
+    }
+    if (!guard.isCurrent()) return;
     applyImageToCell(
       cell,
       row,
@@ -7621,17 +8105,17 @@ document.addEventListener("drop", async (e) => {
   const imageUrl = imageUrlFromDataTransfer(dt);
   if (!imageUrl) return;
   if (isInternalAppImageUrl(imageUrl)) return;
-
   const rawFileName = fileNameFromUrl(imageUrl);
   const fileName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${rawFileName}`;
   try {
-    await invoke("download_image", { url: imageUrl, destDir, fileName });
+    await invokeActiveEventAssetWrite("download_image", { url: imageUrl, destDir, fileName });
   } catch (err) {
     const msg = `画像ダウンロード失敗: ${String(err)} (URL: ${imageUrl})`;
     resultEl.textContent = msg;
     logToFile(msg);
     return;
   }
+  if (!guard.isCurrent()) return;
   applyImageToCell(cell, row, col, eventRelativeAssetPath(subdir, fileName));
 });
 
@@ -7672,6 +8156,84 @@ let activeEventSlug: string | null = null;
 let crawlMetaSaveTimer: number | null = null;
 let syncInProgress = false;
 let renameInProgress = false;
+function eventMetaOwnerKey(slug: string, dir: string): string {
+  return `${slug}\n${normalizeEventPath(dir)}`;
+}
+
+type EventMetaWriteOptions = {
+  requireListedOwner?: boolean;
+  commitToEventList?: boolean;
+  isCurrent?: () => boolean;
+  onCommit?: (meta: EventMeta) => void;
+};
+
+async function writeEventMetaSnapshot(
+  owner: Pick<EventEntry, "slug" | "dir">,
+  meta: EventMeta,
+  options: EventMetaWriteOptions = {},
+): Promise<boolean> {
+  const ownerDir = normalizeEventPath(owner.dir);
+  const activeRawEvent =
+    activeEventSlug === owner.slug &&
+    normalizeEventPath(editorJsonPathValue()) === eventJsonPathForDir(ownerDir)
+      ? eventJsonData?.event
+      : null;
+  // event metaフォームが認識しないraw event fieldsも維持する。明示clearは
+  // caller snapshotのundefinedがraw値を上書きし、JSON送信時にabsenceになる。
+  const writeSnapshot = {
+    ...(activeRawEvent ? cloneJsonSnapshot(activeRawEvent) : {}),
+    ...cloneJsonSnapshot(meta),
+  } as EventMeta;
+  const requireListedOwner = options.requireListedOwner !== false;
+  const result = await eventMetaWriteCoordinator.run({
+    key: eventMetaOwnerKey(owner.slug, ownerDir),
+    snapshot: writeSnapshot,
+    isCurrent: () => {
+      if (options.isCurrent && !options.isCurrent()) return false;
+      if (!requireListedOwner) return true;
+      const current = eventList.find((entry) => entry.slug === owner.slug);
+      return Boolean(
+        current && normalizeEventPath(current.dir) === ownerDir,
+      );
+    },
+    write: (snapshot) =>
+      invoke("write_event_meta", { eventDir: ownerDir, meta: snapshot }),
+    commit: (snapshot) => {
+      if (options.commitToEventList !== false) {
+        const current = eventList.find((entry) => entry.slug === owner.slug);
+        if (current && normalizeEventPath(current.dir) === ownerDir) {
+          // 非同期画像操作が捕捉したmeta object identityを維持しつつ、
+          // 成功したsnapshotのoptional field absenceも正確に反映する。
+          for (const key of Object.keys(current.meta)) {
+            if (!Object.prototype.hasOwnProperty.call(snapshot, key)) {
+              delete (current.meta as Record<string, unknown>)[key];
+            }
+          }
+          Object.assign(current.meta, snapshot);
+        }
+      }
+      if (
+        activeEventSlug === owner.slug &&
+        normalizeEventPath(editorJsonPathValue()) === eventJsonPathForDir(ownerDir)
+      ) {
+        const reconcileEventSection = (documentData: EventJsonData | null) => {
+          if (!documentData) return;
+          const currentEvent = (documentData.event ??= {});
+          for (const key of Object.keys(currentEvent)) {
+            if (!Object.prototype.hasOwnProperty.call(snapshot, key)) {
+              delete (currentEvent as Record<string, unknown>)[key];
+            }
+          }
+          Object.assign(currentEvent, snapshot);
+        };
+        reconcileEventSection(eventJsonData);
+        reconcileEventSection(persistedEventJsonData);
+      }
+      options.onCommit?.(snapshot);
+    },
+  });
+  return result.committed;
+}
 
 function updateConcurrentEventSummary() {
   const el = document.getElementById("concurrentEventSummary");
@@ -7691,11 +8253,14 @@ type CrawlMetaSnapshot = {
   ownerSlug: string;
   ownerDir: string;
   meta: EventMeta;
+  editRevision: number;
 };
 
-let crawlMetaWriteSerial: Promise<void> = Promise.resolve();
+let crawlMetaEditRevision = 0;
+let persistedCrawlMetaRevision = 0;
 
 function captureCrawlMetaSnapshot(): CrawlMetaSnapshot | null {
+  if (crawlMetaEditRevision <= persistedCrawlMetaRevision) return null;
   if (!activeEventSlug) return null;
   const ev = eventList.find((event) => event.slug === activeEventSlug);
   if (!ev) return null;
@@ -7708,36 +8273,49 @@ function captureCrawlMetaSnapshot(): CrawlMetaSnapshot | null {
     (document.getElementById("additionalPrompt") as HTMLTextAreaElement).value,
   );
   const mapConfig = parseEventMapConfig(mapUrl, eventUrls);
+  const meta: EventMeta = {
+    ...cloneJsonSnapshot(ev.meta),
+    name: eventName || ev.meta.name,
+    date: eventDate || undefined,
+    event_url: eventUrls[0] || eventUrl || undefined,
+    event_urls: eventUrls.length ? eventUrls : undefined,
+    map_config: eventUrls.length > 1 ? mapUrl || undefined : undefined,
+    map_url: mapConfig.allMapUrls[0] || mapUrl || undefined,
+    additional_prompt: additionalPrompt || undefined,
+  };
   return {
     ownerSlug: ev.slug,
     ownerDir: ev.dir,
-    meta: {
-      ...cloneJsonSnapshot(ev.meta),
-      name: eventName || ev.meta.name,
-      date: eventDate || undefined,
-      event_url: eventUrls[0] || eventUrl || undefined,
-      event_urls: eventUrls.length ? eventUrls : undefined,
-      map_config: eventUrls.length > 1 ? mapUrl || undefined : undefined,
-      map_url: mapConfig.allMapUrls[0] || mapUrl || undefined,
-      additional_prompt: additionalPrompt || undefined,
-    },
+    meta,
+    editRevision: crawlMetaEditRevision,
   };
 }
 
-function flushCrawlMetaSnapshot(snapshot: CrawlMetaSnapshot | null): Promise<void> {
+function flushCrawlMetaSnapshot(
+  snapshot: CrawlMetaSnapshot | null,
+  permit?: InternalOperationSavePermit,
+): Promise<void> {
   if (!snapshot) return Promise.resolve();
-  const request = crawlMetaWriteSerial.then(async () => {
-    await invoke("write_event_meta", {
-      eventDir: snapshot.ownerDir,
-      meta: snapshot.meta,
-    });
-    const ev = eventList.find((event) => event.slug === snapshot.ownerSlug);
-    if (ev && normalizeEventPath(ev.dir) === normalizeEventPath(snapshot.ownerDir)) {
-      ev.meta = snapshot.meta;
+  if (isOperationBusy(operationState) && permit !== INTERNAL_OPERATION_SAVE) {
+    return Promise.reject(new Error("イベント処理中はイベントメタデータを保存できません"));
+  }
+  return writeEventMetaSnapshot(
+    { slug: snapshot.ownerSlug, dir: snapshot.ownerDir },
+    snapshot.meta,
+    {
+      isCurrent: () => snapshot.editRevision === crawlMetaEditRevision,
+      onCommit: () => {
+        persistedCrawlMetaRevision = Math.max(
+          persistedCrawlMetaRevision,
+          snapshot.editRevision,
+        );
+      },
+    },
+  ).then((committed) => {
+    if (!committed && snapshot.editRevision === crawlMetaEditRevision) {
+      throw new Error("イベントメタデータの保存対象が切り替わりました");
     }
   });
-  crawlMetaWriteSerial = request.catch(() => undefined);
-  return request;
 }
 
 function cancelCrawlMetaSave(): void {
@@ -7746,7 +8324,10 @@ function cancelCrawlMetaSave(): void {
 }
 
 function scheduleCrawlMetaSave() {
+  if (isOperationBusy(operationState) || renameInProgress) return;
   cancelCrawlMetaSave();
+  markEventDocumentMutated();
+  crawlMetaEditRevision += 1;
   const snapshot = captureCrawlMetaSnapshot();
   if (!snapshot) return;
   crawlMetaSaveTimer = window.setTimeout(() => {
@@ -7808,6 +8389,7 @@ function renameEventDir(
   const generation = ++selectEventGeneration;
   const crawlSnapshot = captureCrawlMetaSnapshot();
   cancelAutoSave();
+  cancelEventMemoSave();
   cancelCrawlMetaSave();
   renameInProgress = true;
   const request = eventDocumentSerial.then(() =>
@@ -7825,16 +8407,23 @@ async function renameEventDirLocked(
   crawlSnapshot: CrawlMetaSnapshot | null,
 ): Promise<string | null> {
   const isCurrent = () => generation === selectEventGeneration;
+  const oldLifecycleKey = eventMetaOwnerKey(oldSlug, ev.dir);
+  let oldLifecycleClosed = false;
+  let renamed = false;
   try {
-    await flushCrawlMetaSnapshot(crawlSnapshot);
+    await flushCrawlMetaSnapshot(crawlSnapshot, INTERNAL_OPERATION_SAVE);
     if (!isCurrent() || activeEventSlug !== oldSlug) return null;
 
-    const saveResult = await saveNow(true);
+    const saveResult = await saveNow(INTERNAL_OPERATION_SAVE);
     if (!saveResult.ok) {
       resultEl.textContent = `イベント名変更前の保存に失敗しました: ${String(saveResult.error)}`;
       return null;
     }
     await eventSaveQueue.flush();
+    if (!isCurrent() || activeEventSlug !== oldSlug) return null;
+
+    await eventLifecycleGate.closeAndDrain(oldLifecycleKey);
+    oldLifecycleClosed = true;
     if (!isCurrent() || activeEventSlug !== oldSlug) return null;
 
     const res = await invoke<{
@@ -7847,6 +8436,8 @@ async function renameEventDirLocked(
       newSlug,
     });
 
+    eventLifecycleGate.open(eventMetaOwnerKey(res.new_slug, res.new_dir));
+    renamed = true;
     ev.slug = res.new_slug;
     ev.dir = res.new_dir;
     if (!isCurrent() || activeEventSlug !== oldSlug) return res.new_slug;
@@ -7866,6 +8457,9 @@ async function renameEventDirLocked(
     console.error("ディレクトリ名変更エラー:", error);
     return null;
   } finally {
+    if (oldLifecycleClosed && !renamed) {
+      eventLifecycleGate.open(oldLifecycleKey);
+    }
     renameInProgress = false;
   }
 }
@@ -8068,7 +8662,11 @@ document.getElementById("eventSortSelect")?.addEventListener("change", () => {
   if (saved && sortEl) sortEl.value = saved;
 }
 
-async function loadEventList() {
+let loadEventListGeneration = 0;
+
+async function loadEventList(): Promise<boolean> {
+  const generation = ++loadEventListGeneration;
+  let nextEvents: EventEntry[];
   try {
     const res = await invoke<{ status: string; events: EventEntry[] }>(
       "list_event_dirs",
@@ -8076,33 +8674,68 @@ async function loadEventList() {
         projectRoot: projectRootEl.value,
       },
     );
-    eventList = res.events || [];
+    nextEvents = res.events || [];
   } catch {
-    eventList = [];
+    nextEvents = [];
   }
+  if (generation !== loadEventListGeneration) return false;
+  eventList = nextEvents;
   sortEventList();
   renderSidebar();
+  return true;
+}
+
+function captureEventImageMutationGuard(ev: EventEntry): AsyncMutationGuard {
+  const owner = `${ev.slug}\n${normalizeEventPath(ev.dir)}`;
+  const revision =
+    (ev.slug === activeEventSlug ? eventDocumentStateRevision : 0) +
+    selectEventGeneration;
+  return createAsyncMutationGuard(
+    { owner, revision, document: ev, targets: [ev.meta] },
+    () => {
+      const current = eventList.find((entry) => entry.slug === ev.slug);
+      return {
+        owner: current
+          ? `${current.slug}\n${normalizeEventPath(current.dir)}`
+          : "",
+        revision:
+          (current?.slug === activeEventSlug ? eventDocumentStateRevision : 0) +
+          selectEventGeneration,
+        document: current ?? null,
+        targets: current ? [current.meta] : [],
+      };
+    },
+  );
 }
 
 /** イベント画像をファイル選択で設定 */
 async function pickEventImage(ev: EventEntry) {
+  const guard = captureEventImageMutationGuard(ev);
+  const eventDir = ev.dir;
   const selected = await dialogOpen({
     multiple: false,
     filters: [{ name: "画像ファイル", extensions: IMAGE_EXTENSIONS }],
   });
+  if (!guard.isCurrent()) return;
   if (selected && typeof selected === "string") {
     const fileName = selected.replace(/\\/g, "/").split("/").pop() || selected;
     try {
-      await invoke("copy_file_to_dir", {
-        sourcePath: selected,
-        destDir: eventAssetDir(ev.dir, "event_image"),
+      await eventImageMutationSerial.run(`${ev.slug}\nevent_image`, async () => {
+        if (!guard.isCurrent()) return;
+        await invokeEventAssetWrite(ev, "copy_file_to_dir", {
+          sourcePath: selected,
+          destDir: eventAssetDir(eventDir, "event_image"),
+        });
+        if (!guard.isCurrent()) return;
+        const nextMeta = {
+          ...cloneJsonSnapshot(ev.meta),
+          event_image: eventRelativeAssetPath("event_image", fileName),
+        };
+        const committed = await writeEventMetaSnapshot(ev, nextMeta, {
+          isCurrent: guard.isCurrent,
+        });
+        if (committed) renderSidebar();
       });
-      ev.meta.event_image = eventRelativeAssetPath("event_image", fileName);
-      await invoke("write_event_meta", {
-        eventDir: ev.dir,
-        meta: ev.meta,
-      });
-      renderSidebar();
     } catch (err) {
       console.error("イベント画像設定エラー:", err);
     }
@@ -8146,14 +8779,19 @@ function showEventImageContextMenu(x: number, y: number, ev: EventEntry) {
     deleteItem.textContent = "画像を削除";
     deleteItem.addEventListener("click", async () => {
       menu.remove();
-      ev.meta.event_image = undefined;
+      const guard = captureEventImageMutationGuard(ev);
+      const eventDir = ev.dir;
       try {
-        await invoke("write_event_meta", {
-          eventDir: ev.dir,
-          meta: ev.meta,
+        await eventImageMutationSerial.run(`${ev.slug}\nevent_image`, async () => {
+          if (!guard.isCurrent()) return;
+          const nextMeta = cloneJsonSnapshot(ev.meta);
+          nextMeta.event_image = undefined;
+          const committed = await writeEventMetaSnapshot(ev, nextMeta, {
+            isCurrent: guard.isCurrent,
+          });
+          if (committed) renderSidebar();
         });
       } catch {}
-      renderSidebar();
     });
     menu.appendChild(deleteItem);
   }
@@ -8359,6 +8997,8 @@ function renderSidebar() {
         if (!slug) return;
         const ev = eventList.find((x) => x.slug === slug);
         if (!ev) return;
+        const guard = captureEventImageMutationGuard(ev);
+        const eventDir = ev.dir;
 
         const dt = e.dataTransfer;
         if (!dt) return;
@@ -8370,20 +9010,27 @@ function renderSidebar() {
           const ext = file.name.split(".").pop()?.toLowerCase() || "";
           if (!IMAGE_EXTENSIONS.includes(ext)) return;
           const buf = await file.arrayBuffer();
+          if (!guard.isCurrent()) return;
           const bytes = Array.from(new Uint8Array(buf));
           const destName = `event_image.${ext}`;
           try {
-            await invoke("save_image_bytes", {
-              destDir: eventAssetDir(ev.dir, "event_image"),
-              fileName: destName,
-              bytes,
+            await eventImageMutationSerial.run(`${ev.slug}\nevent_image`, async () => {
+              if (!guard.isCurrent()) return;
+              await invokeEventAssetWrite(ev, "save_image_bytes", {
+                destDir: eventAssetDir(eventDir, "event_image"),
+                fileName: destName,
+                bytes,
+              });
+              if (!guard.isCurrent()) return;
+              const nextMeta = {
+                ...cloneJsonSnapshot(ev.meta),
+                event_image: eventRelativeAssetPath("event_image", destName),
+              };
+              const committed = await writeEventMetaSnapshot(ev, nextMeta, {
+                isCurrent: guard.isCurrent,
+              });
+              if (committed) renderSidebar();
             });
-            ev.meta.event_image = eventRelativeAssetPath("event_image", destName);
-            await invoke("write_event_meta", {
-              eventDir: ev.dir,
-              meta: ev.meta,
-            });
-            renderSidebar();
           } catch (err) {
             console.error("イベント画像D&Dエラー:", err);
           }
@@ -8398,17 +9045,23 @@ function renderSidebar() {
         const urlExt = imageUrl.split(".").pop()?.split("?")[0] || "jpg";
         const destName = `event_image.${IMAGE_EXTENSIONS.includes(urlExt) ? urlExt : "jpg"}`;
         try {
-          await invoke("download_image", {
-            url: imageUrl,
-            destDir: eventAssetDir(ev.dir, "event_image"),
-            fileName: destName,
+          await eventImageMutationSerial.run(`${ev.slug}\nevent_image`, async () => {
+            if (!guard.isCurrent()) return;
+            await invokeEventAssetWrite(ev, "download_image", {
+              url: imageUrl,
+              destDir: eventAssetDir(eventDir, "event_image"),
+              fileName: destName,
+            });
+            if (!guard.isCurrent()) return;
+            const nextMeta = {
+              ...cloneJsonSnapshot(ev.meta),
+              event_image: eventRelativeAssetPath("event_image", destName),
+            };
+            const committed = await writeEventMetaSnapshot(ev, nextMeta, {
+              isCurrent: guard.isCurrent,
+            });
+            if (committed) renderSidebar();
           });
-          ev.meta.event_image = eventRelativeAssetPath("event_image", destName);
-          await invoke("write_event_meta", {
-            eventDir: ev.dir,
-            meta: ev.meta,
-          });
-          renderSidebar();
         } catch (err) {
           console.error("イベント画像URLドロップエラー:", err);
         }
@@ -8428,17 +9081,15 @@ function renderSidebar() {
 async function toggleEventCompleted(slug: string) {
   const ev = eventList.find((e) => e.slug === slug);
   if (!ev) return;
+  const guard = captureEventImageMutationGuard(ev);
 
   try {
-    const metaRes = await invoke<{ found: boolean; meta: EventMeta }>(
-      "read_event_meta",
-      { eventDir: ev.dir },
-    );
-    const meta = metaRes.found ? metaRes.meta : {};
+    const meta = cloneJsonSnapshot(ev.meta);
     meta.completed = !meta.completed;
-    await invoke("write_event_meta", { eventDir: ev.dir, meta });
-    ev.meta.completed = meta.completed;
-    renderSidebar();
+    const committed = await writeEventMetaSnapshot(ev, meta, {
+      isCurrent: guard.isCurrent,
+    });
+    if (committed) renderSidebar();
   } catch (err) {
     console.error("完了フラグ更新エラー:", err);
   }
@@ -8493,19 +9144,21 @@ function startInlineEdit(slug: string, card: HTMLDivElement) {
     const newName = nameInput.value.trim() || currentName;
     const newDate = dateInput.value || null;
     const newVenue = venueInput.value.trim() || null;
-    evRef.meta.name = newName;
-    evRef.meta.date = newDate ?? undefined;
-    evRef.meta.venue = newVenue ?? undefined;
+    const nextMeta = {
+      ...cloneJsonSnapshot(evRef.meta),
+      name: newName,
+      date: newDate ?? undefined,
+      venue: newVenue ?? undefined,
+    };
     try {
-      await invoke("write_event_meta", {
-        eventDir: evRef.dir,
-        meta: evRef.meta,
-      });
+      const committed = await writeEventMetaSnapshot(evRef, nextMeta);
+      if (!committed) return;
     } catch (e) {
       resultEl.textContent = `メタデータ保存エラー: ${String(e)}`;
+      return;
     }
     renderSidebar();
-    updateActiveEventDisplay(evRef.meta);
+    updateActiveEventDisplay(nextMeta);
 
     // クロールフォームにも同期
     syncInProgress = true;
@@ -8577,16 +9230,60 @@ function confirmDeleteEvent(slug: string) {
 let selectEventGeneration = 0;
 let eventDocumentSerial: Promise<unknown> = Promise.resolve();
 
-function selectEvent(slug: string): Promise<boolean> {
+function runEventDocumentSerial<T>(task: () => Promise<T>): Promise<T> {
+  const request = eventDocumentSerial.then(task);
+  eventDocumentSerial = request.then(() => undefined, () => undefined);
+  return request;
+}
+
+function runManagedEventDocumentMutation<T>(task: () => Promise<T>): Promise<T> {
+  if (!canStartEventDocumentMutation(operationState) || renameInProgress) {
+    return Promise.reject(
+      new Error("別のイベント処理中のためイベント管理操作を開始できません"),
+    );
+  }
+  applyOperationEvent({ type: "start-event-document" });
+  setEventPipelineButtonsDisabled(true);
+  selectEventGeneration += 1;
+  markEventDocumentMutated();
+  const metadataBarriers = eventList
+    .filter((event) =>
+      eventLifecycleGate.isOpen(eventMetaOwnerKey(event.slug, event.dir)),
+    )
+    .map((event) =>
+      eventMetaWriteCoordinator.runExclusive(
+        eventMetaOwnerKey(event.slug, event.dir),
+        async () => undefined,
+      ),
+    );
+  cancelAutoSave();
+  cancelEventMemoSave();
+  cancelCrawlMetaSave();
+  return runEventDocumentSerial(async () => {
+    await Promise.all(metadataBarriers);
+    return task();
+  }).finally(() => {
+    if (operationState.kind === "event-document-running") {
+      applyOperationEvent({ type: "finish-event-document" });
+    }
+    setEventPipelineButtonsDisabled(false);
+  });
+}
+
+function selectEvent(
+  slug: string,
+  savePermit?: InternalOperationSavePermit,
+): Promise<boolean> {
   // 物理rename中はgenerationを無効化せず、rename完了後の新slug/dir状態から
   // crawl snapshotを取得して選択処理を開始する。
   if (renameInProgress) {
     const deferredRequest = eventDocumentSerial.then(async () => {
       const crawlSnapshot = captureCrawlMetaSnapshot();
       cancelAutoSave();
+      cancelEventMemoSave();
       cancelCrawlMetaSave();
       const generation = ++selectEventGeneration;
-      return selectEventLocked(slug, generation, crawlSnapshot);
+      return selectEventLocked(slug, generation, crawlSnapshot, savePermit);
     });
     eventDocumentSerial = deferredRequest.then(() => undefined, () => undefined);
     return deferredRequest;
@@ -8594,10 +9291,11 @@ function selectEvent(slug: string): Promise<boolean> {
   // 呼び出し時点で旧リクエストを無効化する。旧イベント保存のawaitより必ず先。
   const crawlSnapshot = captureCrawlMetaSnapshot();
   cancelAutoSave();
+  cancelEventMemoSave();
   cancelCrawlMetaSave();
   const generation = ++selectEventGeneration;
   const request = eventDocumentSerial.then(() =>
-    selectEventLocked(slug, generation, crawlSnapshot),
+    selectEventLocked(slug, generation, crawlSnapshot, savePermit),
   );
   // rejectedでも後続選択を止めない直列mutex。
   eventDocumentSerial = request.then(() => undefined, () => undefined);
@@ -8608,6 +9306,7 @@ async function selectEventLocked(
   slug: string,
   generation: number,
   crawlSnapshot: CrawlMetaSnapshot | null,
+  savePermit?: InternalOperationSavePermit,
 ): Promise<boolean> {
   const isStale = () => generation !== selectEventGeneration;
   try {
@@ -8617,7 +9316,10 @@ async function selectEventLocked(
     return false;
   }
   if (isStale()) return false;
-  if (isOperationBusy(operationState) && slug !== activeEventSlug) {
+  if (
+    isOperationBusy(operationState) &&
+    (slug !== activeEventSlug || isMapAutoOperation(operationState))
+  ) {
     resultEl.textContent =
       "イベント処理中はイベントを切り替えられません。完了後に選択してください。";
     return false;
@@ -8625,14 +9327,20 @@ async function selectEventLocked(
   const ev = eventList.find((event) => event.slug === slug);
   if (!ev) return false;
 
-  if (slug !== activeEventSlug) {
-    const saveResult = await saveNow();
-    if (!saveResult.ok) {
-      resultEl.textContent = `イベント切替前の保存に失敗しました: ${String(saveResult.error)}`;
-      return false;
-    }
-    if (isStale()) return false;
+  // 同一slugの再選択（dblclick/F2/rename）でも、load前に現在のUI stateと
+  // save queueを確定する。in-flight payloadより古いdisk内容の再loadを防ぐ。
+  const saveResult = await saveNow(savePermit);
+  if (!saveResult.ok) {
+    resultEl.textContent = `イベント切替前の保存に失敗しました: ${String(saveResult.error)}`;
+    return false;
   }
+  await eventSaveQueue.flush();
+  if (isStale()) return false;
+  const loadOwnerSlug = activeEventSlug;
+  const loadOwnerPath = normalizeEventPath(editorJsonPathValue());
+  const loadStateRevision = eventDocumentStateRevision;
+  const metaOwnerKey = eventMetaOwnerKey(ev.slug, ev.dir);
+  const loadMetaRevision = eventMetaWriteCoordinator.revision(metaOwnerKey);
 
   const eventJsonPath = eventJsonPathForDir(ev.dir);
   let nextMeta: EventMeta = { ...ev.meta };
@@ -8671,6 +9379,8 @@ async function selectEventLocked(
   const nextTableState = nextEventJsonData
     ? circlesToTableState(nextEventJsonData)
     : { headers: [], rows: [] };
+  // circle_masterは表示上の初期値として重ねるだけ。baselineにも含めることで、
+  // ユーザーがジャンル列を明示編集するまでevent.jsonへは永続化しない。
   applyCircleMasterGenres(nextTableState);
 
   // 購入済みindexもlocalで構築し、古い選択処理からglobalへ途中反映しない。
@@ -8680,13 +9390,14 @@ async function selectEventLocked(
   );
   if (isStale()) return false;
 
-  let nextMapImagePaths: { name: string; path: string }[] = [];
+  let nextMapImagePaths: EventMapImage[] = [];
   try {
+    const preferredRefs = preferredEventMapReferences(nextEventJsonData);
     const mapRes = await invoke<{
       status: string;
-      maps: { name: string; path: string }[];
-    }>("list_event_map_images", { eventDir: ev.dir });
-    nextMapImagePaths = mapRes.maps || [];
+      maps: EventMapImage[];
+    }>("list_event_map_images", { eventDir: ev.dir, preferredRefs });
+    nextMapImagePaths = selectActiveMapImages(mapRes.maps || [], preferredRefs);
   } catch {
     /* マップなしでもOK */
   }
@@ -8727,10 +9438,26 @@ async function selectEventLocked(
     nextMeta.date = normalizeDateInputValue(loadedEvent.date);
     metaChanged = true;
   }
+  // load中に別のmetadata操作が成功/要求された場合、取得済みnextMetaで
+  // その更新を上書きしない。ユーザーの次の選択でfreshに再試行する。
+  if (!eventMetaWriteCoordinator.isRevision(metaOwnerKey, loadMetaRevision)) {
+    return false;
+  }
   if (metaChanged) {
     try {
-      await invoke("write_event_meta", { eventDir: ev.dir, meta: nextMeta });
-    } catch {}
+      const committed = await writeEventMetaSnapshot(ev, nextMeta, {
+        commitToEventList: false,
+        isCurrent: () =>
+          !isStale() &&
+          activeEventSlug === loadOwnerSlug &&
+          normalizeEventPath(editorJsonPathValue()) === loadOwnerPath &&
+          eventDocumentStateRevision === loadStateRevision,
+      });
+      if (!committed) return false;
+    } catch (error) {
+      resultEl.textContent = `イベントメタデータ補完の保存に失敗しました: ${String(error)}`;
+      return false;
+    }
     if (isStale()) return false;
   }
 
@@ -8739,12 +9466,32 @@ async function selectEventLocked(
     (typeof loadedEvent.additional_prompt === "string"
       ? loadedEvent.additional_prompt
       : "");
+  const commitMetaRevision = eventMetaWriteCoordinator.revision(metaOwnerKey);
+
+  // load await中にmemo/table/image/crawl等が編集された場合、取得済みの古い
+  // documentをglobalへcommitしない。次の明示選択で最新stateから再試行する。
+  if (
+    isStale() ||
+    activeEventSlug !== loadOwnerSlug ||
+    normalizeEventPath(editorJsonPathValue()) !== loadOwnerPath ||
+    eventDocumentStateRevision !== loadStateRevision ||
+    !eventMetaWriteCoordinator.isRevision(metaOwnerKey, commitMetaRevision)
+  ) {
+    return false;
+  }
 
   // 全global ownerとフォームを、最後のawait後に同一generationで一括commitする。
   ev.meta = nextMeta;
   activeEventSlug = slug;
   eventJsonData = nextEventJsonData;
   tableState = nextTableState;
+  markEventDocumentMutated();
+  persistedEventJsonData = nextEventJsonData
+    ? cloneJsonSnapshot(nextEventJsonData)
+    : null;
+  eventTableBaseline = cloneJsonSnapshot(nextTableState);
+  crawlMetaEditRevision = 0;
+  persistedCrawlMetaRevision = 0;
   applyPurchasedItemIndex(nextPurchasedItemKeys);
   mapImagePaths = nextMapImagePaths;
   (document.getElementById("pipelineOutputDir") as HTMLInputElement).value = ev.dir;
@@ -8825,19 +9572,51 @@ async function selectEventLocked(
 async function deleteEvent(slug: string) {
   const ev = eventList.find((e) => e.slug === slug);
   if (!ev) return;
+  const pendingCrawlMeta =
+    activeEventSlug === slug ? captureCrawlMetaSnapshot() : null;
+  const lifecycleKey = eventMetaOwnerKey(ev.slug, ev.dir);
+  const pendingMetaSettle =
+    activeEventSlug === slug
+      ? flushCrawlMetaSnapshot(pendingCrawlMeta, INTERNAL_OPERATION_SAVE)
+      : Promise.resolve();
+  const pendingDocumentSettle =
+    activeEventSlug === slug
+      ? saveNow(INTERNAL_OPERATION_SAVE)
+      : Promise.resolve<SaveNowResult>({ ok: true, revision: null });
+  const lifecycleDrain = eventLifecycleGate.closeAndDrain(lifecycleKey);
+  let deleted = false;
 
   try {
-    await invoke("delete_event_dir", { eventDir: ev.dir });
-    if (activeEventSlug === slug) {
-      activeEventSlug = null;
-      eventJsonData = null;
-      tableState = { headers: [], rows: [] };
-      renderCircleEditorAndMap();
-      updateEventMemoUI();
-    }
-    await loadEventList();
+    await runManagedEventDocumentMutation(async () => {
+      if (activeEventSlug === slug) {
+        await pendingMetaSettle;
+        const settled = await pendingDocumentSettle;
+        if (!settled.ok) {
+          throw new Error(`削除前の保存に失敗しました: ${String(settled.error)}`);
+        }
+        await eventSaveQueue.flush();
+        if (eventSaveQueue.error) {
+          throw new Error(`削除前の保存キューに失敗しました: ${String(eventSaveQueue.error)}`);
+        }
+      }
+      await lifecycleDrain;
+      await invoke("delete_event_dir", { eventDir: ev.dir });
+      deleted = true;
+      if (activeEventSlug === slug) {
+        activeEventSlug = null;
+        eventJsonData = null;
+        persistedEventJsonData = null;
+        tableState = { headers: [], rows: [] };
+        eventTableBaseline = { headers: [], rows: [] };
+        eventDocumentStateRevision += 1;
+        renderCircleEditorAndMap();
+        updateEventMemoUI();
+      }
+      await loadEventList();
+    });
     resultEl.textContent = `イベントを削除しました`;
   } catch (e) {
+    if (!deleted) eventLifecycleGate.open(lifecycleKey);
     resultEl.textContent = `削除エラー: ${String(e)}`;
   }
 }
@@ -8850,25 +9629,26 @@ newEventBtn.addEventListener("click", async () => {
   const slug = `new_event_${timestamp}`;
 
   try {
-    const res = await invoke<{ status: string; dir: string }>(
-      "create_event_dir",
-      {
-        projectRoot: projectRootEl.value,
-        slug,
-      },
-    );
-
-    // 仮の名前でevent_meta.jsonを作成
-    await invoke("write_event_meta", {
-      eventDir: res.dir,
-      meta: {
+    await runManagedEventDocumentMutation(async () => {
+      const created = await invoke<{ status: string; dir: string }>(
+        "create_event_dir",
+        {
+          projectRoot: projectRootEl.value,
+          slug,
+        },
+      );
+      eventLifecycleGate.open(eventMetaOwnerKey(slug, created.dir));
+      await writeEventMetaSnapshot(
+        { slug, dir: created.dir },
+        {
         name: NEW_EVENT_NAME,
         created_at: new Date().toISOString(),
         source: "desktop_created",
-      },
+        },
+        { requireListedOwner: false, commitToEventList: false },
+      );
+      await loadEventList();
     });
-
-    await loadEventList();
     // selectEventを呼んで内部状態(pipelineOutputDir等)を正しく初期化
     await selectEvent(slug);
 
@@ -8947,19 +9727,26 @@ document.getElementById("visionFallbackModelProvider")?.addEventListener("change
     const dateVal = (document.getElementById("eventDate") as HTMLInputElement)
       .value;
 
-    ev.meta.name = nameVal || ev.meta.name;
-    ev.meta.date = dateVal || undefined;
+    const nextMeta = {
+      ...cloneJsonSnapshot(ev.meta),
+      name: nameVal || ev.meta.name,
+      date: dateVal || undefined,
+    };
 
     syncInProgress = true;
-    updateActiveEventDisplay(ev.meta);
-    renderSidebar();
+    updateActiveEventDisplay(nextMeta);
     syncInProgress = false;
 
-    if (nameVal && shouldRenameEventSlug(currentSlug, nameVal, ev.meta.date)) {
+    if (nameVal && shouldRenameEventSlug(currentSlug, nameVal, nextMeta.date)) {
       try {
-        await invoke("write_event_meta", { eventDir: ev.dir, meta: ev.meta });
-      } catch {}
-      const newSlug = await renameEventDir(currentSlug, nameVal, ev.meta.date);
+        const committed = await writeEventMetaSnapshot(ev, nextMeta);
+        if (!committed) return;
+      } catch (error) {
+        resultEl.textContent = `メタデータ保存エラー: ${String(error)}`;
+        return;
+      }
+      renderSidebar();
+      const newSlug = await renameEventDir(currentSlug, nameVal, nextMeta.date);
       if (newSlug) {
         await loadEventList();
         await selectEvent(newSlug);
@@ -9037,51 +9824,153 @@ listen<{ zipPath: string; size: number }>("result-uploaded", async (event) => {
 
 // 受信完了イベントのリスナー
 listen<{
+  uploadId: string;
   zipPath: string;
   size: number;
-  importResult?: {
-    status: string;
-    slug: string;
-    dir: string;
-    meta: EventMeta;
-  };
 }>("result-received", async (event) => {
   importModalOverlay.classList.remove("active");
   importModalOverlay.classList.add("hidden");
-  const { zipPath, size, importResult } = event.payload;
+  const { uploadId, zipPath, size } = event.payload;
+  let successAckSent = false;
+  let leaseHeartbeatTimer: number | null = null;
+  let leaseHeartbeatFailure: unknown = null;
+  const heartbeatUploadLease = () =>
+    invoke("heartbeat_received_upload", { uploadId });
+  const assertUploadLeaseCurrent = async () => {
+    if (leaseHeartbeatFailure) throw leaseHeartbeatFailure;
+    await heartbeatUploadLease();
+    if (leaseHeartbeatFailure) throw leaseHeartbeatFailure;
+  };
+  const startUploadLeaseHeartbeat = () => {
+    leaseHeartbeatTimer = window.setInterval(() => {
+      void heartbeatUploadLease().catch((error) => {
+        leaseHeartbeatFailure = error;
+        if (leaseHeartbeatTimer !== null) clearInterval(leaseHeartbeatTimer);
+        leaseHeartbeatTimer = null;
+      });
+    }, 20_000);
+  };
 
   resultEl.textContent = `データ受信完了 (${(size / 1024 / 1024).toFixed(1)} MB)\nインポート完了処理中...`;
 
   try {
-    if (importResult?.status === "ok") {
-      await loadEventList();
-      await selectEvent(importResult.slug);
-      resultEl.textContent = `同期完了: ${importResult.meta.name || importResult.slug}`;
-      logToFile(
-        `モバイル同期: 同期完了 slug=${importResult.slug} size=${size} zip=${zipPath}`,
+    await invoke("claim_received_upload", { uploadId });
+    startUploadLeaseHeartbeat();
+    await waitForOperationIdle();
+    await assertUploadLeaseCurrent();
+    const pendingCrawlMeta = captureCrawlMetaSnapshot();
+    const res = await runManagedEventDocumentMutation(async () => {
+      await assertUploadLeaseCurrent();
+      await flushCrawlMetaSnapshot(
+        pendingCrawlMeta,
+        INTERNAL_OPERATION_SAVE,
       );
-      return;
-    }
-
-    const res = await invoke<{
-      status: string;
-      slug: string;
-      dir: string;
-      meta: EventMeta;
-    }>("import_result_zip", {
-      zipPath,
-      projectRoot: projectRootEl.value,
+      await assertUploadLeaseCurrent();
+      const activeSave = await saveNow(INTERNAL_OPERATION_SAVE);
+      if (!activeSave.ok) {
+        throw new Error(`インポート前の保存に失敗しました: ${String(activeSave.error)}`);
+      }
+      await assertUploadLeaseCurrent();
+      await eventSaveQueue.flush();
+      await flushCircleMasterSaves();
+      await assertUploadLeaseCurrent();
+      return circleMasterWriteSerial.run(CIRCLE_MASTER_WRITE_KEY, async () => {
+        const plan = await invoke<{
+        status: string;
+        slug: string;
+        dir: string;
+        affectedEvents: Array<{ slug: string; dir: string; survives: boolean }>;
+        }>("plan_received_result_import", {
+          uploadId,
+          projectRoot: projectRootEl.value,
+        });
+        await assertUploadLeaseCurrent();
+        const lifecycleKeys = Array.from(
+          new Set(
+            plan.affectedEvents.map((affected) =>
+              eventMetaOwnerKey(affected.slug, affected.dir),
+            ),
+          ),
+        );
+        await Promise.all(
+          lifecycleKeys.map((key) => eventLifecycleGate.closeAndDrain(key)),
+        );
+        let published = false;
+        try {
+          const staged = await invoke<{
+            status: string;
+            slug: string;
+            dir: string;
+            meta: EventMeta;
+          }>("stage_received_result_import", {
+            uploadId,
+            projectRoot: projectRootEl.value,
+            expectedSlug: plan.slug,
+          });
+          await assertUploadLeaseCurrent();
+          const imported = await invoke<{
+            status: string;
+            slug: string;
+            dir: string;
+          }>("publish_received_result_import", { uploadId });
+          published = true;
+          // publish commandがmobile successをatomicに確定する。以後のUI復旧失敗は
+          // committed uploadをfailure/retryへ戻してはいけない。
+          successAckSent = true;
+          return { ...staged, ...imported };
+        } finally {
+          for (const affected of plan.affectedEvents) {
+            if (!published || affected.survives) {
+              eventLifecycleGate.open(
+                eventMetaOwnerKey(affected.slug, affected.dir),
+              );
+            }
+          }
+        }
+      });
     });
 
     if (res.status === "ok") {
-      await loadEventList();
-      await selectEvent(res.slug);
-      resultEl.textContent = `インポート完了: ${res.meta.name || res.slug}`;
+      const recoveryWarnings: string[] = [];
+      try {
+        await loadCircleMasterStrict();
+      } catch (error) {
+        recoveryWarnings.push(`circle_master再読込失敗: ${String(error)}`);
+      }
+      try {
+        await loadEventList();
+      } catch (error) {
+        recoveryWarnings.push(`イベント一覧再読込失敗: ${String(error)}`);
+      }
+      try {
+        const selected = await selectEvent(res.slug);
+        if (!selected) recoveryWarnings.push("インポート後のイベント選択に失敗しました");
+      } catch (error) {
+        recoveryWarnings.push(`イベント選択エラー: ${String(error)}`);
+      }
+      const warningText = recoveryWarnings.length
+        ? `\nUI再読込警告: ${recoveryWarnings.join(" / ")}`
+        : "";
+      resultEl.textContent = `インポート完了: ${res.meta.name || res.slug}${warningText}`;
       logToFile(`モバイル同期: インポート完了 slug=${res.slug} zip=${zipPath}`);
+    } else {
+      throw new Error("インポート結果が成功ではありません");
     }
   } catch (e) {
+    if (!successAckSent) {
+      try {
+        await invoke("cancel_received_upload", {
+          uploadId,
+          error: String(e),
+        });
+      } catch (ackError) {
+        logToFile(`モバイル同期: failure ackエラー ${String(ackError)}`);
+      }
+    }
     resultEl.textContent = `インポートエラー: ${String(e)}`;
     logToFile(`モバイル同期: インポートエラー ${String(e)} zip=${zipPath}`);
+  } finally {
+    if (leaseHeartbeatTimer !== null) clearInterval(leaseHeartbeatTimer);
   }
 });
 
@@ -9292,6 +10181,11 @@ function initBudgetPanel() {
 // === イベントメモ ===
 let eventMemoTimer: number | null = null;
 
+function cancelEventMemoSave(): void {
+  if (eventMemoTimer) clearTimeout(eventMemoTimer);
+  eventMemoTimer = null;
+}
+
 function initEventMemo() {
   const memoArea = document.getElementById("eventMemoArea");
   const memoToggle = document.getElementById("eventMemoToggle");
@@ -9308,10 +10202,12 @@ function initEventMemo() {
 
   memoInput.addEventListener("input", () => {
     if (!eventJsonData) return;
+    if (isMapAutoOperation(operationState)) return;
+    markEventDocumentMutated();
     if (!eventJsonData.event) eventJsonData.event = {};
     eventJsonData.event.memo = memoInput.value;
     // デバウンス保存
-    if (eventMemoTimer) clearTimeout(eventMemoTimer);
+    cancelEventMemoSave();
     eventMemoTimer = window.setTimeout(() => saveNow(), 500);
   });
 }

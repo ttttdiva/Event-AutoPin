@@ -2,7 +2,7 @@
 CLI LLM ユーティリティ
 subprocess で Antigravity CLI / Claude Code / Codex CLI を呼び出す
 
-AoiTalk (C:\\nk\\41_AoiTalk\\src\\llm\\cli_backends) のパターンを参考に
+別projectの `<project-root>/src/llm/cli_backends` のパターンを参考に
 画像分析に特化した軽量版として実装
 """
 
