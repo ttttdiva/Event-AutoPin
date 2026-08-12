@@ -1,14 +1,14 @@
 {
-  "desktop": {
-    "version": "0.1.9",
-    "url": "https://github.com/ttttdiva/autocircle/releases/download/desktop-v0.1.9/EventTrailStudio.exe",
-    "notes": "v0.1.9 無編集イベント切替時の保存抑止と非同期競合・データ保全の強化",
-    "date": "2026-08-13"
-  },
-  "mobile": {
-    "version": "1.4.48",
-    "url": "https://github.com/ttttdiva/autocircle/releases/download/mobile-v1.4.48/EventTrailGo.apk",
-    "notes": "v1.4.48 リリース",
-    "date": "2026-07-19"
-  }
+    "desktop":  {
+                    "version":  "0.1.10",
+                    "url":  "https://github.com/ttttdiva/Event-AutoPin-Publish/releases/download/desktop-v0.1.10/EventAutoPin.exe",
+                    "notes":  "Event AutoPin desktop v0.1.10",
+                    "date":  "2026-08-13"
+                },
+    "mobile":  {
+                   "version":  "1.4.49",
+                   "url":  "https://github.com/ttttdiva/Event-AutoPin-Publish/releases/download/mobile-v1.4.49/EventAutoPin.apk",
+                   "notes":  "Event AutoPin mobile v1.4.49",
+                   "date":  "2026-08-13"
+               }
 }
