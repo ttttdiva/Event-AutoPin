@@ -1,9 +1,9 @@
 {
     "desktop":  {
-                    "version":  "0.1.6",
-                    "url":  "https://github.com/ttttdiva/autocircle/releases/download/desktop-v0.1.6/EventTrailStudio.exe",
-                    "notes":  "v0.1.6 X/Twitter現行API対応と既存環境のtwscrape自動更新",
-                    "date":  "2026-07-19"
+                    "version":  "0.1.7",
+                    "url":  "https://github.com/ttttdiva/autocircle/releases/download/desktop-v0.1.7/EventTrailStudio.exe",
+                    "notes":  "v0.1.7 過去イベントの曖昧検索と状態管理・非同期保存の改善",
+                    "date":  "2026-08-12"
                 },
     "mobile":  {
                    "version":  "1.4.48",
