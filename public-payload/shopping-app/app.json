@@ -2,7 +2,7 @@
   "expo": {
     "name": "Event AutoPin",
     "slug": "event-autopin",
-    "version": "1.4.49",
+    "version": "1.4.50",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "eventtrailgo",
@@ -23,7 +23,7 @@
       },
       "edgeToEdgeEnabled": true,
       "package": "com.eventtrail.go",
-      "versionCode": 189,
+      "versionCode": 190,
       "permissions": [
         "android.permission.REQUEST_INSTALL_PACKAGES"
       ]
