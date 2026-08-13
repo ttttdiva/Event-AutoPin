@@ -1145,6 +1145,67 @@ html.dark {
     @apply hover:opacity-80;
   }
 
+  .cookie-file-drop-zone {
+    border: 1px dashed var(--border-default);
+    border-radius: 0.375rem;
+    padding: 0.5rem;
+    transition: border-color 120ms ease, background-color 120ms ease;
+  }
+  .cookie-file-drop-zone:focus-visible {
+    outline: 2px solid #60a5fa;
+    outline-offset: 2px;
+  }
+  .cookie-file-drop-zone[data-drop-state="hover"] {
+    border-color: #60a5fa;
+    background-color: rgba(37, 99, 235, 0.14);
+  }
+  .cookie-file-drop-zone[data-drop-state="ready"] {
+    border-color: #34d399;
+    background-color: rgba(16, 185, 129, 0.08);
+  }
+  .cookie-file-drop-zone[data-drop-state="error"] {
+    border-color: #f87171;
+    background-color: rgba(239, 68, 68, 0.08);
+  }
+  .cookie-file-status,
+  .cookie-file-drop-hint,
+  .cookie-file-drop-state,
+  .cookie-console-warning {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+  }
+  .cookie-file-drop-hint {
+    margin-top: 0.35rem;
+  }
+  .cookie-file-drop-state {
+    min-height: 1rem;
+    margin-top: 0.2rem;
+  }
+  .cookie-console-guide {
+    grid-column: 2;
+    margin-top: -0.5rem;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+  }
+  .cookie-console-guide summary {
+    cursor: pointer;
+  }
+  .cookie-console-warning {
+    margin: 0.5rem 0;
+    line-height: 1.45;
+  }
+  .cookie-console-command {
+    max-height: 12rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--bg-surface2);
+    border: 1px solid var(--border-default);
+    border-radius: 0.25rem;
+    padding: 0.5rem;
+    user-select: text;
+  }
+
   /* kbdキー */
   .kbd {
     background-color: var(--kbd-bg);

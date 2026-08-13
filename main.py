@@ -1130,19 +1130,37 @@ class CircleListGenerator:
                 if update_result:
                     updated = update_result["updated_count"]
                     skipped = update_result["skipped_count"]
-                    total_updated += updated
                     self.logger.info(f"更新: {updated}件 / スキップ: {skipped}件")
-                    succeeded += 1
-                    map_diagnostics.append(
-                        {
-                            "map_number": map_number,
-                            "status": "success",
-                            "image_path": str(local_map_path),
-                            "output_json": str(output_json),
-                            "updated_count": updated,
-                            "skipped_count": skipped,
-                        }
-                    )
+                    if updated > 0:
+                        total_updated += updated
+                        succeeded += 1
+                        map_diagnostics.append(
+                            {
+                                "map_number": map_number,
+                                "status": "success",
+                                "image_path": str(local_map_path),
+                                "output_json": str(output_json),
+                                "updated_count": updated,
+                                "skipped_count": skipped,
+                            }
+                        )
+                    else:
+                        # A generated coordinate map that updates no event
+                        # circles is not a successful map: reporting success
+                        # would make the caller display a false-positive run.
+                        failed += 1
+                        map_diagnostics.append(
+                            {
+                                "map_number": map_number,
+                                "status": "failed",
+                                "image_path": str(local_map_path),
+                                "output_json": str(output_json),
+                                "updated_count": 0,
+                                "skipped_count": skipped,
+                                "error": "event.jsonの座標更新対象がありませんでした",
+                                "error_code": "coordinate_update_zero",
+                            }
+                        )
                 else:
                     failed += 1
                     map_diagnostics.append(

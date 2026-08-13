@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +23,17 @@ NUMBER_RE = re.compile(r"(?<!\d)(\d{1,2})(?!\d)")
 
 
 def _space_numbers(value: Any) -> list[str]:
-    text = str(value or "")
+    text = unicodedata.normalize("NFKC", str(value or ""))
     return [f"{int(match):02d}" for match in NUMBER_RE.findall(text) if 1 <= int(match) <= 99]
+
+
+def _space_prefix(value: Any) -> str | None:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    first_number = re.search(r"\d", text)
+    if first_number is None:
+        return None
+    prefix = text[: first_number.start()].rstrip(" -‐‑‒–—−ー－").strip()
+    return prefix or None
 
 
 def build_for_event(event_dir: Path, *, box_size: int = 24) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -46,7 +56,7 @@ def build_for_event(event_dir: Path, *, box_size: int = 24) -> tuple[list[dict[s
             width, height = image.size
         map_number = map_entry.get("map_number")
         points: list[dict[str, Any]] = []
-        for circle in circles:
+        for circle_index, circle in enumerate(circles):
             if not isinstance(circle, dict):
                 continue
             circle_map_number = circle.get("map_number")
@@ -67,14 +77,23 @@ def build_for_event(event_dir: Path, *, box_size: int = 24) -> tuple[list[dict[s
                 skipped += 1
                 continue
             numbers = _space_numbers(circle.get("space"))
+            prefix = _space_prefix(circle.get("space")) or ""
             if not numbers:
                 skipped += 1
                 continue
             cx, cy = pin_x * width, pin_y * height
+            group_identity = f"map:{map_number if map_number is not None else 1}:circle:{circle_index}"
+            merged = len(numbers) > 1
             for number in numbers:
                 points.append(
                     {
+                        "space_id": f"{prefix}{number}",
+                        "prefix": prefix,
                         "number": number,
+                        "group_identity": group_identity,
+                        "merged": merged,
+                        "missing_slot": bool(circle.get("missing_slot", False)),
+                        "raw_space": str(circle.get("space") or ""),
                         "center_x": round(cx, 3),
                         "center_y": round(cy, 3),
                         "normalized_x": round(pin_x, 8),
@@ -85,7 +104,10 @@ def build_for_event(event_dir: Path, *, box_size: int = 24) -> tuple[list[dict[s
             image_ref = str(image_path.relative_to(Path.cwd()))
         except ValueError:
             image_ref = str(image_path)
-        images.append({"image": image_ref, "points": points, "width": width, "height": height})
+        image_entry = {"image": image_ref, "points": points, "width": width, "height": height}
+        if map_entry.get("ocr_text") is not None:
+            image_entry["ocr_text"] = str(map_entry.get("ocr_text"))
+        images.append(image_entry)
     try:
         event_ref = str(event_dir.relative_to(Path.cwd()))
     except ValueError:
@@ -106,7 +128,7 @@ def main() -> int:
         images.extend(entries)
         summaries.append(summary)
     output = {
-        "schema_version": 2,
+        "schema_version": 3,
         "coordinate_metric": "pin_center",
         "iou_applicable": False,
         "source": "repo event.json pin_x/pin_y",

@@ -7,11 +7,13 @@ event.json座標更新機能
 
 import json
 import re
+from copy import deepcopy
 from typing import Dict, List, Any, Optional, Tuple
 from pathlib import Path
 import logging
 
 from src.space_locator.auto_coordinate_generator import expand_space_ids
+from src.utils.atomic_json import atomic_write_json
 
 
 class JSONUpdater:
@@ -40,24 +42,71 @@ class JSONUpdater:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        coord_dict = self._build_coordinate_dict(coordinate_map)
-        self.logger.info(f"座標マップ: {len(coord_dict)}件")
+        patches = self.build_coordinate_patches(data, coordinate_map, map_number)
+        self.logger.info(f"座標マップ: {len(self._build_coordinate_dict(coordinate_map))}件")
 
         circles = data.get('circles', [])
-        event = data.get('event', {})
-        maps = event.get('maps', []) if isinstance(event, dict) else []
+        if isinstance(circles, list):
+            for patch in patches.get("circle_patches", []):
+                try:
+                    index = int(patch["circle_index"])
+                    changes = patch.get("changes") or {}
+                    if 0 <= index < len(circles) and isinstance(circles[index], dict):
+                        circles[index].update(changes)
+                except (KeyError, TypeError, ValueError):
+                    # build_coordinate_patches emits validated indices; keep the
+                    # writer defensive if a caller supplies a custom payload.
+                    continue
+
+        # 書き戻し
+        atomic_write_json(path, data, indent=2)
+
+        result = {
+            key: value
+            for key, value in patches.items()
+            if key != "circle_patches"
+        }
+        self.logger.info(
+            f"更新完了: {patches.get('updated_count', 0)}件更新、"
+            f"{patches.get('skipped_count', 0)}件スキップ"
+        )
+        return result
+
+    def build_coordinate_patches(
+        self,
+        event_data: Dict[str, Any],
+        coordinate_map: List[Dict[str, Any]],
+        map_number: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Build pure, auditable event pin patches without mutating ``event_data``.
+
+        The returned ``circle_patches`` contains the original circle snapshot and
+        only the pin changes needed for each matched circle.  This lets callers
+        review/atomically apply updates while retaining the legacy aggregate
+        counters used by the desktop and CLI flows.
+        """
+        coord_dict = self._build_coordinate_dict(coordinate_map)
+        circles = event_data.get("circles", []) if isinstance(event_data, dict) else []
+        if not isinstance(circles, list):
+            circles = []
+        event = event_data.get("event", {}) if isinstance(event_data, dict) else {}
+        maps = event.get("maps", []) if isinstance(event, dict) else []
         multi_map = isinstance(maps, list) and len(maps) > 1
         updated_count = 0
         skipped_count = 0
-        updated_space_ids = []
+        updated_space_ids: List[Optional[str]] = []
+        circle_patches: List[Dict[str, Any]] = []
 
-        for circle in circles:
-            space_id = (circle.get('space') or '').strip()
+        for circle_index, circle in enumerate(circles):
+            if not isinstance(circle, dict):
+                skipped_count += 1
+                continue
+            space_id = (circle.get("space") or "").strip()
             if not space_id:
                 skipped_count += 1
                 continue
             if map_number is not None:
-                existing_map_number = circle.get('map_number')
+                existing_map_number = circle.get("map_number")
                 if existing_map_number is None and multi_map:
                     skipped_count += 1
                     continue
@@ -71,33 +120,41 @@ class JSONUpdater:
                         continue
 
             resolved_id, coord = self._find_coordinate(space_id, coord_dict)
-
-            if coord:
-                if coord['normalized_x'] is not None and coord['normalized_y'] is not None:
-                    circle['pin_x'] = coord['normalized_x']
-                    circle['pin_y'] = coord['normalized_y']
-                else:
-                    circle['pin_x'] = coord['x']
-                    circle['pin_y'] = coord['y']
-                if map_number is not None:
-                    circle['map_number'] = int(map_number)
-                updated_count += 1
-                updated_space_ids.append(resolved_id)
-            else:
+            if not coord:
                 skipped_count += 1
+                continue
 
-        # 書き戻し
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            if coord.get("normalized_x") is not None and coord.get("normalized_y") is not None:
+                pin_x = coord["normalized_x"]
+                pin_y = coord["normalized_y"]
+            else:
+                pin_x = coord.get("x")
+                pin_y = coord.get("y")
+            if pin_x is None or pin_y is None:
+                skipped_count += 1
+                continue
 
-        result = {
-            'total_circles': len(circles),
-            'updated_count': updated_count,
-            'skipped_count': skipped_count,
-            'updated_space_ids': updated_space_ids,
+            updated_count += 1
+            updated_space_ids.append(resolved_id)
+            circle_patches.append(
+                {
+                    "circle_index": circle_index,
+                    "circle_identity": {
+                        key: str(circle.get(key) or "")
+                        for key in ("name", "penname", "space", "hall")
+                    },
+                    "base_circle": deepcopy(circle),
+                    "changes": {"pin_x": pin_x, "pin_y": pin_y},
+                }
+            )
+
+        return {
+            "total_circles": len(circles),
+            "updated_count": updated_count,
+            "skipped_count": skipped_count,
+            "updated_space_ids": updated_space_ids,
+            "circle_patches": circle_patches,
         }
-        self.logger.info(f"更新完了: {updated_count}件更新、{skipped_count}件スキップ")
-        return result
 
     def _build_coordinate_dict(self, coordinate_map: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         coord_dict = {}

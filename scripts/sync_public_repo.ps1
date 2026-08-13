@@ -10,6 +10,7 @@ $ExpectedRemote = 'https://github.com/ttttdiva/Event-AutoPin.git'
 $ExpectedRepository = 'ttttdiva/Event-AutoPin'
 $LegacyPayloadName = 'public-payload'
 $TransactionPrefix = '.event-autopin-sync.'
+$DependencyChecker = 'scripts/check_public_dependency_closure.py'
 
 function Run([string]$Exe, [string[]]$Arguments) {
     $value = @(& $Exe @Arguments 2>&1)
@@ -300,6 +301,39 @@ try {
     $tracked = @(Run git @('-C',$source,'-c','core.quotePath=false','ls-tree','-r','--name-only','HEAD')) | ForEach-Object { ([string]$_).Replace('\','/') }
     if ($tracked -notcontains $manifestPath) { throw "$manifestPath must be committed in HEAD." }
     $manifestText = (Run git @('-C',$source,'show',"HEAD:$manifestPath")) -join "`n"
+    # Preserve the native path-safety diagnostics before invoking the deeper
+    # Python module-closure checker.
+    ReadManifestPaths $manifestText 'manifest' | Out-Null
+    if ($tracked -notcontains $DependencyChecker) {
+        throw "$DependencyChecker must be committed in HEAD."
+    }
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCommand) { $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue }
+    if (-not $pythonCommand) {
+        throw 'Python 3 is required for the fail-closed public dependency gate.'
+    }
+    $checkerTemp = Join-Path ([IO.Path]::GetTempPath()) ('event-autopin-checker-' + [guid]::NewGuid().ToString('N'))
+    $checkerArchive = "$checkerTemp.zip"
+    New-Item -ItemType Directory -Path $checkerTemp | Out-Null
+    try {
+        # Execute the checker bytes committed at the same revision as the
+        # manifest and sources.  A modified working-tree checker must never be
+        # able to approve a dependency omission from HEAD.
+        ArchiveManifest $source $checkerArchive $checkerTemp @($DependencyChecker)
+        $committedChecker = Join-Path $checkerTemp $DependencyChecker
+        if (-not (Test-Path -LiteralPath $committedChecker -PathType Leaf)) {
+            throw "$DependencyChecker could not be extracted from HEAD."
+        }
+        $dependencyOutput = @(& $pythonCommand.Source $committedChecker `
+            '--repository' $source '--revision' 'HEAD' '--manifest' $manifestPath 2>&1)
+        $dependencyExit = $LASTEXITCODE
+        $dependencyOutput | ForEach-Object { Write-Output ([string]$_) }
+        if ($dependencyExit -ne 0) {
+            throw 'Public dependency closure failed closed; destination was not changed.'
+        }
+    } finally {
+        if (Test-Path -LiteralPath $checkerTemp) { Remove-Item -LiteralPath $checkerTemp -Recurse -Force }
+    }
     $entries = @($manifestText -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
     $paths = @(); $assetHashes = @{}; $seenPaths = @{}
     foreach ($entry in $entries) {

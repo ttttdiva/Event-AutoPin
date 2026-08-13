@@ -11,6 +11,7 @@ from typing import List, Dict, Optional, Any
 import logging
 
 from .circle_master import CircleMasterManager
+from .atomic_json import atomic_write_json
 from .reprocess_helpers import (
     REASON_NO_CATALOG,
     REASON_PREVIEW_ONLY,
@@ -201,8 +202,7 @@ class JSONReprocessor:
         """更新されたevent.jsonを保存"""
         save_path = Path(output_path) if output_path else self.json_path
         try:
-            with open(save_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            atomic_write_json(save_path, data)
             self.logger.info(f"✅ event.jsonを更新しました: {save_path}")
         except Exception as e:
             self.logger.error(f"event.json保存エラー: {e}")

@@ -2,10 +2,15 @@ import Constants from "expo-constants";
 import { Alert, Linking } from "react-native";
 import ApkInstaller from "../modules/apk-installer";
 
+const TRUSTED_REPOSITORY = "ttttdiva/Event-AutoPin";
 const UPDATE_CHECK_URL =
-  "https://raw.githubusercontent.com/ttttdiva/Event-AutoPin/main/latest.json";
+  `https://raw.githubusercontent.com/${TRUSTED_REPOSITORY}/main/latest.json`;
 const RELEASES_URL =
-  "https://api.github.com/repos/ttttdiva/Event-AutoPin/releases?per_page=10";
+  `https://api.github.com/repos/${TRUSTED_REPOSITORY}/releases?per_page=10`;
+const MOBILE_ASSET_NAME = "EventAutoPin.apk";
+const DESKTOP_ASSET_NAME = "EventAutoPin.exe";
+const SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 interface UpdateInfo {
   version: string;
@@ -26,9 +31,16 @@ interface GitHubReleaseAsset {
 
 interface GitHubRelease {
   tag_name: string;
-  draft?: boolean;
-  prerelease?: boolean;
-  assets?: GitHubReleaseAsset[];
+  draft: boolean;
+  prerelease: boolean;
+  assets: GitHubReleaseAsset[];
+}
+
+type UpdateFetch = (url: string, init?: RequestInit) => Promise<Response>;
+
+export interface UpdateServiceDependencies {
+  fetch?: UpdateFetch;
+  now?: () => Date;
 }
 
 export interface UpdateCheckResult {
@@ -40,19 +52,78 @@ export interface UpdateCheckResult {
   errorMessage?: string;
 }
 
-function isNewerVersion(current: string, latest: string): boolean {
-  const parse = (s: string) =>
-    s
-      .replace(/^v/, "")
-      .split(".")
-      .map((n) => parseInt(n, 10) || 0);
-  const cur = parse(current);
-  const lat = parse(latest);
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isValidSemver(version: string): boolean {
+  return SEMVER_PATTERN.test(version);
+}
+
+function isValidIsoDate(date: string): boolean {
+  if (!ISO_DATE_PATTERN.test(date)) return false;
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === date;
+}
+
+function expectedDownloadUrl(
+  channel: "desktop" | "mobile",
+  version: string,
+): string {
+  const asset = channel === "mobile" ? MOBILE_ASSET_NAME : DESKTOP_ASSET_NAME;
+  return `https://github.com/${TRUSTED_REPOSITORY}/releases/download/${channel}-v${version}/${asset}`;
+}
+
+function parseUpdateInfo(
+  value: unknown,
+  channel: "desktop" | "mobile",
+): UpdateInfo {
+  if (!isRecord(value)) {
+    throw new Error(`latest.json ${channel} invalid`);
+  }
+
+  const { version, url, notes, date } = value;
+  if (
+    typeof version !== "string" ||
+    !isValidSemver(version) ||
+    typeof url !== "string" ||
+    url !== expectedDownloadUrl(channel, version) ||
+    typeof notes !== "string" ||
+    typeof date !== "string" ||
+    !isValidIsoDate(date)
+  ) {
+    throw new Error(`latest.json ${channel} invalid`);
+  }
+
+  return { version, url, notes, date };
+}
+
+export function parseLatestJson(value: unknown): LatestJson {
+  if (!isRecord(value)) {
+    throw new Error("latest.json invalid");
+  }
+  return {
+    desktop: parseUpdateInfo(value.desktop, "desktop"),
+    mobile: parseUpdateInfo(value.mobile, "mobile"),
+  };
+}
+
+export function isTrustedMobileDownloadUrl(
+  url: string,
+  version: string,
+): boolean {
+  return isValidSemver(version) && url === expectedDownloadUrl("mobile", version);
+}
+
+export function isNewerVersion(current: string, latest: string): boolean {
+  if (!isValidSemver(current) || !isValidSemver(latest)) return false;
+  const cur = current.split(".").map(Number);
+  const lat = latest.split(".").map(Number);
   for (let i = 0; i < 3; i++) {
-    const c = cur[i] ?? 0;
-    const l = lat[i] ?? 0;
-    if (l > c) return true;
-    if (l < c) return false;
+    const currentPart = cur[i] ?? 0;
+    const latestPart = lat[i] ?? 0;
+    if (latestPart > currentPart) return true;
+    if (latestPart < currentPart) return false;
   }
   return false;
 }
@@ -61,70 +132,143 @@ export function getCurrentVersion(): string {
   return Constants.expoConfig?.version ?? "0.0.0";
 }
 
-async function fetchWithTimeout(url: string): Promise<Response> {
+async function fetchWithTimeout(
+  url: string,
+  fetchImpl: UpdateFetch,
+): Promise<Response> {
+  if (url !== UPDATE_CHECK_URL && url !== RELEASES_URL) {
+    throw new Error("untrusted update endpoint");
+  }
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
   try {
-    return await fetch(url, { signal: controller.signal });
+    // React Native 0.81 uses whatwg-fetch, which supports cache: "no-store"
+    // for GET by adding a cache-busting query parameter before native dispatch.
+    return await fetchImpl(url, {
+      cache: "no-store",
+      headers: {
+        "Cache-Control": "no-cache, no-store, max-age=0",
+        Pragma: "no-cache",
+      },
+      signal: controller.signal,
+    });
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
-async function fetchLatestJsonInfo(): Promise<UpdateInfo> {
-  const resp = await fetchWithTimeout(UPDATE_CHECK_URL);
+async function fetchLatestJsonInfo(fetchImpl: UpdateFetch): Promise<UpdateInfo> {
+  const resp = await fetchWithTimeout(UPDATE_CHECK_URL, fetchImpl);
   if (!resp.ok) {
     throw new Error(`latest.json HTTP ${resp.status}`);
   }
-  const data = (await resp.json()) as LatestJson;
-  if (!data.mobile?.url || !data.mobile.version) {
-    throw new Error("latest.json mobile missing");
-  }
+  const data = parseLatestJson(await resp.json());
   return data.mobile;
 }
 
-async function fetchLatestReleaseInfo(): Promise<UpdateInfo> {
-  const resp = await fetchWithTimeout(RELEASES_URL);
+function parseGitHubRelease(value: unknown): GitHubRelease | null {
+  if (!isRecord(value)) return null;
+  if (
+    typeof value.tag_name !== "string" ||
+    value.draft !== false ||
+    value.prerelease !== false ||
+    !Array.isArray(value.assets)
+  ) {
+    return null;
+  }
+  const assets: GitHubReleaseAsset[] = [];
+  for (const asset of value.assets) {
+    if (
+      !isRecord(asset) ||
+      typeof asset.name !== "string" ||
+      typeof asset.browser_download_url !== "string"
+    ) {
+      return null;
+    }
+    assets.push({
+      name: asset.name,
+      browser_download_url: asset.browser_download_url,
+    });
+  }
+  return {
+    tag_name: value.tag_name,
+    draft: false,
+    prerelease: false,
+    assets,
+  };
+}
+
+async function fetchLatestReleaseInfo(
+  fetchImpl: UpdateFetch,
+  now: () => Date,
+): Promise<UpdateInfo> {
+  const resp = await fetchWithTimeout(RELEASES_URL, fetchImpl);
   if (!resp.ok) {
     throw new Error(`releases HTTP ${resp.status}`);
   }
-  const releases = (await resp.json()) as GitHubRelease[];
-  for (const release of releases) {
-    if (release.draft || release.prerelease) continue;
+  const values: unknown = await resp.json();
+  if (!Array.isArray(values)) {
+    throw new Error("releases invalid");
+  }
+  for (const value of values) {
+    const release = parseGitHubRelease(value);
+    if (!release) continue;
     const match = /^mobile-v(.+)$/.exec(release.tag_name);
-    if (!match) continue;
-    const asset = release.assets?.find((a) => a.name === "EventAutoPin.apk");
-    if (!asset?.browser_download_url) continue;
+    const version = match?.[1];
+    if (!version || !isValidSemver(version)) continue;
+    const expectedUrl = expectedDownloadUrl("mobile", version);
+    const asset = release.assets.find(
+      (candidate) =>
+        candidate.name === MOBILE_ASSET_NAME &&
+        candidate.browser_download_url === expectedUrl,
+    );
+    if (!asset) continue;
     return {
-      version: match[1],
-      url: asset.browser_download_url,
-      notes: `v${match[1]} リリース`,
-      date: new Date().toISOString().slice(0, 10),
+      version,
+      url: expectedUrl,
+      notes: `v${version} リリース`,
+      date: now().toISOString().slice(0, 10),
     };
   }
   throw new Error("mobile release not found");
 }
 
-async function getLatestMobileInfo(): Promise<UpdateInfo> {
+async function getLatestMobileInfo(
+  fetchImpl: UpdateFetch,
+  now: () => Date,
+): Promise<UpdateInfo> {
   const errors: string[] = [];
   try {
-    return await fetchLatestJsonInfo();
+    return await fetchLatestJsonInfo(fetchImpl);
   } catch (e) {
     errors.push(e instanceof Error ? e.message : String(e));
   }
   try {
-    return await fetchLatestReleaseInfo();
+    return await fetchLatestReleaseInfo(fetchImpl, now);
   } catch (e) {
     errors.push(e instanceof Error ? e.message : String(e));
   }
   throw new Error(errors.join(" / "));
 }
 
-export async function checkForUpdate(): Promise<UpdateCheckResult> {
-  const currentVersion = getCurrentVersion();
+export async function checkForUpdateWithDependencies(
+  currentVersion: string,
+  dependencies: UpdateServiceDependencies = {},
+): Promise<UpdateCheckResult> {
+  if (!isValidSemver(currentVersion)) {
+    return {
+      available: false,
+      currentVersion,
+      errorMessage: "current version invalid",
+    };
+  }
 
   try {
-    const mobile = await getLatestMobileInfo();
+    const mobile = await getLatestMobileInfo(
+      dependencies.fetch ?? fetch,
+      dependencies.now ?? (() => new Date()),
+    );
 
     if (!isNewerVersion(currentVersion, mobile.version)) {
       return { available: false, currentVersion };
@@ -143,20 +287,32 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
   }
 }
 
-export function showUpdateAlert(result: UpdateCheckResult): void {
-  if (!result.available || !result.downloadUrl) return;
+export async function checkForUpdate(): Promise<UpdateCheckResult> {
+  return checkForUpdateWithDependencies(getCurrentVersion());
+}
 
+export function showUpdateAlert(result: UpdateCheckResult): void {
+  if (
+    !result.available ||
+    !result.downloadUrl ||
+    !result.latestVersion ||
+    !isTrustedMobileDownloadUrl(result.downloadUrl, result.latestVersion)
+  ) {
+    return;
+  }
+
+  const downloadUrl = result.downloadUrl;
+  const latestVersion = result.latestVersion;
   const notes = result.releaseNotes ? `\n\n${result.releaseNotes}` : "";
-  const message = `v${result.currentVersion} → v${result.latestVersion}${notes}`;
+  const message = `v${result.currentVersion} → v${latestVersion}${notes}`;
 
   Alert.alert("アプリの更新があります", message, [
     { text: "後で", style: "cancel" },
     {
       text: "更新する",
       onPress: async () => {
-        if (!result.downloadUrl) return;
         try {
-          await ApkInstaller.installApk(result.downloadUrl);
+          await ApkInstaller.installApk(downloadUrl);
           Alert.alert(
             "ダウンロード開始",
             "通知バーにダウンロードの進捗が表示されます。\n完了後、通知をタップしてインストールしてください。",
@@ -170,7 +326,7 @@ export function showUpdateAlert(result: UpdateCheckResult): void {
               { text: "キャンセル", style: "cancel" },
               {
                 text: "ブラウザで開く",
-                onPress: () => Linking.openURL(result.downloadUrl!),
+                onPress: () => Linking.openURL(downloadUrl),
               },
             ],
           );

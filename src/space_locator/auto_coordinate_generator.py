@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from .coordinate_mapper import CoordinateMapper
+from .catalog_geometry_assignment import global_min_cost_association
 from .number_validator import NumberValidator
 from .ocr_engine import OCREngine
 from .pattern_analyzer import PatternAnalyzer
@@ -124,6 +125,26 @@ def calibration_points_from_event(
     event_data: Dict[str, Any],
     map_number: int,
 ) -> List[Dict[str, Any]]:
+    def parse_map_number(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value) or not value.is_integer():
+                return None
+            return int(value)
+        text = str(value).strip()
+        if not re.fullmatch(r"[+-]?\d+", text):
+            return None
+        try:
+            return int(text)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    requested_map = parse_map_number(map_number)
+    if requested_map is None:
+        return []
     event = event_data.get("event", {})
     points = []
     if isinstance(event, dict):
@@ -135,18 +156,32 @@ def calibration_points_from_event(
     for point in points:
         if not isinstance(point, dict):
             continue
-        point_map = int(point.get("map_number") or map_number)
-        if point_map != map_number:
+        point_map_raw = point.get("map_number")
+        if point_map_raw is None or point_map_raw == "":
+            point_map = requested_map
+        else:
+            point_map = parse_map_number(point_map_raw)
+            if point_map is None:
+                continue
+        if point_map != requested_map:
             continue
         space = str(point.get("space") or point.get("space_id") or "").strip()
         pin_x = point.get("pin_x", point.get("x"))
         pin_y = point.get("pin_y", point.get("y"))
+        if isinstance(pin_x, bool) or isinstance(pin_y, bool):
+            continue
         try:
             x = float(pin_x)
             y = float(pin_y)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
-        if not space or not (0 <= x <= 1) or not (0 <= y <= 1):
+        if not (
+            space
+            and math.isfinite(x)
+            and math.isfinite(y)
+            and 0 <= x <= 1
+            and 0 <= y <= 1
+        ):
             continue
         result.append({"space": space, "pin_x": x, "pin_y": y, "map_number": point_map})
     return result
@@ -1115,13 +1150,28 @@ def _catalog_lcs_observations(
     monotonic matches are retained; unmatched tokens are intentionally treated
     as missing/imputed rather than allowed to shift every later slot.
     """
+    observations, _ = _catalog_lcs_alignment(row, expected_numbers)
+    return observations
+
+
+def _catalog_lcs_alignment(
+    row: Sequence[Mapping[str, Any]],
+    expected_numbers: Sequence[int],
+) -> Tuple[Dict[int, float], int]:
+    """Return the strongest LCS alignment and its number-to-x direction.
+
+    Rows are spatially sorted from left to right, but catalog numbering can run
+    in either direction.  Comparing both catalog orders here prevents a valid
+    right-to-left row from being reduced to one retained token before lattice
+    construction.
+    """
     expected = [int(value) for value in expected_numbers if 1 <= int(value) <= 99]
     tokens = sorted(
         [item for item in row if _catalog_geometry_number(item.get("number")) is not None],
         key=lambda item: float(item.get("_cx", _number_center(item)[0])),
     )
     if not expected or not tokens:
-        return {}
+        return {}, 1
     values = [_catalog_geometry_number(item.get("number")) for item in tokens]
     # Keep one token for an adjacent duplicate before the DP; this is both
     # deterministic and matches the tile-overlap failure mode.
@@ -1132,29 +1182,57 @@ def _catalog_lcs_observations(
         deduped.append(item)
     tokens = deduped
     values = [_catalog_geometry_number(item.get("number")) for item in tokens]
-    n, m = len(tokens), len(expected)
-    table = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(n - 1, -1, -1):
-        for j in range(m - 1, -1, -1):
-            match = 1 + table[i + 1][j + 1] if values[i] == expected[j] else 0
-            table[i][j] = max(match, table[i + 1][j], table[i][j + 1])
-    result: Dict[int, float] = {}
-    i = j = 0
-    while i < n and j < m:
-        if values[i] == expected[j] and table[i][j] == 1 + table[i + 1][j + 1]:
-            result[expected[j]] = float(tokens[i].get("_cx", _number_center(tokens[i])[0]))
-            i += 1
-            j += 1
-        elif table[i + 1][j] >= table[i][j + 1]:
-            i += 1
-        else:
-            j += 1
-    return result
+    n = len(tokens)
+
+    def align(ordered_expected: Sequence[int]) -> Dict[int, float]:
+        m = len(ordered_expected)
+        table = [[0] * (m + 1) for _ in range(n + 1)]
+        for i in range(n - 1, -1, -1):
+            for j in range(m - 1, -1, -1):
+                match = (
+                    1 + table[i + 1][j + 1]
+                    if values[i] == ordered_expected[j]
+                    else 0
+                )
+                table[i][j] = max(match, table[i + 1][j], table[i][j + 1])
+        result: Dict[int, float] = {}
+        i = j = 0
+        while i < n and j < m:
+            if (
+                values[i] == ordered_expected[j]
+                and table[i][j] == 1 + table[i + 1][j + 1]
+            ):
+                result[int(ordered_expected[j])] = float(
+                    tokens[i].get("_cx", _number_center(tokens[i])[0])
+                )
+                i += 1
+                j += 1
+            elif table[i + 1][j] >= table[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return result
+
+    forward = align(expected)
+    reverse = align(list(reversed(expected)))
+    if len(reverse) > len(forward):
+        return reverse, -1
+    if len(forward) > len(reverse):
+        return forward, 1
+
+    # Equal LCS lengths occur for sparse rows.  Use the observed endpoint trend
+    # only as a deterministic tie-breaker; a singleton keeps the legacy LTR
+    # default and will normally be rejected later by the observation gate.
+    distinct_values = [value for index, value in enumerate(values) if value not in values[:index]]
+    if len(distinct_values) >= 2 and distinct_values[-1] < distinct_values[0]:
+        return reverse, -1
+    return forward, 1
 
 
 def _catalog_global_lattice(
     observations: Sequence[Mapping[int, float]],
     expected_numbers: Sequence[int],
+    directions: Optional[Sequence[int]] = None,
 ) -> Dict[int, float]:
     """Build one robust x lattice from all horizontal rows."""
     expected = sorted({int(value) for value in expected_numbers if 1 <= int(value) <= 99})
@@ -1171,19 +1249,47 @@ def _catalog_global_lattice(
         for number, xs in by_number.items()
         if xs
     }
-    if len(direct) >= 2:
-        slopes: List[float] = []
+    slopes: List[float] = []
+    direction_votes: List[int] = []
+    for index, row in enumerate(observations):
+        row_direction = (
+            int(directions[index])
+            if directions is not None and index < len(directions)
+            else 0
+        )
+        ordered_numbers = sorted(int(number) for number in row)
+        for left, right in zip(ordered_numbers[:-1], ordered_numbers[1:]):
+            if right == left:
+                continue
+            slope = (float(row[right]) - float(row[left])) / (right - left)
+            if not math.isfinite(slope) or abs(slope) <= 1e-9:
+                continue
+            slope_direction = 1 if slope > 0 else -1
+            if row_direction and slope_direction != row_direction:
+                continue
+            slopes.append(slope)
+            direction_votes.append(row_direction or slope_direction)
+
+    if not slopes and len(direct) >= 2:
         direct_numbers = sorted(direct)
-        for left, right in zip(direct_numbers[:-1], direct_numbers[1:]):
-            if right > left and direct[right] > direct[left]:
-                slopes.append((direct[right] - direct[left]) / (right - left))
-        spacing = statistics.median(slopes) if slopes else 0.0
-    else:
-        spacing = 0.0
-    if spacing <= 0:
+        slopes = [
+            (direct[right] - direct[left]) / (right - left)
+            for left, right in zip(direct_numbers[:-1], direct_numbers[1:])
+            if right > left and abs(direct[right] - direct[left]) > 1e-9
+        ]
+        direction_votes.extend(1 if slope > 0 else -1 for slope in slopes)
+
+    dominant_direction = 1
+    if direction_votes and sum(direction_votes) < 0:
+        dominant_direction = -1
+    consistent_slopes = [
+        slope for slope in slopes if (slope > 0) == (dominant_direction > 0)
+    ]
+    spacing = statistics.median(consistent_slopes) if consistent_slopes else 0.0
+    if abs(spacing) <= 1e-9:
         # A single row may have only one OCR token.  Keep the fallback
         # data-derived and bounded; callers can reject a low-coverage result.
-        spacing = 1.0
+        spacing = float(dominant_direction)
     lattice: Dict[int, float] = dict(direct)
     if direct:
         anchor_number = min(direct, key=lambda number: (len(by_number[number]) * -1, number))
@@ -1244,6 +1350,7 @@ def _build_catalog_geometry_grid(
         for label in horizontal_labels
     }
     row_observations: Dict[str, Dict[int, float]] = {}
+    row_directions: Dict[str, int] = {}
     row_y: Dict[str, float] = {}
     observed_expected_numbers = [number for values in expected_horizontal.values() for number in values]
     if observed_expected_numbers:
@@ -1254,10 +1361,16 @@ def _build_catalog_geometry_grid(
     for label in horizontal_labels:
         assigned = layout["horizontal"].get(label) or []
         row = assigned[0] if assigned else []
-        row_observations[label] = _catalog_lcs_observations(row, number_range)
+        observations, direction = _catalog_lcs_alignment(row, number_range)
+        row_observations[label] = observations
+        row_directions[label] = direction
         if row:
             row_y[label] = statistics.median(item["_cy"] for item in row)
-    lattice = _catalog_global_lattice(list(row_observations.values()), all_numbers)
+    lattice = _catalog_global_lattice(
+        [row_observations[label] for label in horizontal_labels],
+        all_numbers,
+        [row_directions[label] for label in horizontal_labels],
+    )
     centers: Dict[Tuple[str, int], Tuple[float, float]] = {}
     for label in horizontal_labels:
         observations = row_observations.get(label, {})
@@ -1355,7 +1468,12 @@ def _build_catalog_geometry_grid(
                     float(observation["_cy"]),
                 )
                 continue
-            usable_models = [model for model in track_models if model[0]]
+            sequence_models = [
+                model
+                for model in track_models
+                if len(model[0]) >= 3 and model[4] > 0
+            ]
+            usable_models = sequence_models or [model for model in track_models if model[0]]
             if not usable_models:
                 continue
             observed_numbers, slope, intercept, track_x, _ = min(
@@ -1471,36 +1589,42 @@ def _catalog_geometry_quality(
             )
         circle_grid[circle_identity].append((key, number, x, y))
 
-    edges: List[Tuple[float, str, int, Any]] = []
+    # Associate OCR candidates to circle geometry globally.  Iteration-order
+    # greedy matching can consume a near duplicate for the wrong circle;
+    # Hungarian assignment keeps one-to-one evidence deterministic while
+    # preserving grouped/range circle identity.
+    targets: List[Dict[str, Any]] = []
     for circle_identity, slots in circle_grid.items():
-        for raw_index, raw in enumerate(numbers):
-            raw_number = _catalog_geometry_number(raw.get("number"))
-            if raw_number is None:
+        for key, number, x, y in slots:
+            expected_item = expected_by_key.get(key)
+            if expected_item is None:
                 continue
-            bbox = _catalog_geometry_bbox(raw)
-            if bbox is None:
-                continue
-            raw_x, raw_y, raw_width, raw_height = bbox
-            cx, cy = raw_x + raw_width / 2.0, raw_y + raw_height / 2.0
-            distances = [
-                math.hypot(cx - x, cy - y)
-                for _, number, x, y in slots
-                if number == raw_number
-                and abs(cx - x) <= max(110.0, image_width * 0.045)
-                and abs(cy - y) <= max(110.0, image_height * 0.07)
-            ]
-            if not distances:
-                continue
-            edges.append((min(distances), str(circle_identity), raw_index, circle_identity))
-    used_circles: set[Any] = set()
-    used_raw: set[int] = set()
-    for distance, _, raw_index, circle_identity in sorted(edges):
-        if circle_identity in used_circles or raw_index in used_raw:
+            targets.append(
+                {
+                    "space_id": key,
+                    "prefix": expected_item.get("prefix"),
+                    "number": number,
+                    "center_x": x,
+                    "center_y": y,
+                    "group_identity": repr(circle_identity),
+                }
+            )
+    association = global_min_cost_association(
+        numbers,
+        targets,
+        distance_threshold=max(110.0, image_width * 0.045, image_height * 0.07),
+        require_number=True,
+        require_prefix_when_present=True,
+        group_aware=True,
+    )
+    for match in association.get("matches", []):
+        distance = match.get("distance_px")
+        if distance is None:
             continue
-        used_circles.add(circle_identity)
-        used_raw.add(raw_index)
-        observed_keys.update(key for key, _, _, _ in circle_grid[circle_identity])
-        residuals.append(distance)
+        for target_index in match.get("target_indices", []):
+            if 0 <= int(target_index) < len(targets):
+                observed_keys.add(str(targets[int(target_index)]["space_id"]))
+        residuals.append(float(distance))
 
     # Duplicate candidates are useful ambiguity diagnostics but do not make a
     # valid map fail by themselves.
@@ -1517,6 +1641,16 @@ def _catalog_geometry_quality(
 
     horizontal_labels = set(layout["horizontal_labels"])
     vertical_labels = set(layout["vertical_labels"])
+    horizontal_directions: Dict[str, int] = {}
+    for prefix, tracks in layout["horizontal"].items():
+        row = tracks[0] if tracks else []
+        expected_numbers = sorted(
+            {int(item["number"]) for item in expected if item["prefix"] == prefix}
+        )
+        _, horizontal_directions[prefix] = _catalog_lcs_alignment(
+            row,
+            expected_numbers,
+        )
     monotonic = True
     by_prefix: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
     for item in grid:
@@ -1531,7 +1665,16 @@ def _catalog_geometry_quality(
             continue
         else:
             values = [float(item.get("x", 0)) for item in ordered]
-            if any(right < left for left, right in zip(values[:-1], values[1:])):
+            direction = horizontal_directions.get(prefix, 1)
+            if direction < 0:
+                violates_direction = any(
+                    right > left for left, right in zip(values[:-1], values[1:])
+                )
+            else:
+                violates_direction = any(
+                    right < left for left, right in zip(values[:-1], values[1:])
+                )
+            if violates_direction:
                 monotonic = False
         if not monotonic:
             break
@@ -1545,7 +1688,12 @@ def _catalog_geometry_quality(
         except (TypeError, ValueError):
             out_of_bounds += 1
             continue
-        if not (0 <= point_x <= image_width and 0 <= point_y <= image_height):
+        if not (
+            math.isfinite(point_x)
+            and math.isfinite(point_y)
+            and 0 <= point_x <= image_width
+            and 0 <= point_y <= image_height
+        ):
             out_of_bounds += 1
     observed_coverage = len(observed_keys) / expected_count if expected_count else 0.0
     residual = statistics.median(residuals) if residuals else None
@@ -1641,6 +1789,10 @@ def _catalog_geometry_quality(
         "near_duplicate_circles": near_duplicate_circles,
         "out_of_bounds": out_of_bounds,
         "monotonic": monotonic,
+        "horizontal_directions": {
+            prefix: ("right_to_left" if direction < 0 else "left_to_right")
+            for prefix, direction in horizontal_directions.items()
+        },
         "residual_px": round(float(residual), 3) if residual is not None else None,
         "gate": {
             "passed": passed,
@@ -1720,28 +1872,88 @@ def apply_calibration_points(
     if not grid or not calibration_points:
         return grid, {"applied": False, "points": 0, "mode": "none"}
 
-    lookup = _coordinate_lookup(grid)
+    def rejected(points: int, reason: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        return grid, {
+            "applied": False,
+            "points": points,
+            "mode": "rejected",
+            "reason": reason,
+        }
+
+    try:
+        width = float(image_width)
+        height = float(image_height)
+    except (TypeError, ValueError, OverflowError):
+        return rejected(0, "invalid_image_dimensions")
+    if not (
+        math.isfinite(width)
+        and math.isfinite(height)
+        and width > 0
+        and height > 0
+    ):
+        return rejected(0, "invalid_image_dimensions")
+
+    lookup: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+    base_coordinates: List[Tuple[float, float]] = []
+    for index, item in enumerate(grid):
+        if not isinstance(item, dict):
+            return rejected(0, "invalid_grid")
+        try:
+            nx, ny = _coord_normalized(item, int(round(width)), int(round(height)))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError, OverflowError):
+            return rejected(0, "invalid_grid")
+        if not (
+            math.isfinite(nx)
+            and math.isfinite(ny)
+            and 0 <= nx <= 1
+            and 0 <= ny <= 1
+        ):
+            return rejected(0, "invalid_grid")
+        base_coordinates.append((nx, ny))
+        space_id = str(item.get("space_id") or "")
+        if space_id:
+            lookup[normalize_space_key(space_id)] = (index, item)
+
     source: List[Tuple[float, float]] = []
     target: List[Tuple[float, float]] = []
+    matched_keys: Dict[str, Tuple[float, float]] = {}
     for point in calibration_points:
-        space = str(point.get("space") or point.get("space_id") or "")
-        item = lookup.get(normalize_space_key(space))
-        if not item:
+        if not isinstance(point, Mapping):
             continue
-        source.append(_coord_normalized(item, image_width, image_height))
-        target.append((float(point["pin_x"]), float(point["pin_y"])))
+        space = str(point.get("space") or point.get("space_id") or "")
+        key = normalize_space_key(space)
+        matched = lookup.get(key)
+        if not matched:
+            continue
+        if isinstance(point.get("pin_x"), bool) or isinstance(point.get("pin_y"), bool):
+            continue
+        try:
+            target_point = (float(point["pin_x"]), float(point["pin_y"]))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if not (
+            math.isfinite(target_point[0])
+            and math.isfinite(target_point[1])
+            and 0 <= target_point[0] <= 1
+            and 0 <= target_point[1] <= 1
+        ):
+            continue
+        if key in matched_keys:
+            if math.hypot(
+                matched_keys[key][0] - target_point[0],
+                matched_keys[key][1] - target_point[1],
+            ) > 1e-9:
+                return rejected(len(source), "conflicting_calibration_points")
+            continue
+        matched_keys[key] = target_point
+        source.append(base_coordinates[matched[0]])
+        target.append(target_point)
 
     if not source:
         return grid, {"applied": False, "points": 0, "mode": "no_match"}
 
-    def apply_point(item: Dict[str, Any], nx: float, ny: float) -> None:
-        nx = min(1.0, max(0.0, nx))
-        ny = min(1.0, max(0.0, ny))
-        item["normalized_x"] = nx
-        item["normalized_y"] = ny
-        item["x"] = int(round(nx * image_width))
-        item["y"] = int(round(ny * image_height))
-
+    mode = "translation"
+    transform: Any
     if len(source) >= 3:
         try:
             import numpy as np
@@ -1749,26 +1961,167 @@ def apply_calibration_points(
             a = np.array([[x, y, 1.0] for x, y in source], dtype=float)
             bx = np.array([x for x, _ in target], dtype=float)
             by = np.array([y for _, y in target], dtype=float)
-            if np.linalg.matrix_rank(a) >= 3:
-                coef_x, *_ = np.linalg.lstsq(a, bx, rcond=None)
-                coef_y, *_ = np.linalg.lstsq(a, by, rcond=None)
-                for item in grid:
-                    nx, ny = _coord_normalized(item, image_width, image_height)
-                    next_x = float(coef_x[0] * nx + coef_x[1] * ny + coef_x[2])
-                    next_y = float(coef_y[0] * nx + coef_y[1] * ny + coef_y[2])
-                    apply_point(item, next_x, next_y)
-                return grid, {"applied": True, "points": len(source), "mode": "affine"}
-        except Exception:
-            pass
+            if np.linalg.matrix_rank(a) < 3 or not np.isfinite(np.linalg.cond(a)):
+                return rejected(len(source), "degenerate_affine_source")
+            if float(np.linalg.cond(a)) > 1e4:
+                return rejected(len(source), "degenerate_affine_source")
+            coef_x, *_ = np.linalg.lstsq(a, bx, rcond=None)
+            coef_y, *_ = np.linalg.lstsq(a, by, rcond=None)
+            coefficients = np.concatenate((coef_x, coef_y))
+            if not np.all(np.isfinite(coefficients)):
+                return rejected(len(source), "non_finite_affine")
 
-    dx_values = [target_x - source_x for (source_x, _), (target_x, _) in zip(source, target)]
-    dy_values = [target_y - source_y for (_, source_y), (_, target_y) in zip(source, target)]
-    dx = statistics.median(dx_values)
-    dy = statistics.median(dy_values)
-    for item in grid:
-        nx, ny = _coord_normalized(item, image_width, image_height)
-        apply_point(item, nx + dx, ny + dy)
-    return grid, {"applied": True, "points": len(source), "mode": "translation"}
+            linear = np.array(
+                [[coef_x[0], coef_x[1]], [coef_y[0], coef_y[1]]],
+                dtype=float,
+            )
+            determinant = float(np.linalg.det(linear))
+            singular_values = np.linalg.svd(linear, compute_uv=False)
+            column_norms = [float(np.linalg.norm(linear[:, index])) for index in range(2)]
+            shear = abs(
+                float(np.dot(linear[:, 0], linear[:, 1]))
+                / max(column_norms[0] * column_norms[1], 1e-12)
+            )
+            if not math.isfinite(determinant) or determinant <= 0.0:
+                return rejected(len(source), "invalid_affine_determinant")
+            if not (
+                0.25 <= determinant <= 4.0
+                and float(min(singular_values)) >= 0.5
+                and float(max(singular_values)) <= 2.0
+                and all(0.5 <= value <= 2.0 for value in column_norms)
+            ):
+                return rejected(len(source), "unsafe_affine_scale")
+            if not math.isfinite(shear) or shear > 0.35:
+                return rejected(len(source), "unsafe_affine_shear")
+
+            residuals = [
+                math.hypot(
+                    float(coef_x[0] * sx + coef_x[1] * sy + coef_x[2]) - tx,
+                    float(coef_y[0] * sx + coef_y[1] * sy + coef_y[2]) - ty,
+                )
+                for (sx, sy), (tx, ty) in zip(source, target)
+            ]
+            rms_residual = math.sqrt(
+                sum(residual * residual for residual in residuals) / len(residuals)
+            )
+            if max(residuals) > 0.04 or rms_residual > 0.025:
+                return rejected(len(source), "affine_residual_too_large")
+
+            def transform(nx: float, ny: float) -> Tuple[float, float]:
+                return (
+                    float(coef_x[0] * nx + coef_x[1] * ny + coef_x[2]),
+                    float(coef_y[0] * nx + coef_y[1] * ny + coef_y[2]),
+                )
+
+            mode = "affine"
+        except Exception:
+            return rejected(len(source), "affine_validation_failed")
+    else:
+        dx_values = [
+            target_x - source_x
+            for (source_x, _), (target_x, _) in zip(source, target)
+        ]
+        dy_values = [
+            target_y - source_y
+            for (_, source_y), (_, target_y) in zip(source, target)
+        ]
+        dx = statistics.median(dx_values)
+        dy = statistics.median(dy_values)
+        residuals = [
+            math.hypot(source_x + dx - target_x, source_y + dy - target_y)
+            for (source_x, source_y), (target_x, target_y) in zip(source, target)
+        ]
+        rms_residual = math.sqrt(
+            sum(residual * residual for residual in residuals) / len(residuals)
+        )
+        if max(residuals) > 0.04 or rms_residual > 0.025:
+            return rejected(len(source), "translation_residual_too_large")
+
+        def transform(nx: float, ny: float) -> Tuple[float, float]:
+            return nx + dx, ny + dy
+
+    transformed_coordinates = [transform(nx, ny) for nx, ny in base_coordinates]
+    if any(
+        not (
+            math.isfinite(nx)
+            and math.isfinite(ny)
+            and 0 <= nx <= 1
+            and 0 <= ny <= 1
+        )
+        for nx, ny in transformed_coordinates
+    ):
+        return rejected(len(source), "transformed_grid_out_of_bounds")
+
+    # Distinct source pins must remain distinct after calibration.  Exact
+    # duplicates are allowed only when the deterministic grid already shared a
+    # center (for example a grouped/range circle).
+    transformed_buckets: Dict[Tuple[int, int], Tuple[float, float]] = {}
+    for original, transformed_point in zip(base_coordinates, transformed_coordinates):
+        bucket = (
+            int(round(transformed_point[0] * width * 1000)),
+            int(round(transformed_point[1] * height * 1000)),
+        )
+        previous = transformed_buckets.get(bucket)
+        if previous is not None and math.hypot(
+            (previous[0] - original[0]) * width,
+            (previous[1] - original[1]) * height,
+        ) > 1e-6:
+            return rejected(len(source), "transformed_grid_not_distinct")
+        transformed_buckets[bucket] = original
+
+    # Preserve the deterministic numeric direction of every spatial row.  This
+    # catches reflections, 90-degree rotations, and near-collapses even when an
+    # exactly fitted affine happens to have small point residuals.
+    by_row: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    for index, item in enumerate(grid):
+        row = str(item.get("row") or "")
+        number = _catalog_geometry_number(item.get("number", item.get("col")))
+        if not row or number is None:
+            expanded = expand_space_ids(str(item.get("space_id") or ""))
+            if expanded:
+                row = str(expanded[0]["prefix"])
+                number = int(expanded[0]["number"])
+        if row and number is not None:
+            by_row[row].append((number, index))
+    for row_items in by_row.values():
+        ordered = sorted(row_items)
+        for (_, left_index), (_, right_index) in zip(ordered[:-1], ordered[1:]):
+            left = base_coordinates[left_index]
+            right = base_coordinates[right_index]
+            next_left = transformed_coordinates[left_index]
+            next_right = transformed_coordinates[right_index]
+            original_dx = (right[0] - left[0]) * width
+            original_dy = (right[1] - left[1]) * height
+            transformed_dx = (next_right[0] - next_left[0]) * width
+            transformed_dy = (next_right[1] - next_left[1]) * height
+            original_distance = math.hypot(original_dx, original_dy)
+            transformed_distance = math.hypot(transformed_dx, transformed_dy)
+            if original_distance <= 1.0:
+                continue
+            if transformed_distance < max(1.0, original_distance * 0.35):
+                return rejected(len(source), "transformed_grid_not_distinct")
+            if abs(original_dx) >= abs(original_dy):
+                direction_ok = (
+                    original_dx * transformed_dx > 0
+                    and abs(transformed_dx) >= max(1.0, abs(original_dx) * 0.25)
+                )
+            else:
+                direction_ok = (
+                    original_dy * transformed_dy > 0
+                    and abs(transformed_dy) >= max(1.0, abs(original_dy) * 0.25)
+                )
+            if not direction_ok:
+                return rejected(len(source), "transformed_grid_direction_changed")
+
+    adjusted: List[Dict[str, Any]] = []
+    for item, (nx, ny) in zip(grid, transformed_coordinates):
+        next_item = dict(item)
+        next_item["normalized_x"] = nx
+        next_item["normalized_y"] = ny
+        next_item["x"] = int(round(nx * width))
+        next_item["y"] = int(round(ny * height))
+        adjusted.append(next_item)
+    return adjusted, {"applied": True, "points": len(source), "mode": mode}
 
 
 def _load_ocr_result(ocr_result_path: str) -> List[Dict[str, Any]]:
@@ -1903,11 +2256,74 @@ def generate_coordinates_from_map(
     try:
         validator = NumberValidator(model=model)
         numbers = validator.validate_numbers(image_path, raw_numbers)
-        if not numbers:
-            numbers = raw_numbers
-    except Exception as exc:
-        logger.warning(f"OCR番号検証をスキップ: {exc}")
-        numbers = raw_numbers
+    except Exception:
+        # Validator 自体が実行不能な場合も raw 候補へ戻さない。未承認
+        # OCRを pin 化せず、診断付き controlled failure として終了する。
+        logger.warning("OCR番号検証に失敗したため座標生成を中断")
+        try:
+            output_path = Path(output_json_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            failure_diagnostics = dict(ocr_engine.diagnostics)
+            failure_diagnostics["error"] = {
+                "code": "number_validation_failed",
+                "message": "NumberValidator failed before approving OCR candidates",
+            }
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "image_path": image_path,
+                        "event_json_path": event_json_path,
+                        "map_number": map_number,
+                        "error": "number_validation_failed",
+                        "ocr_diagnostics": failure_diagnostics,
+                        "validated_count": 0,
+                        "raw_count": len(raw_numbers),
+                        "complete_grid": [],
+                        "total_spaces": 0,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except OSError:
+            pass
+        return None
+
+    # 空の検証結果を raw_numbers で補完しない。検証で候補が全て除外
+    # された場合は、誤検出を pin として出力するより安全に失敗させる。
+    if not isinstance(numbers, list) or not numbers:
+        logger.error(
+            "OCR番号検証結果が空のため座標生成を中断 (raw=%d)",
+            len(raw_numbers),
+        )
+        try:
+            output_path = Path(output_json_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            failure_diagnostics = dict(ocr_engine.diagnostics)
+            failure_diagnostics["error"] = {
+                "code": "number_validation_empty",
+                "message": "NumberValidator returned no approved OCR candidates",
+            }
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "image_path": image_path,
+                        "event_json_path": event_json_path,
+                        "map_number": map_number,
+                        "error": "number_validation_empty",
+                        "ocr_diagnostics": failure_diagnostics,
+                        "validated_count": 0,
+                        "raw_count": len(raw_numbers),
+                        "complete_grid": [],
+                        "total_spaces": 0,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except OSError:
+            pass
+        return None
 
     import cv2
 
@@ -1936,8 +2352,9 @@ def generate_coordinates_from_map(
 
     horizontal_candidates = select_horizontal_numbers(numbers)
     if len(horizontal_candidates) < max(12, len(numbers) // 3):
-        horizontal_candidates = select_horizontal_numbers(raw_numbers) or raw_numbers
-        numbers = raw_numbers
+        # Filtered candidates are only used for the coarse pattern estimate;
+        # retain the validator-approved list for final geometry resolution.
+        horizontal_candidates = numbers
 
     logger.info("[Step 2] OCR結果からグリッド候補を推定")
     pattern_info = ocr_engine.analyze_grid_pattern(horizontal_candidates)
@@ -1998,16 +2415,17 @@ def generate_coordinates_from_map(
         pattern_info["rows"] = len(y_positions)
 
     logger.info("[Step 4] catalog geometry resolverで座標を生成")
-    # Final geometry is deliberately resolved from raw OCR bboxes and the
-    # expanded catalog only.  LLM pattern output and event pin/calibration
-    # points remain diagnostics, never geometry inputs (evaluation-leak guard).
+    # Final geometry is deliberately resolved from validator-approved OCR
+    # bboxes and the expanded catalog only.  LLM pattern output and event
+    # pin/calibration points remain diagnostics until the explicit post-gate
+    # calibration step (evaluation-leak guard).
     complete_grid = _build_catalog_geometry_grid(
-        raw_numbers,
+        numbers,
         catalog_info,
         (image_width, image_height),
     )
     geometry_quality = _catalog_geometry_quality(
-        raw_numbers,
+        numbers,
         catalog_info,
         complete_grid,
         (image_width, image_height),
@@ -2043,12 +2461,54 @@ def generate_coordinates_from_map(
             pass
         return None
 
-    # Calibration is intentionally not applied to the deterministic resolver.
-    calibration_summary = {
-        "applied": False,
-        "points": 0,
-        "mode": "deterministic_catalog_geometry",
-    }
+    # Resolve deterministic catalog geometry first, then apply calibration as
+    # an explicit coordinate transform.  Quality/evaluation remains based on
+    # the pre-calibration geometry so existing event pins cannot influence the
+    # resolver gate.
+    if use_calibration:
+        complete_grid, calibration_summary = apply_calibration_points(
+            complete_grid,
+            catalog_info.get("calibration_points") or [],
+            image_width=image_width,
+            image_height=image_height,
+        )
+        if calibration_summary.get("mode") == "rejected":
+            logger.error("calibration safety gate failed: %s", calibration_summary)
+            failure_diagnostics = dict(ocr_engine.diagnostics)
+            failure_diagnostics["error"] = {
+                "code": "calibration_safety_gate_failed",
+                "message": "calibration transform was rejected before pin update",
+                "calibration": calibration_summary,
+            }
+            try:
+                output_path = Path(output_json_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "image_path": image_path,
+                            "event_json_path": event_json_path,
+                            "map_number": map_number,
+                            "error": "calibration_safety_gate_failed",
+                            "ocr_diagnostics": failure_diagnostics,
+                            "geometry_quality": geometry_quality,
+                            "calibration": calibration_summary,
+                            "complete_grid": [],
+                            "total_spaces": 0,
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+            except OSError:
+                pass
+            return None
+    else:
+        calibration_summary = {
+            "applied": False,
+            "points": 0,
+            "mode": "disabled",
+        }
 
     result = {
         "image_path": image_path,

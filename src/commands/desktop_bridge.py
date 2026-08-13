@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from copy import deepcopy
 import glob
 import hashlib
 import json
@@ -22,27 +23,42 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import yaml
 
+from src.utils.cookie_loader import validate_cookie_file_path
+from src.utils.atomic_json import atomic_write_json
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _event_file_fingerprint(path: Path, contents: Optional[bytes] = None) -> Dict[str, Any]:
+    """Return a stable base fingerprint without exposing event contents."""
+
+    if contents is None:
+        contents = path.read_bytes()
+    stat_result = path.stat()
+    content_hash = 0xCBF29CE484222325
+    for byte in contents:
+        content_hash ^= byte
+        content_hash = (content_hash * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return {
+        "modified_ms": stat_result.st_mtime_ns // 1_000_000,
+        "modified_ns": stat_result.st_mtime_ns,
+        "file_size": stat_result.st_size,
+        "content_hash": f"{content_hash:016x}",
+    }
+
+
+def _load_event_json_snapshot(path: Path) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    contents = path.read_bytes()
+    data = json.loads(contents.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("event.json root must be an object")
+    return data, _event_file_fingerprint(path, contents)
+
+
 def _write_json_atomic(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+    atomic_write_json(path, data)
 
 
 @contextmanager
@@ -402,7 +418,15 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     ]
     for key in optional_keys:
         if key in payload and payload[key] not in (None, ""):
-            config[key] = payload[key]
+            if key == "cookie_file":
+                # main.py は一時作業ディレクトリから起動されるため、相対
+                # pathを先にプロジェクトルート基準の絶対pathへ固定する。
+                # 検証失敗時は明示pathの自動検出fallbackを許可しない。
+                config[key] = str(
+                    validate_cookie_file_path(str(payload[key]), project_root)
+                )
+            else:
+                config[key] = payload[key]
 
     # 旧版GUI/外部呼び出しがフラットなキーを送る場合も同じ契約へ寄せる。
     # ocr_config が明示されていれば優先し、空の値で既定を壊さない。
@@ -432,6 +456,14 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
             config["ocr_config"] = flat_config
 
     return config
+
+
+def _safe_config_for_result(config: Dict[str, Any]) -> Dict[str, Any]:
+    """bridge結果向けに機密pathを含まない設定要約を返す。"""
+    safe = dict(config)
+    if "cookie_file" in safe:
+        safe["cookie_file"] = "<選択済みCookieファイル>"
+    return safe
 
 
 def _collect_coordinate_diagnostics(output_dir: str | Path) -> Dict[str, Any] | None:
@@ -694,7 +726,7 @@ def _run_main_process(
         "command": cmd,
         "cwd": str(run_dir),
         "project_root": str(project_root),
-        "config_used": config,
+        "config_used": _safe_config_for_result(config),
         "stdout": stdout_output,
         "stderr": "\n".join(stderr_lines),
     }
@@ -965,9 +997,7 @@ def _merge_multi_event_outputs(
         },
     }
     output_path = final_output_dir / "event.json"
-    output_path.write_text(
-        json.dumps(merged_data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    atomic_write_json(output_path, merged_data)
     return merged_data
 
 
@@ -1030,7 +1060,7 @@ def _job_run_multi_main_pipeline(
                     "mode": "multi_event",
                     "returncode": reprocess_result["returncode"],
                     "project_root": str(project_root),
-                    "config_used": base_config,
+                    "config_used": _safe_config_for_result(base_config),
                     "source_results": run_results,
                     "stdout": str(reprocess_result.get("stdout", "")),
                     "stderr": str(reprocess_result.get("stderr", "")),
@@ -1080,7 +1110,7 @@ def _job_run_multi_main_pipeline(
                     "mode": "multi_event",
                     "returncode": result["returncode"],
                     "project_root": str(project_root),
-                    "config_used": base_config,
+                    "config_used": _safe_config_for_result(base_config),
                     "source_results": run_results,
                     "stdout": "\n".join(str(r.get("stdout", "")) for r in run_results),
                     "stderr": "\n".join(str(r.get("stderr", "")) for r in run_results),
@@ -1095,9 +1125,7 @@ def _job_run_multi_main_pipeline(
         twitter_processing = _aggregate_twitter_processing_results(run_results)
         if twitter_processing:
             merged.setdefault("metadata", {})["twitter_processing"] = twitter_processing
-            (final_output_dir / "event.json").write_text(
-                json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            atomic_write_json(final_output_dir / "event.json", merged)
 
     result = {
         "status": "ok",
@@ -1106,7 +1134,7 @@ def _job_run_multi_main_pipeline(
         "mode": "multi_event",
         "returncode": 0,
         "project_root": str(project_root),
-        "config_used": base_config,
+        "config_used": _safe_config_for_result(base_config),
         "source_results": run_results,
         "merged_circle_count": len(merged.get("circles") or []),
         "merged_source_count": len(merged.get("event", {}).get("source_events") or []),
@@ -1189,7 +1217,7 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
             "command": cmd,
             "cwd": str(temp_dir_path),
             "project_root": str(project_root),
-            "config_used": config,
+            "config_used": _safe_config_for_result(config),
             "stdout": stdout_output,
             "stderr": "\n".join(stderr_lines),
         }
@@ -1263,8 +1291,7 @@ def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not json_path.exists():
         raise FileNotFoundError(f"event.json not found: {json_path}")
 
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    data, base_fingerprint = _load_event_json_snapshot(json_path)
 
     circles = data.get("circles", [])
     idx = int(circle_index)
@@ -1278,48 +1305,11 @@ def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
     ):
         circle_identity = {}
     circle_dict = circles[idx]
-
-    def _matches_identity(candidate: Dict[str, Any], identity: Dict[str, Any]) -> bool:
-        checks = [
-            ("name", "name"),
-            ("penname", "penname"),
-            ("space", "space"),
-            ("hall", "hall"),
-        ]
-        matched_any = False
-        for identity_key, circle_key in checks:
-            expected = str(identity.get(identity_key) or "").strip()
-            if not expected:
-                continue
-            matched_any = True
-            actual = str(candidate.get(circle_key) or "").strip()
-            if actual != expected:
-                return False
-        return matched_any
-
-    def _resolve_latest_circle_index(
-        latest_circles: List[Dict[str, Any]],
-        preferred_idx: int,
-        identity: Dict[str, Any],
-    ) -> int:
-        if 0 <= preferred_idx < len(latest_circles):
-            if not identity or _matches_identity(latest_circles[preferred_idx], identity):
-                return preferred_idx
-        if identity:
-            matches = [
-                i
-                for i, candidate in enumerate(latest_circles)
-                if isinstance(candidate, dict) and _matches_identity(candidate, identity)
-            ]
-            if len(matches) == 1:
-                return matches[0]
-            if len(matches) > 1:
-                raise ValueError(
-                    "circle_identity matched multiple circles; cannot apply reprocess result safely"
-                )
+    if circle_identity and not _matches_circle_identity(circle_dict, circle_identity):
         raise ValueError(
-            f"target circle was changed or removed while reprocessing: index={preferred_idx}"
+            f"circle_identity does not match requested circle_index: index={idx}"
         )
+    base_circle = deepcopy(circle_dict)
 
     # Circleオブジェクト構築（更新対象フィールドのみ）
     from src.models import Circle, ItemImage
@@ -1405,7 +1395,8 @@ def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
     run_result = asyncio.run(_run())
     success = bool(run_result.get("updated"))
 
-    # 更新結果をパッチ化する。完了時に最新event.jsonへ差し込み、並行編集を巻き戻さない。
+    # 更新結果だけを返す。desktop sessionが最新event.jsonへidentity patchを
+    # native atomic saveするため、このworkerはlive event.jsonを書き換えない。
     circle_patch: Dict[str, Any] = {}
     if success or circle_obj.items or circle_obj.catalog_status or circle_obj.existing_only_status:
         circle_patch["items"] = list(circle_obj.items)
@@ -1425,37 +1416,32 @@ def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
     if post_url not in existing_memo:
         circle_patch["memo"] = (existing_memo + "\n" + post_url) if existing_memo else post_url
 
-    # 保存直前に最新のevent.jsonを読み直し、対象サークルだけへ反映する。
-    latest_data = json.loads(json_path.read_text(encoding="utf-8"))
-    latest_circles = latest_data.get("circles", [])
-    if not isinstance(latest_circles, list):
-        raise ValueError("event.json circles must be a list")
-    resolved_idx = _resolve_latest_circle_index(latest_circles, idx, circle_identity)
-    latest_circle = latest_circles[resolved_idx]
-    if not isinstance(latest_circle, dict):
-        raise ValueError(f"target circle is not an object: index={resolved_idx}")
     _apply_missing_circle_cut_from_catalog(
         project_root,
         output_dir,
-        latest_circle,
+        circle_dict,
         circle_patch,
     )
-    latest_circle.update(circle_patch)
-    _write_json_atomic(json_path, latest_data)
+    updated_circle = dict(circle_dict)
+    updated_circle.update(circle_patch)
 
     return {
         "status": "ok",
         "job": "reprocess_circle_from_post",
         "timestamp": _utc_now_iso(),
         "event_json": str(json_path),
-        "circle_index": resolved_idx,
+        "circle_index": idx,
         "requested_circle_index": idx,
-        "circle_name": latest_circle.get("name", ""),
+        "circle_identity": circle_identity,
+        "base_circle": base_circle,
+        "base_fingerprint": base_fingerprint,
+        "circle_patch": circle_patch,
+        "circle_name": updated_circle.get("name", ""),
         "tweet_id": tweet_id,
         "post_url": post_url,
         "image_updated": bool(run_result.get("image_updated")),
-        "items_count": len(latest_circle.get("items", [])),
-        "updated_circle": latest_circle,
+        "items_count": len(updated_circle.get("items", [])),
+        "updated_circle": updated_circle,
     }
 
 
@@ -1497,8 +1483,7 @@ def _job_reprocess_circle_from_image(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not image_filename:
         image_filename = local_image_path.name
 
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    data, base_fingerprint = _load_event_json_snapshot(json_path)
 
     circles = data.get("circles", [])
     idx = int(circle_index)
@@ -1512,6 +1497,11 @@ def _job_reprocess_circle_from_image(payload: Dict[str, Any]) -> Dict[str, Any]:
     ):
         circle_identity = {}
     circle_dict = circles[idx]
+    if circle_identity and not _matches_circle_identity(circle_dict, circle_identity):
+        raise ValueError(
+            f"circle_identity does not match requested circle_index: index={idx}"
+        )
+    base_circle = deepcopy(circle_dict)
     existing_items = list(circle_dict.get("items", []) or [])
     previous_images = list(circle_dict.get("item_images", []) or [])
 
@@ -1556,22 +1546,14 @@ def _job_reprocess_circle_from_image(payload: Dict[str, Any]) -> Dict[str, Any]:
         "catalog_status": "confirmed" if detected_items else "no_extractable_items",
     }
 
-    latest_data = json.loads(json_path.read_text(encoding="utf-8"))
-    latest_circles = latest_data.get("circles", [])
-    if not isinstance(latest_circles, list):
-        raise ValueError("event.json circles must be a list")
-    resolved_idx = _resolve_latest_circle_index(latest_circles, idx, circle_identity)
-    latest_circle = latest_circles[resolved_idx]
-    if not isinstance(latest_circle, dict):
-        raise ValueError(f"target circle is not an object: index={resolved_idx}")
     _apply_missing_circle_cut_from_catalog(
         project_root,
         str(local_image_path.parent),
-        latest_circle,
+        circle_dict,
         circle_patch,
     )
-    latest_circle.update(circle_patch)
-    _write_json_atomic(json_path, latest_data)
+    updated_circle = dict(circle_dict)
+    updated_circle.update(circle_patch)
 
     image_updated = previous_images != circle_patch["item_images"]
     return {
@@ -1579,15 +1561,19 @@ def _job_reprocess_circle_from_image(payload: Dict[str, Any]) -> Dict[str, Any]:
         "job": "reprocess_circle_from_image",
         "timestamp": _utc_now_iso(),
         "event_json": str(json_path),
-        "circle_index": resolved_idx,
+        "circle_index": idx,
         "requested_circle_index": idx,
-        "circle_name": latest_circle.get("name", ""),
+        "circle_identity": circle_identity,
+        "base_circle": base_circle,
+        "base_fingerprint": base_fingerprint,
+        "circle_patch": circle_patch,
+        "circle_name": updated_circle.get("name", ""),
         "image_filename": image_filename,
         "image_path": str(local_image_path),
         "image_updated": image_updated,
         "detected_items_count": len(detected_items),
-        "items_count": len(latest_circle.get("items", [])),
-        "updated_circle": latest_circle,
+        "items_count": len(updated_circle.get("items", [])),
+        "updated_circle": updated_circle,
     }
 
 
@@ -1763,8 +1749,7 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if not event_json_path.exists():
         raise FileNotFoundError(f"event.json not found: {event_json_path}")
-    with open(event_json_path, "r", encoding="utf-8") as f:
-        event_data = json.load(f)
+    event_data, base_fingerprint = _load_event_json_snapshot(event_json_path)
 
     map_image_value = payload.get("map_image")
     map_image_path = Path(str(map_image_value)) if map_image_value else None
@@ -1840,11 +1825,32 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     updater = JSONUpdater()
-    update_result = updater.update_event_json(
-        event_json_path=str(event_json_path),
+    update_result = updater.build_coordinate_patches(
+        event_data=event_data,
         coordinate_map=coord_map.get("complete_grid", []),
         map_number=map_number,
     )
+    if int(update_result.get("updated_count", 0) or 0) <= 0:
+        return {
+            "status": "error",
+            "job": "auto_place_map_pins",
+            "timestamp": _utc_now_iso(),
+            "error_code": "no_matching_circles",
+            "error": (
+                f"map pin coordinates were generated but no circles matched "
+                f"map_number={map_number}"
+            ),
+            "event_json": str(event_json_path),
+            "map_image": str(map_image_path),
+            "map_number": map_number,
+            "coordinate_json": str(output_json_path),
+            "generated_count": len(coord_map.get("complete_grid", [])),
+            "updated_count": 0,
+            "skipped_count": update_result.get("skipped_count", 0),
+            "circle_patches": [],
+            "calibration": coord_map.get("calibration", {}),
+            "ocr_diagnostics": coord_map.get("ocr_diagnostics", {}),
+        }
 
     return {
         "status": "ok",
@@ -1857,6 +1863,8 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
         "generated_count": len(coord_map.get("complete_grid", [])),
         "updated_count": update_result.get("updated_count", 0),
         "skipped_count": update_result.get("skipped_count", 0),
+        "base_fingerprint": base_fingerprint,
+        "circle_patches": update_result.get("circle_patches", []),
         "calibration": coord_map.get("calibration", {}),
         "ocr_diagnostics": coord_map.get("ocr_diagnostics", {}),
     }

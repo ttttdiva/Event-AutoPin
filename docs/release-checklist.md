@@ -21,9 +21,13 @@ Event AutoPin の APK、EXE、installer、GitHub Release asset など公開用 a
 
 ## EXE / Desktop
 
+- `scripts/check_desktop_release_gate.ps1` をPublic checkoutとともに実行する。`-FailOnMismatch` はPrivate/Publicのdesktop source、`desktop-app/package.json`・`src-tauri/tauri.conf.json`・`src-tauri/Cargo.toml` のversion、`desktop-v<version>`、`EventAutoPin.exe`、`latest.json.desktop` のversion/URLをstrictに検証する。
+- desktop sourceに差分がある場合、既存Releaseのversionを使い回さず3箇所のversionを同じ新versionへ更新する。
 - desktop build script、Tauri / Electron / PyInstaller / installer 設定を確認する。
 - EXE / installer をビルドし、成果物のパス、version、起動可否を確認する。
 - GitHub Release や配布先へ upload する運用の場合は、tag、asset 名、公開先を確認して upload する。
+- `ttttdiva/Event-AutoPin` の `desktop-v<version>` に `EventAutoPin.exe` が存在し、`latest.json.desktop.version` とURLが同じtag/assetを指すことを確認する。
+- Public sync後、strict gateとPublic source build CIがgreenになるまで完了扱いにしない。
 - 生成物を開発リポジトリに残す必要がない場合は、追跡対象に含めない。
 
 ## Report

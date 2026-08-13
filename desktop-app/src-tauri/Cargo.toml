@@ -1,6 +1,6 @@
 [package]
 name = "event-autopin-desktop"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 
 [build-dependencies]
@@ -17,7 +17,7 @@ local-ip-address = "0.6"
 zip = "0.6"
 chrono = "0.4"
 unicode-normalization = "0.1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 default = ["custom-protocol"]

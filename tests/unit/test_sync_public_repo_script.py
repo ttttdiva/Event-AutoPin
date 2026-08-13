@@ -10,6 +10,7 @@ import pytest
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "sync_public_repo.ps1"
+DEPENDENCY_CHECKER = Path(__file__).resolve().parents[2] / "scripts" / "check_public_dependency_closure.py"
 REMOTE = "https://github.com/ttttdiva/Event-AutoPin.git"
 REAL_GIT = shutil.which("git")
 MANIFEST_PATH = "scripts/public-sync-manifest.txt"
@@ -19,6 +20,12 @@ def git(root: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
 
 
+def compact_output(value: str) -> str:
+    """Ignore PowerShell's path-dependent display wrapping in error assertions."""
+
+    return re.sub(r"\s+", "", value).casefold()
+
+
 def commit_all(root: Path) -> None:
     git(root, "add", ".")
     git(root, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture")
@@ -26,6 +33,13 @@ def commit_all(root: Path) -> None:
 
 def write_manifest(root: Path, entries: list[str], include_self: bool = True) -> None:
     paths = list(entries)
+    checker_relative = "scripts/check_public_dependency_closure.py"
+    checker = root / checker_relative
+    if not checker.exists():
+        checker.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(DEPENDENCY_CHECKER, checker)
+    if checker_relative not in paths:
+        paths.append(checker_relative)
     if include_self and MANIFEST_PATH not in paths:
         paths.append(MANIFEST_PATH)
     target = root / MANIFEST_PATH
@@ -52,7 +66,7 @@ def source_repo(tmp_path: Path, secret: bool = False) -> Path:
     write_manifest(root, ["src/app.py"])
     (root / "untracked.py").write_text("must not publish", encoding="utf-8")
     git(root, "init")
-    git(root, "add", "src/app.py", "scripts/public-sync-manifest.txt")
+    git(root, "add", "src/app.py", "scripts/public-sync-manifest.txt", "scripts/check_public_dependency_closure.py")
     git(root, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture")
     return root
 
@@ -145,11 +159,55 @@ def test_dry_run_uses_only_exact_committed_manifest(tmp_path: Path) -> None:
     source, destination = source_repo(tmp_path), destination_repo(tmp_path)
     result = run(source, destination, tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "[candidates] 2" in result.stdout and "INCLUDE src/app.py" in result.stdout
+    assert "[candidates] 3" in result.stdout and "INCLUDE src/app.py" in result.stdout
+    assert "[dependency-closure] OK" in result.stdout
     assert "all uncommitted" in result.stdout and "untracked.py" not in result.stdout
     assert "[scan] 0 findings" in result.stdout and "dry-run" in result.stdout
     assert not (destination / "src" / "app.py").exists()
     assert not (destination / "public-payload").exists()
+
+
+def test_dependency_closure_failure_stops_before_destination_changes(tmp_path: Path) -> None:
+    source, destination = source_repo(tmp_path), destination_repo(tmp_path)
+    entry = source / "desktop-app" / "src" / "main.ts"
+    entry.parent.mkdir(parents=True)
+    entry.write_text('import "./missing-from-manifest";\n', encoding="utf-8")
+    missing = entry.parent / "missing-from-manifest.ts"
+    missing.write_text("export const missing = true;\n", encoding="utf-8")
+    write_manifest(source, ["desktop-app/src/main.ts"])
+    commit_all(source)
+    latest_before = (destination / "latest.json").read_bytes()
+
+    result = run(source, destination, tmp_path, apply=True)
+
+    assert result.returncode != 0
+    assert "[dependency-closure] 1 finding" in result.stdout
+    assert "missing-from-manifest.ts" in result.stdout
+    assert not (destination / "desktop-app").exists()
+    assert (destination / "latest.json").read_bytes() == latest_before
+
+
+def test_dependency_closure_executes_committed_checker_not_working_copy(tmp_path: Path) -> None:
+    source, destination = source_repo(tmp_path), destination_repo(tmp_path)
+    entry = source / "desktop-app" / "src" / "main.ts"
+    entry.parent.mkdir(parents=True)
+    entry.write_text('import "./missing-from-manifest";\n', encoding="utf-8")
+    missing = entry.parent / "missing-from-manifest.ts"
+    missing.write_text("export const missing = true;\n", encoding="utf-8")
+    write_manifest(source, ["desktop-app/src/main.ts"])
+    commit_all(source)
+    (source / "scripts" / "check_public_dependency_closure.py").write_text(
+        "raise SystemExit(0)\n", encoding="utf-8"
+    )
+    latest_before = (destination / "latest.json").read_bytes()
+
+    result = run(source, destination, tmp_path, apply=True)
+
+    assert result.returncode != 0
+    assert "[dependency-closure] 1 finding" in result.stdout
+    assert "missing-from-manifest.ts" in result.stdout
+    assert not (destination / "desktop-app").exists()
+    assert (destination / "latest.json").read_bytes() == latest_before
 
 
 def test_source_manifest_must_include_itself(tmp_path: Path) -> None:
@@ -160,7 +218,7 @@ def test_source_manifest_must_include_itself(tmp_path: Path) -> None:
     result = run(source, destination, tmp_path, apply=True)
 
     assert result.returncode != 0
-    assert "must include itself" in result.stderr
+    assert "mustincludeitself" in compact_output(result.stderr)
     assert not (destination / "src" / "app.py").exists()
     assert (destination / "latest.json").read_text(encoding="utf-8") == "keep"
 
@@ -194,7 +252,7 @@ def test_large_manifest_is_archived_in_safe_chunks_and_literal_paths_are_preserv
     result = run(source, destination, tmp_path, apply=True)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert f"[candidates] {len(entries) + 1}" in result.stdout
+    assert f"[candidates] {len(entries) + 2}" in result.stdout
     assert (destination / literal).read_text(encoding="utf-8") == "literal path\n"
     assert (destination / unicode_name).read_text(encoding="utf-8") == "unicode path\n"
     assert (destination / bang_name).read_text(encoding="utf-8") == "bang path\n"
@@ -244,7 +302,7 @@ def test_rejects_legacy_payload_not_matching_its_committed_manifest(tmp_path: Pa
     result = run(source, destination, tmp_path, apply=True)
 
     assert result.returncode != 0
-    assert "Legacy payload/manifest mismatch" in result.stderr
+    assert "legacypayload/manifestmismatch" in compact_output(result.stderr)
     assert (destination / "public-payload" / "old.txt").read_text(encoding="utf-8") == "old"
 
 
@@ -253,7 +311,7 @@ def test_hash_failure_after_install_rolls_back_legacy_payload(tmp_path: Path) ->
     install_legacy_payload(destination, {"old.txt": "old"})
     old = destination / "public-payload" / "old.txt"
     result = run(source, destination, tmp_path, apply=True, corrupt=True)
-    assert result.returncode != 0 and "hash verification failed" in result.stderr
+    assert result.returncode != 0 and "hashverificationfailed" in compact_output(result.stderr)
     assert old.read_text(encoding="utf-8") == "old"
     assert not (destination / "public-payload" / "src" / "app.py").exists()
 
@@ -264,7 +322,7 @@ def test_hash_failure_after_root_update_rolls_back_previous_manifest_files(tmp_p
 
     result = run(source, destination, tmp_path, apply=True, corrupt=True)
 
-    assert result.returncode != 0 and "hash verification failed" in result.stderr
+    assert result.returncode != 0 and "hashverificationfailed" in compact_output(result.stderr)
     assert (destination / "old.txt").read_text(encoding="utf-8") == "old"
     assert (destination / "scripts" / "public-sync-manifest.txt").is_file()
     assert not (destination / "src" / "app.py").exists()
@@ -278,7 +336,7 @@ def test_rollback_failure_retains_backup_and_reports_its_path(tmp_path: Path) ->
     result = run(source, destination, tmp_path, apply=True, corrupt=True, fail_rollback=True)
 
     assert result.returncode != 0
-    assert "Rollback failed: test rollback failure" in result.stderr
+    assert "rollbackfailed:testrollbackfailure" in compact_output(result.stderr)
     backups = list(destination.glob(".event-autopin-sync.backup-*"))
     assert len(backups) == 1
     assert str(backups[0]) in re.sub(r"\s+", "", result.stderr)
@@ -291,7 +349,7 @@ def test_pre_swap_failure_preserves_legacy_payload(tmp_path: Path) -> None:
     install_legacy_payload(destination, {"old.txt": "old"})
     old = destination / "public-payload" / "old.txt"
     result = run(source, destination, tmp_path, apply=True, fail_pre_swap=True)
-    assert result.returncode != 0 and "test pre-swap failure" in result.stderr
+    assert result.returncode != 0 and "testpre-swapfailure" in compact_output(result.stderr)
     assert old.read_text(encoding="utf-8") == "old"
     assert not (destination / "public-payload" / "src" / "app.py").exists()
     assert not list(destination.glob(".event-autopin-sync.*"))
@@ -302,7 +360,7 @@ def test_rejects_mismatched_push_url(tmp_path: Path) -> None:
     git(destination, "remote", "set-url", "--push", "origin", "https://github.com/example/push.git")
     result = run(source, destination, tmp_path)
     assert result.returncode != 0
-    assert "push URL mismatch" in result.stderr
+    assert "pushurlmismatch" in compact_output(result.stderr)
 
 
 def test_rejects_wrong_remote_dirty_private_and_nested_destinations(tmp_path: Path) -> None:
@@ -313,15 +371,17 @@ def test_rejects_wrong_remote_dirty_private_and_nested_destinations(tmp_path: Pa
     # Retarget, then prove dirty and non-public gates independently.
     git(wrong, "remote", "set-url", "origin", REMOTE)
     (wrong / "dirty.txt").write_text("dirty", encoding="utf-8")
-    assert "not clean" in run(source, wrong, tmp_path).stderr
+    assert "notclean" in compact_output(run(source, wrong, tmp_path).stderr)
     (wrong / "dirty.txt").unlink()
-    assert "not confirmed public" in run(source, wrong, tmp_path, visibility="private").stderr
+    assert "notconfirmedpublic" in compact_output(
+        run(source, wrong, tmp_path, visibility="private").stderr
+    )
 
     nested = source / "nested-public"
     nested.mkdir()
     git(nested, "init")
     result = run(source, nested, tmp_path)
-    assert result.returncode != 0 and "non-nested" in result.stderr
+    assert result.returncode != 0 and "non-nested" in compact_output(result.stderr)
 
 
 def test_rejects_non_default_current_branch(tmp_path: Path) -> None:
@@ -329,7 +389,8 @@ def test_rejects_non_default_current_branch(tmp_path: Path) -> None:
     git(destination, "switch", "-c", "feature")
     result = run(source, destination, tmp_path)
     assert result.returncode != 0
-    assert "current branch 'feature'" in result.stderr and "origin default" in result.stderr
+    compact_error = compact_output(result.stderr)
+    assert "currentbranch'feature'" in compact_error and "origindefault" in compact_error
 
 
 def test_rejects_detached_head(tmp_path: Path) -> None:
@@ -337,7 +398,7 @@ def test_rejects_detached_head(tmp_path: Path) -> None:
     git(destination, "checkout", "--detach")
     result = run(source, destination, tmp_path)
     assert result.returncode != 0
-    assert "HEAD is detached" in result.stderr
+    assert "headisdetached" in compact_output(result.stderr)
 
 
 def test_rejects_upstream_other_than_origin_default(tmp_path: Path) -> None:
@@ -346,7 +407,8 @@ def test_rejects_upstream_other_than_origin_default(tmp_path: Path) -> None:
     git(destination, "branch", "--set-upstream-to=origin/other", "main")
     result = run(source, destination, tmp_path)
     assert result.returncode != 0
-    assert "upstream 'origin/other'" in result.stderr and "origin/main" in result.stderr
+    compact_error = compact_output(result.stderr)
+    assert "upstream'origin/other'" in compact_error and "origin/main" in compact_error
 
 
 def test_fetches_origin_before_rejecting_stale_head(tmp_path: Path) -> None:
@@ -360,7 +422,7 @@ def test_fetches_origin_before_rejecting_stale_head(tmp_path: Path) -> None:
     result = run(source, destination, tmp_path)
 
     assert result.returncode != 0
-    assert "HEAD does not match fetched origin/main" in result.stderr
+    assert "headdoesnotmatchfetchedorigin/main" in compact_output(result.stderr)
     fetched = subprocess.run(
         [REAL_GIT, "-C", str(destination), "show", "origin/main:remote-change.txt"],
         check=True,
@@ -379,7 +441,7 @@ def test_manifest_allows_dotfiles_but_rejects_traversal(tmp_path: Path) -> None:
     write_manifest(source, ["../secret"])
     commit_all(source)
     result = run(source, destination, tmp_path)
-    assert result.returncode != 0 and "Unsafe manifest path" in result.stderr
+    assert result.returncode != 0 and "unsafemanifestpath" in compact_output(result.stderr)
 
 
 @pytest.mark.parametrize("protected", ["latest.json", ".git/config", ".github/workflow.yml", "release/app.exe"])
@@ -395,7 +457,7 @@ def test_manifest_cannot_manage_destination_protected_paths(tmp_path: Path, prot
     result = run(source, destination, tmp_path, apply=True)
 
     assert result.returncode != 0
-    assert "Protected root path" in result.stderr
+    assert "protectedrootpath" in compact_output(result.stderr)
     assert (destination / "latest.json").read_text(encoding="utf-8") == "keep"
 
 

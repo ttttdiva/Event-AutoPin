@@ -55,3 +55,27 @@ def test_coordinate_generation_passes_gui_ocr_config_and_reports_failure(tmp_pat
     assert captured["ocr_config"]["model"] == "org/custom"
     assert generator.coordinate_generation_summary["status"] == "failed"
     assert generator.coordinate_generation_summary["failed"] == 1
+
+
+def test_coordinate_generation_zero_updates_is_failed(tmp_path, monkeypatch):
+    generator = _generator(tmp_path)
+
+    def fake_generate(**kwargs):
+        return {"complete_grid": [{"space_id": "A01", "x": 10, "y": 20, "normalized_x": 0.1, "normalized_y": 0.2}]}
+
+    class ZeroUpdate:
+        def update_event_json(self, **kwargs):
+            return {"updated_count": 0, "skipped_count": 1}
+
+    import src.space_locator as package
+    import src.space_locator.json_updater as updater_module
+
+    monkeypatch.setattr(package, "generate_coordinates_from_map", fake_generate)
+    monkeypatch.setattr(updater_module, "JSONUpdater", ZeroUpdate)
+
+    assert generator._generate_coordinates() is False
+    summary = generator.coordinate_generation_summary
+    assert summary["status"] == "failed"
+    assert summary["succeeded"] == 0
+    assert summary["failed"] == 1
+    assert summary["maps"][0]["error_code"] == "coordinate_update_zero"

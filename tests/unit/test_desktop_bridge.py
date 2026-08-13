@@ -27,6 +27,7 @@ from src.commands.desktop_bridge import (
     _payload_url_list,
     _job_auto_place_map_pins,
     _safe_diagnostic_text,
+    _safe_config_for_result,
     _job_validate_mobile_json,
     _load_payload,
     run_job,
@@ -249,6 +250,63 @@ def test_auto_place_map_pins_image_read_exception_reaches_gui_recovery_hint(tmp_
     assert (tmp_path / "coordinates_map_1.json").exists()
 
 
+def test_auto_place_map_pins_returns_patches_without_writing_event_json(tmp_path: Path, monkeypatch):
+    event_json = _write_coordinate_test_event(tmp_path)
+    map_image = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "unlimited_ocr_pin_center"
+        / "map_01.png"
+    )
+    original = json.loads(event_json.read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(
+        "src.space_locator.generate_coordinates_from_map",
+        lambda **_kwargs: {
+            "complete_grid": [
+                {"space_id": "A01", "x": 10, "y": 20, "normalized_x": 0.1, "normalized_y": 0.2}
+            ],
+            "calibration": {"applied": False, "points": 0, "mode": "disabled"},
+            "ocr_diagnostics": {},
+        },
+    )
+
+    result = _job_auto_place_map_pins(
+        {"event_json": str(event_json), "map_image": str(map_image), "map_number": 1}
+    )
+
+    assert result["status"] == "ok"
+    assert result["updated_count"] == 1
+    assert result["circle_patches"][0]["changes"] == {"pin_x": 0.1, "pin_y": 0.2}
+    assert json.loads(event_json.read_text(encoding="utf-8")) == original
+
+
+def test_auto_place_map_pins_zero_updates_returns_no_matching_error(tmp_path: Path, monkeypatch):
+    event_json = _write_coordinate_test_event(tmp_path)
+    map_image = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "unlimited_ocr_pin_center"
+        / "map_01.png"
+    )
+    original = json.loads(event_json.read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(
+        "src.space_locator.generate_coordinates_from_map",
+        lambda **_kwargs: {"complete_grid": [{"space_id": "Z99", "x": 10, "y": 20, "normalized_x": 0.1, "normalized_y": 0.2}]},
+    )
+
+    result = _job_auto_place_map_pins(
+        {"event_json": str(event_json), "map_image": str(map_image), "map_number": 1}
+    )
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "no_matching_circles"
+    assert result["updated_count"] == 0
+    assert result["circle_patches"] == []
+    assert json.loads(event_json.read_text(encoding="utf-8")) == original
+
+
 class TestLoadPayload:
     def test_インラインJSONをパースできる(self):
         ns = argparse.Namespace(payload=None, payload_json='{"foo": "bar"}')
@@ -361,6 +419,36 @@ class TestBuildMainConfig:
         )
         assert config["output_dir"] == abs_dir
 
+    def test_cookie_fileはproject_root基準で検証し絶対化される(self, tmp_path: Path):
+        cookie_path = tmp_path / "cookies" / "site.txt"
+        cookie_path.parent.mkdir()
+        cookie_path.write_text(
+            "# Netscape HTTP Cookie File\nexample.com\tFALSE\t/\tFALSE\t0\tname\tvalue\n",
+            encoding="utf-8",
+        )
+
+        config = _build_main_config(
+            {
+                "url": "https://example.com",
+                "output_dir": str(tmp_path / "out"),
+                "project_root": str(tmp_path),
+                "cookie_file": "cookies/site.txt",
+            }
+        )
+
+        assert Path(config["cookie_file"]) == cookie_path.resolve()
+
+    def test_invalid_cookie_fileは自動検出へfallbackしない(self, tmp_path: Path):
+        with pytest.raises(ValueError, match="Cookieファイル"):
+            _build_main_config(
+                {
+                    "url": "https://example.com",
+                    "output_dir": str(tmp_path / "out"),
+                    "project_root": str(tmp_path),
+                    "cookie_file": "cookies/not-found.txt",
+                }
+            )
+
     def test_オプションキーは空値なら省略される(self, tmp_path: Path):
         config = _build_main_config(
             {
@@ -461,6 +549,14 @@ class TestBuildMainConfig:
         assert config["ocr_config"]["model_path"] == str(tmp_path / "model")
         assert config["ocr_config"]["device"] == "cpu"
         assert config["ocr_config"]["strategy"] == "single"
+
+
+def test_bridge結果のcookie_fileはbasenameを含めず固定ラベルにする(tmp_path: Path):
+    cookie_path = str(tmp_path / "private" / "session.txt")
+    safe = _safe_config_for_result({"url": "https://example.com", "cookie_file": cookie_path})
+
+    assert safe["cookie_file"] == "<選択済みCookieファイル>"
+    assert cookie_path not in str(safe)
 
 
 def test_unlimited_ocr_doctor_uses_project_root_for_default_cache(tmp_path: Path, monkeypatch):
@@ -991,9 +1087,12 @@ class TestReprocessCircleFromPost:
 
         saved = json.loads(event_json.read_text(encoding="utf-8"))
         assert result["status"] == "ok"
-        assert saved["circles"][0]["items"] == [{"name": "New Book", "price": 500}]
-        assert saved["circles"][0]["catalog_status"] == "confirmed"
+        # Worker returns a patch; the live event writer applies it later.
+        assert saved["circles"][0]["items"] == []
+        assert "catalog_status" not in saved["circles"][0]
         assert saved["circles"][1]["memo"] == "parallel edit"
+        assert result["circle_patch"]["items"] == [{"name": "New Book", "price": 500}]
+        assert result["updated_circle"]["catalog_status"] == "confirmed"
 
     def test_circle_identity_resolves_shifted_index(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1044,10 +1143,13 @@ class TestReprocessCircleFromPost:
         )
 
         saved = json.loads(event_json.read_text(encoding="utf-8"))
-        assert result["circle_index"] == 1
+        assert result["circle_index"] == 0
+        assert result["requested_circle_index"] == 0
         assert saved["circles"][0]["name"] == "Inserted"
-        assert saved["circles"][1]["items"] == [{"name": "Shifted Item"}]
-        assert saved["circles"][2]["items"] == []
+        assert saved["circles"][1]["name"] == "Circle A"
+        assert saved["circles"][1]["items"] == []
+        assert result["circle_patch"]["items"] == [{"name": "Shifted Item"}]
+        assert result["circle_identity"]["space"] == "A-01"
 
     def test_reprocess_replaces_item_images(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1105,10 +1207,14 @@ class TestReprocessCircleFromPost:
         assert result["status"] == "ok"
         assert result["image_updated"] is True
         assert saved["circles"][0]["item_images"] == [
+            {"path": "old.jpg", "source": "twitter"}
+        ]
+        assert saved["circles"][0]["items"] == []
+        assert result["circle_patch"]["item_images"] == [
             {"path": "new_a.jpg", "source": "twitter"},
             {"path": "new_b.jpg", "source": "twitter"},
         ]
-        assert saved["circles"][0]["items"] == [
+        assert result["updated_circle"]["items"] == [
             {"name": "New Book", "image": "new_a.jpg"}
         ]
 
@@ -1173,9 +1279,14 @@ class TestReprocessCircleFromImage:
         assert result["status"] == "ok"
         assert result["detected_items_count"] == 2
         assert result["image_updated"] is True
-        assert circle["catalog_status"] == "confirmed"
-        assert circle["item_images"] == [{"path": "dropped.jpg", "source": "local"}]
+        assert "catalog_status" not in circle
+        assert circle["item_images"] == [{"path": "old.jpg", "source": "twitter"}]
         assert circle["items"] == [
+            {"name": "Existing Book", "type": "book", "price": 100}
+        ]
+        assert result["updated_circle"]["catalog_status"] == "confirmed"
+        assert result["updated_circle"]["item_images"] == [{"path": "dropped.jpg", "source": "local"}]
+        assert result["updated_circle"]["items"] == [
             {
                 "name": "Existing Book",
                 "type": "book",

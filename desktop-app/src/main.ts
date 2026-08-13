@@ -24,9 +24,13 @@ import {
   type AsyncMutationGuard,
 } from "./state/async-mutation-guard";
 import {
+  applyEventPatchToLatest,
   EventLifecycleGate,
   EventWriteCoordinator,
+  type CircleIdentityPatch,
   type EventLifecycleLease,
+  type EventPatchResult,
+  type EventSourceFingerprint as CoordinatedEventSourceFingerprint,
 } from "./state/event-write-coordinator";
 import {
   canAutoSave,
@@ -62,6 +66,19 @@ import {
   tableDataStartIndex,
   tableWindowForScroll as calculateTableWindowForScroll,
 } from "./state/table-window";
+import {
+  COOKIE_DROP_MAX_BYTES,
+  decideCookieDrop,
+  type CookieDropDecision,
+} from "./state/cookie-drop";
+import {
+  createCookieFileController,
+  type CookieFileStageResult,
+  type CookieFileReason,
+  type CookieFileSnapshot,
+  type CookieFileValidationResult,
+  type CookieValidationMetadata,
+} from "./features/cookie-file";
 
 // 画像読み込みエラーのグローバルハンドラ（CSP対策: インラインonerror不使用）
 document.addEventListener(
@@ -653,6 +670,33 @@ const modelCatalogStatusEl = document.getElementById(
 const refreshModelCatalogBtn = document.getElementById(
   "refreshModelCatalogBtn",
 ) as HTMLButtonElement | null;
+const cookieFileDropZoneEl = document.getElementById(
+  "cookieFileDropZone",
+) as HTMLDivElement | null;
+const cookieFileBrowseBtn = document.getElementById(
+  "cookieFileBrowseBtn",
+) as HTMLButtonElement | null;
+const cookieFileClearBtn = document.getElementById(
+  "cookieFileClearBtn",
+) as HTMLButtonElement | null;
+const cookieFileStatusEl = document.getElementById(
+  "cookieFileStatus",
+) as HTMLSpanElement | null;
+const cookieFileDropHintEl = document.getElementById(
+  "cookieFileDropHint",
+) as HTMLDivElement | null;
+const cookieFileDropStateEl = document.getElementById(
+  "cookieFileDropState",
+) as HTMLDivElement | null;
+const cookieConsoleCommandEl = document.getElementById(
+  "cookieConsoleCommand",
+) as HTMLPreElement | null;
+const cookieConsoleCopyBtn = document.getElementById(
+  "cookieConsoleCopyBtn",
+) as HTMLButtonElement | null;
+const cookieConsoleCopyStatusEl = document.getElementById(
+  "cookieConsoleCopyStatus",
+) as HTMLSpanElement | null;
 
 const FALLBACK_MODEL_CATALOG: ModelCatalog = {
   providers: [
@@ -841,6 +885,399 @@ function invokeBridgeJob<T>(
   desktopPerf.tauriIpcCalls += 1;
   return rawInvokeBridgeJob<T>(job, payload, options);
 }
+
+const COOKIE_CONSOLE_COMMAND = [
+  "(() => {",
+  "  const domain = location.hostname;",
+  "  const secure = location.protocol === 'https:' ? 'TRUE' : 'FALSE';",
+  "  const rows = document.cookie.split(/;\\s*/).filter(Boolean).map((pair) => {",
+  "    const separator = pair.indexOf('=');",
+  "    if (separator < 1) return '';",
+  "    const name = pair.slice(0, separator);",
+  "    const value = pair.slice(separator + 1);",
+  // Keep expiry empty so browser-exported session cookies remain usable;
+  // MozillaCookieJar interprets `0` as already expired.
+  "    return domain + '\\tFALSE\\t/\\t' + secure + '\\t\\t' + name + '\\t' + value;",
+  "  }).filter(Boolean);",
+  "  if (!rows.length) { window.alert('取得できるCookieが0件です。HttpOnly CookieはConsoleから取得できません。'); return; }",
+  "  const blob = new Blob(['# Netscape HTTP Cookie File\\n' + rows.join('\\n') + '\\n'], { type: 'text/plain' });",
+  "  const link = document.createElement('a');",
+  "  link.href = URL.createObjectURL(blob);",
+  "  link.download = 'cookies.txt';",
+  "  link.click();",
+  "  setTimeout(() => URL.revokeObjectURL(link.href), 1000);",
+  "})();",
+].join("\n");
+
+type CookieValidationInvokeResult = Partial<CookieFileStageResult> & {
+  ok?: boolean;
+};
+
+let cookieDomReadSerial = 0;
+
+function cookieReasonText(reason?: CookieFileReason): { status: string; hint: string } {
+  switch (reason) {
+    case "missing":
+      return {
+        status: "Cookieファイルを取得できません",
+        hint: "Netscape .txtを1件指定してください。",
+      };
+    case "multiple":
+      return {
+        status: "複数のCookieファイルは受け付けません",
+        hint: "Netscape .txtを1件だけ指定してください。",
+      };
+    case "directory":
+      return {
+        status: "フォルダはCookieとして受け付けません",
+        hint: "通常のファイル（Netscape .txt）を指定してください。",
+      };
+    case "unsupported":
+      return {
+        status: "対応形式はNetscape .txtのみです",
+        hint: "拡張子 .txt のCookieファイルを指定してください。",
+      };
+    case "too_large":
+      return {
+        status: "Cookieファイルが大きすぎます",
+        hint: "最大2MBのNetscape .txtを指定してください。",
+      };
+    case "unreadable":
+    case "read_error":
+      return {
+        status: "Cookieファイルを読み取れません",
+        hint: "アクセス可能なNetscape .txtを指定してください。",
+      };
+    case "choose_error":
+      return {
+        status: "Cookieファイル選択を利用できません",
+        hint: "参照ボタンをもう一度試してください。",
+      };
+    case "stage_error":
+      return {
+        status: "Cookieファイルを安全に準備できません",
+        hint: "ファイルを確認して、もう一度ドロップしてください。",
+      };
+    default:
+      return {
+        status: "Netscape形式のCookieを確認できません",
+        hint: "コメント/空行を除きCookieが1件以上あるNetscape .txtを指定してください。",
+      };
+  }
+}
+
+function cookieDomainSummary(validation: CookieValidationMetadata): string {
+  const displayed = validation.domains.join("、");
+  const omitted = Math.max(0, validation.domainCount - validation.domains.length);
+  return `ドメイン ${validation.domainCount}件: ${displayed}${
+    omitted > 0 ? `（ほか${omitted}件）` : ""
+  }`;
+}
+
+function cookieExpirySummary(validation: CookieValidationMetadata): string {
+  const expiry = validation.expiry;
+  const status =
+    expiry.status === "session"
+      ? "セッションのみ"
+      : expiry.status === "expired"
+        ? "期限切れと思われる項目のみ"
+        : expiry.status === "future"
+          ? "将来期限のみ"
+          : "混在";
+  const warning =
+    expiry.expiredCount > 0
+      ? ` 期限切れと思われるCookieが${expiry.expiredCount}件あります。`
+      : " 記載期限は利用可否を保証しません。";
+  return `期限の目安（${status}）: セッション ${expiry.sessionCount}件 / 期限切れと思われる ${expiry.expiredCount}件 / 将来期限 ${expiry.futureCount}件。${warning}`;
+}
+
+function renderCookieSnapshot(snapshot: CookieFileSnapshot) {
+  if (cookieFileClearBtn) cookieFileClearBtn.disabled = !snapshot.hasSelection;
+  cookieFileDropZoneEl?.setAttribute(
+    "data-drop-state",
+    snapshot.state === "validating"
+      ? "hover"
+      : snapshot.state === "ready"
+        ? "ready"
+        : snapshot.state === "error"
+          ? "error"
+          : "idle",
+  );
+
+  if (snapshot.state === "validating") {
+    if (cookieFileStatusEl) cookieFileStatusEl.textContent = "Cookieファイルを検証中…";
+    if (cookieFileDropHintEl) {
+      cookieFileDropHintEl.textContent =
+        "内容はRust側で一時的に検証しますが、画面表示・設定・localStorageへ保存しません。";
+    }
+    if (cookieFileDropStateEl) cookieFileDropStateEl.textContent = "検証中（最大2MB）";
+    return;
+  }
+
+  if (snapshot.state === "ready" && snapshot.basename && snapshot.validation) {
+    const validation = snapshot.validation;
+    if (cookieFileStatusEl) {
+      cookieFileStatusEl.textContent = `明示選択済み: ${snapshot.basename}`;
+    }
+    if (cookieFileDropHintEl) {
+      cookieFileDropHintEl.textContent = `検証時点でファイルが存在し、読み取り可能でした。Cookie ${validation.cookieCount}件 / ${cookieDomainSummary(validation)}。形式と記載期限の要約であり、ログインや認証の有効性は確認していません。`;
+    }
+    if (cookieFileDropStateEl) {
+      cookieFileDropStateEl.textContent = `${cookieExpirySummary(validation)} 実行時にもファイルを再検証します。`;
+    }
+    return;
+  }
+
+  if (snapshot.state === "error") {
+    const message = cookieReasonText(snapshot.reason);
+    if (cookieFileStatusEl) cookieFileStatusEl.textContent = message.status;
+    if (cookieFileDropHintEl) {
+      cookieFileDropHintEl.textContent = `${message.hint} 選択済みの値は変更していません。`;
+    }
+    if (cookieFileDropStateEl) cookieFileDropStateEl.textContent = "選択値は変更していません。";
+    return;
+  }
+
+  if (cookieFileStatusEl) cookieFileStatusEl.textContent = "明示Cookieファイル: 未選択";
+  if (cookieFileDropHintEl) {
+    cookieFileDropHintEl.textContent =
+      "明示ファイルを使う場合はNetscape .txtを1件指定してください。未選択でも、対象URLに応じたCookieファイルの自動検出が実行時に行われる場合があります。";
+  }
+  if (cookieFileDropStateEl) {
+    cookieFileDropStateEl.textContent = "明示ファイル未選択（自動検出は無効化されません）。";
+  }
+}
+
+const cookieFileController = createCookieFileController({
+  choosePath: async () => {
+    let selected: string | string[] | null;
+    try {
+      selected = await dialogOpen({
+        multiple: false,
+        filters: [{ name: "Netscape Cookieファイル", extensions: ["txt"] }],
+      });
+    } catch {
+      throw new Error("cookie_choose");
+    }
+    if (Array.isArray(selected)) throw new Error("cookie_multiple");
+    return typeof selected === "string" ? selected : null;
+  },
+  validatePath: async (path) => {
+    const result = await invoke<CookieValidationInvokeResult>(
+      "validate_cookie_file",
+      { filePath: path },
+    );
+    if (!result?.ok || !result.basename) throw new Error("cookie_empty_or_invalid");
+    return result as CookieFileValidationResult;
+  },
+  stageBytes: async (fileName, bytes) => {
+    const result = await invoke<CookieValidationInvokeResult>("stage_cookie_file", {
+      fileName,
+      contents: bytes,
+    });
+    if (!result?.ok || !result.path || !result.basename) {
+      throw new Error("cookie_stage_unavailable");
+    }
+    return result as CookieFileStageResult;
+  },
+  cleanupStage: async (path) => {
+    await invoke("cleanup_staged_cookie_file", { stagedPath: path });
+  },
+  cleanupAllStages: async () => {
+    await invoke("cleanup_cookie_stages");
+  },
+  onSnapshot: renderCookieSnapshot,
+});
+
+function getCookieFilePathForRun(): string {
+  return cookieFileController.getSelectedPathForRun();
+}
+
+async function clearCookieFile() {
+  // Staged files are allowlist-cleaned; browsed user files are never deleted.
+  ++cookieDomReadSerial;
+  await cookieFileController.clear();
+}
+
+async function disposeCookieFileSelection() {
+  ++cookieDomReadSerial;
+  await cookieFileController.dispose();
+}
+
+function initCookieConsoleGuide() {
+  if (cookieConsoleCommandEl) cookieConsoleCommandEl.textContent = COOKIE_CONSOLE_COMMAND;
+  cookieConsoleCopyBtn?.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(COOKIE_CONSOLE_COMMAND);
+      if (cookieConsoleCopyStatusEl) {
+        cookieConsoleCopyStatusEl.textContent = "コピーしました（コマンド文字列のみ）";
+      }
+    } catch {
+      if (cookieConsoleCopyStatusEl) {
+        cookieConsoleCopyStatusEl.textContent =
+          "自動コピーできません。上のコマンドを手動でコピーしてください。";
+      }
+    }
+  });
+}
+
+function dataTransferHasFiles(dataTransfer: DataTransfer | null): boolean {
+  if (!dataTransfer) return false;
+  if (Array.from(dataTransfer.types || []).some((type) => type.toLowerCase() === "files")) {
+    return true;
+  }
+  if (Array.from(dataTransfer.items || []).some((item) => item.kind === "file")) return true;
+  return dataTransfer.files.length > 0;
+}
+
+type CookieDropEntry = { file: File | null; isDirectory: boolean };
+
+function cookieDropEntries(dataTransfer: DataTransfer): CookieDropEntry[] {
+  const items = Array.from(dataTransfer.items || []).filter((item) => item.kind === "file");
+  if (items.length > 0) {
+    return items.map((item) => {
+      let isDirectory = false;
+      try {
+        const entry = (
+          item as DataTransferItem & {
+            webkitGetAsEntry?: () => { isDirectory?: boolean } | null;
+          }
+        ).webkitGetAsEntry?.();
+        isDirectory = entry?.isDirectory === true;
+      } catch {
+        // Directory detection is best effort in the browser File API.
+      }
+      return { file: item.getAsFile(), isDirectory };
+    });
+  }
+  return Array.from(dataTransfer.files || []).map((file) => ({
+    file,
+    isDirectory: false,
+  }));
+}
+
+function safeDroppedCookieFileName(name: string): string {
+  const basename = name.replace(/\\/g, "/").split("/").pop() || "cookies.txt";
+  const safe = Array.from(basename)
+    .filter((character) => !/[\u0000-\u001f\u007f/\\]/.test(character))
+    .slice(0, 128)
+    .join("");
+  return safe || "cookies.txt";
+}
+
+function renderCookieDropHover() {
+  cookieFileDropZoneEl?.setAttribute("data-drop-state", "hover");
+  if (cookieFileStatusEl) cookieFileStatusEl.textContent = "Cookieファイルを確認中…";
+  if (cookieFileDropHintEl) {
+    cookieFileDropHintEl.textContent = "Netscape .txtを1件ドロップしてください。";
+  }
+  if (cookieFileDropStateEl) cookieFileDropStateEl.textContent = "ドロップ受付中（最大2MB）";
+}
+
+function restoreCookieDropState() {
+  renderCookieSnapshot(cookieFileController.getSnapshot());
+}
+
+function initCookieDomDrop() {
+  if (!cookieFileDropZoneEl) return;
+  let domFileDragDepth = 0;
+
+  cookieFileBrowseBtn?.addEventListener("click", () => {
+    ++cookieDomReadSerial;
+    void cookieFileController.choose();
+  });
+  cookieFileClearBtn?.addEventListener("click", () => void clearCookieFile());
+  cookieFileDropZoneEl.addEventListener("keydown", (event) => {
+    if (event.target !== event.currentTarget) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    ++cookieDomReadSerial;
+    void cookieFileController.choose();
+  });
+  cookieFileDropZoneEl.addEventListener("dragenter", (event) => {
+    const dragEvent = event as DragEvent;
+    if (!dataTransferHasFiles(dragEvent.dataTransfer)) return;
+    dragEvent.preventDefault();
+    dragEvent.stopPropagation();
+    domFileDragDepth += 1;
+    renderCookieDropHover();
+  });
+  cookieFileDropZoneEl.addEventListener("dragover", (event) => {
+    const dragEvent = event as DragEvent;
+    if (!dataTransferHasFiles(dragEvent.dataTransfer)) return;
+    dragEvent.preventDefault();
+    dragEvent.stopPropagation();
+    if (dragEvent.dataTransfer) dragEvent.dataTransfer.dropEffect = "copy";
+    renderCookieDropHover();
+  });
+  cookieFileDropZoneEl.addEventListener("dragleave", (event) => {
+    if (domFileDragDepth === 0) return;
+    const related = (event as DragEvent).relatedTarget as Node | null;
+    if (related && cookieFileDropZoneEl.contains(related)) return;
+    domFileDragDepth = 0;
+    restoreCookieDropState();
+  });
+  cookieFileDropZoneEl.addEventListener("drop", (event) => {
+    const dragEvent = event as DragEvent;
+    const dataTransfer = dragEvent.dataTransfer;
+    // Cookie handling is strictly zone-local and File-only. URL/image/reorder
+    // DataTransfer routes continue through their established DOM handlers.
+    if (!dataTransferHasFiles(dataTransfer) || !dataTransfer) return;
+    dragEvent.preventDefault();
+    dragEvent.stopPropagation();
+    domFileDragDepth = 0;
+    const readSerial = ++cookieDomReadSerial;
+
+    const entries = cookieDropEntries(dataTransfer);
+    const decision: CookieDropDecision = decideCookieDrop(
+      entries.map(({ file, isDirectory }) => ({
+        name: file?.name || "",
+        size: file?.size ?? -1,
+        isDirectory,
+      })),
+    );
+    if (!decision.accepted) {
+      cookieFileController.reject(decision.reason);
+      return;
+    }
+    const file = entries[0]?.file;
+    if (!file) {
+      cookieFileController.reject("read_error");
+      return;
+    }
+
+    renderCookieSnapshot({
+      ...cookieFileController.getSnapshot(),
+      state: "validating",
+    });
+    void (async () => {
+      let buffer: ArrayBuffer;
+      try {
+        buffer = await file.arrayBuffer();
+      } catch {
+        if (readSerial === cookieDomReadSerial) cookieFileController.reject("read_error");
+        return;
+      }
+      if (readSerial !== cookieDomReadSerial) return;
+      if (buffer.byteLength > COOKIE_DROP_MAX_BYTES) {
+        cookieFileController.reject("too_large");
+        return;
+      }
+      await cookieFileController.stage(
+        safeDroppedCookieFileName(file.name),
+        Array.from(new Uint8Array(buffer)),
+      );
+    })();
+  });
+  window.addEventListener("blur", () => {
+    domFileDragDepth = 0;
+    restoreCookieDropState();
+  });
+}
+
+initCookieConsoleGuide();
+initCookieDomDrop();
+
 function publishDesktopPerf(): void {
   // devtoolsから `window.__eventAutoPinPerf` を参照できるが、productionへ
   // console.logを追加しない。
@@ -2306,6 +2743,110 @@ const eventLifecycleGate = new EventLifecycleGate();
 // commit時に確認して、遅いloadが削除対象をglobalへ蘇生しないようにする。
 const deletingEventKeys = new Set<string>();
 const eventMetaWriteCoordinator = new EventWriteCoordinator(eventLifecycleGate);
+
+type NativeEventFingerprint = CoordinatedEventSourceFingerprint & {
+  modified_ms?: number;
+  modified_ns?: number;
+  file_size?: number;
+  content_hash?: string;
+};
+
+function normalizeNativeEventFingerprint(
+  value: NativeEventFingerprint | undefined,
+): CoordinatedEventSourceFingerprint | undefined {
+  if (!value) return undefined;
+  return {
+    modifiedMs: value.modifiedMs ?? value.modified_ms,
+    modifiedNs: value.modifiedNs ?? value.modified_ns,
+    fileSize: value.fileSize ?? value.file_size,
+    contentHash: value.contentHash ?? value.content_hash,
+  };
+}
+
+function circlePatchFromBridge(value: Record<string, any>): CircleIdentityPatch {
+  const baseCircle = value.base_circle ?? value.baseCircle;
+  return {
+    circleIndex: Number(value.circle_index ?? value.circleIndex ?? -1),
+    circleIdentity: (value.circle_identity ?? value.circleIdentity ?? {}) as
+      CircleIdentityPatch["circleIdentity"],
+    baseCircle:
+      baseCircle && typeof baseCircle === "object"
+        ? cloneJsonSnapshot(baseCircle)
+        : undefined,
+    changes: cloneJsonSnapshot(value.changes ?? value.circle_patch ?? {}),
+  };
+}
+
+/**
+ * Python jobs are read-only for live event.json.  Their targeted result is
+ * merged into a freshly loaded document under the same lifecycle/serial gate
+ * as autosave, then committed through Rust's atomic writer.
+ */
+async function applyBridgeEventPatch(
+  ownerSlug: string,
+  ownerDir: string,
+  bridgePatch: EventPatchResult,
+): Promise<{ data: EventJsonData; resolvedCircleIndices: number[] }> {
+  const key = eventMetaOwnerKey(ownerSlug, ownerDir);
+  const eventJsonPath = eventJsonPathForDir(ownerDir);
+  return eventMetaWriteCoordinator.runExclusive(key, async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const bundle = await invoke<{
+        data?: EventJsonData;
+        modified_ms?: number;
+        modified_ns?: number;
+        file_size?: number;
+        content_hash?: string;
+      }>("load_event_bundle", {
+        eventJson: eventJsonPath,
+        eventDir: ownerDir,
+        includeMaps: false,
+      });
+      if (!bundle?.data || typeof bundle.data !== "object" || Array.isArray(bundle.data)) {
+        throw new Error("最新event.jsonを読み込めません");
+      }
+      const currentFingerprint = normalizeNativeEventFingerprint(bundle);
+      const applied = applyEventPatchToLatest(
+        bundle.data,
+        bridgePatch,
+        currentFingerprint,
+      );
+      try {
+        const saved = await invoke<NativeEventFingerprint>(
+          "save_event_json_native_checked",
+          {
+            eventJson: eventJsonPath,
+            data: applied.data,
+            expectedFingerprint: {
+              modified_ms: bundle.modified_ms,
+              modified_ns: bundle.modified_ns,
+              file_size: bundle.file_size,
+              content_hash: bundle.content_hash,
+            },
+          },
+        );
+        const savedFingerprint = normalizeNativeEventFingerprint(saved);
+        purchaseHistoryIndexService.replace(ownerSlug, applied.data, {
+          modifiedMs: savedFingerprint?.modifiedMs,
+          fileSize: savedFingerprint?.fileSize,
+        });
+        if (applied.data.event) {
+          eventMetaWriteCoordinator.recordCommitted(key, applied.data.event);
+        }
+        return {
+          data: applied.data,
+          resolvedCircleIndices: applied.resolvedCircleIndices,
+        };
+      } catch (error) {
+        if (attempt < 2 && String(error).includes("fingerprint conflict")) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error("event.json patch save retry exhausted");
+  });
+}
 
 const eventSaveQueue = new KeyedRevisionedSaveQueue<EventSaveRequest>(
   async ({ snapshot }) => {
@@ -4704,11 +5245,32 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
   }
 
   const bridge = res?.bridge as Record<string, any> | undefined;
-  if (res?.ok && bridge?.updated_circle) {
+  if (res?.ok && bridge?.circle_patch) {
+    const applied = await applyBridgeEventPatch(
+      job.eventSlug || "",
+      outputDir,
+      {
+        baseFingerprint: normalizeNativeEventFingerprint(
+          bridge.base_fingerprint as NativeEventFingerprint | undefined,
+        ),
+        circlePatches: [circlePatchFromBridge(bridge)],
+      },
+    );
+    if (!stillTargetsQueuedEvent()) {
+      resultEl.textContent =
+        `「${job.circleName}」の保存中にイベントが切り替わったため画面反映を中止しました。`;
+      return;
+    }
+    eventJsonData = cloneJsonSnapshot(applied.data);
+    persistedEventJsonData = cloneJsonSnapshot(applied.data);
+    tableState = circlesToTableState(eventJsonData);
+    eventTableBaseline = cloneJsonSnapshot(tableState);
+    markEventDocumentMutated();
+    const resolvedIndex = applied.resolvedCircleIndices[0] ?? currentIdx;
     mergeReprocessedCircleIntoState(
-      Number(bridge.circle_index ?? currentIdx),
+      resolvedIndex,
       job.circleIdentity,
-      bridge.updated_circle,
+      eventJsonData.circles?.[resolvedIndex],
     );
     resultEl.textContent = `「${job.circleName}」の再処理が完了しました\nアイテム数: ${bridge.items_count ?? "?"}\n残りキュー: ${reprocessCircleQueue.length}件`;
   }
@@ -5632,8 +6194,7 @@ function buildPipelinePayload() {
     event_date: eventDate,
     event_name: eventName,
     catalog_additional_prompt: additionalPrompt,
-    cookie_file:
-      (document.getElementById("cookieFile") as HTMLInputElement)?.value || "",
+    cookie_file: getCookieFilePathForRun(),
     days_before: Number(
       (document.getElementById("daysBefore") as HTMLInputElement)?.value || "30",
     ),
@@ -5838,6 +6399,7 @@ function isValidEventDate(value: unknown): value is string {
       image_fallback_llm_effort: payload.image_fallback_llm_effort,
       image_api_reasoning_effort_map: payload.image_api_reasoning_effort_map,
       catalog_additional_prompt: payload.catalog_additional_prompt,
+      cookie_file: payload.cookie_file,
     })) as any;
   } catch (e) {
     resultEl.textContent = `プレビュー解析失敗: ${String(e)}。フルパイプラインを実行します...`;
@@ -6904,6 +7466,7 @@ async function handleApplicationCloseRequested(event: { preventDefault: () => vo
     await flushAllEventSavesOrThrow();
     await flushCircleMasterSaves();
     saveFormValues();
+    await disposeCookieFileSelection();
     applicationCloseFlowCompleted = true;
     applicationCloseUnlisten?.();
     applicationCloseUnlisten = null;
@@ -6926,6 +7489,7 @@ async function installApplicationCloseHandler(): Promise<void> {
 
 window.addEventListener("beforeunload", () => {
   if (applicationCloseFlowCompleted) return;
+  void disposeCookieFileSelection();
   // Browser fallbackはbeforeunloadをawaitできないためbest effort。ただしsnapshot投入
   // とflushAllを開始し、Tauri flowがない環境でもpendingを可能な限り排出する。
   void (async () => {
@@ -8471,20 +9035,39 @@ async function runMapAutoPlacement(useCalibration: boolean) {
       return;
     }
 
-    const reloadBridge = await retryUntilValue<Record<string, any>>({
+    const bridgeCirclePatches = Array.isArray(bridge.circle_patches)
+      ? bridge.circle_patches.map((value: Record<string, any>) =>
+          circlePatchFromBridge(value),
+        )
+      : [];
+    const appliedPatch = await retryUntilValue<{
+      data: EventJsonData;
+      resolvedCircleIndices: number[];
+    }>({
       attempt: async () => {
         try {
-          const reload = await invokeBridgeJob<Record<string, unknown>>(
-            "load_event_json",
-            { event_json: eventJsonPath },
-            currentBridgeJobOptions(),
+          return await applyBridgeEventPatch(
+            owner.slug || "",
+            eventDir,
+            {
+              baseFingerprint: normalizeNativeEventFingerprint(
+                bridge.base_fingerprint as NativeEventFingerprint | undefined,
+              ),
+              circlePatches: bridgeCirclePatches,
+            },
           );
-          const candidate = reload?.bridge as Record<string, any> | undefined;
-          return reload?.ok && candidate?.status === "ok" && candidate.data
-            ? candidate
-            : null;
-        } catch {
-          return null;
+        } catch (error) {
+          const message = String(error);
+          // A native CAS miss is transient: reload and reapply to the new
+          // latest document.  Identity/field conflicts are semantic and must
+          // fail instead of holding the UI in an endless recovery loop.
+          if (
+            message.includes("fingerprint conflict") ||
+            message.includes("最新event.jsonを読み込めません")
+          ) {
+            return null;
+          }
+          throw error;
         }
       },
       onFailure: (retryCount) => {
@@ -8511,7 +9094,7 @@ async function runMapAutoPlacement(useCalibration: boolean) {
         "自動配置後の所有状態が一致しません。編集と保存をロックしたまま再読み込みが必要です。";
       return;
     }
-    eventJsonData = reloadBridge.data;
+    eventJsonData = appliedPatch.data;
     tableState = circlesToTableState(eventJsonData);
     persistedEventJsonData = cloneJsonSnapshot(eventJsonData);
     eventTableBaseline = cloneJsonSnapshot(tableState);
@@ -11140,6 +11723,7 @@ listen<{
           lifecycleKeys.map((key) => eventLifecycleGate.closeAndDrain(key)),
         );
         let published = false;
+        const cacheReadyLifecycleKeys = new Set<string>();
         try {
           const staged = await invoke<{
             status: string;
@@ -11161,13 +11745,54 @@ listen<{
           // publish commandがmobile successをatomicに確定する。以後のUI復旧失敗は
           // committed uploadをfailure/retryへ戻してはいけない。
           successAckSent = true;
+          for (const affected of plan.affectedEvents) {
+            const key = eventMetaOwnerKey(affected.slug, affected.dir);
+            eventMetaWriteCoordinator.invalidate(key);
+            eventMetaWriteCoordinator.forgetCommitted(key);
+          }
+          // publishはevent directoryを外部置換するため、survivorを再openする前に
+          // fresh documentのevent metadataをcacheへ戻す。古いUI snapshotが直後に
+          // 保存されてもmobile import metadataを巻き戻さない。
+          for (const affected of plan.affectedEvents) {
+            if (!affected.survives) continue;
+            const key = eventMetaOwnerKey(affected.slug, affected.dir);
+            const freshBundle = await invoke<{ data?: EventJsonData }>(
+              "load_event_bundle",
+              {
+                eventJson: eventJsonPathForDir(affected.dir),
+                eventDir: affected.dir,
+                includeMaps: false,
+              },
+            );
+            if (
+              !freshBundle?.data ||
+              typeof freshBundle.data !== "object" ||
+              Array.isArray(freshBundle.data)
+            ) {
+              throw new Error(
+                `インポート後のevent.json再読込に失敗しました: ${affected.slug}`,
+              );
+            }
+            const freshMeta = freshBundle.data.event;
+            if (
+              freshMeta !== undefined &&
+              (freshMeta === null ||
+                typeof freshMeta !== "object" ||
+                Array.isArray(freshMeta))
+            ) {
+              throw new Error(
+                `インポート後のevent metadataが不正です: ${affected.slug}`,
+              );
+            }
+            eventMetaWriteCoordinator.recordCommitted(key, freshMeta ?? {});
+            cacheReadyLifecycleKeys.add(key);
+          }
           return { ...staged, ...imported };
         } finally {
           for (const affected of plan.affectedEvents) {
-            if (!published || affected.survives) {
-              eventLifecycleGate.open(
-                eventMetaOwnerKey(affected.slug, affected.dir),
-              );
+            const key = eventMetaOwnerKey(affected.slug, affected.dir);
+            if (!published || cacheReadyLifecycleKeys.has(key)) {
+              eventLifecycleGate.open(key);
             }
           }
         }

@@ -7,6 +7,7 @@ import logging
 
 from ..core import BaseOutputFormatter
 from ..models import Circle, Event
+from ..utils.atomic_json import atomic_write_json
 
 
 class JSONFormatter(BaseOutputFormatter):
@@ -78,8 +79,7 @@ class JSONFormatter(BaseOutputFormatter):
             except (json.JSONDecodeError, OSError):
                 pass
 
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        atomic_write_json(output_path, data)
 
         self.logger.info(f"event.json を保存: {output_path}")
         return output_path

@@ -218,11 +218,26 @@
             <label for="outputDir">Twitter出力先</label>
             <input id="outputDir" value="twitter_catalogs" />
 
-            <label for="cookieFile">Cookieファイル（任意）</label>
-            <input
-              id="cookieFile"
-              placeholder="cookies/example.com_cookies.txt"
-            />
+            <label for="cookieFileBrowseBtn">Cookieファイル（任意）</label>
+            <div id="cookieFileDropZone" class="cookie-file-drop-zone" role="button" tabindex="0" aria-label="Cookieファイルを選択またはドロップ">
+              <input id="cookieFile" type="hidden" />
+              <div class="flex items-center gap-2">
+                <button id="cookieFileBrowseBtn" type="button" class="btn-secondary px-3 py-1.5 rounded">参照…</button>
+                <button id="cookieFileClearBtn" type="button" class="btn-secondary px-3 py-1.5 rounded" aria-label="選択済みCookieを解除" disabled>解除</button>
+                <span id="cookieFileStatus" class="cookie-file-status" role="status" aria-live="polite">明示Cookieファイル: 未選択（実行時に自動検出される場合があります）</span>
+              </div>
+              <div id="cookieFileDropHint" class="cookie-file-drop-hint">ここへNetscape形式の .txt（最大2MB）を1件ドロップ</div>
+              <div id="cookieFileDropState" class="cookie-file-drop-state" aria-hidden="true">明示ファイル未選択（自動検出は無効化されません）。</div>
+            </div>
+            <details id="cookieConsoleGuide" class="cookie-console-guide">
+              <summary>ブラウザConsoleから取得（任意）</summary>
+              <p class="cookie-console-warning">Event AutoPinへの送信・保存は行いません。DevTools Consoleで実行すると、ブラウザが現在のページで取得できるCookie（HttpOnlyを除く）だけをNetscape .txtとしてローカル保存します。Cookieが0件ならファイルは作成されません。HttpOnly Cookieはdocument.cookie/Consoleから取得できないため、完全な認証Cookie取得は保証されません。</p>
+              <pre id="cookieConsoleCommand" class="cookie-console-command" tabindex="0"></pre>
+              <div class="flex items-center gap-2 mt-2">
+                <button id="cookieConsoleCopyBtn" type="button" class="btn-secondary px-3 py-1 rounded">コマンドをコピー</button>
+                <span id="cookieConsoleCopyStatus" class="cookie-file-status" role="status" aria-live="polite"></span>
+              </div>
+            </details>
 
             <label for="daysBefore">イベント前日数</label>
             <input id="daysBefore" type="number" value="30" />
@@ -732,7 +747,7 @@
           <h3 class="mt-7 text-sm font-semibold">アプリ情報</h3>
           <div class="flex items-center gap-3 mt-2">
             <span class="text-sm" style="color: var(--text-muted)">
-              バージョン: <span id="appVersionLabel">0.1.11</span>
+              バージョン: <span id="appVersionLabel">0.1.12</span>
             </span>
             <button
               id="checkUpdateBtn"

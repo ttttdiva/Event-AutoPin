@@ -102,6 +102,7 @@ def test_elements_to_numbers_splits_short_row_with_non_numeric_heading():
 
     assert [item["number"] for item in numbers] == ["01", "02"]
     assert [item["x"] for item in numbers] == [140, 180]
+    assert [item["prefix"] for item in numbers] == ["あ", "あ"]
 
 
 def test_elements_to_numbers_prefix_policy_rejects_dates_and_long_ids():
@@ -163,3 +164,87 @@ def test_elements_to_numbers_skips_missing_coordinates_and_invalid_boxes():
     )
 
     assert [item["number"] for item in numbers] == ["03"]
+
+
+def test_elements_to_numbers_preserves_prefix_space_id_and_raw_context():
+    numbers = _elements_to_numbers(
+        [
+            {"text": "A-01", "x1": 10, "y1": 10, "x2": 30, "y2": 30},
+            {"text": "B-01", "x1": 40, "y1": 10, "x2": 60, "y2": 30},
+        ]
+    )
+
+    assert [(item["space_id"], item["prefix"], item["raw_text"]) for item in numbers] == [
+        ("A01", "A", "A-01"),
+        ("B01", "B", "B-01"),
+    ]
+
+
+def test_elements_to_numbers_preserves_prefix_for_merged_group_members():
+    numbers = _elements_to_numbers(
+        [{"text": "M-03,04", "x1": 100, "y1": 20, "x2": 180, "y2": 40}]
+    )
+
+    assert [(item["space_id"], item["number"]) for item in numbers] == [
+        ("M03", "03"),
+        ("M04", "04"),
+    ]
+    assert all(item["raw_text"] == "M-03,04" for item in numbers)
+
+
+def test_elements_to_numbers_does_not_merge_adjacent_same_number_without_overlap():
+    numbers = _elements_to_numbers(
+        [
+            {"text": "01", "x1": 100, "y1": 100, "x2": 120, "y2": 120},
+            {"text": "01", "x1": 125, "y1": 100, "x2": 145, "y2": 120},
+        ]
+    )
+
+    assert len(numbers) == 2
+    assert [item["x"] for item in numbers] == [100, 125]
+
+
+def test_elements_to_numbers_does_not_merge_overlapping_different_prefixes():
+    numbers = _elements_to_numbers(
+        [
+            {"text": "A-01", "x1": 100, "y1": 100, "x2": 130, "y2": 120},
+            {"text": "B-01", "x1": 101, "y1": 100, "x2": 131, "y2": 120},
+        ]
+    )
+
+    assert [item["space_id"] for item in numbers] == ["A01", "B01"]
+
+
+def test_elements_to_numbers_merges_bare_and_prefixed_duplicate_and_keeps_context():
+    numbers = _elements_to_numbers(
+        [
+            {"text": "01", "x1": 100, "y1": 100, "x2": 130, "y2": 120},
+            {"text": "A-01", "x1": 101, "y1": 100, "x2": 131, "y2": 120},
+        ]
+    )
+
+    assert len(numbers) == 1
+    assert numbers[0]["space_id"] == "A01"
+    assert numbers[0]["prefix"] == "A"
+
+
+def test_elements_to_numbers_keeps_table_row_prefix_for_duplicate_numbers():
+    numbers = _elements_to_numbers(
+        [
+            {
+                "text": (
+                    "<table>"
+                    "<tr><td>A</td><td>01</td></tr>"
+                    "<tr><td>B</td><td>01</td></tr>"
+                    "</table>"
+                ),
+                "x1": 0,
+                "y1": 0,
+                "x2": 200,
+                "y2": 100,
+            }
+        ]
+    )
+
+    assert [item["space_id"] for item in numbers] == ["A01", "B01"]
+    assert [item["y"] for item in numbers] == [0, 50]

@@ -27,6 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER_PATH = REPO_ROOT / "src" / "space_locator" / "unlimited_ocr_runner.py"
 UNLIMITED_OCR_VARIANT = "unlimited_ocr_0"
 NUMBER_TOKEN_RE = re.compile(r"\d{1,2}")
+PREFIXED_NUMBER_RE = re.compile(
+    r"(?P<prefix>.+?)(?:\s*[-‐‑‒–—−ー－]\s*|\s+)(?P<number>\d{1,2})"
+)
 HTML_TAG_RE = re.compile(r"<[^>]*>")
 HTML_BREAK_RE = re.compile(r"<\s*/?\s*(?:br|td|th|tr|table|p|div|li|ul|ol)\b[^>]*>", re.IGNORECASE)
 
@@ -75,10 +78,7 @@ def _number_from_text(text: str) -> int | None:
     # Prefix付き番号は、単一英字（A-01/P-12）または数字を含まない
     # 非ASCII名称（企業-01）だけ許可する。AB-12、2025-01、123-45、
     # 2025/01のような日付・長いIDは番号候補へ落とさない。
-    match = re.fullmatch(
-        r"(?P<prefix>.+?)(?:\s*[-‐‑‒–—−ー－]\s*|\s+)(?P<number>\d{1,2})",
-        stripped,
-    )
+    match = PREFIXED_NUMBER_RE.fullmatch(stripped)
     if match:
         prefix = match.group("prefix").strip()
         allowed_ascii_prefix = bool(re.fullmatch(r"[A-Za-z]", prefix))
@@ -93,12 +93,71 @@ def _number_from_text(text: str) -> int | None:
     return None
 
 
+def _accepted_prefix(value: str) -> str | None:
+    prefix = str(value or "").strip()
+    allowed_ascii_prefix = bool(re.fullmatch(r"[A-Za-z]", prefix))
+    allowed_named_prefix = (
+        bool(prefix)
+        and not re.search(r"[0-9A-Za-z]", prefix)
+        and any(ord(char) > 127 for char in prefix)
+    )
+    return prefix if allowed_ascii_prefix or allowed_named_prefix else None
+
+
+def _prefix_from_text(text: str) -> str | None:
+    """Return an accepted booth prefix using the same policy as number parsing."""
+    match = PREFIXED_NUMBER_RE.fullmatch(_normalize_ocr_text(text))
+    if not match:
+        return None
+    return _accepted_prefix(match.group("prefix"))
+
+
+def _leading_prefix(text: str) -> str | None:
+    """Preserve a row heading while leaving numeric token positions intact."""
+    tokens = _normalize_ocr_text(text).split()
+    if len(tokens) < 2 or not all(NUMBER_TOKEN_RE.fullmatch(token) for token in tokens[1:]):
+        return None
+    return _accepted_prefix(tokens[0])
+
+
+def _prefixed_group(text: str) -> tuple[str, list[int]] | None:
+    """Parse a compact booth group such as ``A-03,04`` without losing A."""
+    normalized = unicodedata.normalize("NFKC", html.unescape(str(text or "")))
+    normalized = HTML_TAG_RE.sub(" ", normalized).strip()
+    match = re.fullmatch(
+        r"(?P<prefix>.+?)(?:\s*[-‐‑‒–—−ー－]\s*|\s+)"
+        r"(?P<numbers>\d{1,2}(?:\s*[,，、;；|/／\s]\s*\d{1,2})+)",
+        normalized,
+    )
+    if not match:
+        return None
+    prefix_separator = normalized[: match.start("numbers")]
+    number_text = match.group("numbers")
+    if not re.search(r"[-‐‑‒–—−ー－]", prefix_separator) and not re.search(
+        r"[,，、;；|/／]", number_text
+    ):
+        # ``heading 01 02`` is a spatial row with a non-numeric heading, not a
+        # shared-prefix booth group; retain the original token positions.
+        return None
+    prefix = _accepted_prefix(match.group("prefix"))
+    if prefix is None:
+        return None
+    values = [int(value) for value in re.findall(r"\d{1,2}", number_text)]
+    if len(values) < 2 or not all(1 <= value <= 99 for value in values):
+        return None
+    return prefix, values
+
+
 def _split_numeric_tokens(text: str) -> list[tuple[int, int, int]]:
     original = str(text or "")
     # 年月や長い数値IDを ``/`` 区切りの番号グループと誤認しない。
     # 例: 2025/01, 2025-01, 123/45。
     if re.fullmatch(r"\s*\d{3,}\s*[-/／‐‑‒–—−ー－]\s*\d{1,2}\s*", original):
         return []
+    prefixed_group = _prefixed_group(original)
+    if prefixed_group is not None:
+        values = prefixed_group[1]
+        return [(index, len(values), value) for index, value in enumerate(values)]
     normalized = _normalize_ocr_text(original)
     raw_tokens = [token for token in re.split(r"\s+", normalized.strip()) if token]
     if not raw_tokens:
@@ -219,7 +278,7 @@ class _TableParser(HTMLParser):
 
 def _table_to_numbers(
     text: str, x1: int, y1: int, x2: int, y2: int
-) -> list[tuple[int, int, int, int, int]] | None:
+) -> list[tuple[int, int, int, int, int, str | None, str]] | None:
     """構造化されたtableを2Dセル矩形へ変換する。
 
     戻り値 ``None`` はtable構造不明を表し、呼び出し側は座標を捏造せず
@@ -260,7 +319,18 @@ def _table_to_numbers(
     col_count = max((col + colspan for _, _, col, _, colspan in placements), default=0)
     if col_count <= 0:
         return None
-    output: list[tuple[int, int, int, int, int]] = []
+    row_prefix_candidates: dict[int, list[str]] = {}
+    for cell, row_index, _, _, _ in placements:
+        cell_text = _normalize_ocr_text(str(cell.get("text", "")))
+        prefix = _accepted_prefix(cell_text) if not re.search(r"\d", cell_text) else None
+        if prefix:
+            row_prefix_candidates.setdefault(row_index, []).append(prefix)
+    row_prefixes = {
+        row_index: prefixes[0]
+        for row_index, prefixes in row_prefix_candidates.items()
+        if len(set(prefixes)) == 1
+    }
+    output: list[tuple[int, int, int, int, int, str | None, str]] = []
     for cell, row_index, col, rowspan, colspan in placements:
         cell_text = str(cell.get("text", ""))
         # 明示的な<br>/改行は同じセル内の縦方向番号として扱う。
@@ -289,17 +359,42 @@ def _table_to_numbers(
         cell_y2 = y1 + int(round((y2 - y1) * (row_index + rowspan) / row_count))
         if cell_x2 <= cell_x1 or cell_y2 <= cell_y1:
             continue
+        cell_prefix = _prefix_from_text(cell_text)
+        if cell_prefix is None:
+            grouped = _prefixed_group(cell_text)
+            cell_prefix = grouped[0] if grouped else None
+        cell_prefix = cell_prefix or row_prefixes.get(row_index)
         # A multi-number cell with an explicit colspan is still safely split
         # only inside its own structural cell; rows remain two-dimensional.
         for index, value in enumerate(values):
             if vertical_values:
                 token_y1 = cell_y1 + int(round((cell_y2 - cell_y1) * index / len(values)))
                 token_y2 = cell_y1 + int(round((cell_y2 - cell_y1) * (index + 1) / len(values)))
-                output.append((value, cell_x1, token_y1, cell_x2, max(token_y2, token_y1 + 1)))
+                output.append(
+                    (
+                        value,
+                        cell_x1,
+                        token_y1,
+                        cell_x2,
+                        max(token_y2, token_y1 + 1),
+                        cell_prefix,
+                        cell_text,
+                    )
+                )
             else:
                 token_x1 = cell_x1 + int(round((cell_x2 - cell_x1) * index / len(values)))
                 token_x2 = cell_x1 + int(round((cell_x2 - cell_x1) * (index + 1) / len(values)))
-                output.append((value, token_x1, cell_y1, max(token_x2, token_x1 + 1), cell_y2))
+                output.append(
+                    (
+                        value,
+                        token_x1,
+                        cell_y1,
+                        max(token_x2, token_x1 + 1),
+                        cell_y2,
+                        cell_prefix,
+                        cell_text,
+                    )
+                )
     return output
 
 
@@ -364,8 +459,32 @@ def _elements_to_numbers(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     ),
                 ),
             )
-            if existing["number"] == entry["number"] and (
-                iou >= 0.25 or center_distance <= size_distance
+            prefix_compatible = (
+                existing.get("prefix") == entry.get("prefix")
+                or not existing.get("prefix")
+                or not entry.get("prefix")
+            )
+            # Two adjacent booths can legitimately carry the same number under
+            # different prefixes.  Even for bare numbers, proximity alone is
+            # not duplicate evidence: require bbox overlap, or near-identical
+            # centres at a fraction of the smaller glyph size.
+            near_identical = center_distance <= min(
+                size_distance,
+                max(
+                    3.0,
+                    0.18
+                    * min(
+                        existing["width"],
+                        existing["height"],
+                        entry["width"],
+                        entry["height"],
+                    ),
+                ),
+            )
+            if (
+                existing["number"] == entry["number"]
+                and prefix_compatible
+                and (iou >= 0.25 or near_identical)
             ):
                 # overlap tile由来のboxは数px〜数十pxずれる。同一候補の
                 # 片方を恣意的に選ぶと中心座標が偏るため、包含boxへ統合する。
@@ -385,11 +504,25 @@ def _elements_to_numbers(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                         "height": merged_y2 - merged_y1,
                     }
                 )
+                if not existing.get("prefix") and entry.get("prefix"):
+                    existing["prefix"] = entry["prefix"]
+                    existing["space_id"] = entry.get("space_id")
+                    existing["raw_text"] = entry.get("raw_text", existing.get("raw_text", ""))
                 return
         candidates.append(entry)
 
-    def make_entry(value: int, x1: int, y1: int, x2: int, y2: int) -> Dict[str, Any]:
-        return {
+    def make_entry(
+        value: int,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        *,
+        source_text: str = "",
+        prefix: str | None = None,
+        group_identity: str | None = None,
+    ) -> Dict[str, Any]:
+        entry = {
             "number": str(value).zfill(2),
             "x": x1,
             "y": y1,
@@ -398,9 +531,23 @@ def _elements_to_numbers(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             "confidence": 99,
             "variant": UNLIMITED_OCR_VARIANT,
         }
+        # Preserve identity/context only when it exists.  Bare-number output
+        # retains the historical exact dictionary contract.
+        if prefix:
+            entry["prefix"] = prefix
+            entry["space_id"] = f"{prefix}{value:02d}"
+        if prefix or len(_split_numeric_tokens(source_text)) > 1:
+            entry["raw_text"] = source_text
+        if group_identity:
+            entry["group_identity"] = group_identity
+        return entry
 
     for element in elements:
         text = str(element.get("text", "")).strip()
+        explicit_prefix = str(element.get("prefix") or "").strip() or None
+        explicit_group = str(
+            element.get("group_identity", element.get("group_id", "")) or ""
+        ).strip() or None
         try:
             x1 = int(element["x1"])
             y1 = int(element["y1"])
@@ -418,13 +565,43 @@ def _elements_to_numbers(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             table_values = _table_to_numbers(text, x1, y1, x2, y2)
             if table_values is None:
                 continue
-            for value, token_x1, token_y1, token_x2, token_y2 in table_values:
-                add_candidate(make_entry(value, token_x1, token_y1, token_x2, token_y2))
+            for (
+                value,
+                token_x1,
+                token_y1,
+                token_x2,
+                token_y2,
+                token_prefix,
+                token_text,
+            ) in table_values:
+                add_candidate(
+                    make_entry(
+                        value,
+                        token_x1,
+                        token_y1,
+                        token_x2,
+                        token_y2,
+                        source_text=token_text,
+                        prefix=token_prefix or explicit_prefix,
+                        group_identity=explicit_group,
+                    )
+                )
             continue
 
         single_value = _number_from_text(text)
         if single_value is not None:
-            add_candidate(make_entry(single_value, x1, y1, x2, y2))
+            add_candidate(
+                make_entry(
+                    single_value,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    source_text=text,
+                    prefix=_prefix_from_text(text) or explicit_prefix,
+                    group_identity=explicit_group,
+                )
+            )
             continue
 
         token_values = _split_numeric_tokens(text)
@@ -433,17 +610,41 @@ def _elements_to_numbers(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         vertical_values = _plain_group_is_vertical(
             text, x2 - x1, y2 - y1, len(token_values)
         )
+        grouped = _prefixed_group(text)
+        token_prefix = (grouped[0] if grouped else None) or _leading_prefix(text)
         for token_position, (index, token_count, value) in enumerate(token_values):
             if vertical_values:
                 token_height = (y2 - y1) / len(token_values)
                 token_y1 = int(y1 + token_height * token_position)
                 token_y2 = int(y1 + token_height * (token_position + 1))
-                add_candidate(make_entry(value, x1, token_y1, x2, token_y2))
+                add_candidate(
+                    make_entry(
+                        value,
+                        x1,
+                        token_y1,
+                        x2,
+                        token_y2,
+                        source_text=text,
+                        prefix=token_prefix or explicit_prefix,
+                        group_identity=explicit_group,
+                    )
+                )
             else:
                 token_width = (x2 - x1) / token_count
                 token_x1 = int(x1 + token_width * index)
                 token_x2 = int(x1 + token_width * (index + 1))
-                add_candidate(make_entry(value, token_x1, y1, token_x2, y2))
+                add_candidate(
+                    make_entry(
+                        value,
+                        token_x1,
+                        y1,
+                        token_x2,
+                        y2,
+                        source_text=text,
+                        prefix=token_prefix or explicit_prefix,
+                        group_identity=explicit_group,
+                    )
+                )
 
     candidates.sort(key=lambda n: (n["y"], n["x"]))
     return candidates

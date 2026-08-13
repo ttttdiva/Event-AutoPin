@@ -14,20 +14,25 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use history_search::search_past_participations;
-
 // Native event I/O is intentionally kept independent from the Python bridge.  The
 // counters are cheap atomics so development builds can expose enough evidence for
 // switch/save profiling without writing verbose production logs.
 static PYTHON_BRIDGE_SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
 static TAURI_EVENT_IO_IPC_COUNT: AtomicU64 = AtomicU64::new(0);
 static EVENT_JSON_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static COOKIE_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static EVENT_JSON_REPLACE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static EVENT_JSON_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn event_json_replace_lock() -> &'static Mutex<()> {
     EVENT_JSON_REPLACE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn event_json_mutation_lock() -> &'static Mutex<()> {
+    EVENT_JSON_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn absolute_project_root(project_root: &str) -> Result<PathBuf, String> {
@@ -1100,6 +1105,888 @@ fn run_python_bridge_sync(
     }))
 }
 
+const COOKIE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const COOKIE_DOMAIN_SAMPLE_LIMIT: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CookieValidationCode {
+    Missing,
+    Directory,
+    Unsupported,
+    EmptyOrInvalid,
+    TooLarge,
+    Unreadable,
+    StageUnavailable,
+    StageNotAllowed,
+}
+
+impl CookieValidationCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "cookie_missing",
+            Self::Directory => "cookie_directory",
+            Self::Unsupported => "cookie_unsupported",
+            Self::EmptyOrInvalid => "cookie_empty_or_invalid",
+            Self::TooLarge => "cookie_too_large",
+            Self::Unreadable => "cookie_unreadable",
+            Self::StageUnavailable => "cookie_stage_unavailable",
+            Self::StageNotAllowed => "cookie_stage_not_allowed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CookieExpiryStatus {
+    Session,
+    Expired,
+    Future,
+    Mixed,
+}
+
+impl CookieExpiryStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Expired => "expired",
+            Self::Future => "future",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CookieExpirySummary {
+    status: CookieExpiryStatus,
+    session_count: usize,
+    expired_count: usize,
+    future_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CookieValidationSummary {
+    cookie_count: usize,
+    domain_count: usize,
+    domains: Vec<String>,
+    expiry: CookieExpirySummary,
+}
+
+#[derive(Default)]
+struct CookieStageRegistry {
+    root: Option<PathBuf>,
+    allowed_paths: HashSet<PathBuf>,
+}
+
+#[derive(Default)]
+struct CookieStageState {
+    registry: Mutex<CookieStageRegistry>,
+}
+
+#[cfg(target_os = "windows")]
+mod windows_cookie_acl {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io;
+    use std::mem;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::path::Path;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS,
+        ERROR_INSUFFICIENT_BUFFER, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, AddAccessAllowedAceEx, GetAce, GetAclInformation, GetLengthSid,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation,
+        InitializeAcl, InitializeSecurityDescriptor, SetSecurityDescriptorControl,
+        SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERITED_ACE, OBJECT_INHERIT_ACE,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+        SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateDirectoryW, CreateFileW, CREATE_NEW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    fn wide_path(path: &Path) -> Result<Vec<u16>, ()> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.iter().any(|value| *value == 0) {
+            return Err(());
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    fn current_user_sid() -> Result<Vec<u8>, ()> {
+        let mut token: HANDLE = ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(());
+        }
+        let token = OwnedHandle(token);
+        let mut required = 0u32;
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut required);
+        }
+        if required == 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+            return Err(());
+        }
+        let mut token_user_buffer = vec![0u8; required as usize];
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                token_user_buffer.as_mut_ptr().cast(),
+                required,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(());
+        }
+        let token_user = unsafe { &*(token_user_buffer.as_ptr().cast::<TOKEN_USER>()) };
+        let sid_len = unsafe { GetLengthSid(token_user.User.Sid) };
+        if sid_len == 0 {
+            return Err(());
+        }
+        let mut sid = vec![0u8; sid_len as usize];
+        unsafe {
+            ptr::copy_nonoverlapping(
+                token_user.User.Sid.cast::<u8>(),
+                sid.as_mut_ptr(),
+                sid_len as usize,
+            );
+        }
+        Ok(sid)
+    }
+
+    struct PrivateSecurity {
+        descriptor: Box<SECURITY_DESCRIPTOR>,
+        _acl: Vec<u64>,
+        user_sid: Vec<u8>,
+    }
+
+    impl PrivateSecurity {
+        fn new(for_directory: bool) -> Result<Self, ()> {
+            let mut user_sid = current_user_sid()?;
+            let sid_len = user_sid.len();
+            let acl_bytes = mem::size_of::<ACL>()
+                .checked_add(mem::size_of::<
+                    windows_sys::Win32::Security::ACCESS_ALLOWED_ACE,
+                >())
+                .and_then(|value| value.checked_sub(mem::size_of::<u32>()))
+                .and_then(|value| value.checked_add(sid_len))
+                .ok_or(())?;
+            if acl_bytes > u16::MAX as usize {
+                return Err(());
+            }
+            let acl_words =
+                acl_bytes.checked_add(mem::size_of::<u64>() - 1).ok_or(())? / mem::size_of::<u64>();
+            let mut acl = vec![0u64; acl_words];
+            let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
+            if unsafe { InitializeAcl(acl_ptr, acl_bytes as u32, ACL_REVISION) } == 0 {
+                return Err(());
+            }
+            let inherit_flags = if for_directory {
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+            } else {
+                0
+            };
+            if unsafe {
+                AddAccessAllowedAceEx(
+                    acl_ptr,
+                    ACL_REVISION,
+                    inherit_flags,
+                    FILE_ALL_ACCESS,
+                    user_sid.as_mut_ptr().cast::<c_void>(),
+                )
+            } == 0
+            {
+                return Err(());
+            }
+            let mut descriptor = Box::new(SECURITY_DESCRIPTOR::default());
+            if unsafe {
+                InitializeSecurityDescriptor(
+                    descriptor.as_mut() as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
+                    1,
+                )
+            } == 0
+            {
+                return Err(());
+            }
+            if unsafe {
+                SetSecurityDescriptorDacl(
+                    descriptor.as_mut() as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
+                    1,
+                    acl_ptr,
+                    0,
+                )
+            } == 0
+            {
+                return Err(());
+            }
+            if unsafe {
+                SetSecurityDescriptorControl(
+                    descriptor.as_mut() as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
+                    SE_DACL_PROTECTED,
+                    SE_DACL_PROTECTED,
+                )
+            } == 0
+            {
+                return Err(());
+            }
+            Ok(Self {
+                descriptor,
+                _acl: acl,
+                user_sid,
+            })
+        }
+
+        fn attributes(&mut self) -> SECURITY_ATTRIBUTES {
+            SECURITY_ATTRIBUTES {
+                nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: self.descriptor.as_mut() as *mut SECURITY_DESCRIPTOR as _,
+                bInheritHandle: 0,
+            }
+        }
+
+        fn user_sid(&self) -> PSID {
+            self.user_sid.as_ptr() as PSID
+        }
+    }
+
+    fn verify_private_descriptor(
+        descriptor: PSECURITY_DESCRIPTOR,
+        expected_user_sid: PSID,
+        expect_directory_inheritance: Option<bool>,
+    ) -> Result<(), ()> {
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+            || control & SE_DACL_PROTECTED == 0
+        {
+            return Err(());
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut acl = ptr::null_mut();
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) }
+            == 0
+            || present == 0
+            || acl.is_null()
+        {
+            return Err(());
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        if unsafe {
+            GetAclInformation(
+                acl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+            || info.AceCount != 1
+        {
+            return Err(());
+        }
+        let mut ace: *mut c_void = ptr::null_mut();
+        if unsafe { GetAce(acl, 0, &mut ace) } == 0 || ace.is_null() {
+            return Err(());
+        }
+        let ace = ace.cast::<windows_sys::Win32::Security::ACCESS_ALLOWED_ACE>();
+        let header = unsafe { (*ace).Header };
+        if header.AceType != 0
+            || u32::from(header.AceFlags) & INHERITED_ACE != 0
+            || unsafe { (*ace).Mask } != FILE_ALL_ACCESS
+        {
+            return Err(());
+        }
+        if let Some(expect_directory_inheritance) = expect_directory_inheritance {
+            let inheritance =
+                u32::from(header.AceFlags) & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE);
+            let expected = if expect_directory_inheritance {
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+            } else {
+                0
+            };
+            if inheritance != expected {
+                return Err(());
+            }
+        }
+        let sid = unsafe { &mut (*ace).SidStart as *mut u32 as PSID };
+        let sid_len = unsafe { GetLengthSid(sid) };
+        let expected_len = unsafe { GetLengthSid(expected_user_sid) };
+        if sid_len == 0
+            || sid_len != expected_len
+            || unsafe {
+                std::slice::from_raw_parts(sid.cast::<u8>(), sid_len as usize)
+                    != std::slice::from_raw_parts(expected_user_sid.cast::<u8>(), sid_len as usize)
+            }
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn verify_private_path(
+        path: &Path,
+        expected_user_sid: PSID,
+        expect_directory_inheritance: Option<bool>,
+    ) -> Result<(), ()> {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+
+        let wide = wide_path(path)?;
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let result = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if result != 0 || descriptor.is_null() {
+            return Err(());
+        }
+        let verified =
+            verify_private_descriptor(descriptor, expected_user_sid, expect_directory_inheritance);
+        unsafe {
+            LocalFree(descriptor as _);
+        }
+        verified
+    }
+
+    fn protect_path_dacl(path: &Path, acl: *const ACL) -> Result<(), ()> {
+        use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+
+        let wide = wide_path(path)?;
+        let result = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr() as *mut u16,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                acl,
+                ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    pub(super) fn create_private_directory(path: &Path) -> io::Result<()> {
+        let mut security = PrivateSecurity::new(true).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("private ACL unavailable: {}", io::Error::last_os_error()),
+            )
+        })?;
+        let mut attributes = security.attributes();
+        let wide = wide_path(path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        if unsafe { CreateDirectoryW(wide.as_ptr(), &mut attributes) } == 0 {
+            let error = unsafe { GetLastError() };
+            let kind = if error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS {
+                io::ErrorKind::AlreadyExists
+            } else {
+                io::ErrorKind::Other
+            };
+            return Err(io::Error::new(
+                kind,
+                format!("CreateDirectoryW failed: {error}"),
+            ));
+        }
+        if protect_path_dacl(path, security._acl.as_ptr().cast()).is_err()
+            || verify_private_path(path, security.user_sid(), Some(true)).is_err()
+        {
+            let _ = std::fs::remove_dir(path);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private directory ACL verification failed",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
+        let mut security = PrivateSecurity::new(false).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("private ACL unavailable: {}", io::Error::last_os_error()),
+            )
+        })?;
+        let mut attributes = security.attributes();
+        let wide = wide_path(path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_ALL_ACCESS,
+                0,
+                &mut attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let error = unsafe { GetLastError() };
+            let kind = if error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS {
+                io::ErrorKind::AlreadyExists
+            } else {
+                io::ErrorKind::Other
+            };
+            return Err(io::Error::new(kind, format!("CreateFileW failed: {error}")));
+        }
+        let file = unsafe { File::from_raw_handle(handle) };
+        if protect_path_dacl(path, security._acl.as_ptr().cast()).is_err()
+            || verify_private_path(path, security.user_sid(), Some(false)).is_err()
+        {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private file ACL verification failed",
+            ));
+        }
+        Ok(file)
+    }
+
+    #[cfg(test)]
+    pub(super) fn assert_private_path(path: &Path, is_directory: bool) {
+        let sid = current_user_sid().expect("current user SID");
+        verify_private_path(path, sid.as_ptr() as PSID, Some(is_directory))
+            .expect("protected current-user-only DACL");
+    }
+}
+
+impl CookieStageState {
+    fn lock_registry(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, CookieStageRegistry>, CookieValidationCode> {
+        self.registry
+            .lock()
+            .map_err(|_| CookieValidationCode::StageUnavailable)
+    }
+
+    fn stage(&self, contents: &[u8]) -> Result<PathBuf, CookieValidationCode> {
+        let mut registry = self.lock_registry()?;
+        let root = match registry.root.as_ref() {
+            Some(root) => root.clone(),
+            None => {
+                let root = create_private_cookie_stage_root()?;
+                registry.root = Some(root.clone());
+                root
+            }
+        };
+
+        for _ in 0..128 {
+            let path = root.join(format!("cookie-{}.txt", next_cookie_stage_token()));
+            #[cfg(target_os = "windows")]
+            let mut file = match windows_cookie_acl::create_private_file(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => {
+                    let _ = fs::remove_dir_all(&root);
+                    registry.root = None;
+                    registry.allowed_paths.clear();
+                    return Err(CookieValidationCode::StageUnavailable);
+                }
+            };
+            #[cfg(not(target_os = "windows"))]
+            let mut file = {
+                let mut options = fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                match options.open(&path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(_) => return Err(CookieValidationCode::StageUnavailable),
+                }
+            };
+            if file
+                .write_all(contents)
+                .and_then(|_| file.sync_all())
+                .is_err()
+            {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(CookieValidationCode::StageUnavailable);
+            }
+            registry.allowed_paths.insert(path.clone());
+            return Ok(path);
+        }
+        Err(CookieValidationCode::StageUnavailable)
+    }
+
+    fn cleanup_path(&self, path: &Path) -> Result<(), CookieValidationCode> {
+        let mut registry = self.lock_registry()?;
+        if !registry.allowed_paths.contains(path) {
+            return Err(CookieValidationCode::StageNotAllowed);
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(CookieValidationCode::StageUnavailable),
+        }
+        registry.allowed_paths.remove(path);
+        Ok(())
+    }
+
+    fn cleanup_all(&self) -> Result<(), CookieValidationCode> {
+        let mut registry = self.lock_registry()?;
+        let Some(root) = registry.root.take() else {
+            registry.allowed_paths.clear();
+            return Ok(());
+        };
+        match fs::remove_dir_all(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                registry.root = Some(root);
+                return Err(CookieValidationCode::StageUnavailable);
+            }
+        }
+        registry.allowed_paths.clear();
+        Ok(())
+    }
+}
+
+impl Drop for CookieStageState {
+    fn drop(&mut self) {
+        let registry = match self.registry.get_mut() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(root) = registry.root.take() {
+            let _ = fs::remove_dir_all(root);
+        }
+        registry.allowed_paths.clear();
+    }
+}
+
+fn next_cookie_stage_token() -> String {
+    let counter = COOKIE_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:x}-{:x}-{:x}", std::process::id(), nanos, counter)
+}
+
+fn create_private_cookie_stage_root() -> Result<PathBuf, CookieValidationCode> {
+    for _ in 0..128 {
+        let root = env::temp_dir().join(format!(
+            ".event-autopin-cookie-stage-{}",
+            next_cookie_stage_token()
+        ));
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+        };
+        #[cfg(target_os = "windows")]
+        let created = windows_cookie_acl::create_private_directory(&root);
+        #[cfg(not(target_os = "windows"))]
+        let created = builder.create(&root);
+        match created {
+            Ok(()) => return Ok(root),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(CookieValidationCode::StageUnavailable),
+        }
+    }
+    Err(CookieValidationCode::StageUnavailable)
+}
+
+fn safe_cookie_basename(path: &Path) -> String {
+    let value = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("選択済みCookieファイル"));
+    let sanitized: String = value
+        .chars()
+        .filter(|ch| !ch.is_control() && *ch != '/' && *ch != '\\')
+        .take(128)
+        .collect();
+    if sanitized.is_empty() {
+        "選択済みCookieファイル".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn current_epoch_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
+fn normalize_cookie_domain(domain: &str) -> String {
+    domain.trim_start_matches('.').to_lowercase()
+}
+
+fn validate_netscape_cookie_contents_at(
+    content: &[u8],
+    now_epoch_seconds: i64,
+) -> Result<CookieValidationSummary, CookieValidationCode> {
+    if content.is_empty() || content.len() as u64 > COOKIE_MAX_BYTES {
+        return Err(if content.len() as u64 > COOKIE_MAX_BYTES {
+            CookieValidationCode::TooLarge
+        } else {
+            CookieValidationCode::EmptyOrInvalid
+        });
+    }
+    let text = std::str::from_utf8(content).map_err(|_| CookieValidationCode::EmptyOrInvalid)?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut cookie_count = 0usize;
+    let mut domain_set = HashSet::new();
+    let mut domains = Vec::new();
+    let mut session_count = 0usize;
+    let mut expired_count = 0usize;
+    let mut future_count = 0usize;
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let trimmed_start = line.trim_start();
+        let candidate = if let Some(http_only) = line.strip_prefix("#HttpOnly_") {
+            http_only
+        } else if trimmed_start.starts_with('#') || trimmed_start.starts_with('$') {
+            continue;
+        } else {
+            line
+        };
+        let fields: Vec<&str> = candidate.split('\t').collect();
+        if fields.len() != 7 {
+            return Err(CookieValidationCode::EmptyOrInvalid);
+        }
+        let domain = fields[0].trim();
+        if domain.is_empty() || domain != fields[0] || domain.chars().any(char::is_whitespace) {
+            return Err(CookieValidationCode::EmptyOrInvalid);
+        }
+        let include_subdomains = fields[1];
+        if !matches!(include_subdomains, "TRUE" | "FALSE")
+            || (include_subdomains == "TRUE") != domain.starts_with('.')
+        {
+            return Err(CookieValidationCode::EmptyOrInvalid);
+        }
+        if !fields[2].starts_with('/') || fields[2].is_empty() {
+            return Err(CookieValidationCode::EmptyOrInvalid);
+        }
+        if !matches!(fields[3], "TRUE" | "FALSE") {
+            return Err(CookieValidationCode::EmptyOrInvalid);
+        }
+        let normalized_domain = normalize_cookie_domain(domain);
+        if normalized_domain.is_empty()
+            || normalized_domain.chars().count() > 253
+            || normalized_domain
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+        {
+            return Err(CookieValidationCode::EmptyOrInvalid);
+        }
+        if domain_set.insert(normalized_domain.clone())
+            && domains.len() < COOKIE_DOMAIN_SAMPLE_LIMIT
+        {
+            domains.push(normalized_domain);
+        }
+        // An empty expiry denotes a session cookie and is accepted by
+        // MozillaCookieJar (the Python trust-boundary parser). Keep the
+        // seven-column Netscape contract while preserving that compatibility;
+        // the cookie name may likewise be empty, as MozillaCookieJar accepts
+        // it and the existing loader historically did not reject it.
+        if fields[4].is_empty() {
+            session_count += 1;
+        } else {
+            let expiry = fields[4]
+                .parse::<i64>()
+                .map_err(|_| CookieValidationCode::EmptyOrInvalid)?;
+            if expiry <= now_epoch_seconds {
+                expired_count += 1;
+            } else {
+                future_count += 1;
+            }
+        }
+        cookie_count += 1;
+    }
+    if cookie_count == 0 {
+        return Err(CookieValidationCode::EmptyOrInvalid);
+    }
+    let non_empty_expiry_kinds = usize::from(session_count > 0)
+        + usize::from(expired_count > 0)
+        + usize::from(future_count > 0);
+    let status = if non_empty_expiry_kinds > 1 {
+        CookieExpiryStatus::Mixed
+    } else if session_count > 0 {
+        CookieExpiryStatus::Session
+    } else if expired_count > 0 {
+        CookieExpiryStatus::Expired
+    } else {
+        CookieExpiryStatus::Future
+    };
+    Ok(CookieValidationSummary {
+        cookie_count,
+        domain_count: domain_set.len(),
+        domains,
+        expiry: CookieExpirySummary {
+            status,
+            session_count,
+            expired_count,
+            future_count,
+        },
+    })
+}
+
+fn validate_netscape_cookie_contents(
+    content: &[u8],
+) -> Result<CookieValidationSummary, CookieValidationCode> {
+    validate_netscape_cookie_contents_at(content, current_epoch_seconds())
+}
+
+fn validate_cookie_path(path: &Path) -> Result<CookieValidationSummary, CookieValidationCode> {
+    let metadata = match fs::metadata(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CookieValidationCode::Missing)
+        }
+        Err(_) => return Err(CookieValidationCode::Unreadable),
+    };
+    if metadata.is_dir() {
+        return Err(CookieValidationCode::Directory);
+    }
+    if !metadata.is_file() {
+        return Err(CookieValidationCode::Unreadable);
+    }
+    if path
+        .extension()
+        .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("txt"))
+        != Some(true)
+    {
+        return Err(CookieValidationCode::Unsupported);
+    }
+    if metadata.len() == 0 {
+        return Err(CookieValidationCode::EmptyOrInvalid);
+    }
+    if metadata.len() > COOKIE_MAX_BYTES {
+        return Err(CookieValidationCode::TooLarge);
+    }
+    let file = fs::File::open(path).map_err(|_| CookieValidationCode::Unreadable)?;
+    let mut content = Vec::new();
+    file.take(COOKIE_MAX_BYTES + 1)
+        .read_to_end(&mut content)
+        .map_err(|_| CookieValidationCode::Unreadable)?;
+    validate_netscape_cookie_contents(&content)
+}
+
+fn cookie_validation_response(basename: String, summary: &CookieValidationSummary) -> Value {
+    json!({
+        "ok": true,
+        "basename": basename,
+        "exists": true,
+        "readable": true,
+        "cookieCount": summary.cookie_count,
+        "domainCount": summary.domain_count,
+        "domains": summary.domains,
+        "expiry": {
+            "status": summary.expiry.status.as_str(),
+            "sessionCount": summary.expiry.session_count,
+            "expiredCount": summary.expiry.expired_count,
+            "futureCount": summary.expiry.future_count,
+        },
+    })
+}
+
+#[tauri::command]
+fn validate_cookie_file(file_path: String) -> Result<Value, String> {
+    let path = PathBuf::from(file_path.trim());
+    let summary = validate_cookie_path(&path).map_err(|code| code.as_str().to_string())?;
+    Ok(cookie_validation_response(
+        safe_cookie_basename(&path),
+        &summary,
+    ))
+}
+
+#[tauri::command]
+fn stage_cookie_file(
+    file_name: String,
+    contents: Vec<u8>,
+    state: tauri::State<'_, CookieStageState>,
+) -> Result<Value, String> {
+    let file_name = file_name.trim();
+    if file_name.is_empty() {
+        return Err(CookieValidationCode::Missing.as_str().to_string());
+    }
+    let source_name = Path::new(file_name);
+    if source_name
+        .extension()
+        .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("txt"))
+        != Some(true)
+    {
+        return Err(CookieValidationCode::Unsupported.as_str().to_string());
+    }
+    validate_netscape_cookie_contents(&contents).map_err(|code| code.as_str().to_string())?;
+    let staged_path = state
+        .stage(&contents)
+        .map_err(|code| code.as_str().to_string())?;
+    let summary = match validate_cookie_path(&staged_path) {
+        Ok(summary) => summary,
+        Err(code) => {
+            let _ = state.cleanup_path(&staged_path);
+            return Err(code.as_str().to_string());
+        }
+    };
+    let mut response = cookie_validation_response(safe_cookie_basename(source_name), &summary);
+    response["path"] = Value::String(staged_path.to_string_lossy().into_owned());
+    Ok(response)
+}
+
+#[tauri::command]
+fn cleanup_staged_cookie_file(
+    staged_path: String,
+    state: tauri::State<'_, CookieStageState>,
+) -> Result<(), String> {
+    state
+        .cleanup_path(Path::new(&staged_path))
+        .map_err(|code| code.as_str().to_string())
+}
+
+#[tauri::command]
+fn cleanup_cookie_stages(state: tauri::State<'_, CookieStageState>) -> Result<(), String> {
+    state
+        .cleanup_all()
+        .map_err(|code| code.as_str().to_string())
+}
+
 #[tauri::command]
 async fn run_python_bridge(
     window: tauri::Window,
@@ -1693,7 +2580,60 @@ fn merge_event_meta_preserving_unknown(existing: &mut Value, incoming: Value) {
     }
 }
 
-fn atomic_write_json(path: &Path, data: &Value, label: &str) -> Result<u64, String> {
+fn event_content_hash(bytes: &[u8]) -> String {
+    // FNV-1a is intentionally used as a fast change fingerprint, not as a
+    // security digest.  Python bridge jobs use the same algorithm for their
+    // base fingerprint, while native CAS always compares a freshly read file.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn event_document_fingerprint(path: &Path) -> Result<Value, String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("event.json metadata取得失敗: {error}"))?;
+    let modified = metadata
+        .modified()
+        .map_err(|error| format!("event.json modified time取得失敗: {error}"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("event.json modified timeが不正です: {error}"))?;
+    let bytes = fs::read(path).map_err(|error| format!("event.json読み込み失敗: {error}"))?;
+    Ok(json!({
+        "modified_ms": modified.as_millis() as u64,
+        "modified_ns": modified.as_nanos().min(u128::from(u64::MAX)) as u64,
+        "file_size": metadata.len(),
+        "content_hash": event_content_hash(&bytes),
+    }))
+}
+
+fn fingerprint_matches(expected: &Value, actual: &Value) -> bool {
+    let expected_hash = expected.get("content_hash").and_then(Value::as_str);
+    let actual_hash = actual.get("content_hash").and_then(Value::as_str);
+    if let (Some(expected_hash), Some(actual_hash)) = (expected_hash, actual_hash) {
+        return expected_hash == actual_hash;
+    }
+    let expected_ns = expected.get("modified_ns").and_then(Value::as_u64);
+    let actual_ns = actual.get("modified_ns").and_then(Value::as_u64);
+    if let (Some(expected_ns), Some(actual_ns)) = (expected_ns, actual_ns) {
+        return expected_ns == actual_ns
+            && expected.get("file_size").and_then(Value::as_u64)
+                == actual.get("file_size").and_then(Value::as_u64);
+    }
+    expected.get("modified_ms").and_then(Value::as_u64)
+        == actual.get("modified_ms").and_then(Value::as_u64)
+        && expected.get("file_size").and_then(Value::as_u64)
+            == actual.get("file_size").and_then(Value::as_u64)
+}
+
+fn atomic_write_json_checked(
+    path: &Path,
+    data: &Value,
+    label: &str,
+    expected_fingerprint: Option<&Value>,
+) -> Result<u64, String> {
     let parent = path.parent().ok_or_else(|| {
         format!(
             "{label} parent directoryを解決できません: {}",
@@ -1766,6 +2706,19 @@ fn atomic_write_json(path: &Path, data: &Value, label: &str) -> Result<u64, Stri
         file.sync_all()
             .map_err(|error| format!("{label} fsync失敗: {error}"))?;
         drop(file);
+        // Keep fingerprint validation and replacement in one process-wide
+        // mutation critical section.  All native event writers use this helper.
+        let _mutation_guard = event_json_mutation_lock()
+            .lock()
+            .map_err(|error| format!("{label} mutation lock取得失敗: {error}"))?;
+        if let Some(expected) = expected_fingerprint {
+            let actual = event_document_fingerprint(path)?;
+            if !fingerprint_matches(expected, &actual) {
+                return Err(format!(
+                    "{label} fingerprint conflict: reload latest event.json before saving"
+                ));
+            }
+        }
         // Windows can report ERROR_ACCESS_DENIED when two MoveFileExW replace
         // operations target the same file at once.  Serializing only the final
         // replacement keeps preparation concurrent while preserving atomicity.
@@ -1781,6 +2734,10 @@ fn atomic_write_json(path: &Path, data: &Value, label: &str) -> Result<u64, Stri
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn atomic_write_json(path: &Path, data: &Value, label: &str) -> Result<u64, String> {
+    atomic_write_json_checked(path, data, label, None)
 }
 
 #[cfg(target_os = "windows")]
@@ -1864,7 +2821,14 @@ fn load_event_bundle(
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
     let file_size = metadata.len();
+    let content_hash = event_content_hash(&bytes);
     let meta = event_meta_from_full_json(&full, &event_dir_path);
     Ok(json!({
         "status": "ok",
@@ -1876,7 +2840,9 @@ fn load_event_bundle(
         "map_images": map_images.clone(),
         "active_map_images": map_images,
         "modified_ms": modified_ms,
-        "file_size": file_size
+        "modified_ns": modified_ns,
+        "file_size": file_size,
+        "content_hash": content_hash
     }))
 }
 
@@ -1887,19 +2853,29 @@ fn save_event_json_native(event_json: String, data: Value) -> Result<Value, Stri
     if !path.is_file() {
         return Err(format!("event.jsonが存在しません: {}", path.display()));
     }
-    let file_size = atomic_write_json(&path, &data, "event.json")?;
-    let modified_ms = fs::metadata(&path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0);
-    Ok(json!({
-        "status": "ok",
-        "event_json": path.to_string_lossy().to_string().replace('\\', "/"),
-        "file_size": file_size,
-        "modified_ms": modified_ms
-    }))
+    atomic_write_json(&path, &data, "event.json")?;
+    let mut receipt = event_document_fingerprint(&path)?;
+    receipt["status"] = json!("ok");
+    receipt["event_json"] = json!(path.to_string_lossy().to_string().replace('\\', "/"));
+    Ok(receipt)
+}
+
+#[tauri::command]
+fn save_event_json_native_checked(
+    event_json: String,
+    data: Value,
+    expected_fingerprint: Value,
+) -> Result<Value, String> {
+    TAURI_EVENT_IO_IPC_COUNT.fetch_add(1, Ordering::Relaxed);
+    let path = PathBuf::from(&event_json);
+    if !path.is_file() {
+        return Err(format!("event.jsonが存在しません: {}", path.display()));
+    }
+    atomic_write_json_checked(&path, &data, "event.json", Some(&expected_fingerprint))?;
+    let mut receipt = event_document_fingerprint(&path)?;
+    receipt["status"] = json!("ok");
+    receipt["event_json"] = json!(path.to_string_lossy().to_string().replace('\\', "/"));
+    Ok(receipt)
 }
 
 /// Return only the cheap filesystem fingerprint for an event document.
@@ -1919,16 +2895,16 @@ fn event_file_fingerprint(event_json: String) -> Result<Value, String> {
     }
     let metadata =
         fs::metadata(&path).map_err(|error| format!("event.json metadata取得失敗: {error}"))?;
-    let modified_ms = metadata
+    let modified = metadata
         .modified()
         .map_err(|error| format!("event.json modified time取得失敗: {error}"))?
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("event.json modified timeが不正です: {error}"))?
-        .as_millis() as u64;
+        .map_err(|error| format!("event.json modified timeが不正です: {error}"))?;
     Ok(json!({
         "status": "ok",
         "event_json": path.to_string_lossy().to_string().replace('\\', "/"),
-        "modified_ms": modified_ms,
+        "modified_ms": modified.as_millis() as u64,
+        "modified_ns": modified.as_nanos().min(u128::from(u64::MAX)) as u64,
         "file_size": metadata.len()
     }))
 }
@@ -3188,8 +4164,7 @@ fn create_event_dir(project_root: String, slug: String) -> Result<Value, String>
                 "source": "desktop_created"
             }
         });
-        let text = serde_json::to_string_pretty(&data).unwrap_or_default();
-        fs::write(&ej_path, text).ok();
+        atomic_write_json(&ej_path, &data, "event.json")?;
     }
     Ok(json!({
         "status": "ok",
@@ -3875,9 +4850,7 @@ fn import_result_zip_into_root(
     );
     data_to_save["event"] = meta.clone();
     normalize_imported_circle_asset_refs(&mut data_to_save, &event_dir);
-    let ej_text = serde_json::to_string_pretty(&data_to_save).unwrap_or_default();
-    fs::write(event_dir.join("event.json"), &ej_text)
-        .map_err(|e| format!("event.json書き込み失敗: {e}"))?;
+    atomic_write_json(&event_dir.join("event.json"), &data_to_save, "event.json")?;
     let duplicate_mobile_imports_removed = remove_redundant_mobile_import_dirs(
         &project_root_path,
         &event_name,
@@ -6057,6 +7030,8 @@ mod native_event_io_tests {
         assert_eq!(bundle["meta"]["source"], "fixture");
         assert_eq!(bundle["map_images"][0]["name"], "map_1.png");
         assert!(bundle["modified_ms"].as_u64().unwrap_or(0) > 0);
+        assert!(bundle["modified_ns"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(bundle["content_hash"].as_str().map(str::len), Some(16));
         assert_eq!(
             bundle["file_size"].as_u64(),
             Some(fs::metadata(&path).unwrap().len())
@@ -6072,6 +7047,50 @@ mod native_event_io_tests {
             .as_array()
             .is_some_and(Vec::is_empty));
         assert_eq!(bundle_without_maps["data"]["raw_json"]["keep"], "all");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn checked_save_rejects_stale_snapshot_and_preserves_concurrent_metadata() {
+        let root = temp_root("checked-conflict");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("event.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "event": {"name": "base"},
+                "circles": [{"name": "A", "pin_x": 0.1}],
+                "metadata": {"memo": "base"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let base = event_document_fingerprint(&path).unwrap();
+
+        save_event_json_native(
+            path.to_string_lossy().to_string(),
+            json!({
+                "event": {"name": "base"},
+                "circles": [{"name": "A", "pin_x": 0.1}],
+                "metadata": {"memo": "concurrent"}
+            }),
+        )
+        .unwrap();
+
+        let error = save_event_json_native_checked(
+            path.to_string_lossy().to_string(),
+            json!({
+                "event": {"name": "base"},
+                "circles": [{"name": "A", "pin_x": 0.9}],
+                "metadata": {"memo": "base"}
+            }),
+            base,
+        )
+        .unwrap_err();
+        assert!(error.contains("fingerprint conflict"));
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["metadata"]["memo"], "concurrent");
+        assert_eq!(saved["circles"][0]["pin_x"], 0.1);
         cleanup(&root);
     }
 
@@ -6186,8 +7205,13 @@ mod native_event_io_tests {
 
 fn main() {
     tauri::Builder::default()
+        .manage(CookieStageState::default())
         .invoke_handler(tauri::generate_handler![
             run_python_bridge,
+            validate_cookie_file,
+            stage_cookie_file,
+            cleanup_staged_cookie_file,
+            cleanup_cookie_stages,
             load_desktop_config,
             save_desktop_config,
             load_env_keys,
@@ -6210,6 +7234,7 @@ fn main() {
             list_event_dirs,
             load_event_bundle,
             save_event_json_native,
+            save_event_json_native_checked,
             event_file_fingerprint,
             get_desktop_performance_counters,
             read_event_meta,
@@ -6236,4 +7261,297 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod cookie_validation_tests {
+    use super::*;
+
+    fn temp_cookie_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "event-autopin-cookie-test-{}-{}-{}.txt",
+            label,
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ))
+    }
+
+    #[test]
+    fn valid_netscape_cookie_and_http_only_row_are_accepted() {
+        let body = b"# Netscape HTTP Cookie File\nexample.com\tFALSE\t/\tFALSE\t0\thost\tvalue\n.example.com\tTRUE\t/\tFALSE\t0\ta\tb\n#HttpOnly_.example.com\tTRUE\t/\tTRUE\t0\tc\td\n";
+        let summary = validate_netscape_cookie_contents_at(body, 1).unwrap();
+        assert_eq!(summary.cookie_count, 3);
+        assert_eq!(summary.domain_count, 1);
+        assert_eq!(summary.domains, vec!["example.com"]);
+        assert_eq!(summary.expiry.status, CookieExpiryStatus::Expired);
+
+        let bom = validate_netscape_cookie_contents_at(
+            b"\xEF\xBB\xBF# Netscape HTTP Cookie File\nexample.com\tFALSE\t/\tFALSE\t0\thost\tvalue\n",
+            1,
+        )
+        .unwrap();
+        assert_eq!(bom.cookie_count, 1);
+
+        let session =
+            validate_netscape_cookie_contents_at(b"example.com\tFALSE\t/\tFALSE\t\t\tvalue\n", 1)
+                .unwrap();
+        assert_eq!(session.cookie_count, 1);
+        assert_eq!(session.expiry.status, CookieExpiryStatus::Session);
+
+        let comments = validate_netscape_cookie_contents_at(
+            b"# Netscape HTTP Cookie File\n $ generated comment\n  # another comment\nexample.com\tFALSE\t/\tFALSE\t\tname\tvalue\n",
+            1,
+        )
+        .unwrap();
+        assert_eq!(comments.cookie_count, 1);
+    }
+
+    #[test]
+    fn expiry_summary_distinguishes_session_expired_future_and_mixed() {
+        let session = validate_netscape_cookie_contents_at(
+            b"example.com\tFALSE\t/\tFALSE\t\tname\tvalue\n",
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(session.expiry.status, CookieExpiryStatus::Session);
+        assert_eq!(
+            (
+                session.expiry.session_count,
+                session.expiry.expired_count,
+                session.expiry.future_count
+            ),
+            (1, 0, 0)
+        );
+
+        let expired = validate_netscape_cookie_contents_at(
+            b"example.com\tFALSE\t/\tFALSE\t999\tname\tvalue\n",
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(expired.expiry.status, CookieExpiryStatus::Expired);
+        assert_eq!(
+            (
+                expired.expiry.session_count,
+                expired.expiry.expired_count,
+                expired.expiry.future_count
+            ),
+            (0, 1, 0)
+        );
+
+        let future = validate_netscape_cookie_contents_at(
+            b"example.com\tFALSE\t/\tFALSE\t1001\tname\tvalue\n",
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(future.expiry.status, CookieExpiryStatus::Future);
+        assert_eq!(
+            (
+                future.expiry.session_count,
+                future.expiry.expired_count,
+                future.expiry.future_count
+            ),
+            (0, 0, 1)
+        );
+
+        let mixed = validate_netscape_cookie_contents_at(
+            b"one.example\tFALSE\t/\tFALSE\t\tsession-name\tsession-value\ntwo.example\tFALSE\t/\tFALSE\t999\texpired-name\texpired-value\nthree.example\tFALSE\t/\tFALSE\t1001\tfuture-name\tfuture-value\n",
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(mixed.expiry.status, CookieExpiryStatus::Mixed);
+        assert_eq!(
+            (
+                mixed.expiry.session_count,
+                mixed.expiry.expired_count,
+                mixed.expiry.future_count
+            ),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn domain_summary_is_normalized_deduplicated_and_bounded() {
+        let summary = validate_netscape_cookie_contents_at(
+            b".Example.COM\tTRUE\t/\tFALSE\t\tn1\tv1\nexample.com\tFALSE\t/\tFALSE\t\tn2\tv2\nA.test\tFALSE\t/\tFALSE\t\tn3\tv3\nb.test\tFALSE\t/\tFALSE\t\tn4\tv4\nc.test\tFALSE\t/\tFALSE\t\tn5\tv5\nd.test\tFALSE\t/\tFALSE\t\tn6\tv6\ne.test\tFALSE\t/\tFALSE\t\tn7\tv7\n",
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(summary.cookie_count, 7);
+        assert_eq!(summary.domain_count, 6);
+        assert_eq!(summary.domains.len(), COOKIE_DOMAIN_SAMPLE_LIMIT);
+        assert_eq!(
+            summary.domains,
+            vec!["example.com", "a.test", "b.test", "c.test", "d.test"]
+        );
+    }
+
+    #[test]
+    fn validator_response_excludes_cookie_secrets_and_full_path() {
+        let root = std::env::temp_dir().join(format!(
+            "event-autopin-cookie-private-parent-{}",
+            next_cookie_stage_token()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("visible-cookie.txt");
+        fs::write(
+            &path,
+            b"Secret.Example\tFALSE\t/\tFALSE\t\tSECRET_COOKIE_NAME\tSECRET_COOKIE_VALUE\n",
+        )
+        .unwrap();
+
+        let response = validate_cookie_file(path.to_string_lossy().into_owned()).unwrap();
+        let object = response.as_object().unwrap();
+        let keys: HashSet<&str> = object.keys().map(String::as_str).collect();
+        let expected: HashSet<&str> = [
+            "ok",
+            "basename",
+            "exists",
+            "readable",
+            "cookieCount",
+            "domainCount",
+            "domains",
+            "expiry",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected);
+        assert_eq!(response["basename"], "visible-cookie.txt");
+        assert_eq!(response["domains"], json!(["secret.example"]));
+        let serialized = response.to_string();
+        assert!(!serialized.contains("SECRET_COOKIE_NAME"));
+        assert!(!serialized.contains("SECRET_COOKIE_VALUE"));
+        assert!(!serialized.contains("event-autopin-cookie-private-parent"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_or_empty_content_is_rejected() {
+        assert_eq!(
+            validate_netscape_cookie_contents(b"{}\n"),
+            Err(CookieValidationCode::EmptyOrInvalid)
+        );
+        assert_eq!(
+            validate_netscape_cookie_contents(b"example.com\tTRUE\t/\tFALSE\t0\tname\tvalue\n"),
+            Err(CookieValidationCode::EmptyOrInvalid)
+        );
+        assert_eq!(
+            validate_netscape_cookie_contents(b".example.com\tFALSE\t/\tFALSE\t0\tname\tvalue\n"),
+            Err(CookieValidationCode::EmptyOrInvalid)
+        );
+        assert_eq!(
+            validate_netscape_cookie_contents(b" example.com\tFALSE\t/\tFALSE\t0\tname\tvalue\n"),
+            Err(CookieValidationCode::EmptyOrInvalid)
+        );
+        assert_eq!(
+            validate_netscape_cookie_contents(b"# Netscape HTTP Cookie File\n"),
+            Err(CookieValidationCode::EmptyOrInvalid)
+        );
+    }
+
+    #[test]
+    fn path_classifier_rejects_missing_directory_unsupported_empty_and_oversize() {
+        let missing = temp_cookie_path("missing");
+        assert_eq!(
+            validate_cookie_path(&missing),
+            Err(CookieValidationCode::Missing)
+        );
+
+        let directory = std::env::temp_dir().join(format!(
+            "event-autopin-cookie-test-dir-{}.txt",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        assert_eq!(
+            validate_cookie_path(&directory),
+            Err(CookieValidationCode::Directory)
+        );
+        fs::remove_dir_all(&directory).unwrap();
+
+        let unsupported = std::env::temp_dir().join(format!(
+            "event-autopin-cookie-test-unsupported-{}.har",
+            std::process::id()
+        ));
+        fs::write(&unsupported, b"{}").unwrap();
+        assert_eq!(
+            validate_cookie_path(&unsupported),
+            Err(CookieValidationCode::Unsupported)
+        );
+        fs::remove_file(&unsupported).unwrap();
+
+        let empty = temp_cookie_path("empty");
+        fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            validate_cookie_path(&empty),
+            Err(CookieValidationCode::EmptyOrInvalid)
+        );
+        fs::remove_file(&empty).unwrap();
+
+        let oversize = temp_cookie_path("oversize");
+        let file = fs::File::create(&oversize).unwrap();
+        file.set_len(COOKIE_MAX_BYTES + 1).unwrap();
+        assert_eq!(
+            validate_cookie_path(&oversize),
+            Err(CookieValidationCode::TooLarge)
+        );
+        fs::remove_file(&oversize).unwrap();
+    }
+
+    #[test]
+    fn staged_cookie_is_unique_allowlisted_and_removed_without_arbitrary_delete() {
+        let state = CookieStageState::default();
+        let contents = b"example.com\tFALSE\t/\tFALSE\t0\tname\tvalue\n";
+        assert_eq!(
+            validate_netscape_cookie_contents(contents)
+                .unwrap()
+                .cookie_count,
+            1
+        );
+
+        let first = state.stage(contents).unwrap();
+        let second = state.stage(contents).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            first.extension().and_then(|value| value.to_str()),
+            Some("txt")
+        );
+        assert_eq!(fs::read(&first).unwrap(), contents);
+        assert_eq!(fs::read(&second).unwrap(), contents);
+
+        let unrelated = temp_cookie_path("unrelated");
+        fs::write(&unrelated, contents).unwrap();
+        assert_eq!(
+            state.cleanup_path(&unrelated),
+            Err(CookieValidationCode::StageNotAllowed)
+        );
+        assert!(unrelated.exists());
+
+        state.cleanup_path(&first).unwrap();
+        assert!(!first.exists());
+        assert_eq!(
+            state.cleanup_path(&first),
+            Err(CookieValidationCode::StageNotAllowed)
+        );
+        let root = second.parent().unwrap().to_path_buf();
+        state.cleanup_all().unwrap();
+        assert!(!root.exists());
+        fs::remove_file(unrelated).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn staged_cookie_directory_and_files_have_protected_current_user_only_dacls() {
+        let state = CookieStageState::default();
+        let contents = b"example.com\tFALSE\t/\tFALSE\t0\tname\tvalue\n";
+        let first = state.stage(contents).unwrap();
+        let second = state.stage(contents).unwrap();
+        let root = first.parent().unwrap().to_path_buf();
+
+        windows_cookie_acl::assert_private_path(&root, true);
+        windows_cookie_acl::assert_private_path(&first, false);
+        windows_cookie_acl::assert_private_path(&second, false);
+
+        state.cleanup_all().unwrap();
+        assert!(!root.exists());
+    }
 }

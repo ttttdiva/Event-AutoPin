@@ -69,6 +69,41 @@ def test_predictions_are_normalized_like_production_engine():
     assert [item["number"] for item in predictions["map_01.png"]] == ["01", "02"]
 
 
+def test_schema_v3_normalized_grouped_predictions_are_not_resplit():
+    normalized_elements = [
+        {
+            "number": "01",
+            "x": 0,
+            "y": 0,
+            "width": 50,
+            "height": 20,
+            "prefix": "A",
+            "space_id": "A01",
+            "group_identity": "grouped-row-1",
+            "raw_text": "A-01 A-02",
+        },
+        {
+            "number": "02",
+            "x": 50,
+            "y": 0,
+            "width": 50,
+            "height": 20,
+            "prefix": "A",
+            "space_id": "A02",
+            "group_identity": "grouped-row-1",
+            "raw_text": "A-01 A-02",
+        },
+    ]
+    payload = {
+        "schema_version": 3,
+        "results": [{"image": "map_01.png", "elements": normalized_elements}],
+    }
+
+    predictions = MODULE._predictions_by_image(payload)
+
+    assert predictions["map_01.png"] == normalized_elements
+
+
 def test_saved_empty_runner_payload_is_rejected_with_diagnostic(tmp_path, monkeypatch):
     prediction_path = tmp_path / "empty.json"
     prediction_path.write_text(json.dumps({"results": []}), encoding="utf-8")
@@ -171,3 +206,156 @@ def test_canonical_repo_event_report_fixes_input_command_and_metrics():
         "coordinate_metric": "pin_center",
         "distance_threshold_px": 50.0,
     }
+
+
+def test_identity_metrics_cover_neighbor_prefix_merged_missing_and_unresolved():
+    ground_truth = [
+        {"space_id": "A01", "prefix": "A", "number": "01", "group_identity": "g1", "center_x": 0, "center_y": 0},
+        {"space_id": "A02", "prefix": "A", "number": "02", "group_identity": "g2", "center_x": 100, "center_y": 0},
+        {"space_id": "B01", "prefix": "B", "number": "01", "group_identity": "g3", "center_x": 0, "center_y": 100},
+        {"space_id": "M03", "prefix": "M", "number": "03", "group_identity": "gm", "merged": True, "center_x": 200, "center_y": 0},
+        {"space_id": "M04", "prefix": "M", "number": "04", "group_identity": "gm", "merged": True, "center_x": 200, "center_y": 0},
+        {"space_id": "A05", "prefix": "A", "number": "05", "group_identity": "missing", "missing_slot": True, "center_x": 300, "center_y": 0},
+        {"space_id": "A06", "prefix": "A", "number": "06", "group_identity": "unresolved", "center_x": 400, "center_y": 0},
+    ]
+    predictions = [
+        {"space_id": "A01", "prefix": "A", "number": "01", "center_x": 0, "center_y": 0},
+        {"space_id": "A03", "prefix": "A", "number": "03", "center_x": 100, "center_y": 0},
+        {"space_id": "A01", "prefix": "A", "number": "01", "center_x": 0, "center_y": 100},
+        {"space_id": "M03", "prefix": "M", "number": "03", "center_x": 200, "center_y": 0},
+        {"space_id": "A05", "prefix": "A", "number": "05", "center_x": 300, "center_y": 0},
+    ]
+
+    result = MODULE.score_image(predictions, ground_truth, distance_threshold=10)
+
+    assert result["ground_truth"] == 5
+    assert result["matched"] == 2
+    assert result["exact_space_accuracy"] == 0.5
+    assert result["wrong_neighbor_rate"] == 0.25
+    assert result["wrong_prefix_rate"] == 0.25
+    assert result["merged_booth_accuracy"] == 1.0
+    assert result["exact_spaces"] == 3
+    assert result["space_ground_truth"] == 6
+    assert result["missing_slot_false_positive_rate"] == 1.0
+    assert result["unresolved_rate"] == 0.2
+    assert result["pin_error_px"] == {"mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
+
+
+def test_global_assignment_is_independent_of_prediction_order():
+    targets = [
+        {"number": "01", "center_x": 0, "center_y": 0},
+        {"number": "01", "center_x": 20, "center_y": 0},
+    ]
+    predictions = [
+        {"number": "01", "center_x": 9, "center_y": 0},
+        {"number": "01", "center_x": 0, "center_y": 0},
+    ]
+
+    result = MODULE.score_image(predictions, targets, distance_threshold=12)
+
+    assert result["matched"] == 2
+    assert sorted(match["distance_px"] for match in result["matches"]) == [0.0, 11.0]
+
+
+def test_exact_identity_is_preferred_over_nearer_wrong_prefix():
+    ground_truth = [
+        {"space_id": "A01", "prefix": "A", "number": "01", "center_x": 0, "center_y": 0},
+        {"space_id": "B01", "prefix": "B", "number": "01", "center_x": 10, "center_y": 0},
+    ]
+    predictions = [
+        {"space_id": "A01", "prefix": "A", "number": "01", "center_x": 9, "center_y": 0},
+        {"space_id": "B01", "prefix": "B", "number": "01", "center_x": 1, "center_y": 0},
+    ]
+
+    result = MODULE.score_image(predictions, ground_truth, distance_threshold=20)
+
+    assert result["matched"] == 2
+    assert result["wrong_prefix_rate"] == 0.0
+    assert result["pin_error_px"]["mean"] == 9.0
+
+
+def test_exact_group_identity_is_preferred_over_nearer_same_space_number():
+    ground_truth = [
+        {"space_id": "A01", "prefix": "A", "number": "01", "group_identity": "left", "center_x": 0, "center_y": 0},
+        {"space_id": "A01-duplicate", "prefix": "A", "number": "01", "group_identity": "right", "center_x": 10, "center_y": 0},
+    ]
+    predictions = [
+        {"prefix": "A", "number": "01", "group_identity": "left", "center_x": 9, "center_y": 0},
+        {"prefix": "A", "number": "01", "group_identity": "right", "center_x": 1, "center_y": 0},
+    ]
+
+    result = MODULE.score_image(predictions, ground_truth, distance_threshold=20)
+
+    assert result["matched"] == 2
+    assert result["pin_error_px"]["mean"] == 9.0
+
+
+def test_raw_ocr_and_cer_are_reported_when_reference_is_available():
+    result = MODULE.score_image(
+        [{"number": "01", "center_x": 0, "center_y": 0}],
+        [{"number": "01", "center_x": 0, "center_y": 0}],
+        raw_ocr_text="A01 A03",
+        reference_ocr_text="A01 A02",
+    )
+
+    assert result["ocr_raw"] == "A01 A03"
+    assert result["ocr_cer"] == round(1 / len("A01 A02"), 6)
+
+
+def test_summary_ocr_cer_is_corpus_weighted_and_macro_is_retained():
+    ground_truth = {
+        "short.png": MODULE.GroundTruthPoints([], ocr_text="A"),
+        "long.png": MODULE.GroundTruthPoints([], ocr_text="BBBBBBBBB"),
+    }
+    payload = {
+        "results": [
+            {"image": "short.png", "raw_output": "X", "elements": []},
+            {"image": "long.png", "raw_output": "BBBBBBBBB", "elements": []},
+        ]
+    }
+
+    summary = MODULE.evaluate(
+        [Path("short.png"), Path("long.png")],
+        ground_truth,
+        payload,
+        distance_threshold=30,
+        label="corpus-cer",
+    )["summary"]
+
+    assert summary["ocr_cer"] == 0.1
+    assert summary["ocr_cer_macro"] == 0.5
+
+
+def test_ground_truth_v3_preserves_identity_group_and_image_ocr_text(tmp_path):
+    path = tmp_path / "ground_truth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "images": [
+                    {
+                        "image": "synthetic.png",
+                        "ocr_text": "A01 A02",
+                        "points": [
+                            {
+                                "space_id": "A01",
+                                "prefix": "A",
+                                "number": "01",
+                                "group_identity": "circle-1",
+                                "center_x": 10,
+                                "center_y": 20,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = MODULE._ground_truth_by_image(path)["synthetic.png"]
+
+    assert loaded[0]["space_id"] == "A01"
+    assert loaded[0]["prefix"] == "A"
+    assert loaded[0]["group_identity"] == "circle-1"
+    assert loaded.ocr_text == "A01 A02"

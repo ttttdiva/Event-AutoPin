@@ -10,6 +10,38 @@ export type EventLifecycleLease = {
   release(): void;
 };
 
+export type EventSourceFingerprint = {
+  modifiedMs?: number;
+  modifiedNs?: number;
+  fileSize?: number;
+  contentHash?: string;
+};
+
+export type CircleIdentity = {
+  name?: string;
+  penname?: string;
+  space?: string;
+  hall?: string;
+};
+
+export type CircleIdentityPatch = {
+  circleIndex: number;
+  circleIdentity?: CircleIdentity;
+  baseCircle?: Record<string, unknown>;
+  changes: Record<string, unknown>;
+};
+
+export type EventPatchResult = {
+  baseFingerprint?: EventSourceFingerprint;
+  circlePatches: CircleIdentityPatch[];
+};
+
+export type AppliedEventPatch<T> = {
+  data: T;
+  resolvedCircleIndices: number[];
+  baseFingerprintMatched: boolean;
+};
+
 type LifecycleEntry = {
   state: "open" | "closing" | "closed";
   active: number;
@@ -91,6 +123,152 @@ function cloneSnapshot<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+function normalizedIdentityValue(value: unknown): string {
+  return String(value ?? "").trim();
+}
+
+function hasCircleIdentity(identity: CircleIdentity | undefined): boolean {
+  return Boolean(
+    identity &&
+      [identity.name, identity.penname, identity.space, identity.hall].some(
+        (value) => normalizedIdentityValue(value) !== "",
+      ),
+  );
+}
+
+function matchesCircleIdentity(
+  circle: Record<string, unknown>,
+  identity: CircleIdentity,
+): boolean {
+  return (["name", "penname", "space", "hall"] as const).every((key) => {
+    const expected = normalizedIdentityValue(identity[key]);
+    return !expected || normalizedIdentityValue(circle[key]) === expected;
+  });
+}
+
+function resolveCircleIndex(
+  circles: unknown[],
+  preferredIndex: number,
+  identity: CircleIdentity | undefined,
+  preferredIndexAllowed: boolean,
+): number {
+  const preferred = circles[preferredIndex];
+  if (
+    preferredIndexAllowed &&
+    preferred &&
+    typeof preferred === "object" &&
+    !Array.isArray(preferred)
+  ) {
+    return preferredIndex;
+  }
+  if (!hasCircleIdentity(identity)) {
+    throw new Error(
+      `event.json変更後は空のサークルidentityでpatchを適用できません: index=${preferredIndex}`,
+    );
+  }
+  const matches = circles
+    .map((circle, index) => ({ circle, index }))
+    .filter(
+      ({ circle }) =>
+        circle !== null &&
+        typeof circle === "object" &&
+        !Array.isArray(circle) &&
+        matchesCircleIdentity(circle as Record<string, unknown>, identity!),
+    );
+  if (matches.length === 1) return matches[0].index;
+  if (matches.length > 1) {
+    throw new Error("サークルidentityが複数件に一致したためpatchを適用できません");
+  }
+  throw new Error(`対象サークルが変更または削除されています: index=${preferredIndex}`);
+}
+
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+export function sameEventSourceFingerprint(
+  expected: EventSourceFingerprint | undefined,
+  actual: EventSourceFingerprint | undefined,
+): boolean {
+  if (!expected || !actual) return false;
+  if (expected.contentHash && actual.contentHash) {
+    return expected.contentHash === actual.contentHash;
+  }
+  if (
+    expected.modifiedNs !== undefined &&
+    actual.modifiedNs !== undefined
+  ) {
+    if (expected.modifiedNs !== actual.modifiedNs) return false;
+    return (
+      expected.fileSize !== undefined &&
+      actual.fileSize !== undefined &&
+      expected.fileSize === actual.fileSize
+    );
+  }
+  return (
+    expected.modifiedMs !== undefined &&
+    actual.modifiedMs !== undefined &&
+    expected.fileSize !== undefined &&
+    actual.fileSize !== undefined &&
+    expected.modifiedMs === actual.modifiedMs &&
+    expected.fileSize === actual.fileSize
+  );
+}
+
+/**
+ * Apply only identity-addressed circle fields to the latest event document.
+ * A base fingerprint mismatch is reported but does not reject unrelated edits:
+ * resolving every target against the latest circles is the field-level CAS.
+ */
+export function applyEventPatchToLatest<T extends { circles?: unknown[] }>(
+  latest: T,
+  patch: EventPatchResult,
+  latestFingerprint?: EventSourceFingerprint,
+): AppliedEventPatch<T> {
+  const data = cloneSnapshot(latest);
+  if (!Array.isArray(data.circles)) {
+    throw new Error("event.json circlesが配列ではありません");
+  }
+  const resolvedCircleIndices: number[] = [];
+  const baseFingerprintMatched = sameEventSourceFingerprint(
+    patch.baseFingerprint,
+    latestFingerprint,
+  );
+  for (const circlePatch of patch.circlePatches) {
+    const resolved = resolveCircleIndex(
+      data.circles,
+      circlePatch.circleIndex,
+      circlePatch.circleIdentity,
+      baseFingerprintMatched,
+    );
+    const circle = data.circles[resolved];
+    if (!circle || typeof circle !== "object" || Array.isArray(circle)) {
+      throw new Error(`対象サークルがobjectではありません: index=${resolved}`);
+    }
+    const current = circle as Record<string, unknown>;
+    if (!baseFingerprintMatched && circlePatch.baseCircle) {
+      for (const [field, desired] of Object.entries(circlePatch.changes)) {
+        const baseValue = circlePatch.baseCircle[field];
+        if (
+          !jsonValuesEqual(current[field], baseValue) &&
+          !jsonValuesEqual(current[field], desired)
+        ) {
+          throw new Error(
+            `対象サークルの「${field}」がjob実行中に変更されたためpatchを適用できません`,
+          );
+        }
+      }
+    }
+    Object.assign(current, cloneSnapshot(circlePatch.changes));
+    resolvedCircleIndices.push(resolved);
+  }
+  return {
+    data,
+    resolvedCircleIndices,
+    baseFingerprintMatched,
+  };
+}
+
 /**
  * 同一イベントへの書き込みを直列化し、後発snapshotが存在する場合は旧要求を
  * fail-closedにする。write/commitへ渡す値は呼び出し時点のcloneで固定される。
@@ -129,6 +307,10 @@ export class EventWriteCoordinator {
 
   recordCommitted<T>(key: string, snapshot: T): void {
     this.committedSnapshots.set(key, cloneSnapshot(snapshot));
+  }
+
+  forgetCommitted(key: string): void {
+    this.committedSnapshots.delete(key);
   }
 
   run<T>(options: CoordinatedWriteOptions<T>): Promise<CoordinatedWriteResult> {
