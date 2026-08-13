@@ -134,12 +134,40 @@ function SameOrNested([string]$A, [string]$B) {
         $A.StartsWith($B + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Sha256Hash([string]$Path) {
+    # Use the .NET primitives directly so hashing remains available in both
+    # Windows PowerShell 5.1 and PowerShell 7, even when the utility module is
+    # not installed or auto-loaded. FileStream takes the path literally (no
+    # wildcard expansion) and accepts the extended paths used by long trees.
+    $stream = $null
+    $algorithm = $null
+    try {
+        $stream = [System.IO.FileStream]::new(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read,
+            4096,
+            [System.IO.FileOptions]::SequentialScan
+        )
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        $bytes = $algorithm.ComputeHash($stream)
+        # BitConverter emits the same uppercase hex representation as the
+        # previous hash implementation; callers that compare manifest entries
+        # normalize to lowercase explicitly.
+        return [BitConverter]::ToString($bytes).Replace('-', '').ToUpperInvariant()
+    } finally {
+        if ($null -ne $algorithm) { $algorithm.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
 function HashTree([string]$Root) {
     $result = @{}
     if (-not (Test-Path -LiteralPath $Root)) { return $result }
     Get-ChildItem -LiteralPath $Root -File -Recurse -Force | ForEach-Object {
         $relative = $_.FullName.Substring($Root.Length).TrimStart('\', '/').Replace('\', '/')
-        $result[$relative] = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+        $result[$relative] = Sha256Hash $_.FullName
     }
     return $result
 }
@@ -155,7 +183,7 @@ function HashPaths([string]$Root, [string[]]$Paths) {
     foreach ($relative in $Paths) {
         $file = Join-Path $Root $relative
         if (Test-Path -LiteralPath $file -PathType Leaf) {
-            $result[$relative] = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+            $result[$relative] = Sha256Hash $file
         }
     }
     return $result
@@ -256,7 +284,7 @@ function Scan([string]$Root, [string[]]$Paths, $AssetHashes) {
         $bytes = [IO.File]::ReadAllBytes($file)
         if ($relative -match $imageExtensions) {
             if (-not $AssetHashes.ContainsKey($relative)) { $findings += "$relative (image missing exact SHA256 allowlist)"; continue }
-            $actualHash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            $actualHash = (Sha256Hash $file).ToLowerInvariant()
             if ($actualHash -ne $AssetHashes[$relative]) { $findings += "$relative (image SHA256 mismatch)"; continue }
             if (-not (TestImageSignature $relative $bytes)) { $findings += "$relative (invalid image signature)" }
             continue
@@ -431,7 +459,7 @@ try {
         $latestPath = Join-Path $destination 'latest.json'
         if (Test-Path -LiteralPath $latestPath -PathType Container) { throw 'Protected latest.json is unexpectedly a directory.' }
         $latestExisted = Test-Path -LiteralPath $latestPath -PathType Leaf
-        $latestHash = if ($latestExisted) { (Get-FileHash -LiteralPath $latestPath -Algorithm SHA256).Hash } else { $null }
+        $latestHash = if ($latestExisted) { Sha256Hash $latestPath } else { $null }
         $movedPaths = @()
         $installedPaths = @()
         $legacyMoved = $false
@@ -472,7 +500,7 @@ try {
             if ($legacyMigration -and (Test-Path -LiteralPath $legacyRoot)) { throw 'Legacy public-payload remains after root migration.' }
             if (-not (Test-Path -LiteralPath (Join-Path $destination '.git'))) { throw 'Protected .git disappeared during sync.' }
             $latestStillExists = Test-Path -LiteralPath $latestPath -PathType Leaf
-            $latestStillHash = if ($latestStillExists) { (Get-FileHash -LiteralPath $latestPath -Algorithm SHA256).Hash } else { $null }
+            $latestStillHash = if ($latestStillExists) { Sha256Hash $latestPath } else { $null }
             if ($latestStillExists -ne $latestExisted -or $latestStillHash -ne $latestHash) { throw 'Protected latest.json changed during sync.' }
         } catch {
             $installError = $_.Exception.Message

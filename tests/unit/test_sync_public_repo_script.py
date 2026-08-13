@@ -155,6 +155,18 @@ if /I "%~3"=="ls-remote" if /I "%~4"=="--symref" if /I "%~5"=="origin" (
     return subprocess.run(command, text=True, encoding="utf-8", errors="replace", capture_output=True, env=env)
 
 
+def test_hashing_uses_portable_dotnet_primitives_not_get_file_hash() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+
+    # The public runner may execute either Windows PowerShell 5.1 or
+    # PowerShell 7 without the utility module that provides Get-FileHash.
+    # Keep this dependency check close to the integration tests so a future
+    # refactor cannot silently reintroduce the runner-specific command.
+    assert "Get-FileHash" not in script
+    assert "[System.IO.FileStream]::new" in script
+    assert "[System.Security.Cryptography.SHA256]::Create()" in script
+
+
 def test_dry_run_uses_only_exact_committed_manifest(tmp_path: Path) -> None:
     source, destination = source_repo(tmp_path), destination_repo(tmp_path)
     result = run(source, destination, tmp_path)
