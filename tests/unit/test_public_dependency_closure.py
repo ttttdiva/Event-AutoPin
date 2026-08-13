@@ -42,6 +42,8 @@ def test_repository_manifest_includes_python_runtime_dependencies() -> None:
     }
 
     assert {
+        "scripts/build_apk.bat",
+        "scripts/build_apk.sh",
         "src/space_locator/catalog_geometry_assignment.py",
         "src/utils/atomic_json.py",
     } <= manifest

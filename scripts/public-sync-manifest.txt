@@ -61,6 +61,8 @@ main.py
 pytest.ini
 README.md
 requirements.txt
+scripts/build_apk.bat
+scripts/build_apk.sh
 scripts/check_desktop_release_gate.ps1
 scripts/check_public_dependency_closure.py
 scripts/public-sync-manifest.txt
