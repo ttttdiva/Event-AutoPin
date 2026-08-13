@@ -35,7 +35,7 @@ sha256:<64桁のSHA-256> relative/path/to/asset.png
 $SourceRoot = (Resolve-Path .).Path
 # 公開リポジトリの既存checkout。
 # ドライブ文字はscanに誤検出されないよう分割して記述している。
-$DestinationRoot = ('D:' + '\Dev\Event-AutoPin')
+$DestinationRoot = ('D:' + '\Publish\Event-AutoPin')
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync_public_repo.ps1 `
   -SourceRoot $SourceRoot -DestinationRoot $DestinationRoot
 ```
