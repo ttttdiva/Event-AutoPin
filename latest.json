@@ -1,13 +1,13 @@
 {
   "desktop": {
     "date": "2026-08-13",
-    "url": "https://github.com/ttttdiva/Event-AutoPin-Publish/releases/download/desktop-v0.1.11/EventAutoPin.exe",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.11/EventAutoPin.exe",
     "version": "0.1.11",
     "notes": "Event AutoPin desktop v0.1.11"
   },
   "mobile": {
     "version": "1.4.52",
-    "url": "https://github.com/ttttdiva/Event-AutoPin-Publish/releases/download/mobile-v1.4.52/EventAutoPin.apk",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.52/EventAutoPin.apk",
     "notes": "v1.4.52 リリース",
     "date": "2026-08-13"
   }

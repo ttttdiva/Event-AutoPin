@@ -1,0 +1,764 @@
+<!doctype html>
+<html lang="ja" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Cache-Control"
+      content="no-cache, no-store, must-revalidate"
+    />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <title>Event AutoPin</title>
+    <script>
+      // テーマをFOUC防止で即適用
+      (function () {
+        var t = localStorage.getItem("eventtrail-theme");
+        if (t === "light") document.documentElement.classList.remove("dark");
+      })();
+    </script>
+  </head>
+  <body>
+    <!-- サイドバー -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-toggle" id="sidebarToggle">
+        <span>&#9776;</span>
+        <span class="toggle-label">イベント</span>
+      </div>
+      <div class="sidebar-content">
+        <div class="sidebar-header">
+          <h3 class="text-sm font-semibold m-0">イベント一覧</h3>
+          <div class="flex gap-1">
+            <button
+              id="newEventBtn"
+              class="btn-secondary text-xs px-2 py-1 rounded"
+            >
+              + 新規
+            </button>
+          </div>
+        </div>
+        <div
+          class="px-2 py-1 flex items-center gap-1"
+          style="border-bottom: 1px solid var(--border-default)"
+        >
+          <select id="eventSortSelect" class="text-xs w-full">
+            <option value="created_desc">作成日(新しい順)</option>
+            <option value="date_desc">開催日(新しい順)</option>
+            <option value="date_asc">開催日(古い順)</option>
+            <option value="name_asc">名前(A→Z)</option>
+          </select>
+        </div>
+        <div class="event-list" id="eventList">
+          <div class="no-events">
+            イベントがありません<br /><small>「+ 新規」でイベントを作成</small>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- インポートモーダル -->
+    <div
+      class="img-modal-overlay hidden"
+      id="importModalOverlay"
+      style="z-index: 9998"
+    >
+      <div class="modal-dialog text-center">
+        <h3 class="text-lg font-semibold mb-2">モバイルからインポート</h3>
+        <div class="text-sm mb-4" style="color: var(--text-muted)">
+          スマホのアプリで「PCに送信」を選択し、<br />下のQRコードをスキャンしてください
+        </div>
+        <div class="qr-container mx-auto mb-4">
+          <canvas id="importQrCanvas"></canvas>
+          <div
+            class="text-xs mt-1 break-all"
+            style="color: var(--text-muted)"
+            id="importQrUrl"
+          ></div>
+        </div>
+        <div
+          class="text-sm mb-4"
+          style="color: var(--text-muted)"
+          id="importStatus"
+        >
+          受信待機中...
+        </div>
+        <button id="importCancelBtn" class="btn-secondary px-4 py-2 rounded">
+          キャンセル
+        </button>
+      </div>
+    </div>
+
+    <!-- メインエリア -->
+    <div class="main-area">
+      <!-- 更新通知バー -->
+      <div class="update-bar hidden" id="updateBar">
+        <span class="update-bar-msg" id="updateBarMsg"></span>
+        <div class="update-bar-progress hidden" id="updateBarProgress">
+          <progress id="updateProgressBar" max="100" value="0"></progress>
+          <span class="update-bar-size" id="updateBarSize"></span>
+        </div>
+        <button class="update-bar-btn" id="updateBtn">更新する</button>
+        <button class="update-bar-dismiss" id="updateDismissBtn" title="閉じる">
+          &times;
+        </button>
+      </div>
+
+      <header class="tab-bar">
+        <button class="tab-btn active" data-tab="tab-crawl">
+          クロール実行
+        </button>
+        <button class="tab-btn" data-tab="tab-edit">サークルリスト編集</button>
+        <button class="tab-btn" data-tab="tab-map">マップ編集</button>
+        <button class="tab-btn" data-tab="tab-history">過去出展検索</button>
+        <button class="tab-btn" data-tab="tab-mobile">モバイル連携</button>
+        <button class="tab-btn" data-tab="tab-settings">設定</button>
+        <span style="flex: 1"></span>
+        <button
+          id="themeToggleBtn"
+          class="theme-toggle-btn"
+          title="テーマ切り替え"
+        >
+          &#9790;
+        </button>
+      </header>
+
+      <main class="flex-1 overflow-hidden flex flex-col">
+        <section id="tab-crawl" class="tab-pane active">
+          <h2>クロール実行</h2>
+          <div class="mb-3">
+            <progress id="crawlProgress" max="100" value="0"></progress>
+            <div
+              class="text-xs mt-1"
+              style="color: var(--text-muted)"
+              id="crawlProgressText"
+            >
+              待機中
+            </div>
+          </div>
+          <input id="eventJsonHidden" type="hidden" />
+          <input id="pipelineOutputDir" type="hidden" />
+          <div id="crawlActiveEvent" class="active-event-box">
+            <span style="color: var(--text-muted)"
+              >サイドバーでイベントを選択してください</span
+            >
+          </div>
+          <div class="settings-grid">
+            <label for="eventName">イベント名</label>
+            <input id="eventName" placeholder="イベント名" />
+
+            <label for="eventUrl">イベントURL</label>
+            <div>
+              <textarea id="eventUrl" placeholder="https://...&#10;https://..."></textarea>
+              <div id="concurrentEventSummary" class="form-hint"></div>
+            </div>
+
+            <label for="eventDate">イベント日付</label>
+            <input id="eventDate" placeholder="2026-12-30" />
+
+            <label for="mapUrl">マップURL（任意）</label>
+            <textarea id="mapUrl" placeholder="https://...&#10;https://... => https://..."></textarea>
+
+            <label for="additionalPrompt">追加プロンプト</label>
+            <textarea id="additionalPrompt"></textarea>
+
+            <label for="modelProvider">テキスト処理プロバイダー</label>
+            <select id="modelProvider"></select>
+
+            <label for="model">テキスト処理モデル</label>
+            <select id="model"></select>
+
+            <label for="textReasoningEffort">テキスト処理effort</label>
+            <select id="textReasoningEffort"></select>
+
+            <label for="visionModel">画像処理プロバイダー</label>
+            <select id="visionModel"></select>
+
+            <label for="visionModelId">画像処理モデル</label>
+            <select id="visionModelId"></select>
+
+            <label for="visionReasoningEffort">画像処理effort</label>
+            <select id="visionReasoningEffort"></select>
+
+            <label for="llmAdvancedSettings">LLM詳細設定</label>
+            <details id="llmAdvancedSettings" class="rounded border border-gray-700 p-3">
+              <summary class="cursor-pointer text-sm">フォールバックモデル</summary>
+              <div class="settings-grid mt-3">
+                <label for="textFallbackModelProvider">テキストfallbackプロバイダー</label>
+                <select id="textFallbackModelProvider"></select>
+
+                <label for="textFallbackModel">テキストfallbackモデル</label>
+                <select id="textFallbackModel"></select>
+
+                <label for="textFallbackReasoningEffort">テキストfallback effort</label>
+                <select id="textFallbackReasoningEffort"></select>
+
+                <label for="visionFallbackModelProvider">画像fallbackプロバイダー</label>
+                <select id="visionFallbackModelProvider"></select>
+
+                <label for="visionFallbackModel">画像fallbackモデル</label>
+                <select id="visionFallbackModel"></select>
+
+                <label for="visionFallbackReasoningEffort">画像fallback effort</label>
+                <select id="visionFallbackReasoningEffort"></select>
+              </div>
+            </details>
+
+            <label for="refreshModelCatalogBtn">モデル候補</label>
+            <div class="flex items-center gap-2">
+              <button id="refreshModelCatalogBtn" class="btn-secondary text-xs px-3 py-1 rounded">
+                再取得
+              </button>
+              <span
+                id="modelCatalogStatus"
+                class="text-xs"
+                style="color: var(--text-muted)"
+              ></span>
+            </div>
+
+            <label for="outputDir">Twitter出力先</label>
+            <input id="outputDir" value="twitter_catalogs" />
+
+            <label for="cookieFile">Cookieファイル（任意）</label>
+            <input
+              id="cookieFile"
+              placeholder="cookies/example.com_cookies.txt"
+            />
+
+            <label for="daysBefore">イベント前日数</label>
+            <input id="daysBefore" type="number" value="30" />
+
+            <label for="daysAfter">イベント後日数</label>
+            <input id="daysAfter" type="number" value="7" />
+
+            <label for="backup">バックアップ</label>
+            <select id="backup">
+              <option value="false">しない</option>
+              <option value="true">する</option>
+            </select>
+
+            <label for="enableTwitter">Twitter処理</label>
+            <select id="enableTwitter">
+              <option value="true">有効</option>
+              <option value="false">無効</option>
+            </select>
+
+            <label for="useGrokSearch">Grok検索</label>
+            <select id="useGrokSearch">
+              <option value="true">有効</option>
+              <option value="false">無効</option>
+            </select>
+
+            <label for="reprocess">再処理</label>
+            <select id="reprocess">
+              <option value="false">しない</option>
+              <option value="true">する</option>
+            </select>
+
+            <label for="regen">座標再生成</label>
+            <select id="regen">
+              <option value="false">しない</option>
+              <option value="true">する</option>
+            </select>
+
+            <label for="skipCircleImages">サークル画像スキップ</label>
+            <select id="skipCircleImages">
+              <option value="true">スキップ</option>
+              <option value="false">取得する</option>
+            </select>
+
+            <label for="verbose">詳細ログ</label>
+            <select id="verbose">
+              <option value="true">ON</option>
+              <option value="false">OFF</option>
+            </select>
+          </div>
+          <div class="flex gap-2 mt-4">
+            <button id="runExtractBtn" class="btn-secondary px-4 py-2 rounded">
+              Twitterお品書き抽出
+            </button>
+            <button
+              id="runPipelineBtn"
+              class="btn-primary px-4 py-2 rounded font-semibold"
+            >
+              フルパイプライン実行
+            </button>
+          </div>
+        </section>
+
+        <section id="tab-edit" class="tab-pane">
+          <h2>サークルリスト編集</h2>
+          <input id="editorJsonPath" type="hidden" />
+          <input id="editorOutputJsonPath" type="hidden" />
+          <div id="eventMemoArea" class="event-memo-area hidden">
+            <div class="event-memo-header" id="eventMemoToggle">
+              <span class="event-memo-arrow">&#9654;</span>
+              <span>イベントメモ</span>
+            </div>
+            <div class="event-memo-body hidden" id="eventMemoBody">
+              <textarea
+                id="eventMemoInput"
+                placeholder="イベントに関するメモ（会場情報、持ち物など）"
+                rows="3"
+              ></textarea>
+            </div>
+          </div>
+          <div id="circleFilterBar" class="circle-filter-bar">
+            <input
+              id="globalCircleSearch"
+              class="circle-global-search hidden"
+              placeholder="全体検索..."
+            />
+            <select id="circleGenreFilter">
+              <option value="">ジャンル</option>
+            </select>
+            <div id="circleColorFilter" class="circle-filter-group"></div>
+            <div id="circleCheckFilter" class="circle-filter-group"></div>
+            <select id="circleCatalogFilter">
+              <option value="">おしながき: すべて</option>
+              <option value="with">おしながきあり</option>
+              <option value="without">おしながきなし</option>
+            </select>
+            <span id="circleFilterCount"></span>
+          </div>
+          <div id="budgetPanel" class="budget-panel hidden">
+            <div id="budgetToggle" class="budget-toggle">
+              <span class="budget-arrow">&#9654;</span>
+              <span>予算</span>
+              <span
+                id="budgetSummaryInline"
+                class="budget-summary-inline"
+              ></span>
+            </div>
+            <div id="budgetBody" class="budget-body hidden">
+              <div class="budget-grid">
+                <div class="budget-row">
+                  <span class="budget-label">リスト総額</span>
+                  <span id="budgetTotalList" class="budget-value"></span>
+                </div>
+                <div class="budget-row">
+                  <span class="budget-label">予定</span>
+                  <span id="budgetTotalPlanned" class="budget-value"></span>
+                </div>
+                <div class="budget-row">
+                  <span class="budget-label budget-bought">購入済み</span>
+                  <span
+                    id="budgetTotalBought"
+                    class="budget-value budget-bought"
+                  ></span>
+                </div>
+                <div class="budget-row">
+                  <span class="budget-label budget-couldnt">買えなかった</span>
+                  <span
+                    id="budgetTotalCouldnt"
+                    class="budget-value budget-couldnt"
+                  ></span>
+                </div>
+                <div class="budget-row">
+                  <span class="budget-label budget-skipped">見送り</span>
+                  <span
+                    id="budgetTotalSkipped"
+                    class="budget-value budget-skipped"
+                  ></span>
+                </div>
+                <div class="budget-row">
+                  <span class="budget-label">残り</span>
+                  <span id="budgetTotalRemaining" class="budget-value"></span>
+                </div>
+              </div>
+              <div
+                id="budgetPriorityDetail"
+                class="budget-priority-detail"
+              ></div>
+            </div>
+          </div>
+          <div id="circleEditor"></div>
+        </section>
+
+        <section id="tab-map" class="tab-pane">
+          <div class="map-toolbar" id="mapToolbar">
+            <label class="text-sm m-0">マップ:</label>
+            <select id="mapNumberSelect" class="w-auto"></select>
+            <button
+              id="mapChangeImgBtn"
+              class="btn-secondary text-xs px-2 py-1 rounded"
+            >
+              画像差し替え
+            </button>
+            <button
+              id="mapAddImgBtn"
+              class="btn-secondary text-xs px-2 py-1 rounded"
+            >
+              マップ追加
+            </button>
+            <button
+              id="mapAutoPlaceBtn"
+              class="btn-primary text-xs px-2 py-1 rounded"
+            >
+              自動配置
+            </button>
+            <button
+              id="mapReprocessWithCalibrationBtn"
+              class="btn-secondary text-xs px-2 py-1 rounded"
+            >
+              校正点で再処理
+            </button>
+            <div class="flex gap-1 flex-wrap" id="mapFilterChips"></div>
+            <label class="text-xs m-0 flex items-center gap-1"
+              >幅
+              <input
+                type="range"
+                id="mapPinWidth"
+                min="10"
+                max="160"
+                value="77"
+                class="w-16 m-0 p-0 h-auto"
+              />
+            </label>
+            <label class="text-xs m-0 flex items-center gap-1"
+              >高
+              <input
+                type="range"
+                id="mapPinHeight"
+                min="10"
+                max="160"
+                value="24"
+                class="w-16 m-0 p-0 h-auto"
+              />
+            </label>
+            <label class="text-xs m-0 flex items-center gap-1"
+              >X補正
+              <input
+                type="range"
+                id="mapPinOffsetX"
+                min="-160"
+                max="160"
+                value="0"
+                class="w-16 m-0 p-0 h-auto"
+              />
+            </label>
+            <label class="text-xs m-0 flex items-center gap-1"
+              >Y補正
+              <input
+                type="range"
+                id="mapPinOffsetY"
+                min="-160"
+                max="160"
+                value="0"
+                class="w-16 m-0 p-0 h-auto"
+              />
+            </label>
+            <select id="mapPinOrientation" class="w-auto text-xs">
+              <option value="vertical">縦伸長</option>
+              <option value="horizontal">横伸長</option>
+            </select>
+            <span
+              class="text-xs"
+              style="color: var(--text-muted)"
+              id="mapZoomInfo"
+              >100%</span
+            >
+          </div>
+          <div class="flex flex-1 overflow-hidden">
+            <div id="mapViewport" class="flex-1">
+              <div id="mapInner"></div>
+            </div>
+            <div class="map-sidebar" id="mapSidebar">
+              <div class="map-info-card" id="mapInfoCard">
+                <h4 class="text-sm font-semibold m-0 mb-1">サークル情報</h4>
+                <p class="hint">ピンをクリックして選択</p>
+              </div>
+              <div class="flex-1 flex flex-col overflow-hidden p-3">
+                <h4 class="text-sm font-semibold m-0 mb-1">サークル一覧</h4>
+                <div class="flex gap-1 mb-1.5">
+                  <input
+                    id="mapCircleSearch"
+                    placeholder="検索..."
+                    class="flex-1 text-xs"
+                  />
+                  <select id="mapCircleFilter" class="w-auto text-xs">
+                    <option value="unplaced">未配置</option>
+                    <option value="placed">配置済</option>
+                    <option value="all">全て</option>
+                  </select>
+                </div>
+                <div id="mapCircleList" class="flex-1 overflow-y-auto"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-history" class="tab-pane">
+          <div class="history-search-shell">
+            <div class="history-search-heading">
+              <div>
+                <h2>過去出展検索</h2>
+                <p>
+                  保存済みイベントから、うろ覚えの本タイトルやサークル名を探します。
+                  空白・記号・全角半角・ひらがな/カタカナの違いや、少しの入力違いも吸収します。
+                </p>
+              </div>
+              <span class="history-local-badge">ローカル検索</span>
+            </div>
+            <form id="historySearchForm" class="history-search-form">
+              <label for="historySearchQuery">本タイトル / サークル名</label>
+              <div class="history-search-controls">
+                <input
+                  id="historySearchQuery"
+                  autocomplete="off"
+                  placeholder="例: ことのはしまい / ひなぎく書房"
+                />
+                <button
+                  id="historySearchBtn"
+                  class="btn-primary px-5 py-2 rounded font-semibold"
+                  type="submit"
+                >
+                  検索
+                </button>
+              </div>
+              <div class="form-hint">記号・空白を除いて2文字以上入力してください。</div>
+            </form>
+            <div id="historySearchStatus" class="history-search-status" aria-live="polite">
+              検索語を入力すると、events フォルダ内の履歴を横断します。
+            </div>
+            <div id="historySearchResults" class="history-search-results"></div>
+          </div>
+        </section>
+
+        <section id="tab-mobile" class="tab-pane">
+          <h2>モバイル連携</h2>
+          <div id="mobileActiveEvent" class="active-event-box">
+            <span style="color: var(--text-muted)"
+              >サイドバーでイベントを選択してください</span
+            >
+          </div>
+          <div class="flex gap-2 mt-3">
+            <button id="exportZipBtn" class="btn-secondary px-4 py-2 rounded">
+              ZIPエクスポート
+            </button>
+            <button
+              id="sendToMobileBtn"
+              class="btn-primary px-4 py-2 rounded font-semibold"
+            >
+              モバイルに送る
+            </button>
+            <button
+              id="sendFullSyncToMobileBtn"
+              class="btn-secondary px-4 py-2 rounded font-semibold"
+            >
+              全イベント同期
+            </button>
+            <button
+              id="importResultBtn"
+              class="btn-secondary px-4 py-2 rounded"
+            >
+              モバイルから受信
+            </button>
+          </div>
+          <div id="qrCodeArea" class="hidden text-center mt-4">
+            <canvas id="qrCanvas" class="mx-auto"></canvas>
+            <p id="qrUrl" class="font-mono text-xs mt-2 break-all"></p>
+            <button
+              id="stopServerBtn"
+              class="btn-secondary px-3 py-1.5 rounded mt-2"
+            >
+              サーバー停止
+            </button>
+          </div>
+          <p class="text-xs mt-3" style="color: var(--text-muted)">
+            サイドバーで選択中のイベントのデータ +
+            画像をZIPにまとめてモバイルに転送します。
+          </p>
+        </section>
+
+        <section id="tab-settings" class="tab-pane">
+          <h2>設定</h2>
+          <div class="settings-grid">
+            <label for="pythonExe">Python実行ファイル</label>
+            <input id="pythonExe" />
+
+            <label for="projectRoot">プロジェクトルート</label>
+            <input id="projectRoot" />
+
+            <label for="timeoutMs">タイムアウト（ms）</label>
+            <input id="timeoutMs" type="number" value="10800000" />
+
+            <h3 class="settings-subheading">マップOCR（Unlimited OCR）</h3>
+            <span class="settings-hint">専用venv・モデルキャッシュはPCごとに異なるため、配布先で設定してください。モデルパスを指定した場合はHub IDより優先します。</span>
+
+            <label for="unlimitedOcrModel">モデル名（Hub ID）</label>
+            <input id="unlimitedOcrModel" value="baidu/Unlimited-OCR" placeholder="baidu/Unlimited-OCR" />
+
+            <label for="unlimitedOcrModelPath">モデルパス（任意）</label>
+            <input id="unlimitedOcrModelPath" placeholder="例: <model-directory>\\Unlimited-OCR" />
+
+            <label for="unlimitedOcrVenv">OCR専用venv（任意）</label>
+            <input id="unlimitedOcrVenv" placeholder="空欄: temp/unlimited_ocr_venv" />
+
+            <label for="unlimitedOcrHfHome">HFキャッシュ（任意）</label>
+            <input id="unlimitedOcrHfHome" placeholder="空欄: temp/hf_cache" />
+
+            <label for="unlimitedOcrRevision">モデルrevision</label>
+            <input id="unlimitedOcrRevision" value="ee63731b6461c8afcdcc7b15352e7d2ffecc2ead" />
+
+            <label for="unlimitedOcrDevice">実行デバイス</label>
+            <select id="unlimitedOcrDevice">
+              <option value="auto">自動（CUDA優先 / 既定モデルはCUDA必須）</option>
+              <option value="cuda">CUDA</option>
+              <option value="cpu">CPU（CPU対応モデルのみ）</option>
+            </select>
+
+            <label for="unlimitedOcrMode">画像モード</label>
+            <select id="unlimitedOcrMode">
+              <option value="gundam">gundam（高解像度マップ）</option>
+              <option value="base">base（標準）</option>
+            </select>
+
+            <label for="unlimitedOcrStrategy">小文字連番戦略</label>
+            <select id="unlimitedOcrStrategy">
+              <option value="small_digits">small_digits（推奨）</option>
+              <option value="gundam_then_base">gundam → base</option>
+              <option value="balanced">指定モードのみ</option>
+            </select>
+
+            <label></label>
+            <button id="unlimitedOcrDoctorBtn" class="btn-secondary px-3 py-1.5 rounded">OCR環境を診断</button>
+
+            <label for="foamDir">感想フォルダ（Foam）</label>
+            <input id="foamDir" placeholder="&lt;path-to-inbox&gt;" />
+
+            <label for="globalSearchEnabled">全体検索</label>
+            <label class="setting-check-row">
+              <input id="globalSearchEnabled" type="checkbox" />
+              <span>サークルリストに全体検索バーを表示</span>
+            </label>
+          </div>
+
+          <h3 class="mt-7 text-sm font-semibold">優先度カラー</h3>
+          <div
+            id="priorityColorSettings"
+            class="priority-color-settings"
+          ></div>
+
+          <h3 class="mt-7 text-sm font-semibold">APIキー</h3>
+          <div class="settings-grid">
+            <label for="openaiApiKey">OpenAI API Key</label>
+            <input id="openaiApiKey" type="password" placeholder="sk-..." />
+
+            <label for="geminiApiKey">Gemini API Key</label>
+            <input id="geminiApiKey" type="password" placeholder="AIza..." />
+
+            <label for="xaiApiKey">xAI (Grok) API Key</label>
+            <input id="xaiApiKey" type="password" placeholder="xai-..." />
+          </div>
+
+          <div class="flex gap-2 mt-4">
+            <button
+              id="loadConfigBtn"
+              class="btn-secondary px-3 py-1.5 rounded"
+            >
+              設定読み込み
+            </button>
+            <button id="saveConfigBtn" class="btn-primary px-3 py-1.5 rounded">
+              設定保存
+            </button>
+            <button id="pingBtn" class="btn-secondary px-3 py-1.5 rounded">
+              接続確認
+            </button>
+            <button id="listJobsBtn" class="btn-secondary px-3 py-1.5 rounded">
+              ジョブ一覧
+            </button>
+          </div>
+
+          <h3 class="mt-7 text-sm font-semibold">キーボードショートカット</h3>
+          <table class="max-w-lg">
+            <thead>
+              <tr>
+                <th>キー</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><kbd class="kbd">Alt + 1</kbd></td>
+                <td>クロール実行タブ</td>
+              </tr>
+              <tr>
+                <td><kbd class="kbd">Alt + 2</kbd></td>
+                <td>サークルリスト編集タブ</td>
+              </tr>
+              <tr>
+                <td><kbd class="kbd">Alt + 3</kbd></td>
+                <td>マップ編集タブ</td>
+              </tr>
+              <tr>
+                <td><kbd class="kbd">Alt + 4</kbd></td>
+                <td>過去出展検索タブ</td>
+              </tr>
+              <tr>
+                <td><kbd class="kbd">Alt + 5</kbd></td>
+                <td>モバイル連携タブ</td>
+              </tr>
+              <tr>
+                <td><kbd class="kbd">Alt + 6</kbd></td>
+                <td>設定タブ</td>
+              </tr>
+              <tr>
+                <td><kbd class="kbd">Ctrl + Enter</kbd></td>
+                <td>フルパイプライン実行</td>
+              </tr>
+              <tr>
+                <td><kbd class="kbd">Ctrl + Tab</kbd></td>
+                <td>次のタブ</td>
+              </tr>
+              <tr>
+                <td><kbd class="kbd">↑ / ↓</kbd></td>
+                <td>サークル行移動</td>
+              </tr>
+              <tr>
+                <td><kbd class="kbd">&larr; / &rarr;</kbd></td>
+                <td>マップ編集タブでマップ切り替え</td>
+              </tr>
+              <tr>
+                <td><kbd class="kbd">Enter</kbd></td>
+                <td>アイテムパネル展開</td>
+              </tr>
+              <tr>
+                <td><kbd class="kbd">Ctrl + Z</kbd></td>
+                <td>画像Undo</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3 class="mt-7 text-sm font-semibold">アプリ情報</h3>
+          <div class="flex items-center gap-3 mt-2">
+            <span class="text-sm" style="color: var(--text-muted)">
+              バージョン: <span id="appVersionLabel">0.1.12</span>
+            </span>
+            <button
+              id="checkUpdateBtn"
+              class="btn-secondary px-3 py-1.5 rounded text-sm"
+            >
+              更新を確認
+            </button>
+            <span
+              id="updateCheckStatus"
+              class="text-sm"
+              style="color: var(--text-muted)"
+            ></span>
+          </div>
+        </section>
+      </main>
+
+      <div class="log-area collapsed" id="logArea">
+        <div class="log-header" id="logToggle">
+          <span class="log-arrow">&#9654;</span>
+          <h3>結果ログ</h3>
+        </div>
+        <pre id="result" class="hidden"></pre>
+      </div>
+    </div>
+    <!-- /main-area -->
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

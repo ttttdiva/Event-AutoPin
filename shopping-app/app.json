@@ -1,0 +1,69 @@
+{
+  "expo": {
+    "name": "Event AutoPin",
+    "slug": "event-autopin",
+    "version": "1.4.53",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "eventtrailgo",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/images/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "edgeToEdgeEnabled": true,
+      "package": "com.eventtrail.go",
+      "versionCode": 193,
+      "permissions": [
+        "android.permission.REQUEST_INSTALL_PACKAGES"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-sqlite",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "QRコード読み取りにカメラを使用します",
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "イベント画像を選択するためにフォトライブラリを使用します",
+          "microphonePermission": false
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
+      "./plugins/withAndroidPlatformCompatibility"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "60726c09-5985-48f1-9579-d6efd8555373"
+      }
+    },
+    "owner": "idkuudki"
+  }
+}
