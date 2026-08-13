@@ -90,5 +90,5 @@ jobs:
           CI: '1'
         run: npx expo prebuild --platform android --no-install
       - name: Build Android debug APK from generated source
-        working-directory: shopping-app
-        run: .\android\gradlew.bat assembleDebug --no-daemon
+        working-directory: shopping-app/android
+        run: .\gradlew.bat assembleDebug --no-daemon
