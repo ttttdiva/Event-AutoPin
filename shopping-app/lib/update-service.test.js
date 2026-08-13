@@ -78,34 +78,61 @@ function validLatest(mobileVersion = "1.2.0") {
   };
 }
 
+function normalizeScriptLineEndings(source) {
+  return source.replace(/\r\n?/g, "\n");
+}
+
+function extractEmbeddedReleaseValidators(shellSource, batchSource) {
+  // Git's checkout settings may give the public Windows checkout CRLF files,
+  // while the heredoc/marker contract itself is line-ending agnostic.
+  const normalizedShellSource = normalizeScriptLineEndings(shellSource);
+  const shellMatch = normalizedShellSource.match(
+    /cat > "\$VALIDATOR_JS" <<'NODE'\n([\s\S]*?)\nNODE\n/,
+  );
+  assert.ok(shellMatch, "build_apk.sh validator が見つかる");
+
+  const normalizedBatchSource = normalizeScriptLineEndings(batchSource);
+  const beginMarker = "REM __RELEASE_" + "VALIDATOR_JS_BEGIN__";
+  const endMarker = "REM __RELEASE_" + "VALIDATOR_JS_END__";
+  const begin = normalizedBatchSource.indexOf(beginMarker);
+  const bodyStart = normalizedBatchSource.indexOf("\n", begin) + 1;
+  const end = normalizedBatchSource.indexOf(endMarker, bodyStart);
+  assert.ok(begin >= 0 && bodyStart > begin && end > bodyStart);
+  const batchValidator = normalizedBatchSource.slice(bodyStart, end).trimEnd();
+  assert.equal(batchValidator, shellMatch[1], "bash/bat validator の契約が一致する");
+  return [shellMatch[1], batchValidator];
+}
+
 function loadEmbeddedReleaseValidators() {
   const repositoryRoot = path.resolve(__dirname, "../..");
   const shellSource = fs.readFileSync(
     path.join(repositoryRoot, "scripts/build_apk.sh"),
     "utf8",
   );
-  const shellMatch = shellSource.match(
-    /cat > "\$VALIDATOR_JS" <<'NODE'\n([\s\S]*?)\nNODE\n/,
-  );
-  assert.ok(shellMatch, "build_apk.sh validator が見つかる");
-
   const batchSource = fs.readFileSync(
     path.join(repositoryRoot, "scripts/build_apk.bat"),
     "utf8",
   );
-  const beginMarker = "REM __RELEASE_" + "VALIDATOR_JS_BEGIN__";
-  const endMarker = "REM __RELEASE_" + "VALIDATOR_JS_END__";
-  const begin = batchSource.indexOf(beginMarker);
-  const bodyStart = batchSource.indexOf("\n", begin) + 1;
-  const end = batchSource.indexOf(endMarker, bodyStart);
-  assert.ok(begin >= 0 && bodyStart > begin && end > bodyStart);
-  const batchValidator = batchSource
-    .slice(bodyStart, end)
-    .replace(/\r\n/g, "\n")
-    .trimEnd();
-  assert.equal(batchValidator, shellMatch[1], "bash/bat validator の契約が一致する");
-  return [shellMatch[1], batchValidator];
+  return extractEmbeddedReleaseValidators(shellSource, batchSource);
 }
+
+test("release validator loader は CRLF の build script からも抽出できる", () => {
+  const repositoryRoot = path.resolve(__dirname, "../..");
+  const shellSource = fs.readFileSync(
+    path.join(repositoryRoot, "scripts/build_apk.sh"),
+    "utf8",
+  );
+  const batchSource = fs.readFileSync(
+    path.join(repositoryRoot, "scripts/build_apk.bat"),
+    "utf8",
+  );
+  const expected = extractEmbeddedReleaseValidators(shellSource, batchSource);
+  const crlf = (source) => normalizeScriptLineEndings(source).replace(/\n/g, "\r\n");
+  assert.deepEqual(
+    extractEmbeddedReleaseValidators(crlf(shellSource), crlf(batchSource)),
+    expected,
+  );
+});
 
 test("latest.json は desktop と mobile の完全な trusted schema を必須にする", () => {
   const { service } = loadUpdateService();
