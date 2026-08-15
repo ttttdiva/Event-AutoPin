@@ -7473,7 +7473,7 @@ async function handleApplicationCloseRequested(event: { preventDefault: () => vo
     await appWindow.close();
   } catch (error) {
     applicationCloseFlowInProgress = false;
-    resultEl.textContent = `終了前の保存に失敗しました: ${String(error)}`;
+    resultEl.textContent = `終了処理に失敗しました: ${String(error)}`;
   }
 }
 

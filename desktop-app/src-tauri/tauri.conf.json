@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "Event AutoPin",
-    "version": "0.1.12"
+    "version": "0.1.13"
   },
   "tauri": {
     "allowlist": {
@@ -15,6 +15,10 @@
       "shell": {
         "all": false,
         "open": true
+      },
+      "window": {
+        "all": false,
+        "close": true
       },
       "protocol": {
         "asset": true,
