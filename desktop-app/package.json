@@ -6,11 +6,14 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "npm run test:state",
+    "test": "npm run test:state && npm run test:diagnostics",
     "test:state": "node -e \"require('node:fs').rmSync('node_modules/.state-test', { recursive: true, force: true })\" && tsc --target ES2020 --module CommonJS --moduleResolution Node --strict --skipLibCheck --rootDir src --outDir node_modules/.state-test src/state/operation-state.ts src/state/revisioned-save-queue.ts src/state/event-document.ts src/state/async-mutation-guard.ts src/state/event-write-coordinator.ts src/state/purchase-history-index.ts src/state/event-session.ts src/state/event-meta-merge.ts src/state/table-window.ts src/state/cookie-drop.ts src/state/operation-state.test.ts src/state/revisioned-save-queue.test.ts src/state/event-document-ownership.test.ts src/state/event-document-save-flow.test.ts src/state/async-mutation-guard.test.ts src/state/event-write-coordinator.test.ts src/state/purchase-history-index.test.ts src/state/event-session.test.ts src/state/event-meta-merge.test.ts src/state/event-selection-race.test.ts src/state/table-window.test.ts src/state/cookie-drop.test.ts && node node_modules/.state-test/state/operation-state.test.js && node node_modules/.state-test/state/revisioned-save-queue.test.js && node node_modules/.state-test/state/event-document-ownership.test.js && node node_modules/.state-test/state/event-document-save-flow.test.js && node node_modules/.state-test/state/async-mutation-guard.test.js && node node_modules/.state-test/state/event-write-coordinator.test.js && node node_modules/.state-test/state/purchase-history-index.test.js && node node_modules/.state-test/state/event-session.test.js && node node_modules/.state-test/state/event-meta-merge.test.js && node node_modules/.state-test/state/event-selection-race.test.js && node node_modules/.state-test/state/table-window.test.js && node node_modules/.state-test/state/cookie-drop.test.js",
     "preview": "vite preview",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build:raw": "tauri build",
+    "tauri:build": "node ../scripts/run_desktop_build.cjs",
+    "test:diagnostics": "tsc --target ES2020 --module CommonJS --moduleResolution Node --strict --skipLibCheck --rootDir src --outDir node_modules/.diagnostics-test src/coordinate-diagnostics.ts src/coordinate-diagnostics.test.ts && node node_modules/.diagnostics-test/coordinate-diagnostics.test.js",
+    "tauri:build:root": "node ../scripts/run_desktop_build.cjs"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.2.2",

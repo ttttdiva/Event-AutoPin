@@ -7,8 +7,10 @@ Tauri → Python サブプロセス呼び出しの入り口。引数/payload解�
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sys
+import threading
 import zipfile
 from pathlib import Path
 
@@ -26,6 +28,7 @@ from src.commands.desktop_bridge import (
     _merge_multi_event_outputs,
     _payload_url_list,
     _job_auto_place_map_pins,
+    _run_main_process,
     _safe_diagnostic_text,
     _safe_config_for_result,
     _job_validate_mobile_json,
@@ -127,9 +130,47 @@ def test_ocr診断はパスとsecretを除去してbridgeエラーへ返す(tmp_
         encoding="utf-8",
     )
 
+    def fail_with_artifact(**kwargs):
+        Path(kwargs["output_json_path"]).write_text(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "stage": "ocr",
+                    "error": {"code": "runner_failed", "message": "runner failed"},
+                    "ocr": {"attempted": True, "runner_started": True},
+                    "ocr_diagnostics": {
+                        "error": {
+                            "code": "runner_failed",
+                            "message": f"runner failed at {private_windows_path}",
+                            "returncode": 2,
+                            "stderr": f"API_KEY={fake_secret} {private_venv_path}",
+                            "stdout": f"trace {private_posix_path}",
+                        },
+                        "last_run": {
+                            "model": "org/model",
+                            "revision": "abc123",
+                            "device": "cuda",
+                            "strategy": "small_digits",
+                            "image": str(map_image),
+                        },
+                        "config": {
+                            "model": "org/model",
+                            "model_path": str(tmp_path / "private-model"),
+                            "venv_path": str(tmp_path / "private-venv"),
+                            "hf_home": str(tmp_path / "private-cache"),
+                            "device": "cuda",
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return None
+
     monkeypatch.setattr(
         "src.space_locator.generate_coordinates_from_map",
-        lambda **_kwargs: None,
+        fail_with_artifact,
     )
     result = _job_auto_place_map_pins(
         {
@@ -214,9 +255,11 @@ def test_auto_place_map_pins_missing_venv_keeps_structured_diagnostics(
     assert result["status"] == "error"
     diagnostics = result["ocr_diagnostics"]
     assert diagnostics["error_code"] == "venv_missing"
-    assert diagnostics["model"] == "org/model"
-    assert diagnostics["device"] == "cuda"
-    assert diagnostics["venv"] == {"configured": True}
+    assert diagnostics["model"] == ""
+    assert diagnostics["device"] == ""
+    assert diagnostics["venv"]["configured"] is None
+    assert diagnostics["attempted"] is True
+    assert diagnostics["runner_started"] is False
     assert "セットアップ" in diagnostics["recovery_hint"]
     encoded = json.dumps(result, ensure_ascii=False)
     assert private_venv not in encoded
@@ -243,11 +286,186 @@ def test_auto_place_map_pins_image_read_exception_reaches_gui_recovery_hint(tmp_
     diagnostics = result["ocr_diagnostics"]
     assert diagnostics["error_code"] == "image_read_failed"
     assert "画像" in diagnostics["recovery_hint"]
-    assert diagnostics["model"] == "org/model"
+    assert result["stage"] == "input"
+    assert diagnostics["model"] == ""
+    assert diagnostics["device"] == ""
+    assert diagnostics["venv"]["configured"] is None
+    assert diagnostics["attempted"] is True
+    assert diagnostics["runner_started"] is False
     encoded = json.dumps(result, ensure_ascii=False)
     assert str(map_image) not in encoded
-    assert "<path>" in encoded
+    assert diagnostics["paths_redacted"] is True
     assert (tmp_path / "coordinates_map_1.json").exists()
+
+
+def test_auto_place_map_pins_does_not_reuse_stale_failure_artifact(
+    tmp_path: Path, monkeypatch
+):
+    event_json = _write_coordinate_test_event(tmp_path)
+    map_image = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "unlimited_ocr_pin_center"
+        / "map_01.png"
+    )
+    stale = tmp_path / "coordinates_map_1.json"
+    stale.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "stage": "ocr",
+                "error": {"code": "runner_failed", "message": "stale"},
+                "ocr": {"attempted": True, "runner_started": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "src.space_locator.generate_coordinates_from_map",
+        lambda **_kwargs: None,
+    )
+    result = _job_auto_place_map_pins(
+        {
+            "event_json": str(event_json),
+            "map_image": str(map_image),
+            "map_number": 1,
+        }
+    )
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "coordinate_diagnostic_missing"
+    assert result["coordinate_generation"]["stage"] == "output"
+    assert result["ocr"]["attempted"] is False
+    published = json.loads(stale.read_text(encoding="utf-8"))
+    assert published["error"]["code"] == "coordinate_diagnostic_missing"
+
+
+@pytest.mark.parametrize(
+    ("input_kind", "expected_code"),
+    [
+        ("missing_event", "event_json_missing"),
+        ("invalid_event", "event_json_invalid"),
+        ("missing_map", "map_image_missing"),
+    ],
+)
+def test_auto_place_map_pins_input_failure_invalidates_stale_artifacts(
+    tmp_path: Path, input_kind: str, expected_code: str
+):
+    event_json = tmp_path / "event.json"
+    if input_kind == "missing_event":
+        pass
+    elif input_kind == "invalid_event":
+        event_json.write_text("{", encoding="utf-8")
+    else:
+        event_json = _write_coordinate_test_event(tmp_path)
+
+    summary = tmp_path / "coordinate_generation_summary.json"
+    stale = tmp_path / "coordinates_map_1.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "stage": "ocr",
+                "error": {"code": "stale_previous_run", "message": "stale"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "stage": "ocr",
+                "error": {"code": "stale_previous_run", "message": "stale"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    other_map = tmp_path / "coordinates_map_2.json"
+    other_map.write_text(
+        json.dumps({"status": "success", "complete_grid": []}), encoding="utf-8"
+    )
+
+    result = _job_auto_place_map_pins(
+        {
+            "event_json": str(event_json),
+            "map_number": 1,
+        }
+    )
+
+    assert result["status"] == "error"
+    assert result["error_code"] == expected_code
+    assert result["coordinate_generation"]["stage"] == "input"
+    assert result["ocr"]["attempted"] is False
+    # Canonical map artifact is atomically replaced by this input failure;
+    # summary is invalidated so neither path can expose the prior OCR result.
+    assert not summary.exists()
+    published = json.loads(stale.read_text(encoding="utf-8"))
+    assert published["error"]["code"] == expected_code
+    assert published["stage"] == "input"
+    assert other_map.exists()
+
+
+def test_auto_place_map_pins_event_catalog_failure_keeps_ocr_unattempted(
+    tmp_path: Path, monkeypatch
+):
+    event_json = tmp_path / "event.json"
+    event_json.write_text(
+        json.dumps(
+            {
+                "event": {
+                    "maps": [
+                        {"map_number": 1, "filename": "map_01.png"},
+                        {"map_number": 2, "filename": "map_02.png"},
+                    ]
+                },
+                "circles": [{"space": "A-01"}, {"space": "B-01", "map_number": 2}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    map_image = tmp_path / "map_01.png"
+    map_image.write_bytes(
+        (Path(__file__).resolve().parents[1] / "fixtures" / "unlimited_ocr_pin_center" / "map_01.png").read_bytes()
+    )
+
+    def fail_catalog(**kwargs):
+        Path(kwargs["output_json_path"]).write_text(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "stage": "event_catalog",
+                    "error": {
+                        "code": "event_catalog_empty",
+                        "message": "対象マップに割り当て可能なスペースがありません",
+                    },
+                    "map_number": 1,
+                    "event_catalog": {
+                        "requested_map_number": 1,
+                        "circle_count": 2,
+                        "space_blank_count": 0,
+                        "space_unparseable_count": 0,
+                        "map_mismatch_excluded_count": 1,
+                        "map_unassigned_excluded_count": 1,
+                        "target_space_count": 0,
+                    },
+                    "ocr": {"attempted": False, "runner_started": False},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return None
+
+    monkeypatch.setattr("src.space_locator.generate_coordinates_from_map", fail_catalog)
+    result = _job_auto_place_map_pins(
+        {"event_json": str(event_json), "map_image": str(map_image), "map_number": 1}
+    )
+    assert result["error_code"] == "event_catalog_empty"
+    assert result["stage"] == "event_catalog"
+    assert result["ocr"]["attempted"] is False
+    assert result["ocr_diagnostics"]["venv"]["configured"] is None
 
 
 def test_auto_place_map_pins_returns_patches_without_writing_event_json(tmp_path: Path, monkeypatch):
@@ -305,6 +523,164 @@ def test_auto_place_map_pins_zero_updates_returns_no_matching_error(tmp_path: Pa
     assert result["updated_count"] == 0
     assert result["circle_patches"] == []
     assert json.loads(event_json.read_text(encoding="utf-8")) == original
+
+
+def test_auto_place_map_pins_generator_exception_is_structured(tmp_path: Path, monkeypatch):
+    event_json = _write_coordinate_test_event(tmp_path)
+    map_image = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "unlimited_ocr_pin_center"
+        / "map_01.png"
+    )
+
+    def explode(**_kwargs):
+        raise RuntimeError("generator exploded")
+
+    monkeypatch.setattr("src.space_locator.generate_coordinates_from_map", explode)
+    result = _job_auto_place_map_pins(
+        {"event_json": str(event_json), "map_image": str(map_image), "map_number": 1}
+    )
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "coordinate_generation_internal"
+    assert result["stage"] == "internal"
+    published = json.loads((tmp_path / "coordinates_map_1.json").read_text(encoding="utf-8"))
+    assert published["error"]["code"] == "coordinate_generation_internal"
+
+
+def test_auto_place_map_pins_update_exception_is_structured(tmp_path: Path, monkeypatch):
+    event_json = _write_coordinate_test_event(tmp_path)
+    map_image = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "unlimited_ocr_pin_center"
+        / "map_01.png"
+    )
+
+    monkeypatch.setattr(
+        "src.space_locator.generate_coordinates_from_map",
+        lambda **_kwargs: {
+            "complete_grid": [{"space_id": "A01", "x": 1, "y": 2}],
+            "ocr_diagnostics": {},
+        },
+    )
+
+    class ExplodingUpdater:
+        def build_coordinate_patches(self, **_kwargs):
+            raise RuntimeError("updater exploded")
+
+    monkeypatch.setattr("src.space_locator.json_updater.JSONUpdater", ExplodingUpdater)
+    result = _job_auto_place_map_pins(
+        {"event_json": str(event_json), "map_image": str(map_image), "map_number": 1}
+    )
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "coordinate_update_failed"
+    assert result["stage"] == "update"
+    published = json.loads((tmp_path / "coordinates_map_1.json").read_text(encoding="utf-8"))
+    assert published["error"]["code"] == "coordinate_update_failed"
+
+
+def test_auto_place_map_pins_parallel_runs_keep_run_local_diagnostics(
+    tmp_path: Path, monkeypatch
+):
+    event_json = _write_coordinate_test_event(tmp_path)
+    map_image = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "unlimited_ocr_pin_center"
+        / "map_01.png"
+    )
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    run_codes: dict[str, str] = {}
+
+    def parallel_failure(**kwargs):
+        output_path = str(kwargs["output_json_path"])
+        with lock:
+            code = f"parallel_failure_{len(run_codes) + 1}"
+            run_codes[output_path] = code
+        barrier.wait(timeout=5)
+        Path(output_path).write_text(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "stage": "ocr",
+                    "error": {"code": code, "message": code},
+                    "ocr": {"attempted": True, "runner_started": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return None
+
+    monkeypatch.setattr("src.space_locator.generate_coordinates_from_map", parallel_failure)
+    payload = {
+        "event_json": str(event_json),
+        "map_image": str(map_image),
+        "map_number": 1,
+    }
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(
+            executor.map(
+                _job_auto_place_map_pins,
+                (dict(payload), dict(payload)),
+            )
+        )
+
+    assert sorted(response["error_code"] for response in responses) == [
+        "parallel_failure_1",
+        "parallel_failure_2",
+    ]
+    assert all(response["stage"] == "ocr" for response in responses)
+    assert not list(tmp_path.glob(".coordinates_map_*.json"))
+
+
+def test_auto_place_map_pins_error_object_drops_unknown_debug_fields(
+    tmp_path: Path, monkeypatch
+):
+    event_json = _write_coordinate_test_event(tmp_path)
+    map_image = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "unlimited_ocr_pin_center"
+        / "map_01.png"
+    )
+    secret = "sk-secret-value"
+    private_path = "C:" + "\\Users\\secret\\trace.log"
+
+    def failure_with_debug(**kwargs):
+        Path(kwargs["output_json_path"]).write_text(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "stage": "ocr",
+                    "error": {
+                        "code": "runner_failed",
+                        "message": "runner failed",
+                        "debug": private_path,
+                        "token": secret,
+                    },
+                    "ocr": {"attempted": True, "runner_started": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return None
+
+    monkeypatch.setattr(
+        "src.space_locator.generate_coordinates_from_map", failure_with_debug
+    )
+    result = _job_auto_place_map_pins(
+        {"event_json": str(event_json), "map_image": str(map_image), "map_number": 1}
+    )
+
+    error = result["coordinate_generation"]["error"]
+    assert error == {"code": "runner_failed", "message": "runner failed"}
+    encoded = json.dumps(result, ensure_ascii=False)
+    assert private_path not in encoded
+    assert secret not in encoded
 
 
 class TestLoadPayload:
@@ -559,6 +935,31 @@ def test_bridge結果のcookie_fileはbasenameを含めず固定ラベルにす�
     assert cookie_path not in str(safe)
 
 
+def test_bridge結果のnested_ocr設定もpathとsecretを除去する(tmp_path: Path):
+    model_path = str(tmp_path / "private" / "model")
+    venv_path = str(tmp_path / "private" / "venv")
+    hf_home = str(tmp_path / "private" / "hf-cache")
+    safe = _safe_config_for_result(
+        {
+            "ocr_config": {
+                "model_path": model_path,
+                "venv_path": venv_path,
+                "hf_home": hf_home,
+                "device": "cuda",
+                "token": "sk-secret-value",
+            }
+        }
+    )
+
+    encoded = json.dumps(safe, ensure_ascii=False)
+    assert model_path not in encoded
+    assert venv_path not in encoded
+    assert hf_home not in encoded
+    assert "sk-secret-value" not in encoded
+    assert safe["ocr_config"]["model_path"] == "<path>"
+    assert safe["ocr_config"]["token"] == "<redacted>"
+
+
 def test_unlimited_ocr_doctor_uses_project_root_for_default_cache(tmp_path: Path, monkeypatch):
     from src.commands.desktop_bridge import _job_unlimited_ocr_doctor
 
@@ -707,6 +1108,85 @@ def test_既存イベントのTwitter再処理は実在しないイベント日�
     assert result["status"] == "error"
     assert result["returncode"] != 0
     assert "event_date" in result["stderr"]
+
+
+def test_run_main_pipeline_coordinate_invalidation_failure_is_structured(
+    tmp_path: Path, monkeypatch
+):
+    def fail_invalidation(*_args, **_kwargs):
+        raise OSError("output directory is read-only")
+
+    monkeypatch.setattr(
+        "src.commands.desktop_bridge._invalidate_coordinate_artifacts",
+        fail_invalidation,
+    )
+    result = _job_run_main_pipeline(
+        {
+            "project_root": str(Path.cwd()),
+            "output_dir": str(tmp_path / "event"),
+            "url": "https://example.com/event",
+            "map_url": "https://example.com/map.jpg",
+            "regenerate_coordinates": True,
+        }
+    )
+
+    assert result["status"] == "error"
+    assert result["returncode"] == 1
+    assert result["stage"] == "output"
+    assert result["error_code"] == "coordinate_artifact_invalidation_failed"
+    assert result["coordinate_generation"]["error"]["code"] == (
+        "coordinate_artifact_invalidation_failed"
+    )
+
+
+def test_main_pipeline_stream_redaction_hides_path_and_secret(
+    tmp_path: Path, monkeypatch
+):
+    secret = "sk-secret-value"
+    private_path = "C:" + "\\Users\\private\\trace.log"
+
+    class Stream:
+        def __init__(self, lines):
+            self.lines = lines
+
+        def __iter__(self):
+            return iter(self.lines)
+
+        def read(self):
+            return "".join(self.lines)
+
+    class FakeProcess:
+        returncode = 1
+        pid = 1
+
+        def __init__(self):
+            self.stderr = Stream([f"token={secret} {private_path}\n"])
+            self.stdout = Stream([f"stdout path={private_path}\n"])
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, *args, **kwargs):
+            return self.returncode
+
+    monkeypatch.setattr(
+        "src.commands.desktop_bridge.subprocess.Popen",
+        lambda *args, **kwargs: FakeProcess(),
+    )
+    result = _run_main_process(
+        Path.cwd(),
+        Path.cwd() / "main.py",
+        {"output_dir": str(tmp_path / "out")},
+        {},
+        tmp_path / "run",
+    )
+
+    assert result["status"] == "error"
+    encoded = json.dumps(result, ensure_ascii=False)
+    assert secret not in encoded
+    assert private_path not in encoded
+    assert "<redacted>" in encoded
+    assert "<path>" in encoded
 
 
 class TestMultiEventHelpers:

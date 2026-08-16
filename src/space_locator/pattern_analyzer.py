@@ -11,7 +11,7 @@ LLMによる配置パターン判定機能
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Mapping
 import logging
 
 # プロジェクトのルートをパスに追加
@@ -20,16 +20,44 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.utils.llm_client import LLMClient
 
 
+def _normalize_api_provider(provider: Optional[str]) -> str:
+    value = str(provider or "openai").strip().lower()
+    if value in {"api", "openai"}:
+        return "openai"
+    if value == "gemini":
+        return "gemini"
+    return value
+
+
+def _assert_provider_model_binding(provider: Optional[str], model: str) -> None:
+    expected = _normalize_api_provider(provider)
+    if expected == "gemini" and not str(model).startswith("gemini"):
+        raise RuntimeError(f"Gemini API provider に非Geminiモデル: {model}")
+    if expected == "openai" and str(model).startswith("gemini"):
+        raise RuntimeError(f"OpenAI API provider にGeminiモデル: {model}")
+
+
 class PatternAnalyzer:
     """LLMを使った配置パターン判定器"""
 
-    def __init__(self, model: str = "gpt-5-mini"):
+    def __init__(
+        self,
+        model: str = "gpt-5-mini",
+        *,
+        attempt: Optional[Mapping[str, Any]] = None,
+        api_reasoning_effort_map: Optional[Mapping[str, str]] = None,
+    ):
         """
         Args:
-            model: 使用するLLMモデル名（デフォルト: gpt-5-mini）
+            model: スタンドアロン実行用の legacy API model
+            attempt: explicit {kind, provider, model, effort} routing
+            api_reasoning_effort_map: API モデルごとの reasoning effort
         """
         self.logger = logging.getLogger(__name__)
-        self.llm_client = LLMClient(model=model)
+        self.attempt = dict(attempt) if attempt else None
+        self.api_reasoning_effort_map = dict(api_reasoning_effort_map or {})
+        self._legacy_model = model
+        self._api_clients: Dict[tuple[str, str], LLMClient] = {}
 
     def analyze_pattern(
         self,
@@ -64,14 +92,11 @@ class PatternAnalyzer:
                 "confidence": 0.95
             }
         """
-        # プロンプトを構築
         prompt = self._build_prompt(ocr_results, catalog_info, calibration_points)
 
-        # LLMに画像解析をリクエスト
         self.logger.info(f"配置パターン判定を開始: {image_path}")
-        response_text = self.llm_client.analyze_image(image_path, prompt)
+        response_text = self._analyze_image(image_path, prompt)
 
-        # JSONブロックを抽出
         if "```json" in response_text:
             json_start = response_text.find("```json") + 7
             json_end = response_text.find("```", json_start)
@@ -83,6 +108,78 @@ class PatternAnalyzer:
         self.logger.info(f"判定完了: {result.get('layout_type', 'unknown')}")
         return result
 
+    def _api_client_for_attempt(self, attempt: Mapping[str, Any]) -> LLMClient:
+        provider = _normalize_api_provider(str(attempt.get("provider") or "openai"))
+        model = str(attempt.get("model") or "")
+        key = (provider, model)
+        if key not in self._api_clients:
+            _assert_provider_model_binding(provider, model)
+            self._api_clients[key] = LLMClient(
+                model=model,
+                api_reasoning_effort_map=self.api_reasoning_effort_map,
+            )
+            bound_clients = [
+                client
+                for client in self._api_clients[key].clients
+                if client.get("api_type") == provider and client.get("model") == model
+            ]
+            if not bound_clients:
+                raise RuntimeError(
+                    f"API provider/model binding failed: {provider}/{model}"
+                )
+        return self._api_clients[key]
+
+    def _analyze_api_image(
+        self,
+        attempt: Mapping[str, Any],
+        image_path: str,
+        prompt: str,
+    ) -> str:
+        provider = _normalize_api_provider(str(attempt.get("provider") or "openai"))
+        model = str(attempt.get("model") or "")
+        if not model:
+            raise RuntimeError("API画像解析モデルが空です")
+        client = self._api_client_for_attempt(attempt)
+        matching = [
+            client_info
+            for client_info in client.clients
+            if client_info.get("api_type") == provider
+            and client_info.get("model") == model
+        ]
+        if not matching:
+            raise RuntimeError(
+                f"API provider/model client unavailable: {provider}/{model}"
+            )
+        return client.analyze_image(image_path, prompt, model=model)
+
+    def _analyze_image(self, image_path: str, prompt: str) -> str:
+        if self.attempt:
+            if self.attempt.get("kind") == "cli":
+                from src.utils.cli_llm import analyze_image_cli
+
+                provider = str(self.attempt.get("provider") or "")
+                model = self.attempt.get("model")
+                effort = self.attempt.get("effort")
+                cli_model_map = {provider: model} if model else {}
+                cli_effort_map = {provider: effort} if effort is not None else {}
+                response_text = analyze_image_cli(
+                    image_path=image_path,
+                    prompt=prompt,
+                    providers=[provider],
+                    cli_model_map=cli_model_map,
+                    cli_effort_map=cli_effort_map,
+                )
+                if not str(response_text or "").strip():
+                    raise RuntimeError("CLI画像解析が空でした")
+                return response_text
+            return self._analyze_api_image(self.attempt, image_path, prompt)
+
+        client = LLMClient(
+            model=self._legacy_model,
+            api_reasoning_effort_map=self.api_reasoning_effort_map,
+        )
+        return client.analyze_image(image_path, prompt)
+
     def _build_prompt(
         self,
         ocr_results: List[Dict[str, Any]],
@@ -91,7 +188,6 @@ class PatternAnalyzer:
     ) -> str:
         """LLMに送るプロンプトを構築"""
 
-        # OCR結果を整形
         ocr_summary = self._format_ocr_results(ocr_results)
         catalog_summary = self._format_catalog_info(catalog_info)
         calibration_summary = self._format_calibration_points(calibration_points)
@@ -218,10 +314,7 @@ OCRで番号（01, 02, 03...）と座標を取得しました：
 
     def _format_ocr_results(self, ocr_results: List[Dict[str, Any]]) -> str:
         """OCR結果を読みやすく整形"""
-        # X座標でソートしてグループ化
         sorted_by_x = sorted(ocr_results, key=lambda r: r['x'])
-
-        # Y座標でもグループ化
         sorted_by_y = sorted(ocr_results, key=lambda r: r['y'])
 
         summary = f"検出番号数: {len(ocr_results)}個\n\n"
@@ -247,11 +340,9 @@ def main():
     image_path = sys.argv[1]
     ocr_json_path = sys.argv[2]
 
-    # OCR結果を読み込み
     with open(ocr_json_path, 'r') as f:
         ocr_data = json.load(f)
 
-    # space_idsからnumber_onlyのものを抽出
     ocr_results = []
     for item in ocr_data.get('space_ids', []):
         if item.get('number_only'):
@@ -263,14 +354,12 @@ def main():
 
     print(f"OCR結果: {len(ocr_results)}個の番号を検出")
 
-    # パターン判定を実行
     analyzer = PatternAnalyzer()
     result = analyzer.analyze_pattern(image_path, ocr_results)
 
     print("\n=== 判定結果 ===")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
-    # 結果を保存
     output_path = image_path.replace('.png', '_pattern.json')
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=2)

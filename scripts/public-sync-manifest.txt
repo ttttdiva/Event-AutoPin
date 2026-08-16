@@ -7,6 +7,8 @@ desktop-app/package.json
 desktop-app/package-lock.json
 desktop-app/README.md
 desktop-app/src/bridge-job.ts
+desktop-app/src/coordinate-diagnostics.ts
+desktop-app/src/coordinate-diagnostics.test.ts
 desktop-app/src/features/cookie-file.ts
 desktop-app/src/main.ts
 desktop-app/src/state/async-mutation-guard.test.ts
@@ -63,6 +65,9 @@ README.md
 requirements.txt
 scripts/build_apk.bat
 scripts/build_apk.sh
+scripts/build_desktop.ps1
+scripts/build_desktop.sh
+scripts/run_desktop_build.cjs
 scripts/check_desktop_release_gate.ps1
 scripts/check_public_dependency_closure.py
 scripts/public-sync-manifest.txt
@@ -195,6 +200,7 @@ src/utils/catalog_image_analyzer.py
 src/utils/catalog_updater.py
 src/utils/circle_master.py
 src/utils/cli_llm.py
+src/utils/antigravity_models.py
 src/utils/cookie_loader.py
 src/utils/date_utils.py
 src/utils/downloader.py
@@ -222,6 +228,8 @@ tests/unit/__init__.py
 tests/unit/test_adapter_factory.py
 tests/unit/test_auto_coordinate_generator_event_json.py
 tests/unit/test_base_adapter.py
+tests/unit/test_catalog_geometry_resolver.py
+tests/unit/test_coordinate_generation_diagnostics.py
 tests/unit/test_circle_master.py
 tests/unit/test_date_utils.py
 tests/unit/test_desktop_release_gate.py

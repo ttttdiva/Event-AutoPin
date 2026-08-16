@@ -15,11 +15,12 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import yaml
 
@@ -460,25 +461,121 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _safe_config_for_result(config: Dict[str, Any]) -> Dict[str, Any]:
     """bridge結果向けに機密pathを含まない設定要約を返す。"""
-    safe = dict(config)
-    if "cookie_file" in safe:
-        safe["cookie_file"] = "<選択済みCookieファイル>"
-    return safe
+
+    path_keys = {
+        "path",
+        "*_path",
+        "output_dir",
+        "project_root",
+        "cookie_file",
+        "hf_home",
+        "cache_dir",
+        "image",
+        "image_path",
+        "event_json_path",
+        "output_json",
+    }
+    secret_keys = {
+        "api_key",
+        "token",
+        "password",
+        "passwd",
+        "secret",
+        "authorization",
+        "cookie",
+    }
+
+    def sanitize(value: Any, key: str = "") -> Any:
+        lowered = key.lower()
+        if lowered in secret_keys or any(
+            lowered.endswith(suffix[1:]) for suffix in path_keys if suffix.startswith("*")
+        ):
+            if lowered == "cookie_file":
+                return "<選択済みCookieファイル>"
+            return "<redacted>" if lowered in secret_keys else "<path>"
+        if lowered in path_keys:
+            return "<選択済みCookieファイル>" if lowered == "cookie_file" else "<path>"
+        if isinstance(value, Mapping):
+            return {str(child_key): sanitize(child_value, str(child_key)) for child_key, child_value in value.items()}
+        if isinstance(value, list):
+            return [sanitize(item, key) for item in value]
+        if isinstance(value, tuple):
+            return [sanitize(item, key) for item in value]
+        if isinstance(value, str):
+            return _safe_diagnostic_text(value)
+        return value
+
+    return sanitize(config)
 
 
-def _collect_coordinate_diagnostics(output_dir: str | Path) -> Dict[str, Any] | None:
-    """main.py/auto generator が保存した座標結果をGUI応答へ要約する。"""
+def _invalidate_coordinate_artifacts(
+    output_dir: str | Path,
+    *,
+    map_number: Optional[int] = None,
+    remove_maps: bool = True,
+) -> None:
+    """現在の座標生成実行に属さない成果物を事前に無効化する。
+
+    ``main.py``/旧生成器は失敗時に ``None`` を返すことがあり、前回の
+    ``coordinates_map_N.json`` を今回の結果として誤読してしまう。生成開始前
+    に summary と対象 map artifact を削除し、削除できない場合は fail-closed
+    にすることで stale/race を GUI 契約へ持ち込まない。
+    """
+
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    paths: set[Path] = {root / "coordinate_generation_summary.json"}
+    if remove_maps:
+        if map_number is None:
+            paths.update(root.glob("coordinates_map_*.json"))
+        else:
+            paths.add(root / f"coordinates_map_{int(map_number)}.json")
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"座標生成成果物を事前無効化できません: {path.name}"
+            ) from exc
+
+
+def _coordinate_artifact_is_current(path: Path, minimum_mtime_ns: Optional[int]) -> bool:
+    if minimum_mtime_ns is None:
+        return True
+    try:
+        return path.stat().st_mtime_ns >= minimum_mtime_ns
+    except OSError:
+        return False
+
+
+def _collect_coordinate_diagnostics(
+    output_dir: str | Path,
+    *,
+    minimum_mtime_ns: Optional[int] = None,
+) -> Dict[str, Any] | None:
+    """main.py/auto generator が保存した座標結果をGUI応答へ要約する。
+
+    ``minimum_mtime_ns`` を指定した場合、現在の実行開始前に存在した
+    artifactは無視する。summary は新契約をそのまま保持しつつ、旧 JSON は
+    stage-aware failure payload へ正規化する。
+    """
+
     root = Path(output_dir)
     summary_path = root / "coordinate_generation_summary.json"
-    if summary_path.exists():
+    if summary_path.exists() and _coordinate_artifact_is_current(summary_path, minimum_mtime_ns):
         try:
             summary = json.loads(summary_path.read_text(encoding="utf-8-sig"))
             if isinstance(summary, dict):
-                return summary
+                return _normalize_coordinate_summary(summary)
         except (OSError, ValueError, TypeError):
             pass
 
-    files = sorted(root.glob("coordinates_map_*.json")) if root.exists() else []
+    files = (
+        sorted(root.glob("coordinates_map_*.json"))
+        if root.exists()
+        else []
+    )
+    files = [path for path in files if _coordinate_artifact_is_current(path, minimum_mtime_ns)]
     if not files:
         return None
     maps: list[Dict[str, Any]] = []
@@ -486,21 +583,52 @@ def _collect_coordinate_diagnostics(output_dir: str | Path) -> Dict[str, Any] | 
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, TypeError) as exc:
-            maps.append({"file": str(path), "status": "failed", "error": str(exc)})
+            maps.append(
+                {
+                    "file": _safe_diagnostic_text(path),
+                    "status": "failed",
+                    "stage": "output",
+                    "error": {
+                        "code": "coordinate_artifact_invalid",
+                        "message": _safe_diagnostic_text(exc),
+                    },
+                    "ocr": _empty_coordinate_ocr_summary(),
+                }
+            )
             continue
         if not isinstance(data, dict):
-            maps.append({"file": str(path), "status": "failed", "error": "結果JSONがobjectではありません"})
+            maps.append(
+                {
+                    "file": _safe_diagnostic_text(path),
+                    "status": "failed",
+                    "stage": "output",
+                    "error": {
+                        "code": "coordinate_artifact_invalid",
+                        "message": "結果JSONがobjectではありません",
+                    },
+                    "ocr": _empty_coordinate_ocr_summary(),
+                }
+            )
             continue
         grid = data.get("complete_grid")
-        failed = bool(data.get("error")) or not isinstance(grid, list) or not grid
+        failed = (
+            str(data.get("status") or "").lower() == "failed"
+            or bool(data.get("error"))
+            or not isinstance(grid, list)
+            or not grid
+        )
+        if failed:
+            maps.append(_normalize_coordinate_failure(data, fallback_map_number=data.get("map_number")))
+            continue
         maps.append(
             {
-                "file": str(path),
+                "file": _safe_diagnostic_text(path),
                 "map_number": data.get("map_number"),
-                "status": "failed" if failed else "success",
+                "status": "success",
                 "generated_count": len(grid) if isinstance(grid, list) else 0,
                 "error": data.get("error"),
-                "ocr_diagnostics": data.get("ocr_diagnostics", {}),
+                "ocr_diagnostics": _summarize_ocr_diagnostics(data.get("ocr_diagnostics")),
+                "ocr": _normalize_coordinate_ocr(data.get("ocr"), data.get("ocr_diagnostics")),
             }
         )
     succeeded = sum(1 for item in maps if item.get("status") == "success")
@@ -510,6 +638,21 @@ def _collect_coordinate_diagnostics(output_dir: str | Path) -> Dict[str, Any] | 
         "succeeded": succeeded,
         "failed": len(maps) - succeeded,
         "maps": maps,
+    }
+
+
+def _missing_coordinate_diagnostic() -> Dict[str, Any]:
+    """生成器が成果物を残さず終了したときの明示的な fallback。"""
+
+    return {
+        "schema_version": 2,
+        "status": "failed",
+        "stage": "output",
+        "error": {
+            "code": "coordinate_diagnostic_missing",
+            "message": "座標生成の結果artifactが保存されませんでした",
+        },
+        "ocr": _empty_coordinate_ocr_summary(),
     }
 
 
@@ -527,6 +670,9 @@ _DIAGNOSTIC_WINDOWS_PATH_RE = re.compile(
 _DIAGNOSTIC_POSIX_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_:/])/(?:[^\s\"'`;,)\]]+)"
 )
+_DIAGNOSTIC_URL_QUERY_KEY_RE = re.compile(
+    r"(?i)([?&](?:key|api_key|access_token)=)[^&\s\"']+"
+)
 
 
 def _safe_diagnostic_text(value: Any, *, max_chars: int = 2000) -> str:
@@ -539,6 +685,7 @@ def _safe_diagnostic_text(value: Any, *, max_chars: int = 2000) -> str:
         return f"{raw[: separator + 1] if separator >= 0 else 'secret:'}<redacted>"
 
     text = _DIAGNOSTIC_SECRET_RE.sub(redact_secret, text)
+    text = _DIAGNOSTIC_URL_QUERY_KEY_RE.sub(r"\1<redacted>", text)
     text = _DIAGNOSTIC_BEARER_RE.sub("Bearer <redacted>", text)
     text = _DIAGNOSTIC_TOKEN_RE.sub("<redacted-token>", text)
     text = _DIAGNOSTIC_WINDOWS_PATH_RE.sub("<path>", text)
@@ -549,11 +696,305 @@ def _safe_diagnostic_text(value: Any, *, max_chars: int = 2000) -> str:
     return text
 
 
+def _safe_diagnostic_stream(value: Any) -> str:
+    """Redact each line of a subprocess stream before GUI/log propagation."""
+
+    text = str(value or "")
+    return "\n".join(_safe_diagnostic_text(line) for line in text.splitlines())
+
+
 def _configured_flag(value: Any) -> bool:
     return bool(str(value or "").strip())
 
 
-def _summarize_ocr_diagnostics(raw: Any) -> Dict[str, Any]:
+def _as_nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _empty_coordinate_ocr_summary() -> Dict[str, Any]:
+    return {
+        "attempted": False,
+        "runner_started": False,
+        "candidate_count": 0,
+        "validated_count": 0,
+    }
+
+
+def _venv_public_summary(
+    diagnostics: Mapping[str, Any],
+    config: Mapping[str, Any],
+    last_run: Mapping[str, Any],
+    coordinate_ocr: Mapping[str, Any] | None = None,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """venv状態を known/unknown のままGUIへ公開する。
+
+    旧 ``configured: bool`` フィールドは互換性のため残す。診断 payload が
+    欠落している時は ``configured:false`` を生成せず ``state:unknown`` とする。
+    ``runtime_python_available`` が確認済みなら、GUI入力の空欄でも実際に
+    使用した default/runtime を configured として扱う。
+    """
+
+    coord = coordinate_ocr if isinstance(coordinate_ocr, Mapping) else {}
+    source = (
+        coord.get("venv_source")
+        or last_run.get("venv_source")
+        or diagnostics.get("venv_source")
+        or config.get("venv_source")
+    )
+    checked_value = (
+        coord.get("runtime_python_checked")
+        if "runtime_python_checked" in coord
+        else last_run.get("runtime_python_checked")
+        if "runtime_python_checked" in last_run
+        else diagnostics.get("runtime_python_checked")
+    )
+    available_value = (
+        coord.get("runtime_python_available")
+        if "runtime_python_available" in coord
+        else last_run.get("runtime_python_available")
+        if "runtime_python_available" in last_run
+        else diagnostics.get("runtime_python_available")
+    )
+    checked = bool(checked_value) if checked_value is not None else None
+    available = bool(available_value) if available_value is not None else None
+
+    path_present = "venv_path" in config
+    raw_path = config.get("venv_path")
+    # OCREngine's public config uses ``null`` for an unset path even though it
+    # may resolve the repository's default runtime venv.  Treat null as
+    # unknown; only an explicit empty string is a deliberate not_configured
+    # signal.
+    if not path_present or raw_path is None:
+        path_configured = None
+    elif isinstance(raw_path, str):
+        path_configured = bool(raw_path.strip())
+    else:
+        path_configured = _configured_flag(raw_path)
+    explicit_state = coord.get("venv_state") or diagnostics.get("venv_state")
+    if explicit_state not in {"configured", "not_configured", "unknown"}:
+        explicit_state = None
+
+    if explicit_state:
+        state = str(explicit_state)
+    elif available is True:
+        state = "configured"
+    elif path_present and path_configured is False:
+        # A present, empty venv_path is a deliberate GUI/config choice. It is
+        # different from an artifact that omitted all config diagnostics.
+        state = "not_configured"
+    elif checked is True and available is False:
+        state = "configured"
+    elif path_present and path_configured is True:
+        state = "configured"
+    else:
+        state = "unknown"
+
+    # Keep the old exact shape for known configured paths so existing clients do
+    # not break; additive details live in the separate ``venv_state`` object.
+    if state == "configured" and path_configured is True and not source and checked is None and available is None:
+        public = {"configured": True}
+    elif state == "configured":
+        public = {"configured": True, "state": state}
+    elif state == "not_configured":
+        public = {"configured": False, "state": state}
+    else:
+        public = {"configured": None, "state": "unknown"}
+
+    state_details = {
+        "state": state,
+        "source": _safe_diagnostic_text(source) if source else None,
+        "runtime_python_checked": checked,
+        "runtime_python_available": available,
+    }
+    return public, state_details
+
+
+def _normalize_coordinate_ocr(
+    coordinate_ocr: Any,
+    legacy_diagnostics: Any = None,
+) -> Dict[str, Any]:
+    """座標生成のOCR到達情報だけを正規化する（path/secretなし）。"""
+
+    raw = coordinate_ocr if isinstance(coordinate_ocr, Mapping) else {}
+    legacy = legacy_diagnostics if isinstance(legacy_diagnostics, Mapping) else {}
+    if not raw and legacy:
+        raw = legacy.get("ocr") if isinstance(legacy.get("ocr"), Mapping) else {}
+    attempted = raw.get("attempted")
+    runner_started = raw.get("runner_started")
+    if attempted is None:
+        attempted = bool(legacy.get("attempted") or legacy.get("last_run"))
+    if runner_started is None:
+        runner_started = bool(legacy.get("runner_started"))
+    return {
+        "attempted": bool(attempted),
+        "runner_started": bool(runner_started),
+        "candidate_count": _as_nonnegative_int(
+            raw.get("candidate_count", raw.get("candidates", legacy.get("candidate_count", 0)))
+        ),
+        "validated_count": _as_nonnegative_int(
+            raw.get("validated_count", raw.get("approved_count", legacy.get("validated_count", 0)))
+        ),
+    }
+
+
+def _normalize_coordinate_failure(
+    raw: Mapping[str, Any],
+    *,
+    fallback_map_number: Any = None,
+) -> Dict[str, Any]:
+    """新/旧 failure artifact を一つの安全な機械可読契約へ寄せる。"""
+
+    data = dict(raw)
+    raw_error = data.get("error")
+    legacy_ocr = data.get("ocr_diagnostics")
+    legacy_error = legacy_ocr.get("error") if isinstance(legacy_ocr, Mapping) else None
+    if isinstance(raw_error, Mapping):
+        code = str(raw_error.get("code") or "unexpected_coordinate_failure")
+        message = _safe_diagnostic_text(raw_error.get("message"))
+        error: Dict[str, Any] = {
+            "code": code,
+            "message": message,
+        }
+        # The v2 contract intentionally keeps the error object minimal.  Raw
+        # legacy payloads sometimes attach ``debug``/``traceback``/config
+        # fields containing absolute paths or secrets; copying unknown keys
+        # here would bypass the OCR redaction boundary below.
+    else:
+        code = str(
+            data.get("error_code")
+            or (legacy_error.get("code") if isinstance(legacy_error, Mapping) else "")
+            or (raw_error if isinstance(raw_error, str) and raw_error else "")
+            or "unexpected_coordinate_failure"
+        )
+        message = _safe_diagnostic_text(
+            data.get("error_message")
+            or (legacy_error.get("message") if isinstance(legacy_error, Mapping) else "")
+            or (raw_error if isinstance(raw_error, str) else "座標生成に失敗しました")
+        )
+        error = {"code": code, "message": message}
+
+    stage = str(data.get("stage") or _stage_for_coordinate_error(code))
+    map_number = data.get("map_number", fallback_map_number)
+    ocr = _normalize_coordinate_ocr(data.get("ocr"), legacy_ocr)
+    config = legacy_ocr.get("config") if isinstance(legacy_ocr, Mapping) and isinstance(legacy_ocr.get("config"), Mapping) else {}
+    last_run = legacy_ocr.get("last_run") if isinstance(legacy_ocr, Mapping) and isinstance(legacy_ocr.get("last_run"), Mapping) else {}
+    diagnostics_for_summary: Mapping[str, Any] = legacy_ocr if isinstance(legacy_ocr, Mapping) else {}
+    if ocr.get("attempted") and not diagnostics_for_summary.get("error"):
+        diagnostics_for_summary = {
+            **diagnostics_for_summary,
+            "error": {"code": code, "message": message},
+        }
+    safe_ocr_diagnostics = _summarize_ocr_diagnostics(
+        diagnostics_for_summary, coordinate_ocr=ocr
+    )
+    venv_public, venv_state = _venv_public_summary(legacy_ocr if isinstance(legacy_ocr, Mapping) else {}, config, last_run, ocr)
+    if ocr.get("attempted") and not ocr.get("runner_started"):
+        safe_ocr_diagnostics["venv"] = {"configured": None, "state": "unknown"}
+        safe_ocr_diagnostics["venv_state"] = {
+            "state": "unknown",
+            "source": None,
+            "runtime_python_checked": None,
+            "runtime_python_available": None,
+        }
+    else:
+        safe_ocr_diagnostics["venv"] = venv_public
+        safe_ocr_diagnostics["venv_state"] = venv_state
+    # New artifacts may intentionally omit verbose OCR diagnostics for input
+    # failures.  Preserve the machine-readable failure code in the legacy OCR
+    # summary only when OCR was actually attempted; catalog/input failures that
+    # stopped before OCR remain ``OCR: 未実行`` in the GUI.
+    if ocr.get("attempted"):
+        legacy_code = (
+            legacy_error.get("code")
+            if isinstance(legacy_error, Mapping)
+            else None
+        )
+        legacy_code = legacy_code or {
+            "ocr_venv_missing": "venv_missing",
+            "ocr_runner_failed": "runner_failed",
+            "ocr_runner_timeout": "timeout",
+            "ocr_result_invalid": "invalid_result",
+            "ocr_inference_failed": "image_inference_failed",
+            "ocr_no_numbers": "no_numbers",
+        }.get(code, code)
+        safe_ocr_diagnostics["error_code"] = str(legacy_code)
+        safe_ocr_diagnostics["error_message"] = str(
+            legacy_error.get("message")
+            if isinstance(legacy_error, Mapping) and legacy_error.get("message")
+            else message
+        )
+    data.update(
+        {
+            "schema_version": max(2, _as_nonnegative_int(data.get("schema_version"), 0)),
+            "status": "failed",
+            "stage": stage,
+            "error": error,
+            "map_number": map_number,
+            "ocr": ocr,
+            "ocr_diagnostics": safe_ocr_diagnostics,
+        }
+    )
+    if "event_catalog" in data and isinstance(data["event_catalog"], Mapping):
+        data["event_catalog"] = dict(data["event_catalog"])
+    data.pop("image_path", None)
+    data.pop("event_json_path", None)
+    data.pop("output_json", None)
+    return data
+
+
+def _normalize_coordinate_summary(summary: Mapping[str, Any]) -> Dict[str, Any]:
+    data = dict(summary)
+    maps = data.get("maps")
+    if isinstance(maps, list):
+        normalized_maps: list[Any] = []
+        for item in maps:
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("status") or "").lower() == "failed" or item.get("error"):
+                normalized_maps.append(_normalize_coordinate_failure(item, fallback_map_number=item.get("map_number")))
+            else:
+                safe = dict(item)
+                safe.pop("image_path", None)
+                safe.pop("event_json_path", None)
+                safe.pop("output_json", None)
+                if "ocr_diagnostics" in safe:
+                    safe["ocr_diagnostics"] = _summarize_ocr_diagnostics(safe.get("ocr_diagnostics"))
+                safe["ocr"] = _normalize_coordinate_ocr(safe.get("ocr"), safe.get("ocr_diagnostics"))
+                normalized_maps.append(safe)
+        data["maps"] = normalized_maps
+    if str(data.get("status") or "").lower() == "failed":
+        return _normalize_coordinate_failure(data, fallback_map_number=data.get("map_number"))
+    return data
+
+
+def _stage_for_coordinate_error(code: str) -> str:
+    code_map = {
+        "event_catalog_empty": "event_catalog",
+        "image_read_failed": "input",
+        "ocr_runner_failed": "ocr",
+        "runner_failed": "ocr",
+        "runner_exception": "ocr",
+        "venv_missing": "ocr",
+        "no_numbers": "ocr",
+        "ocr_no_numbers": "ocr",
+        "number_validation_failed": "number_validation",
+        "number_validation_empty": "number_validation",
+        "catalog_geometry_quality_gate_failed": "geometry",
+        "calibration_safety_gate_failed": "calibration",
+        "coordinate_update_zero": "update",
+        "no_matching_circles": "update",
+    }
+    return code_map.get(str(code), "unknown")
+
+
+def _summarize_ocr_diagnostics(
+    raw: Any,
+    *,
+    coordinate_ocr: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
     """OCR診断を機械可読の安全なGUI向け要約へ正規化する。
 
     runnerのstderrにはモデルロード時のパスや環境変数が混ざる可能性があるため、
@@ -565,16 +1006,29 @@ def _summarize_ocr_diagnostics(raw: Any) -> Dict[str, Any]:
     last_run = diagnostics.get("last_run") if isinstance(diagnostics.get("last_run"), dict) else {}
     config = diagnostics.get("config") if isinstance(diagnostics.get("config"), dict) else {}
 
-    code = str(error.get("code") or "coordinate_generation_failed")
+    # ``attempted`` means the OCR code path was entered, not that the external
+    # OCR runner actually started.  Image/input failures (and venv resolution
+    # failures) can therefore carry model/device/config values in the raw
+    # diagnostics even though those settings were never exercised.  Keep the
+    # reachability facts, but suppress those settings from the GUI-safe summary
+    # until ``runner_started`` is true.
+    ocr_reach = _normalize_coordinate_ocr(coordinate_ocr, diagnostics)
+    runner_not_started = bool(ocr_reach.get("attempted")) and not bool(
+        ocr_reach.get("runner_started")
+    )
+
+    code = str(error.get("code") or "ocr_diagnostics_unavailable")
     message = _safe_diagnostic_text(error.get("message"))
     returncode = error.get("returncode")
     if not isinstance(returncode, int):
         returncode = None
-    model = _safe_diagnostic_text(last_run.get("model") or config.get("model"))
-    revision = _safe_diagnostic_text(last_run.get("revision") or config.get("revision"))
-    device = _safe_diagnostic_text(last_run.get("device") or config.get("device"))
-    mode = _safe_diagnostic_text(last_run.get("mode") or config.get("mode"))
-    strategy = _safe_diagnostic_text(last_run.get("strategy") or config.get("strategy"))
+    model = "" if runner_not_started else _safe_diagnostic_text(last_run.get("model") or config.get("model"))
+    revision = "" if runner_not_started else _safe_diagnostic_text(last_run.get("revision") or config.get("revision"))
+    device = "" if runner_not_started else _safe_diagnostic_text(last_run.get("device") or config.get("device"))
+    mode = "" if runner_not_started else _safe_diagnostic_text(last_run.get("mode") or config.get("mode"))
+    strategy = "" if runner_not_started else _safe_diagnostic_text(last_run.get("strategy") or config.get("strategy"))
+    if runner_not_started:
+        returncode = None
     hints = {
         "cpu_unsupported": "CUDA対応PCでdevice=cuda/autoを使うか、CPU対応モデルへ切り替えてください。",
         "venv_missing": "専用OCR環境をセットアップし、設定画面のPython/venvを確認してください。",
@@ -583,24 +1037,49 @@ def _summarize_ocr_diagnostics(raw: Any) -> Dict[str, Any]:
         "image_read_failed": "マップ画像が読み込めません。画像ファイルの存在・形式・権限を確認してください。",
         "timeout": "OCRの入力サイズやtile設定を見直し、専用OCR環境を確認して再実行してください。",
     }
-    return {
+    venv_public, venv_state = _venv_public_summary(diagnostics, config, last_run, coordinate_ocr)
+    result = {
         "schema_version": 1,
         "error_code": code,
         "error_message": message,
         "returncode": returncode,
-        "stderr": _safe_diagnostic_text(error.get("stderr")),
-        "stdout": _safe_diagnostic_text(error.get("stdout"), max_chars=1000),
+        "stderr": "" if runner_not_started else _safe_diagnostic_text(error.get("stderr")),
+        "stdout": "" if runner_not_started else _safe_diagnostic_text(error.get("stdout"), max_chars=1000),
         "model": model,
         "revision": revision,
         "device": device,
         "mode": mode,
         "strategy": strategy,
-        "venv": {"configured": _configured_flag(config.get("venv_path"))},
-        "model_path": {"configured": _configured_flag(config.get("model_path"))},
-        "hf_home": {"configured": _configured_flag(config.get("hf_home"))},
+        "venv": (
+            {"configured": None, "state": "unknown"}
+            if runner_not_started
+            else venv_public
+        ),
+        "venv_state": (
+            {
+                "state": "unknown",
+                "source": None,
+                "runtime_python_checked": None,
+                "runtime_python_available": None,
+            }
+            if runner_not_started
+            else venv_state
+        ),
+        "model_path": (
+            {"configured": None}
+            if runner_not_started
+            else {"configured": _configured_flag(config.get("model_path"))}
+        ),
+        "hf_home": (
+            {"configured": None}
+            if runner_not_started
+            else {"configured": _configured_flag(config.get("hf_home"))}
+        ),
         "recovery_hint": hints.get(code, "OCR設定と入力マップを確認して再実行してください。"),
         "paths_redacted": True,
     }
+    result.update(ocr_reach)
+    return result
 
 
 def _job_ping(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -669,6 +1148,29 @@ def _run_main_process(
     run_dir: Path,
 ) -> Dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
+    coordinate_started_ns: Optional[int] = None
+    if payload.get("regenerate_coordinates"):
+        coordinate_started_ns = time.time_ns()
+        try:
+            _invalidate_coordinate_artifacts(config.get("output_dir"))
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            failure = _coordinate_failure_response(
+                job="run_main_pipeline",
+                map_number=1,
+                code="coordinate_artifact_invalidation_failed",
+                message=_safe_diagnostic_text(exc),
+                stage="output",
+            )
+            failure.update(
+                {
+                    "returncode": 1,
+                    "project_root": str(project_root),
+                    "config_used": _safe_config_for_result(config),
+                    "stdout": "",
+                    "stderr": _safe_diagnostic_text(exc),
+                }
+            )
+            return failure
     config_path = run_dir / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(config, allow_unicode=True), encoding="utf-8"
@@ -708,12 +1210,16 @@ def _run_main_process(
     try:
         if proc.stderr is not None:
             for line in proc.stderr:
-                line_stripped = line.rstrip("\n").rstrip("\r")
+                line_stripped = _safe_diagnostic_text(line.rstrip("\n").rstrip("\r"))
                 stderr_lines.append(line_stripped)
                 sys.stderr.write(line_stripped + "\n")
                 sys.stderr.flush()
 
-        stdout_output = proc.stdout.read() if proc.stdout is not None else ""
+        stdout_output = (
+            _safe_diagnostic_stream(proc.stdout.read())
+            if proc.stdout is not None
+            else ""
+        )
         proc.wait()
     finally:
         _terminate_process_tree(proc)
@@ -730,7 +1236,15 @@ def _run_main_process(
         "stdout": stdout_output,
         "stderr": "\n".join(stderr_lines),
     }
-    coordinate_diagnostics = _collect_coordinate_diagnostics(config.get("output_dir"))
+    coordinate_diagnostics = (
+        _collect_coordinate_diagnostics(
+            config.get("output_dir"), minimum_mtime_ns=coordinate_started_ns
+        )
+        if payload.get("regenerate_coordinates")
+        else None
+    )
+    if payload.get("regenerate_coordinates") and coordinate_diagnostics is None:
+        coordinate_diagnostics = _missing_coordinate_diagnostic()
     if coordinate_diagnostics is not None:
         result["coordinate_generation"] = coordinate_diagnostics
         if (
@@ -1158,6 +1672,30 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     config = _build_main_config(payload)
 
+    coordinate_started_ns: Optional[int] = None
+    if payload.get("regenerate_coordinates"):
+        coordinate_started_ns = time.time_ns()
+        try:
+            _invalidate_coordinate_artifacts(config.get("output_dir"))
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            failure = _coordinate_failure_response(
+                job="run_main_pipeline",
+                map_number=1,
+                code="coordinate_artifact_invalidation_failed",
+                message=_safe_diagnostic_text(exc),
+                stage="output",
+            )
+            failure.update(
+                {
+                    "returncode": 1,
+                    "project_root": str(project_root),
+                    "config_used": _safe_config_for_result(config),
+                    "stdout": "",
+                    "stderr": _safe_diagnostic_text(exc),
+                }
+            )
+            return failure
+
     with tempfile.TemporaryDirectory(prefix="eventtrail-studio-") as temp_dir:
         temp_dir_path = Path(temp_dir)
         config_path = temp_dir_path / "config.yaml"
@@ -1199,12 +1737,12 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
         stdout_output = ""
         try:
             for line in proc.stderr:
-                line_stripped = line.rstrip("\n").rstrip("\r")
+                line_stripped = _safe_diagnostic_text(line.rstrip("\n").rstrip("\r"))
                 stderr_lines.append(line_stripped)
                 sys.stderr.write(line_stripped + "\n")
                 sys.stderr.flush()
 
-            stdout_output = proc.stdout.read()
+            stdout_output = _safe_diagnostic_stream(proc.stdout.read())
             proc.wait()
         finally:
             _terminate_process_tree(proc)
@@ -1221,7 +1759,15 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
             "stdout": stdout_output,
             "stderr": "\n".join(stderr_lines),
         }
-        coordinate_diagnostics = _collect_coordinate_diagnostics(config.get("output_dir"))
+        coordinate_diagnostics = (
+            _collect_coordinate_diagnostics(
+                config.get("output_dir"), minimum_mtime_ns=coordinate_started_ns
+            )
+            if payload.get("regenerate_coordinates")
+            else None
+        )
+        if payload.get("regenerate_coordinates") and coordinate_diagnostics is None:
+            coordinate_diagnostics = _missing_coordinate_diagnostic()
         if coordinate_diagnostics is not None:
             result["coordinate_generation"] = coordinate_diagnostics
             if (
@@ -1733,10 +2279,82 @@ def _find_event_map_image(
     return None
 
 
+def _coordinate_failure_response(
+    *,
+    job: str,
+    map_number: int,
+    artifact: Mapping[str, Any] | None = None,
+    code: str = "coordinate_generation_failed",
+    message: str = "座標生成に失敗しました",
+    stage: str | None = None,
+    run_id: str | None = None,
+    ocr_config: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """座標失敗を旧GUI互換と新failure schemaの両方で返す。"""
+
+    raw: Dict[str, Any] = dict(artifact) if isinstance(artifact, Mapping) else {
+        "status": "failed",
+        "stage": stage or _stage_for_coordinate_error(code),
+        "error": {"code": code, "message": message},
+        "map_number": map_number,
+        "ocr": _empty_coordinate_ocr_summary(),
+    }
+    raw.setdefault("map_number", map_number)
+    raw.setdefault("stage", stage or _stage_for_coordinate_error(code))
+    raw.setdefault("error", {"code": code, "message": message})
+    if ocr_config and not isinstance(raw.get("ocr_diagnostics"), Mapping):
+        raw["ocr_diagnostics"] = {"config": dict(ocr_config)}
+    elif ocr_config and isinstance(raw.get("ocr_diagnostics"), Mapping):
+        existing_diagnostics = dict(raw.get("ocr_diagnostics") or {})
+        existing_config = existing_diagnostics.get("config")
+        merged_config = dict(ocr_config)
+        if isinstance(existing_config, Mapping):
+            merged_config.update(existing_config)
+        raw["ocr_diagnostics"] = {
+            **existing_diagnostics,
+            "config": merged_config,
+        }
+    normalized = _normalize_coordinate_failure(raw, fallback_map_number=map_number)
+    error_obj = normalized.get("error")
+    error_code = str(
+        error_obj.get("code")
+        if isinstance(error_obj, Mapping)
+        else normalized.get("error_code") or code
+    )
+    error_message = str(
+        error_obj.get("message")
+        if isinstance(error_obj, Mapping)
+        else normalized.get("error_message") or message
+    )
+    response: Dict[str, Any] = {
+        "status": "error",
+        "job": job,
+        "timestamp": _utc_now_iso(),
+        "error": f"map pin coordinate generation failed ({error_code}): {error_message}",
+        "error_code": error_code,
+        "error_detail": {"code": error_code, "message": error_message},
+        "stage": normalized.get("stage") or stage or _stage_for_coordinate_error(error_code),
+        "map_number": map_number,
+        "coordinate_generation": normalized,
+        "ocr": normalized.get("ocr", _empty_coordinate_ocr_summary()),
+        "ocr_diagnostics": normalized.get("ocr_diagnostics", _summarize_ocr_diagnostics(None)),
+    }
+    if run_id:
+        response["run_id"] = run_id
+    return response
+
+
 def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
     event_json_value = payload.get("event_json")
     event_dir_value = payload.get("event_dir")
-    map_number = int(payload.get("map_number") or 1)
+    try:
+        map_number = int(payload.get("map_number") or 1)
+        invalid_map_number = False
+    except (TypeError, ValueError):
+        # Resolve the event directory first so malformed map_number input does
+        # not leave a previous run's artifacts behind when a scope is known.
+        map_number = 1
+        invalid_map_number = True
 
     if event_json_value:
         event_json_path = Path(str(event_json_value))
@@ -1745,11 +2363,85 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
         event_dir = Path(str(event_dir_value))
         event_json_path = event_dir / "event.json"
     else:
-        raise ValueError("Missing required payload field: event_json or event_dir")
+        return _coordinate_failure_response(
+            job="auto_place_map_pins",
+            map_number=map_number,
+            code="input_missing_event_json",
+            message="event_json または event_dir が指定されていません",
+            stage="input",
+        )
+
+    # Invalidate the canonical scope before *any* event/map input validation.
+    # Direct auto-place responses are run-scoped below, while this canonical
+    # cleanup/publish keeps legacy readers from mistaking a prior run for the
+    # current input failure.
+    try:
+        _invalidate_coordinate_artifacts(
+            event_dir,
+            map_number=None if invalid_map_number else map_number,
+            remove_maps=not invalid_map_number,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return _coordinate_failure_response(
+            job="auto_place_map_pins",
+            map_number=map_number,
+            code="coordinate_artifact_invalidation_failed",
+            message=str(exc),
+            stage="output",
+        )
+
+    if invalid_map_number:
+        failure_code = "invalid_map_number"
+        failure_message = "map_numberが整数ではありません"
+    else:
+        failure_code = ""
+        failure_message = ""
+
+    run_id = uuid.uuid4().hex
+    canonical_output_path = event_dir / f"coordinates_map_{map_number}.json"
+
+    def publish_canonical_artifact(artifact: Mapping[str, Any]) -> None:
+        try:
+            _write_json_atomic(canonical_output_path, dict(artifact))
+        except (OSError, TypeError, ValueError):
+            # The bridge response is still returned even when a read-only
+            # output directory prevents compatibility artifact publication.
+            pass
+
+    def input_failure(code: str, message: str) -> Dict[str, Any]:
+        artifact = {
+            "schema_version": 2,
+            "status": "failed",
+            "stage": "input",
+            "error": {"code": code, "message": message},
+            "error_code": code,
+            "error_message": message,
+            "map_number": map_number,
+            "ocr": _empty_coordinate_ocr_summary(),
+        }
+        try:
+            publish_canonical_artifact(artifact)
+        except (OSError, TypeError, ValueError):
+            pass
+        return _coordinate_failure_response(
+            job="auto_place_map_pins",
+            map_number=map_number,
+            artifact=artifact,
+            run_id=run_id,
+        )
+
+    if failure_code:
+        return input_failure(failure_code, failure_message)
 
     if not event_json_path.exists():
-        raise FileNotFoundError(f"event.json not found: {event_json_path}")
-    event_data, base_fingerprint = _load_event_json_snapshot(event_json_path)
+        return input_failure("event_json_missing", "event.json が見つかりません")
+    try:
+        event_data, base_fingerprint = _load_event_json_snapshot(event_json_path)
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        return input_failure(
+            "event_json_invalid",
+            f"event.jsonを読み込めません: {_safe_diagnostic_text(exc)}",
+        )
 
     map_image_value = payload.get("map_image")
     map_image_path = Path(str(map_image_value)) if map_image_value else None
@@ -1758,7 +2450,9 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
     elif not map_image_path.is_absolute():
         map_image_path = event_dir / map_image_path
     if map_image_path is None or not map_image_path.exists():
-        raise FileNotFoundError(f"map image not found for map_number={map_number}")
+        return input_failure(
+            "map_image_missing", f"マップ画像が見つかりません（Map {map_number}）"
+        )
 
     model = str(
         payload.get("model")
@@ -1766,7 +2460,19 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
         or payload.get("fallback_model")
         or "gpt-5-mini"
     )
-    output_json_path = event_dir / f"coordinates_map_{map_number}.json"
+    output_json_path = canonical_output_path
+    coordinate_started_ns = time.time_ns()
+    # Never consume a previous canonical map artifact when direct auto-place
+    # is retried.  Each generator invocation writes a run-unique sibling file;
+    # only that file is read below, so concurrent jobs cannot cross-consume
+    # each other's diagnostics.
+    run_output_path = event_dir / f".coordinates_map_{map_number}.{run_id}.json"
+
+    def cleanup_run_artifact() -> None:
+        try:
+            run_output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # OCR設定は desktop.config.json 由来の ocr_config オブジェクト、または
     # 旧UI/CLI互換のフラットな unlimited_ocr_* キーのどちらでも受け付ける。
@@ -1789,68 +2495,199 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     from src.space_locator import generate_coordinates_from_map
     from src.space_locator.json_updater import JSONUpdater
+    from src.utils.llm_attempts import build_image_llm_attempts
+
+    image_attempts = build_image_llm_attempts(
+        payload.get("image_llm_provider"),
+        payload.get("image_llm_model") or model,
+        payload.get("image_llm_effort", payload.get("api_reasoning_effort", "medium")),
+        payload.get("image_fallback_llm_provider"),
+        payload.get("image_fallback_llm_model"),
+        payload.get("image_fallback_llm_effort"),
+    )
 
     generation_kwargs = {
         "image_path": str(map_image_path),
         "event_json_path": str(event_json_path),
-        "output_json_path": str(output_json_path),
+        "output_json_path": str(run_output_path),
         "model": model,
         "map_number": map_number,
         "use_calibration": bool(payload.get("use_calibration", True)),
+        "image_llm_attempts": image_attempts,
+        "image_api_reasoning_effort_map": payload.get("image_api_reasoning_effort_map")
+        or {},
     }
     if ocr_config:
         generation_kwargs["ocr_config"] = ocr_config
-    coord_map = generate_coordinates_from_map(**generation_kwargs)
-    if coord_map is None:
-        raw_diagnostics: Dict[str, Any] = {}
+    try:
+        coord_map = generate_coordinates_from_map(**generation_kwargs)
+    except Exception as exc:
+        failure_payload = {
+            "schema_version": 2,
+            "status": "failed",
+            "stage": "internal",
+            "error": {
+                "code": "coordinate_generation_internal",
+                "message": _safe_diagnostic_text(exc),
+            },
+            "error_code": "coordinate_generation_internal",
+            "error_message": _safe_diagnostic_text(exc),
+            "map_number": map_number,
+            "ocr": _empty_coordinate_ocr_summary(),
+        }
+        publish_canonical_artifact(failure_payload)
+        cleanup_run_artifact()
+        return _coordinate_failure_response(
+            job="auto_place_map_pins",
+            map_number=map_number,
+            artifact=failure_payload,
+            run_id=run_id,
+        )
+    if coord_map is None or (
+        isinstance(coord_map, Mapping)
+        and str(coord_map.get("status") or "").lower() == "failed"
+    ):
+        failure_payload: Dict[str, Any] = {}
         try:
-            failure_payload = json.loads(output_json_path.read_text(encoding="utf-8"))
-            diagnostics = failure_payload.get("ocr_diagnostics")
-            if isinstance(diagnostics, dict):
-                raw_diagnostics = diagnostics
+            # The artifact must be created after this run started.  If a legacy
+            # generator returned None without writing it, do not read a stale
+            # file from an earlier invocation.
+            if run_output_path.exists() and _coordinate_artifact_is_current(
+                run_output_path, coordinate_started_ns
+            ):
+                loaded = json.loads(run_output_path.read_text(encoding="utf-8-sig"))
+                if isinstance(loaded, dict):
+                    failure_payload = loaded
         except (OSError, ValueError, TypeError):
-            pass
-        ocr_diagnostics = _summarize_ocr_diagnostics(raw_diagnostics)
-        error_code = ocr_diagnostics.get("error_code", "coordinate_generation_failed")
-        error_message = f"map pin coordinate generation failed ({error_code})"
-        if ocr_diagnostics.get("error_message"):
-            error_message += f": {ocr_diagnostics['error_message']}"
-        return {
-            "status": "error",
-            "job": "auto_place_map_pins",
-            "timestamp": _utc_now_iso(),
-            "error": error_message,
-            "map_number": map_number,
-            "ocr_diagnostics": ocr_diagnostics,
-        }
+            failure_payload = {}
+        if not failure_payload:
+            failure_payload = {
+                "status": "failed",
+                "stage": "output",
+                "error": {
+                    "code": "coordinate_diagnostic_missing",
+                    "message": "座標生成器が失敗artifactを保存しませんでした",
+                },
+                "map_number": map_number,
+                "ocr": _empty_coordinate_ocr_summary(),
+            }
+        publish_canonical_artifact(failure_payload)
+        cleanup_run_artifact()
+        return _coordinate_failure_response(
+            job="auto_place_map_pins",
+            map_number=map_number,
+            artifact=failure_payload,
+            run_id=run_id,
+            ocr_config=ocr_config,
+        )
 
-    updater = JSONUpdater()
-    update_result = updater.build_coordinate_patches(
-        event_data=event_data,
-        coordinate_map=coord_map.get("complete_grid", []),
-        map_number=map_number,
-    )
-    if int(update_result.get("updated_count", 0) or 0) <= 0:
-        return {
-            "status": "error",
-            "job": "auto_place_map_pins",
-            "timestamp": _utc_now_iso(),
-            "error_code": "no_matching_circles",
-            "error": (
-                f"map pin coordinates were generated but no circles matched "
-                f"map_number={map_number}"
-            ),
-            "event_json": str(event_json_path),
-            "map_image": str(map_image_path),
+    try:
+        if not isinstance(coord_map, Mapping):
+            raise TypeError("座標生成結果がobjectではありません")
+        updater = JSONUpdater()
+        update_result = updater.build_coordinate_patches(
+            event_data=event_data,
+            coordinate_map=coord_map.get("complete_grid", []),
+            map_number=map_number,
+        )
+    except Exception as exc:
+        failure_message = _safe_diagnostic_text(exc)
+        failure_payload = {
+            "schema_version": 2,
+            "status": "failed",
+            "stage": "update",
+            "error": {
+                "code": "coordinate_update_failed",
+                "message": failure_message,
+            },
+            "error_code": "coordinate_update_failed",
+            "error_message": failure_message,
             "map_number": map_number,
-            "coordinate_json": str(output_json_path),
-            "generated_count": len(coord_map.get("complete_grid", [])),
-            "updated_count": 0,
-            "skipped_count": update_result.get("skipped_count", 0),
-            "circle_patches": [],
-            "calibration": coord_map.get("calibration", {}),
-            "ocr_diagnostics": coord_map.get("ocr_diagnostics", {}),
+            "ocr": _normalize_coordinate_ocr(
+                coord_map.get("ocr") if isinstance(coord_map, Mapping) else None,
+                coord_map.get("ocr_diagnostics") if isinstance(coord_map, Mapping) else None,
+            ),
         }
+        publish_canonical_artifact(failure_payload)
+        cleanup_run_artifact()
+        return _coordinate_failure_response(
+            job="auto_place_map_pins",
+            map_number=map_number,
+            artifact=failure_payload,
+            run_id=run_id,
+            ocr_config=ocr_config,
+        )
+    if int(update_result.get("updated_count", 0) or 0) <= 0:
+        result = _coordinate_failure_response(
+            job="auto_place_map_pins",
+            map_number=map_number,
+            artifact={
+                "status": "failed",
+                "stage": "update",
+                "error": {
+                    "code": "no_matching_circles",
+                    "message": (
+                        f"map pin coordinates were generated but no circles matched "
+                        f"map_number={map_number}"
+                    ),
+                },
+                "map_number": map_number,
+                "ocr": coord_map.get("ocr", coord_map.get("ocr_diagnostics", {})),
+                "ocr_diagnostics": coord_map.get("ocr_diagnostics", {}),
+            },
+            run_id=run_id,
+            ocr_config=ocr_config,
+        )
+        result.update(
+            {
+                "event_json": str(event_json_path),
+                "map_image": str(map_image_path),
+                "coordinate_json": str(output_json_path),
+                "generated_count": len(coord_map.get("complete_grid", [])),
+                "updated_count": 0,
+                "skipped_count": update_result.get("skipped_count", 0),
+                "circle_patches": [],
+                "calibration": coord_map.get("calibration", {}),
+            }
+        )
+        publish_canonical_artifact(result["coordinate_generation"])
+        cleanup_run_artifact()
+        return result
+
+    # Publish this run's generated map atomically only after the patch
+    # calculation succeeded.  The response itself never re-reads canonical
+    # output, so another concurrent run cannot alter its result.
+    try:
+        if run_output_path.exists():
+            os.replace(run_output_path, output_json_path)
+        else:
+            _write_json_atomic(output_json_path, dict(coord_map))
+    except (OSError, TypeError, ValueError) as exc:
+        failure_message = _safe_diagnostic_text(exc)
+        failure_payload = {
+            "schema_version": 2,
+            "status": "failed",
+            "stage": "output",
+            "error": {
+                "code": "coordinate_artifact_publish_failed",
+                "message": failure_message,
+            },
+            "error_code": "coordinate_artifact_publish_failed",
+            "error_message": failure_message,
+            "map_number": map_number,
+            "ocr": _normalize_coordinate_ocr(
+                coord_map.get("ocr"), coord_map.get("ocr_diagnostics")
+            ),
+        }
+        publish_canonical_artifact(failure_payload)
+        cleanup_run_artifact()
+        return _coordinate_failure_response(
+            job="auto_place_map_pins",
+            map_number=map_number,
+            artifact=failure_payload,
+            run_id=run_id,
+            ocr_config=ocr_config,
+        )
 
     return {
         "status": "ok",
@@ -1866,7 +2703,18 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
         "base_fingerprint": base_fingerprint,
         "circle_patches": update_result.get("circle_patches", []),
         "calibration": coord_map.get("calibration", {}),
-        "ocr_diagnostics": coord_map.get("ocr_diagnostics", {}),
+        "number_validation": coord_map.get("number_validation"),
+        "warnings": coord_map.get("warnings") or [],
+        "ocr_diagnostics": _summarize_ocr_diagnostics(
+            coord_map.get("ocr_diagnostics", {}),
+            coordinate_ocr=coord_map.get("ocr")
+            if isinstance(coord_map.get("ocr"), Mapping)
+            else None,
+        ),
+        "ocr": _normalize_coordinate_ocr(
+            coord_map.get("ocr"), coord_map.get("ocr_diagnostics")
+        ),
+        "run_id": run_id,
     }
 
 

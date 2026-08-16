@@ -12,7 +12,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from pathlib import Path
 import logging
 
-from src.space_locator.auto_coordinate_generator import expand_space_ids
+from src.space_locator.auto_coordinate_generator import expand_circle_space_ids, expand_space_ids
 from src.utils.atomic_json import atomic_write_json
 
 
@@ -102,6 +102,7 @@ class JSONUpdater:
                 skipped_count += 1
                 continue
             space_id = (circle.get("space") or "").strip()
+            hall = circle.get("hall")
             if not space_id:
                 skipped_count += 1
                 continue
@@ -119,7 +120,7 @@ class JSONUpdater:
                         skipped_count += 1
                         continue
 
-            resolved_id, coord = self._find_coordinate(space_id, coord_dict)
+            resolved_id, coord = self._find_coordinate(space_id, coord_dict, hall=hall)
             if not coord:
                 skipped_count += 1
                 continue
@@ -184,9 +185,12 @@ class JSONUpdater:
         return space_id
 
     def _find_coordinate(
-        self, space_id: str, coord_dict: Dict[str, Dict[str, Any]]
+        self,
+        space_id: str,
+        coord_dict: Dict[str, Dict[str, Any]],
+        hall: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-        expanded_ids = self._expand_multi_space_ids(space_id)
+        expanded_ids = self._expand_multi_space_ids(space_id, hall=hall)
         if len(expanded_ids) > 1:
             collected = []
             collected_ids = []
@@ -204,7 +208,7 @@ class JSONUpdater:
                 return ','.join(collected_ids), avg_coord
             return None, None
 
-        for candidate in self._generate_candidate_ids(space_id):
+        for candidate in self._generate_candidate_ids(space_id, hall=hall):
             if candidate in coord_dict:
                 return candidate, coord_dict[candidate]
         return None, None
@@ -229,7 +233,11 @@ class JSONUpdater:
             'normalized_y': None,
         }
 
-    def _generate_candidate_ids(self, space_id: str) -> List[str]:
+    def _generate_candidate_ids(
+        self,
+        space_id: str,
+        hall: Optional[str] = None,
+    ) -> List[str]:
         candidates = []
         seen = set()
 
@@ -241,11 +249,15 @@ class JSONUpdater:
         add(space_id)
         add(self._normalize_space_id(space_id, '-'))
         add(self._normalize_space_id(space_id, ' '))
-        for expanded in self._expand_multi_space_ids(space_id):
+        for expanded in self._expand_multi_space_ids(space_id, hall=hall):
             add(expanded)
             add(self._normalize_space_id(expanded, '-'))
             add(self._normalize_space_id(expanded, ' '))
         return candidates
 
-    def _expand_multi_space_ids(self, space_id: str) -> List[str]:
-        return [item["space_id"] for item in expand_space_ids(space_id)]
+    def _expand_multi_space_ids(
+        self,
+        space_id: str,
+        hall: Optional[str] = None,
+    ) -> List[str]:
+        return [item["space_id"] for item in expand_circle_space_ids(space_id, hall)]

@@ -69,6 +69,26 @@ def _resolve_ocr_python(venv_override: str | Path | None = None) -> Path:
     return python_path
 
 
+def _read_image_unicode_safe(image_path: str) -> Any:
+    """OpenCV の Windows 日本語パス問題を回避して画像を読み込む。"""
+
+    try:
+        image = cv2.imread(str(image_path))
+    except Exception:
+        image = None
+    if image is not None:
+        return image
+    try:
+        import numpy as np
+
+        encoded = np.fromfile(str(image_path), dtype=np.uint8)
+        if encoded.size == 0:
+            return None
+        return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def _number_from_text(text: str) -> int | None:
     stripped = _normalize_ocr_text(text)
     if NUMBER_TOKEN_RE.fullmatch(stripped):
@@ -668,6 +688,8 @@ class OCREngine:
         # GUI/CLIへ返せる診断情報。番号配列の既存契約は変更しない。
         self.last_error: Dict[str, Any] | None = None
         self.last_run: Dict[str, Any] = {}
+        self._attempted = False
+        self._runner_started = False
 
     @property
     def diagnostics(self) -> Dict[str, Any]:
@@ -676,6 +698,9 @@ class OCREngine:
             "error": self.last_error,
             "last_run": dict(self.last_run),
             "config": self.config.to_public_dict(),
+            "attempted": bool(self._attempted),
+            "runner_started": bool(self._runner_started),
+            "candidate_count": int(self.last_run.get("number_count", 0) or 0),
         }
 
     def _set_error(self, code: str, message: str, **details: Any) -> None:
@@ -705,14 +730,18 @@ class OCREngine:
         """
         self.logger.info(f"Unlimited OCR処理開始: {image_path}")
         self.last_error = None
+        self._attempted = True
+        self._runner_started = False
         self.last_run = {
             "image": str(image_path),
             "strategy": self.config.strategy,
             "expected_candidate_count": expected_candidate_count,
+            "attempted": True,
+            "runner_started": False,
         }
 
-        if cv2.imread(image_path) is None:
-            message = f"画像の読み込みに失敗: {image_path}"
+        if _read_image_unicode_safe(image_path) is None:
+            message = "画像の読み込みに失敗しました"
             self._set_error("image_read_failed", message)
             raise ValueError(message)
 
@@ -789,34 +818,35 @@ class OCREngine:
             if self.config.prompt:
                 command.extend(["--prompt", self.config.prompt])
             child_env = os.environ.copy()
-            # GUIで明示された設定を専用runnerへ伝える際、親プロセスに残る
-            # HF/UNLIMITED_OCR_* の stale 値が競合しないよう一度全て除去する。
-            for key in (
-                "HF_HOME",
-                "HF_HUB_CACHE",
-                "UNLIMITED_OCR_MODEL",
-                "UNLIMITED_OCR_MODEL_NAME",
-                "UNLIMITED_OCR_MODEL_PATH",
-                "UNLIMITED_OCR_VENV",
-                "UNLIMITED_OCR_HF_HOME",
-                "UNLIMITED_OCR_HF_CACHE",
-                "UNLIMITED_OCR_REVISION",
-                "UNLIMITED_OCR_DEVICE",
-                "UNLIMITED_OCR_MODE",
-                "UNLIMITED_OCR_STRATEGY",
-                "UNLIMITED_OCR_PROMPT",
-                "TRANSFORMERS_CACHE",
-                "HUGGINGFACE_HUB_CACHE",
-                "HF_DATASETS_CACHE",
-                "HF_MODULES_CACHE",
-            ):
-                child_env.pop(key, None)
-            if self.config.hf_home:
-                child_env["HF_HOME"] = self.config.hf_home
-            child_env["UNLIMITED_OCR_MODEL"] = self.config.model
-            if self.config.model_path:
-                child_env["UNLIMITED_OCR_MODEL_PATH"] = self.config.model_path
-            child_env["UNLIMITED_OCR_REVISION"] = self.config.revision
+            if self._config_explicit:
+                # GUIで明示された設定を専用runnerへ伝える際、親プロセスに残る
+                # HF/UNLIMITED_OCR_* の stale 値が競合しないよう一度全て除去する。
+                for key in (
+                    "HF_HOME",
+                    "HF_HUB_CACHE",
+                    "UNLIMITED_OCR_MODEL",
+                    "UNLIMITED_OCR_MODEL_NAME",
+                    "UNLIMITED_OCR_MODEL_PATH",
+                    "UNLIMITED_OCR_VENV",
+                    "UNLIMITED_OCR_HF_HOME",
+                    "UNLIMITED_OCR_HF_CACHE",
+                    "UNLIMITED_OCR_REVISION",
+                    "UNLIMITED_OCR_DEVICE",
+                    "UNLIMITED_OCR_MODE",
+                    "UNLIMITED_OCR_STRATEGY",
+                    "UNLIMITED_OCR_PROMPT",
+                    "TRANSFORMERS_CACHE",
+                    "HUGGINGFACE_HUB_CACHE",
+                    "HF_DATASETS_CACHE",
+                    "HF_MODULES_CACHE",
+                ):
+                    child_env.pop(key, None)
+                if self.config.hf_home:
+                    child_env["HF_HOME"] = self.config.hf_home
+                child_env["UNLIMITED_OCR_MODEL"] = self.config.model
+                if self.config.model_path:
+                    child_env["UNLIMITED_OCR_MODEL_PATH"] = self.config.model_path
+                child_env["UNLIMITED_OCR_REVISION"] = self.config.revision
             result = subprocess.run(
                 command,
                 cwd=REPO_ROOT,
@@ -827,6 +857,8 @@ class OCREngine:
                 timeout=timeout_sec,
                 env=child_env,
             )
+            self._runner_started = True
+            self.last_run["runner_started"] = True
             if result.returncode != 0:
                 self._set_error(
                     "runner_failed",
@@ -840,13 +872,27 @@ class OCREngine:
             with open(temp_path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
         except subprocess.TimeoutExpired:
+            # The child process was launched but did not finish in time.
+            self._runner_started = True
+            self.last_run["runner_started"] = True
             self._set_error(
                 "timeout",
                 f"Unlimited OCR runner がタイムアウトしました: {timeout_sec}秒",
                 timeout_sec=timeout_sec,
             )
             return []
+        except OSError as exc:
+            # An executable/working-directory error occurs before the child
+            # runner starts; retain the false flag for stage-aware diagnostics.
+            self._runner_started = False
+            self.last_run["runner_started"] = False
+            self._set_error("runner_exception", "Unlimited OCR runner 実行中に失敗しました: " + str(exc))
+            return []
         except Exception as exc:
+            # Other subprocess failures are treated as an attempted runner;
+            # the concrete exception remains in the OCR diagnostics.
+            self._runner_started = True
+            self.last_run["runner_started"] = True
             self._set_error("runner_exception", f"Unlimited OCR runner 実行中に失敗しました: {exc}")
             return []
         finally:
@@ -911,7 +957,7 @@ class OCREngine:
         output_path: str
     ) -> None:
         """検出した番号を枠とラベル付きで描画して出力する"""
-        img = cv2.imread(image_path)
+        img = _read_image_unicode_safe(image_path)
         if img is None:
             raise ValueError(f"画像の読み込みに失敗: {image_path}")
 

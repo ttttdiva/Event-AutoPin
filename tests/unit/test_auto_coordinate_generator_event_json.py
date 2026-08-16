@@ -6,6 +6,8 @@ from pathlib import Path
 from src.space_locator.auto_coordinate_generator import (
     analyze_space_catalog_from_event,
     apply_calibration_points,
+    combine_hall_and_space,
+    expand_circle_space_ids,
     expand_space_ids,
 )
 from src.space_locator.json_updater import JSONUpdater
@@ -20,6 +22,107 @@ def test_expand_space_ids_handles_ranges_and_comma():
         "B03",
         "B04",
     ]
+
+
+def test_expand_circle_space_ids_combines_hall_prefix_with_numeric_space():
+    assert combine_hall_and_space("14", "E-") == "E-14"
+    assert [item["space_id"] for item in expand_circle_space_ids("14", "E-")] == ["E14"]
+    assert [item["space_id"] for item in expand_circle_space_ids("15, 16", "E-")] == [
+        "E15",
+        "E16",
+    ]
+    assert [item["space_id"] for item in expand_circle_space_ids("14-16", "E-")] == [
+        "E14",
+        "E15",
+        "E16",
+    ]
+
+
+def test_expand_circle_space_ids_rejects_dangerous_hall_space_combinations():
+    assert expand_circle_space_ids("1F-A01", "E-") == []
+    assert expand_circle_space_ids("14", "E1") == []
+    assert expand_circle_space_ids("14", "East1") == []
+    assert expand_circle_space_ids("14abc", "E-") == []
+    assert expand_circle_space_ids("1F-A01", "E-") == []
+    # space 単体で既存 parser が受理できる場合は hall を付け足さない
+    assert [item["space_id"] for item in expand_circle_space_ids("abc14", "E-")] == ["abc14"]
+
+
+def test_analyze_space_catalog_rejects_dangerous_hall_space(tmp_path: Path):
+    event_json = tmp_path / "event.json"
+    event_json.write_text(
+        json.dumps(
+            {
+                "event": {"maps": [{"map_number": 1}]},
+                "circles": [
+                    {"name": "bad", "space": "1F-A01", "hall": "E-"},
+                    {"name": "good", "space": "14", "hall": "E-"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    catalog = analyze_space_catalog_from_event(str(event_json), map_number=1)
+
+    assert catalog["event_catalog"]["space_unparseable_count"] == 1
+    assert catalog["event_catalog"]["target_space_count"] == 1
+    assert [item["space_id"] for item in catalog["spaces"]] == ["E14"]
+
+
+def test_expand_circle_space_ids_does_not_combine_when_space_already_parseable():
+    assert combine_hall_and_space("A-01", "East") == "A-01"
+    assert [item["space_id"] for item in expand_circle_space_ids("A-01", "East")] == ["A01"]
+
+
+def test_analyze_space_catalog_from_event_uses_hall_with_numeric_space(tmp_path: Path):
+    event_json = tmp_path / "event.json"
+    event_json.write_text(
+        json.dumps(
+            {
+                "event": {"maps": [{"map_number": 1}]},
+                "circles": [
+                    {"name": "one", "space": "14", "hall": "E-"},
+                    {"name": "two", "space": "15, 16", "hall": "E-"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    catalog = analyze_space_catalog_from_event(str(event_json), map_number=1)
+
+    assert catalog["event_catalog"]["space_unparseable_count"] == 0
+    assert catalog["event_catalog"]["target_space_count"] == 3
+    assert [item["space_id"] for item in catalog["spaces"]] == ["E14", "E15", "E16"]
+
+
+def test_json_updater_matches_hall_prefixed_numeric_space(tmp_path: Path):
+    event_json = tmp_path / "event.json"
+    event_json.write_text(
+        json.dumps(
+            {
+                "circles": [
+                    {"name": "target", "space": "14", "hall": "E-", "pin_x": None, "pin_y": None},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = JSONUpdater().update_event_json(
+        str(event_json),
+        [{"space_id": "E14", "x": 10, "y": 20, "normalized_x": 0.1, "normalized_y": 0.2}],
+        map_number=1,
+    )
+
+    circle = json.loads(event_json.read_text(encoding="utf-8"))["circles"][0]
+    assert result["updated_count"] == 1
+    assert circle["pin_x"] == 0.1
+    assert circle["pin_y"] == 0.2
 
 
 def test_analyze_space_catalog_from_event_uses_event_json(tmp_path: Path):

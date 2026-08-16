@@ -162,7 +162,7 @@ class CatalogImageAnalyzer:
         )
 
     def _analyze_with_attempts(self, image_path: Path, prompt: str) -> str:
-        from .cli_llm import analyze_image_cli
+        from .cli_llm import analyze_catalog_image_cli
 
         last_error: Optional[Exception] = None
         for index, attempt in enumerate(self.attempts):
@@ -173,7 +173,7 @@ class CatalogImageAnalyzer:
                     effort = attempt.get("effort")
                     cli_model_map = {provider: model} if model else {}
                     cli_effort_map = {provider: effort} if effort is not None else {}
-                    return analyze_image_cli(
+                    return analyze_catalog_image_cli(
                         image_path=str(image_path),
                         prompt=prompt,
                         providers=[provider],
@@ -196,11 +196,11 @@ class CatalogImageAnalyzer:
 
     def _analyze_with_cli(self, image_path: Path, prompt: str) -> str:
         """CLI LLM で画像分析"""
-        from .cli_llm import analyze_image_cli
+        from .cli_llm import analyze_catalog_image_cli
 
         logger.debug(f"Analyzing catalog image (CLI): {image_path.name}")
         try:
-            return analyze_image_cli(
+            return analyze_catalog_image_cli(
                 image_path=str(image_path),
                 prompt=prompt,
                 providers=self.cli_providers,

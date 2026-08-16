@@ -329,6 +329,77 @@ fn known_windows_command_available(_default_bin: &str) -> bool {
     false
 }
 
+fn resolve_agy_bin(dotenv: &HashMap<String, String>) -> String {
+    if let Some(bin) = env_value(dotenv, &["AGY_BIN", "ANTIGRAVITY_BIN", "ANTIGRAVITY_CLI_BIN"]) {
+        return bin;
+    }
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        let candidate = PathBuf::from(local_app_data)
+            .join("agy")
+            .join("bin")
+            .join("agy.exe");
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "agy".to_string()
+}
+
+fn parse_agy_models_text(text: &str) -> Vec<(String, String)> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("Fetching") {
+            continue;
+        }
+        let (slug, label) = if let Some((slug, label)) = line.split_once('\t') {
+            (slug.trim(), label.trim())
+        } else if let Some((slug, label)) = line.split_once("  ") {
+            (slug.trim(), label.trim())
+        } else {
+            continue;
+        };
+        if slug.is_empty() || !seen.insert(slug.to_string()) {
+            continue;
+        }
+        models.push((
+            slug.to_string(),
+            if label.is_empty() {
+                slug.to_string()
+            } else {
+                label.to_string()
+            },
+        ));
+    }
+    models
+}
+
+fn fetch_antigravity_cli_models(dotenv: &HashMap<String, String>) -> (Vec<Value>, &'static str) {
+    let bin = resolve_agy_bin(dotenv);
+    let fallback = || (Vec::new(), "fetch-failed");
+
+    let output = Command::new(&bin).arg("models").output();
+    let Ok(output) = output else {
+        return fallback();
+    };
+    if !output.status.success() {
+        return fallback();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let parsed = parse_agy_models_text(&text);
+    if parsed.is_empty() {
+        return fallback();
+    }
+    (
+        parsed
+            .into_iter()
+            .map(|(id, label)| model_json(&id, &label, "antigravity", "cli-live", "CLI"))
+            .collect(),
+        "cli-live",
+    )
+}
+
 #[tauri::command]
 fn list_model_catalog(project_root: String) -> Result<Value, String> {
     let dotenv = read_dotenv(&project_root);
@@ -356,23 +427,10 @@ fn list_model_catalog(project_root: String) -> Result<Value, String> {
         &[text_model_config.get("codex").cloned()],
         "codex",
     );
-    let antigravity_cli_models = configured_models(
-        cli_candidate_models(
-            "antigravity",
-            vec![
-                ("default", "default"),
-                ("Gemini 3.5 Flash (High)", "Gemini 3.5 Flash (High)"),
-                ("Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Medium)"),
-                ("Gemini 3.5 Flash (Low)", "Gemini 3.5 Flash (Low)"),
-                ("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (High)"),
-                ("Gemini 3.1 Pro (Low)", "Gemini 3.1 Pro (Low)"),
-                (
-                    "Claude Sonnet 4.6 (Thinking)",
-                    "Claude Sonnet 4.6 (Thinking)",
-                ),
-                ("Claude Opus 4.6 (Thinking)", "Claude Opus 4.6 (Thinking)"),
-            ],
-        ),
+    let (mut antigravity_cli_models, antigravity_source) =
+        fetch_antigravity_cli_models(&dotenv);
+    antigravity_cli_models = configured_models(
+        antigravity_cli_models,
         &[text_model_config.get("antigravity").cloned()],
         "antigravity",
     );
@@ -412,7 +470,7 @@ fn list_model_catalog(project_root: String) -> Result<Value, String> {
                     || env_value(&dotenv, &["ANTIGRAVITY_BIN", "ANTIGRAVITY_CLI_BIN"])
                         .map(|bin| command_candidate_available(&bin))
                         .unwrap_or(false),
-                "source": "cli-suggested",
+                "source": antigravity_source,
                 "models": antigravity_cli_models
             },
             {
@@ -7200,6 +7258,30 @@ mod native_event_io_tests {
         let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved["new"], true);
         cleanup(&root);
+    }
+}
+
+#[cfg(test)]
+mod agy_model_catalog_tests {
+    use super::parse_agy_models_text;
+
+    #[test]
+    fn parse_agy_models_text_reads_tab_separated_output() {
+        let text = "Fetching available models...\n\
+gemini-3.5-flash-medium\tGemini 3.5 Flash (Medium)\n\
+claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n";
+        let parsed = parse_agy_models_text(text);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, "gemini-3.5-flash-medium");
+        assert_eq!(parsed[0].1, "Gemini 3.5 Flash (Medium)");
+    }
+
+    #[test]
+    fn parse_agy_models_text_reads_whitespace_separated_output() {
+        let text = "gemini-3.5-flash-medium  Gemini 3.5 Flash (Medium)\n";
+        let parsed = parse_agy_models_text(text);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "gemini-3.5-flash-medium");
     }
 }
 

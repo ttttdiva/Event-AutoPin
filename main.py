@@ -31,6 +31,90 @@ from src.utils.json_reprocessor import JSONReprocessor
 from src.utils.output_cleanup import protected_output_entry_names
 
 
+def _coordinate_failure_payload(
+    code: str,
+    message: str,
+    *,
+    stage: str,
+    map_number: Optional[int] = None,
+    ocr: Optional[Dict[str, Any]] = None,
+    **details: Any,
+) -> Dict[str, Any]:
+    """座標生成の失敗を v2 schema へ揃える（旧文字列errorも許容）。"""
+
+    payload: Dict[str, Any] = {
+        "schema_version": 2,
+        "status": "failed",
+        "stage": stage,
+        "error": {"code": str(code), "message": str(message)},
+        # Legacy callers historically consumed these flat fields.  Keep them
+        # additive so the v2 nested error object remains the canonical shape.
+        "error_code": str(code),
+        "error_message": str(message),
+        "ocr": dict(
+            ocr
+            if isinstance(ocr, dict)
+            else {
+                "attempted": False,
+                "runner_started": False,
+                "candidate_count": 0,
+                "validated_count": 0,
+            }
+        ),
+    }
+    if map_number is not None:
+        payload["map_number"] = map_number
+    payload.update(details)
+    return payload
+
+
+def _normalize_saved_coordinate_failure(
+    saved: Dict[str, Any], *, map_number: int, fallback_message: str
+) -> Dict[str, Any]:
+    """新 failure artifact と旧 ``error: str`` を main の summary に統合する。"""
+
+    raw_error = saved.get("error")
+    if isinstance(raw_error, dict):
+        code = str(raw_error.get("code") or saved.get("error_code") or "unexpected_coordinate_failure")
+        message = str(raw_error.get("message") or fallback_message)
+    else:
+        code = str(saved.get("error_code") or raw_error or "unexpected_coordinate_failure")
+        message = str(raw_error or fallback_message)
+    stage = str(saved.get("stage") or {
+        "event_catalog_empty": "event_catalog",
+        "image_read_failed": "input",
+        "ocr_runner_failed": "ocr",
+        "runner_failed": "ocr",
+        "no_numbers": "ocr",
+        "ocr_no_numbers": "ocr",
+        "number_validation_failed": "number_validation",
+        "number_validation_empty": "number_validation",
+        "catalog_geometry_quality_gate_failed": "geometry",
+        "calibration_safety_gate_failed": "calibration",
+        "coordinate_update_zero": "update",
+    }.get(code, "unknown"))
+    normalized = _coordinate_failure_payload(
+        code,
+        message,
+        stage=stage,
+        map_number=int(saved.get("map_number") or map_number),
+        ocr=saved.get("ocr") if isinstance(saved.get("ocr"), dict) else None,
+    )
+    for key in (
+        "event_catalog",
+        "catalog",
+        "geometry_quality",
+        "calibration",
+        "ocr_diagnostics",
+        "raw_count",
+        "validated_count",
+        "candidate_count",
+    ):
+        if key in saved:
+            normalized[key] = saved[key]
+    return normalized
+
+
 class CircleListGenerator:
     """Event AutoPinのメインクラス（旧API名は互換性のため維持）。"""
 
@@ -1006,6 +1090,44 @@ class CircleListGenerator:
         from src.space_locator import generate_coordinates_from_map
         from src.space_locator.json_updater import JSONUpdater
 
+        output_dir = self.config["output_dir"]
+        event_json_path = Path(output_dir) / "event.json"
+
+        # map_url/event.jsonの入力検証より先に、今回の座標生成に属さない
+        # artifactを無効化する。入力段階でreturnしても前回summaryをGUIが
+        # 今回の結果として読み込まないようにする。
+        try:
+            output_root = Path(output_dir)
+            output_root.mkdir(parents=True, exist_ok=True)
+            (output_root / "coordinate_generation_summary.json").unlink(
+                missing_ok=True
+            )
+            for stale_path in output_root.glob("coordinates_map_*.json"):
+                stale_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self.coordinate_generation_summary = {
+                "schema_version": 2,
+                "status": "failed",
+                "stage": "output",
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "total_updated": 0,
+                "maps": [],
+                "error": {
+                    "code": "coordinate_artifact_invalidation_failed",
+                    "message": str(exc),
+                },
+                "ocr": {
+                    "attempted": False,
+                    "runner_started": False,
+                    "candidate_count": 0,
+                    "validated_count": 0,
+                },
+            }
+            self._save_coordinate_generation_summary()
+            return False
+
         raw_map_urls = self.config.get("map_urls")
         map_urls = []
         if isinstance(raw_map_urls, list):
@@ -1017,13 +1139,24 @@ class CircleListGenerator:
         if not map_urls:
             self.logger.error("map_urlが設定されていません")
             self.coordinate_generation_summary = {
+                "schema_version": 2,
                 "status": "failed",
+                "stage": "input",
                 "attempted": 0,
                 "succeeded": 0,
                 "failed": 0,
                 "total_updated": 0,
                 "maps": [],
-                "error": "map_urlが設定されていません",
+                "error": {
+                    "code": "map_url_missing",
+                    "message": "map_urlが設定されていません",
+                },
+                "ocr": {
+                    "attempted": False,
+                    "runner_started": False,
+                    "candidate_count": 0,
+                    "validated_count": 0,
+                },
             }
             self._save_coordinate_generation_summary()
             return False
@@ -1033,19 +1166,27 @@ class CircleListGenerator:
             models[0] if isinstance(models, list) else models
         )
 
-        output_dir = self.config["output_dir"]
-        event_json_path = Path(output_dir) / "event.json"
-
         if not event_json_path.exists():
             self.logger.error(f"event.jsonが見つかりません: {event_json_path}")
             self.coordinate_generation_summary = {
+                "schema_version": 2,
                 "status": "failed",
+                "stage": "input",
                 "attempted": 0,
                 "succeeded": 0,
                 "failed": 0,
                 "total_updated": 0,
                 "maps": [],
-                "error": f"event.jsonが見つかりません: {event_json_path}",
+                "error": {
+                    "code": "event_json_missing",
+                    "message": f"event.jsonが見つかりません: {event_json_path}",
+                },
+                "ocr": {
+                    "attempted": False,
+                    "runner_started": False,
+                    "candidate_count": 0,
+                    "validated_count": 0,
+                },
             }
             self._save_coordinate_generation_summary()
             return False
@@ -1076,7 +1217,19 @@ class CircleListGenerator:
                         {
                             "map_number": map_number,
                             "status": "failed",
-                            "error": "マップファイルが見つかりません",
+                            "stage": "input",
+                            "error": {
+                                "code": "map_image_missing",
+                                "message": "マップファイルが見つかりません",
+                            },
+                            "error_code": "map_image_missing",
+                            "error_message": "マップファイルが見つかりません",
+                            "ocr": {
+                                "attempted": False,
+                                "runner_started": False,
+                                "candidate_count": 0,
+                                "validated_count": 0,
+                            },
                         }
                     )
                     continue
@@ -1094,24 +1247,31 @@ class CircleListGenerator:
                     generation_kwargs["ocr_config"] = ocr_config
                 coord_map = generate_coordinates_from_map(**generation_kwargs)
 
-                if coord_map is None:
+                if coord_map is None or (
+                    isinstance(coord_map, dict)
+                    and str(coord_map.get("status") or "").lower() == "failed"
+                ):
                     self.logger.error(f"座標生成失敗: {local_map_path}")
                     failed += 1
-                    diagnostic: Dict[str, Any] = {
-                        "map_number": map_number,
-                        "status": "failed",
-                        "image_path": str(local_map_path),
-                        "output_json": str(output_json),
-                        "error": "座標生成関数が結果を返しませんでした",
-                    }
+                    diagnostic: Dict[str, Any] = _coordinate_failure_payload(
+                        "coordinate_generation_failed",
+                        "座標生成関数が結果を返しませんでした",
+                        stage="unknown",
+                        map_number=map_number,
+                    )
                     try:
                         if output_json.exists():
                             saved = json.loads(output_json.read_text(encoding="utf-8-sig"))
                             if isinstance(saved, dict):
-                                diagnostic["error"] = saved.get("error") or diagnostic["error"]
-                                diagnostic["ocr_diagnostics"] = saved.get("ocr_diagnostics", {})
+                                diagnostic = _normalize_saved_coordinate_failure(
+                                    saved,
+                                    map_number=map_number,
+                                    fallback_message="座標生成関数が結果を返しませんでした",
+                                )
                     except (OSError, ValueError, TypeError):
                         pass
+                    diagnostic["image_path"] = str(local_map_path)
+                    diagnostic["output_json"] = str(output_json)
                     map_diagnostics.append(diagnostic)
                     continue
 
@@ -1153,12 +1313,30 @@ class CircleListGenerator:
                             {
                                 "map_number": map_number,
                                 "status": "failed",
+                                "stage": "update",
                                 "image_path": str(local_map_path),
                                 "output_json": str(output_json),
                                 "updated_count": 0,
                                 "skipped_count": skipped,
-                                "error": "event.jsonの座標更新対象がありませんでした",
+                                "error": {
+                                    "code": "coordinate_update_zero",
+                                    "message": "event.jsonの座標更新対象がありませんでした",
+                                },
+                                # Keep the historical flat fields for CLI/test
+                                # consumers while retaining the v2 error object.
                                 "error_code": "coordinate_update_zero",
+                                "error_message": "event.jsonの座標更新対象がありませんでした",
+                                "ocr": coord_map.get("ocr", {
+                                    "attempted": False,
+                                    "runner_started": False,
+                                    "candidate_count": 0,
+                                    "validated_count": 0,
+                                }) if isinstance(coord_map, dict) else {
+                                    "attempted": False,
+                                    "runner_started": False,
+                                    "candidate_count": 0,
+                                    "validated_count": 0,
+                                },
                             }
                         )
                 else:
@@ -1167,9 +1345,26 @@ class CircleListGenerator:
                         {
                             "map_number": map_number,
                             "status": "failed",
+                            "stage": "update",
                             "image_path": str(local_map_path),
                             "output_json": str(output_json),
-                            "error": "event.jsonの座標更新に失敗しました",
+                            "error": {
+                                "code": "coordinate_update_failed",
+                                "message": "event.jsonの座標更新に失敗しました",
+                            },
+                            "error_code": "coordinate_update_failed",
+                            "error_message": "event.jsonの座標更新に失敗しました",
+                            "ocr": coord_map.get("ocr", {
+                                "attempted": False,
+                                "runner_started": False,
+                                "candidate_count": 0,
+                                "validated_count": 0,
+                            }) if isinstance(coord_map, dict) else {
+                                "attempted": False,
+                                "runner_started": False,
+                                "candidate_count": 0,
+                                "validated_count": 0,
+                            },
                         }
                     )
 
@@ -1178,6 +1373,7 @@ class CircleListGenerator:
                 "partial" if succeeded else "failed"
             )
             self.coordinate_generation_summary = {
+                "schema_version": 2,
                 "status": status,
                 "attempted": attempted,
                 "succeeded": succeeded,
@@ -1185,6 +1381,33 @@ class CircleListGenerator:
                 "total_updated": total_updated,
                 "maps": map_diagnostics,
             }
+            if status == "failed":
+                first_failure = next(
+                    (
+                        item
+                        for item in map_diagnostics
+                        if isinstance(item, dict) and item.get("status") == "failed"
+                    ),
+                    None,
+                )
+                if isinstance(first_failure, dict):
+                    raw_error = first_failure.get("error")
+                    if isinstance(raw_error, dict):
+                        self.coordinate_generation_summary["error"] = dict(raw_error)
+                    else:
+                        self.coordinate_generation_summary["error"] = {
+                            "code": str(first_failure.get("error_code") or "coordinate_generation_failed"),
+                            "message": str(raw_error or "座標生成に失敗しました"),
+                        }
+                    self.coordinate_generation_summary["stage"] = str(
+                        first_failure.get("stage") or "unknown"
+                    )
+                else:
+                    self.coordinate_generation_summary["stage"] = "unknown"
+                    self.coordinate_generation_summary["error"] = {
+                        "code": "coordinate_generation_failed",
+                        "message": "座標生成に失敗しました",
+                    }
             self._save_coordinate_generation_summary()
             # 一部成功は既存仕様どおり継続可能だが、全マップ失敗はGUI/CLIの
             # 成功表示を許可しない。
@@ -1193,13 +1416,24 @@ class CircleListGenerator:
         except Exception as e:
             self.logger.error(f"座標生成中にエラー: {e}", exc_info=True)
             self.coordinate_generation_summary = {
+                "schema_version": 2,
                 "status": "failed",
                 "attempted": locals().get("attempted", 0),
                 "succeeded": locals().get("succeeded", 0),
                 "failed": locals().get("failed", 0) + 1,
                 "total_updated": locals().get("total_updated", 0),
                 "maps": locals().get("map_diagnostics", []),
-                "error": str(e),
+                "stage": "unknown",
+                "error": {
+                    "code": "coordinate_generation_internal",
+                    "message": str(e),
+                },
+                "ocr": {
+                    "attempted": False,
+                    "runner_started": False,
+                    "candidate_count": 0,
+                    "validated_count": 0,
+                },
             }
             self._save_coordinate_generation_summary()
             return False
@@ -1235,7 +1469,15 @@ class CircleListGenerator:
             )
             print(f"  更新: {coordinate_summary.get('total_updated', 0)}件")
             if coordinate_summary.get("error"):
-                print(f"  診断: {coordinate_summary['error']}")
+                error = coordinate_summary["error"]
+                if isinstance(error, dict):
+                    print(
+                        "  診断: "
+                        f"{error.get('code', 'unknown')}: "
+                        f"{error.get('message', '')}"
+                    )
+                else:
+                    print(f"  診断: {error}")
 
         print("\n出力ファイル:")
         for file_type, file_path in result["output_files"].items():

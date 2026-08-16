@@ -39,3 +39,26 @@ cd desktop-app
 npm install
 npm run tauri:dev
 ```
+
+## Windows release build
+
+普段起動している **`EventAutoPin.exe`（リポジトリルート）** を更新する標準手順です。
+`npm run tauri:build` は release ビルド後、必ず `EventAutoPin.exe` へ原子的に
+コピーします。release/debug の実体パスを意識する必要はありません。
+
+```powershell
+cd desktop-app
+npm run tauri:build
+```
+
+PowerShell から直接実行する場合:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_desktop.ps1
+```
+
+Tauri 本体だけビルドしてコピーしない場合（CI 向け）:
+
+```powershell
+npm run tauri:build:raw
+```

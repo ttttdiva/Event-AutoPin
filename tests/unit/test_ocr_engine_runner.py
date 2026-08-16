@@ -22,7 +22,7 @@ def test_extract_numbers_runs_runner_and_converts_payload(tmp_path, monkeypatch)
     _write_image(image_path)
     ocr_python = tmp_path / ("python.exe" if ocr_engine.os.name == "nt" else "python")
     ocr_python.write_text("", encoding="utf-8")
-    monkeypatch.setattr(ocr_engine, "_resolve_ocr_python", lambda: ocr_python)
+    monkeypatch.setattr(ocr_engine, "_resolve_ocr_python", lambda *args, **kwargs: ocr_python)
 
     def fake_run(command, **kwargs):
         output_json = Path(command[command.index("--output-json") + 1])
@@ -64,7 +64,7 @@ def test_extract_numbers_passes_expected_candidate_count_and_keeps_diagnostics(t
     _write_image(image_path)
     ocr_python = tmp_path / ("python.exe" if ocr_engine.os.name == "nt" else "python")
     ocr_python.write_text("", encoding="utf-8")
-    monkeypatch.setattr(ocr_engine, "_resolve_ocr_python", lambda: ocr_python)
+    monkeypatch.setattr(ocr_engine, "_resolve_ocr_python", lambda *args, **kwargs: ocr_python)
     captured = {}
 
     def fake_run(command, **kwargs):
@@ -135,3 +135,54 @@ def test_resolve_ocr_python_message_is_os_specific(tmp_path, monkeypatch):
         assert "scripts\\setup_unlimited_ocr.bat" in message
     else:
         assert "python3 scripts/setup_unlimited_ocr.py" in message
+
+
+def test_runner_preserves_parent_hf_cache_for_legacy_env(tmp_path, monkeypatch):
+    image_path = tmp_path / "map.png"
+    _write_image(image_path)
+    ocr_python = tmp_path / ("python.exe" if ocr_engine.os.name == "nt" else "python")
+    ocr_python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(ocr_engine, "_resolve_ocr_python", lambda *args, **kwargs: ocr_python)
+    monkeypatch.setenv("HF_HUB_CACHE", "X")
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", "Y")
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        output_json = Path(command[command.index("--output-json") + 1])
+        output_json.write_text(json.dumps({"results": []}), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ocr_engine.subprocess, "run", fake_run)
+
+    OCREngine().extract_numbers_with_coordinates(str(image_path))
+
+    assert captured["env"]["HF_HUB_CACHE"] == "X"
+    assert captured["env"]["HUGGINGFACE_HUB_CACHE"] == "Y"
+
+
+def test_runner_clears_stale_hf_env_for_explicit_gui_config(tmp_path, monkeypatch):
+    image_path = tmp_path / "map.png"
+    _write_image(image_path)
+    ocr_python = tmp_path / ("python.exe" if ocr_engine.os.name == "nt" else "python")
+    ocr_python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(ocr_engine, "_resolve_ocr_python", lambda *args, **kwargs: ocr_python)
+    monkeypatch.setenv("HF_HOME", "OLD")
+    monkeypatch.setenv("HF_HUB_CACHE", "OLD2")
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        output_json = Path(command[command.index("--output-json") + 1])
+        output_json.write_text(json.dumps({"results": []}), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ocr_engine.subprocess, "run", fake_run)
+
+    OCREngine({"hf_home": "Z", "model": "baidu/Unlimited-OCR"}).extract_numbers_with_coordinates(
+        str(image_path)
+    )
+
+    assert "HF_HUB_CACHE" not in captured["env"]
+    assert captured["env"]["HF_HOME"] == "Z"
+    assert captured["env"]["UNLIMITED_OCR_MODEL"] == "baidu/Unlimited-OCR"

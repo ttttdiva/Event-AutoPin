@@ -25,7 +25,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from .coordinate_mapper import CoordinateMapper
 from .catalog_geometry_assignment import global_min_cost_association
-from .number_validator import NumberValidator
+from .number_validator import (
+    NumberValidator,
+    NumberValidatorImageReadError,
+    NumberValidationResult,
+)
 from .ocr_engine import OCREngine
 from .pattern_analyzer import PatternAnalyzer
 
@@ -69,6 +73,131 @@ def _split_space_prefix_suffix(space: str) -> Optional[Tuple[str, str]]:
     if not prefix or not suffix:
         return None
     return prefix, suffix
+
+
+def _parse_hall_prefix(hall: Optional[str]) -> Optional[str]:
+    """hall を booth prefix として使える場合だけ正規化して返す。
+
+    数字を含む hall (例: ``E1``, ``1F``) は誤結合の温床なので拒否する。
+    """
+
+    normalized = normalize_space_text(hall or "").replace(" ", "")
+    if not normalized:
+        return None
+    if re.search(r"\d", normalized):
+        return None
+    core = normalized.rstrip("-_/")
+    if not core or not re.fullmatch(r"[ぁ-んァ-ヶA-Za-z]+", core):
+        return None
+    return core
+
+
+def _parse_numeric_space_members(space: str) -> Optional[List[int]]:
+    """space が純粋な数値表現だけで構成される場合に番号列を返す。
+
+    先頭一致だけで残りを無視する実装は禁止。token 化後に入力全体が
+    消費されたことだけを成功とみなす。
+    """
+
+    normalized = normalize_space_text(space)
+    if not normalized:
+        return None
+    if re.search(r"[A-Za-zぁ-んァ-ヶ]", normalized):
+        return None
+
+    text = normalized.replace("、", ",").replace("，", ",").replace("・", ",")
+    numbers: List[int] = []
+    for part in re.split(r"[,/]+", text):
+        token = part.strip("- ")
+        if not token:
+            continue
+        range_match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", token)
+        if range_match:
+            start = int(range_match.group(1))
+            end = int(range_match.group(2))
+            step = 1 if start <= end else -1
+            numbers.extend(range(start, end + step, step))
+            continue
+        if re.fullmatch(r"\d+", token):
+            numbers.append(int(token))
+            continue
+        return None
+    return numbers if numbers else None
+
+
+def _space_ids_from_hall_and_numeric_space(
+    space: str,
+    hall: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """安全確認済み hall prefix と numeric space から booth ID を構造的に生成する。"""
+
+    prefix = _parse_hall_prefix(hall)
+    numbers = _parse_numeric_space_members(space)
+    if prefix is None or numbers is None:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, int]] = set()
+    for number in numbers:
+        key = (prefix, number)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(
+            {
+                "space_id": f"{prefix}{number:02d}",
+                "prefix": prefix,
+                "number": number,
+                "number_text": f"{number:02d}",
+            }
+        )
+    return results
+
+
+def combine_hall_and_space(space: str, hall: Optional[str] = None) -> str:
+    """hall と space の表示用結合文字列を返す。
+
+    解析は ``expand_circle_space_ids`` が構造的に行う。ここでは検証済み
+    numeric space に対してのみ ``E-14`` のような表示文字列を作る。
+    """
+
+    normalized_space = normalize_space_text(space)
+    if not normalized_space:
+        return ""
+    if expand_space_ids(normalized_space):
+        return normalized_space
+
+    prefix = _parse_hall_prefix(hall)
+    numbers = _parse_numeric_space_members(normalized_space)
+    if prefix is None or numbers is None:
+        return normalized_space
+
+    hall_compact = normalize_space_text(hall or "").replace(" ", "").rstrip("-_/")
+    if not hall_compact:
+        return normalized_space
+    if len(numbers) == 1:
+        return f"{hall_compact}-{numbers[0]:02d}"
+    joined = ",".join(f"{number:02d}" for number in numbers)
+    if hall_compact.endswith(("-", "_", "/")):
+        return f"{hall_compact}{joined}"
+    return f"{hall_compact}-{joined}"
+
+
+def expand_circle_space_ids(
+    space: str,
+    hall: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """circle の space/hall から booth ID 群を展開する。"""
+
+    normalized_space = normalize_space_text(space)
+    if not normalized_space:
+        return []
+
+    expanded = expand_space_ids(normalized_space)
+    if expanded:
+        return expanded
+
+    return _space_ids_from_hall_and_numeric_space(normalized_space, hall)
 
 
 def expand_space_ids(space: str) -> List[Dict[str, Any]]:
@@ -207,9 +336,38 @@ def analyze_space_catalog_from_event(
     spaces: List[Dict[str, Any]] = []
     target_keys: set[str] = set()
 
+    # Keep the filtering decisions observable.  In particular, an event with
+    # multiple maps must never silently treat an unassigned circle as belonging
+    # to the requested map.  These counters are intentionally based on circles
+    # (not expanded space ids) so the GUI can explain why the catalog became
+    # empty without implying that OCR was attempted.
+    space_blank_count = 0
+    space_unparseable_count = 0
+    map_mismatch_excluded_count = 0
+    map_unassigned_excluded_count = 0
+    invalid_circle_count = 0
+
     for circle_index, circle in enumerate(circles):
         if not isinstance(circle, dict):
+            invalid_circle_count += 1
             continue
+        raw_space = str(circle.get("space") or "").strip()
+        raw_hall = circle.get("hall")
+        hall = str(raw_hall).strip() if raw_hall is not None else ""
+        if not raw_space:
+            space_blank_count += 1
+            expanded: List[Dict[str, Any]] = []
+            resolved_space = ""
+        else:
+            resolved_space = combine_hall_and_space(raw_space, hall)
+            expanded = expand_circle_space_ids(raw_space, hall)
+            if not expanded:
+                # Preserve the existing parser's fail-closed behavior (for
+                # example, ``1F-A01`` is not silently reinterpreted), but
+                # expose the parse failure to diagnostics.  Count this before
+                # map filtering so the report can explain all malformed
+                # circles, including circles excluded from another map.
+                space_unparseable_count += 1
         circle_map_raw = circle.get("map_number")
         if circle_map_raw is None:
             circle_map = None
@@ -217,16 +375,17 @@ def analyze_space_catalog_from_event(
             try:
                 circle_map = int(circle_map_raw)
             except (TypeError, ValueError):
+                invalid_circle_count += 1
                 continue
         if map_count > 1 and circle_map is None:
+            map_unassigned_excluded_count += 1
             continue
         if circle_map is not None and circle_map != map_number:
+            map_mismatch_excluded_count += 1
             continue
 
-        raw_space = str(circle.get("space") or "").strip()
-        if not raw_space:
+        if not expanded:
             continue
-        expanded = expand_space_ids(raw_space)
         for item in expanded:
             prefix = item["prefix"]
             if prefix not in order:
@@ -236,6 +395,8 @@ def analyze_space_catalog_from_event(
             space_item = {
                 **item,
                 "raw_space": raw_space,
+                "resolved_space": resolved_space,
+                "hall": hall,
                 "circle_index": circle_index,
                 "circle_name": circle.get("name", ""),
                 "map_number": map_number,
@@ -265,6 +426,18 @@ def analyze_space_catalog_from_event(
             max_column_number = max(max_column_number, max(numbers))
             min_column_number = min(min_column_number, min(numbers))
 
+    catalog_diagnostics = {
+        "requested_map_number": map_number,
+        "map_count": map_count,
+        "circle_count": len(circles),
+        "invalid_circle_count": invalid_circle_count,
+        "space_blank_count": space_blank_count,
+        "space_unparseable_count": space_unparseable_count,
+        "map_mismatch_excluded_count": map_mismatch_excluded_count,
+        "map_unassigned_excluded_count": map_unassigned_excluded_count,
+        "target_space_count": len(spaces),
+    }
+
     return {
         "order": order,
         "counts": dict(counts),
@@ -277,6 +450,7 @@ def analyze_space_catalog_from_event(
         "target_space_keys": sorted(target_keys),
         "calibration_points": calibration_points_from_event(event_data, map_number),
         "map_number": map_number,
+        "event_catalog": catalog_diagnostics,
     }
 
 
@@ -1308,7 +1482,8 @@ def _catalog_geometry_group_center(
     if not prefix or number is None:
         return None
     raw_space = str(expected.get("raw_space") or "")
-    members = expand_space_ids(raw_space) if raw_space else []
+    resolved_space = str(expected.get("resolved_space") or raw_space)
+    members = expand_circle_space_ids(resolved_space, expected.get("hall")) if resolved_space else []
     member_numbers = [int(item["number"]) for item in members if item.get("prefix") == prefix]
     if len(member_numbers) <= 1:
         return centers.get((prefix, number))
@@ -2128,48 +2303,213 @@ def _load_ocr_result(ocr_result_path: str) -> List[Dict[str, Any]]:
     with open(ocr_result_path, "r", encoding="utf-8") as f:
         ocr_data = json.load(f)
     if isinstance(ocr_data, dict) and "numbers" in ocr_data:
-        return ocr_data["numbers"]
+        numbers = ocr_data["numbers"]
+        if isinstance(numbers, list):
+            return numbers
+        raise ValueError("OCR結果の numbers キーが配列ではありません")
     if isinstance(ocr_data, list):
         return ocr_data
     raise ValueError("OCR結果JSONは numbers キー付きオブジェクトまたは配列である必要があります")
 
 
-def _write_ocr_failure_diagnostics(
+def _empty_ocr_summary(*, attempted: bool = False) -> Dict[str, Any]:
+    """座標生成における OCR 到達状態の最小・安全な要約。"""
+
+    return {
+        "attempted": bool(attempted),
+        "runner_started": False,
+        "candidate_count": 0,
+        "validated_count": 0,
+    }
+
+
+def _safe_nonnegative_int(value: Any, default: int = 0) -> int:
+    """診断値の型崩れで元の失敗経路を隠さないための整数変換。"""
+
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _safe_ocr_diagnostics(ocr_engine: Optional[OCREngine]) -> Dict[str, Any]:
+    """OCREngine 側の壊れた diagnostics も artifact を妨げない。"""
+
+    if ocr_engine is None:
+        return {}
+    try:
+        diagnostics = ocr_engine.diagnostics
+    except Exception:
+        return {}
+    return dict(diagnostics) if isinstance(diagnostics, Mapping) else {}
+
+
+def _ocr_summary(
+    ocr_engine: Optional[OCREngine],
+    *,
+    attempted: Optional[bool] = None,
+    candidate_count: Optional[int] = None,
+    validated_count: Optional[int] = None,
+) -> Dict[str, Any]:
+    """OCREngine の詳細を座標生成用の stage-aware 要約へ正規化する。
+
+    ``ocr_diagnostics`` は既存 API 互換の詳細値として別キーに保存する。
+    この要約は、catalog 段階で OCR が未実行だったことと、runner が本当に
+    起動したことを区別するための機械可読な契約である。
+    """
+
+    if ocr_engine is None:
+        summary = _empty_ocr_summary(attempted=bool(attempted))
+        if candidate_count is not None:
+            summary["candidate_count"] = _safe_nonnegative_int(candidate_count)
+        if validated_count is not None:
+            summary["validated_count"] = _safe_nonnegative_int(validated_count)
+        return summary
+
+    diagnostics = _safe_ocr_diagnostics(ocr_engine)
+    last_run = diagnostics.get("last_run") if isinstance(diagnostics, dict) else {}
+    if not isinstance(last_run, dict):
+        last_run = {}
+    summary = {
+        "attempted": bool(
+            diagnostics.get("attempted", attempted if attempted is not None else False)
+        ),
+        "runner_started": bool(
+            diagnostics.get("runner_started", last_run.get("runner_started", False))
+        ),
+        "candidate_count": _safe_nonnegative_int(
+                candidate_count
+                if candidate_count is not None
+                else diagnostics.get(
+                    "candidate_count", last_run.get("number_count", 0)
+                )
+                or 0,
+        ),
+        "validated_count": _safe_nonnegative_int(validated_count or 0),
+    }
+    if attempted is not None:
+        summary["attempted"] = bool(attempted)
+    return summary
+
+
+def _write_failure_artifact(
     output_json_path: Optional[str],
     *,
     image_path: str,
     event_json_path: str,
     map_number: int,
-    ocr_engine: OCREngine,
+    stage: str,
+    code: str,
+    message: str,
+    ocr_engine: Optional[OCREngine] = None,
+    ocr: Optional[Mapping[str, Any]] = None,
+    catalog: Optional[Mapping[str, Any]] = None,
+    geometry_quality: Optional[Mapping[str, Any]] = None,
+    calibration: Optional[Mapping[str, Any]] = None,
+    candidate_count: Optional[int] = None,
+    validated_count: Optional[int] = None,
+    **details: Any,
 ) -> None:
-    """OCR失敗時の機械可読診断を座標JSONへ保存する。
+    """失敗時の座標 JSON を必ず同じ stage-aware 契約で保存する。
 
-    診断には専用venvやモデルキャッシュの設定値が含まれるため、ここでは
-    GUI向けに整形せず、bridgeの ``_summarize_ocr_diagnostics`` が既存の
-    secret/path除去経路を通してから外へ返す。ファイル保存に失敗しても、
-    呼び出し元の失敗ステータスは維持する。
+    ``None`` を返す旧呼び出し元との互換性を維持しつつ、成功 JSON を
+    上書きして stale な診断が再利用されることを防ぐ。OCR 詳細は既存の
+    ``ocr_diagnostics`` キーにも残すが、GUI 境界では bridge が path/secret
+    を redaction する前提であり、この層では設定の意味を捏造しない。
     """
-    if not output_json_path or not ocr_engine.last_error:
+
+    if not output_json_path:
         return
+    ocr_summary = dict(ocr or _ocr_summary(
+        ocr_engine,
+        candidate_count=candidate_count,
+        validated_count=validated_count,
+    ))
+    if candidate_count is not None:
+        ocr_summary["candidate_count"] = _safe_nonnegative_int(candidate_count)
+    if validated_count is not None:
+        ocr_summary["validated_count"] = _safe_nonnegative_int(validated_count)
+
+    payload: Dict[str, Any] = {
+        "schema_version": 2,
+        "status": "failed",
+        "stage": str(stage),
+        "error": {"code": str(code), "message": str(message)},
+        "error_code": str(code),
+        "error_message": str(message),
+        # Existing consumers still use these identity fields on failure.
+        "image_path": image_path,
+        "event_json_path": event_json_path,
+        "map_number": map_number,
+        "ocr": ocr_summary,
+        "ocr_diagnostics": _safe_ocr_diagnostics(ocr_engine),
+    }
+    if catalog is not None:
+        payload["event_catalog"] = dict(catalog)
+        # ``catalog`` is a concise alias used by some integrations; retaining
+        # both avoids coupling the GUI to the internal analyzer name.
+        payload["catalog"] = dict(catalog)
+    if geometry_quality is not None:
+        payload["geometry_quality"] = dict(geometry_quality)
+    if calibration is not None:
+        payload["calibration"] = dict(calibration)
+    payload.update(details)
+    # Failure artifacts are never consumed as a successful coordinate map,
+    # but keeping the historical empty-grid keys prevents older callers from
+    # treating a missing key as a stale/successful result.
+    payload.setdefault("complete_grid", [])
+    payload.setdefault("total_spaces", 0)
+
     try:
         output_path = Path(output_json_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
-            json.dumps(
-                {
-                    "image_path": image_path,
-                    "event_json_path": event_json_path,
-                    "map_number": map_number,
-                    "error": "ocr_no_numbers",
-                    "ocr_diagnostics": ocr_engine.diagnostics,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
         )
-    except OSError:
-        pass
+    except (OSError, TypeError, ValueError):
+        # Artifact persistence is best effort; never replace the original
+        # stage/code with an exception caused by a read-only output directory.
+        logging.getLogger(__name__).debug(
+            "座標生成 failure artifact の保存に失敗しました", exc_info=True
+        )
+
+
+def _read_image_unicode_safe(image_path: str) -> Any:
+    """OpenCV の Windows 日本語パス問題を回避して画像を読み込む。
+
+    ``cv2.imread`` は環境によって Unicode パスを扱えず ``None`` を返す。
+    まず既存経路を試し、失敗時は ``np.fromfile`` + ``cv2.imdecode`` を使う。
+    """
+
+    import cv2
+
+    try:
+        image = cv2.imread(str(image_path))
+    except Exception as exc:
+        image = None
+    if image is not None:
+        return image
+    try:
+        import numpy as np
+
+        encoded = np.fromfile(str(image_path), dtype=np.uint8)
+        if encoded.size == 0:
+            return None
+        return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _resolve_pattern_analyzer_attempt(
+    image_llm_attempts: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """PatternAnalyzer 用 explicit attempt。CLI-only では None（LLM スキップ）。"""
+
+    for attempt in image_llm_attempts or []:
+        if attempt.get("kind") == "api":
+            return dict(attempt)
+    return None
 
 
 def generate_coordinates_from_map(
@@ -2181,6 +2521,8 @@ def generate_coordinates_from_map(
     map_number: int = 1,
     use_calibration: bool = True,
     ocr_config: Optional[Mapping[str, Any]] = None,
+    image_llm_attempts: Optional[Sequence[Mapping[str, Any]]] = None,
+    image_api_reasoning_effort_map: Optional[Mapping[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     logger = logging.getLogger(__name__)
 
@@ -2188,9 +2530,76 @@ def generate_coordinates_from_map(
         output_json_path = str(Path(image_path).with_suffix(".json"))
 
     load_dotenv()
-    catalog_info = analyze_space_catalog_from_event(event_json_path, map_number=map_number)
+    try:
+        catalog_info = analyze_space_catalog_from_event(
+            event_json_path,
+            map_number=map_number,
+        )
+    except FileNotFoundError as exc:
+        _write_failure_artifact(
+            output_json_path,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="input",
+            code="event_json_read_failed",
+            message="event.json を読み込めませんでした",
+            ocr=_empty_ocr_summary(),
+            exception_type=type(exc).__name__,
+        )
+        return None
+    except (json.JSONDecodeError, UnicodeError, ValueError, TypeError) as exc:
+        _write_failure_artifact(
+            output_json_path,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="event_catalog",
+            code="event_catalog_invalid",
+            message="event.json の形式を解析できませんでした",
+            ocr=_empty_ocr_summary(),
+            exception_type=type(exc).__name__,
+        )
+        return None
+    except Exception as exc:
+        logger.exception("event.json のスペース解析に失敗しました")
+        _write_failure_artifact(
+            output_json_path,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="event_catalog",
+            code="event_catalog_unexpected",
+            message="event.json のスペース解析中に予期しないエラーが発生しました",
+            ocr=_empty_ocr_summary(),
+            exception_type=type(exc).__name__,
+        )
+        return None
+
+    catalog_diagnostics = dict(catalog_info.get("event_catalog") or {})
+    if not catalog_diagnostics:
+        catalog_diagnostics = {
+            "requested_map_number": map_number,
+            "circle_count": 0,
+            "space_blank_count": 0,
+            "space_unparseable_count": 0,
+            "map_mismatch_excluded_count": 0,
+            "map_unassigned_excluded_count": 0,
+            "target_space_count": len(catalog_info.get("spaces") or []),
+        }
     if not catalog_info.get("spaces"):
         logger.error("event.json からスペース情報を取得できませんでした")
+        _write_failure_artifact(
+            output_json_path,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="event_catalog",
+            code="event_catalog_empty",
+            message="対象マップに割り当て可能なスペースがありません",
+            catalog=catalog_diagnostics,
+            ocr=_empty_ocr_summary(),
+        )
         return None
 
     logger.info("=" * 60)
@@ -2201,10 +2610,41 @@ def generate_coordinates_from_map(
     logger.info(f"対象スペース数: {len(catalog_info.get('spaces', []))}")
     logger.info("=" * 60)
 
-    ocr_engine = OCREngine(dict(ocr_config) if ocr_config else None)
+    try:
+        ocr_engine = OCREngine(dict(ocr_config) if ocr_config else None)
+    except Exception as exc:
+        _write_failure_artifact(
+            output_json_path,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="ocr",
+            code="ocr_initialization_failed",
+            message="OCR エンジンの初期化に失敗しました",
+            catalog=catalog_diagnostics,
+            ocr=_empty_ocr_summary(),
+            exception_type=type(exc).__name__,
+        )
+        return None
     if ocr_result_path:
         logger.info("[Step 1] 既存OCR結果を読み込み")
-        raw_numbers = _load_ocr_result(ocr_result_path)
+        try:
+            raw_numbers = _load_ocr_result(ocr_result_path)
+        except (OSError, json.JSONDecodeError, UnicodeError, ValueError, TypeError) as exc:
+            _write_failure_artifact(
+                output_json_path,
+                ocr_engine=ocr_engine,
+                image_path=image_path,
+                event_json_path=event_json_path,
+                map_number=map_number,
+                stage="ocr",
+                code="ocr_result_load_failed",
+                message="既存 OCR 結果を読み込めませんでした",
+                catalog=catalog_diagnostics,
+                ocr=_ocr_summary(ocr_engine, attempted=False),
+                exception_type=type(exc).__name__,
+            )
+            return None
     else:
         logger.info("[Step 1] OCRで番号を検出")
         try:
@@ -2220,118 +2660,340 @@ def generate_coordinates_from_map(
             if not ocr_engine.last_error:
                 ocr_engine._set_error(
                     "runner_exception",
-                    f"Unlimited OCR runner実行中に失敗しました: {exc}",
+                    "Unlimited OCR runner実行中に失敗しました",
+                    exception_type=type(exc).__name__,
                 )
+            safe_diagnostics = _safe_ocr_diagnostics(ocr_engine)
+            safe_error = safe_diagnostics.get("error")
+            safe_error = safe_error if isinstance(safe_error, Mapping) else {}
             logger.error(
-                "OCR診断付き例外: %s",
-                json.dumps(ocr_engine.diagnostics, ensure_ascii=False),
+                "OCR診断付き例外: code=%s returncode=%s attempted=%s runner_started=%s",
+                safe_error.get("code"),
+                safe_error.get("returncode"),
+                safe_diagnostics.get("attempted"),
+                safe_diagnostics.get("runner_started"),
             )
-            _write_ocr_failure_diagnostics(
+            raw_error = ocr_engine.last_error or {}
+            raw_code = str(raw_error.get("code") or "runner_exception")
+            code = {
+                "runner_failed": "ocr_runner_failed",
+                "runner_exception": "ocr_runner_failed",
+                "timeout": "ocr_runner_timeout",
+                "venv_missing": "ocr_venv_missing",
+                "image_read_failed": "image_read_failed",
+                "invalid_result": "ocr_result_invalid",
+                "image_inference_failed": "ocr_inference_failed",
+            }.get(raw_code, f"ocr_{raw_code}")
+            failure_stage = "input" if raw_code == "image_read_failed" else "ocr"
+            _write_failure_artifact(
                 output_json_path,
+                ocr_engine=ocr_engine,
                 image_path=image_path,
                 event_json_path=event_json_path,
                 map_number=map_number,
-                ocr_engine=ocr_engine,
+                stage=failure_stage,
+                code=code,
+                message=str(raw_error.get("message") or "OCR の実行に失敗しました"),
+                catalog=catalog_diagnostics,
+                ocr=_ocr_summary(ocr_engine, attempted=True),
+                exception_type=type(exc).__name__,
             )
             return None
         if not raw_numbers and ocr_engine.last_error:
+            safe_diagnostics = _safe_ocr_diagnostics(ocr_engine)
+            safe_error = safe_diagnostics.get("error")
+            safe_error = safe_error if isinstance(safe_error, Mapping) else {}
             logger.error(
-                "OCR診断: %s",
-                json.dumps(ocr_engine.diagnostics, ensure_ascii=False),
+                "OCR診断: code=%s returncode=%s attempted=%s runner_started=%s",
+                safe_error.get("code"),
+                safe_error.get("returncode"),
+                safe_diagnostics.get("attempted"),
+                safe_diagnostics.get("runner_started"),
             )
+    if not isinstance(raw_numbers, list):
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="ocr",
+            code="ocr_result_invalid",
+            message="OCR 結果の numbers が配列ではありません",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                attempted=not bool(ocr_result_path),
+            ),
+        )
+        return None
+
     logger.info(f"検出番号数: {len(raw_numbers)}")
     if not raw_numbers:
         logger.error("番号を検出できませんでした")
         # GUIが「原因不明の0件」と表示しないよう、出力JSONへ診断だけ残す。
-        _write_ocr_failure_diagnostics(
+        raw_error = ocr_engine.last_error or {}
+        raw_code = str(raw_error.get("code") or "no_numbers")
+        code = {
+            "runner_failed": "ocr_runner_failed",
+            "runner_exception": "ocr_runner_failed",
+            "timeout": "ocr_runner_timeout",
+            "venv_missing": "ocr_venv_missing",
+            "image_read_failed": "image_read_failed",
+            "no_numbers": "ocr_no_numbers",
+            "empty_result": "ocr_no_numbers",
+            "invalid_result": "ocr_result_invalid",
+            "image_inference_failed": "ocr_inference_failed",
+        }.get(raw_code, "ocr_no_numbers")
+        failure_stage = "input" if raw_code == "image_read_failed" else "ocr"
+        _write_failure_artifact(
             output_json_path,
+            ocr_engine=ocr_engine,
             image_path=image_path,
             event_json_path=event_json_path,
             map_number=map_number,
-            ocr_engine=ocr_engine,
+            stage=failure_stage,
+            code=code,
+            message=str(raw_error.get("message") or "OCR 候補番号がありません"),
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                attempted=not bool(ocr_result_path),
+                candidate_count=0,
+            ),
         )
         return None
 
     logger.info("[Step 1.5] LLMでOCR番号を検証")
+    number_validation_info: Dict[str, Any] = {}
+    generation_warnings: List[str] = []
     try:
-        validator = NumberValidator(model=model)
-        numbers = validator.validate_numbers(image_path, raw_numbers)
-    except Exception:
-        # Validator 自体が実行不能な場合も raw 候補へ戻さない。未承認
-        # OCRを pin 化せず、診断付き controlled failure として終了する。
-        logger.warning("OCR番号検証に失敗したため座標生成を中断")
-        try:
-            output_path = Path(output_json_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            failure_diagnostics = dict(ocr_engine.diagnostics)
-            failure_diagnostics["error"] = {
-                "code": "number_validation_failed",
-                "message": "NumberValidator failed before approving OCR candidates",
-            }
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "image_path": image_path,
-                        "event_json_path": event_json_path,
-                        "map_number": map_number,
-                        "error": "number_validation_failed",
-                        "ocr_diagnostics": failure_diagnostics,
-                        "validated_count": 0,
-                        "raw_count": len(raw_numbers),
-                        "complete_grid": [],
-                        "total_spaces": 0,
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-        except OSError:
-            pass
+        validator_kwargs: Dict[str, Any] = {"model": model}
+        if image_llm_attempts:
+            validator_kwargs["attempts"] = [
+                dict(attempt) for attempt in image_llm_attempts
+            ]
+        if image_api_reasoning_effort_map:
+            validator_kwargs["api_reasoning_effort_map"] = dict(
+                image_api_reasoning_effort_map
+            )
+        validator = NumberValidator(**validator_kwargs)
+        validation_result = validator.validate_numbers(image_path, raw_numbers)
+    except NumberValidatorImageReadError as exc:
+        logger.error("NumberValidator がマップ画像を読み込めませんでした")
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="input",
+            code="image_read_failed",
+            message="マップ画像を読み込めませんでした",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=0,
+            ),
+            raw_count=len(raw_numbers),
+            exception_type=type(exc).__name__,
+        )
+        return None
+    except Exception as exc:
+        logger.warning("OCR番号検証で予期しないエラーのため座標生成を中断")
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="number_validation",
+            code="number_validation_failed",
+            message="NumberValidator が OCR 候補を検証できませんでした",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=0,
+            ),
+            raw_count=len(raw_numbers),
+            exception_type=type(exc).__name__,
+        )
         return None
 
-    # 空の検証結果を raw_numbers で補完しない。検証で候補が全て除外
-    # された場合は、誤検出を pin として出力するより安全に失敗させる。
-    if not isinstance(numbers, list) or not numbers:
+    if not isinstance(validation_result, NumberValidationResult):
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="number_validation",
+            code="number_validation_failed",
+            message="NumberValidator の結果形式が不正です",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=0,
+            ),
+            raw_count=len(raw_numbers),
+        )
+        return None
+
+    number_validation_info = dict(validation_result.diagnostics or {})
+    number_validation_info.setdefault("raw_count", len(raw_numbers))
+
+    if validation_result.status == "skipped_error":
+        logger.warning(
+            "[map-auto] number validation skipped provider=%s model=%s effort=%s reason=%s",
+            number_validation_info.get("provider"),
+            number_validation_info.get("model"),
+            number_validation_info.get("effort"),
+            number_validation_info.get("reason"),
+        )
+        generation_warnings.append(
+            "画像LLMによるOCR候補検証をスキップしました。"
+            "後段のgeometry安全検証を通過した候補のみ使用しています。"
+        )
+        numbers = list(validation_result.numbers)
+    elif validation_result.status == "rejected_all":
         logger.error(
             "OCR番号検証結果が空のため座標生成を中断 (raw=%d)",
             len(raw_numbers),
         )
-        try:
-            output_path = Path(output_json_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            failure_diagnostics = dict(ocr_engine.diagnostics)
-            failure_diagnostics["error"] = {
-                "code": "number_validation_empty",
-                "message": "NumberValidator returned no approved OCR candidates",
-            }
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "image_path": image_path,
-                        "event_json_path": event_json_path,
-                        "map_number": map_number,
-                        "error": "number_validation_empty",
-                        "ocr_diagnostics": failure_diagnostics,
-                        "validated_count": 0,
-                        "raw_count": len(raw_numbers),
-                        "complete_grid": [],
-                        "total_spaces": 0,
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-        except OSError:
-            pass
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="number_validation",
+            code="number_validation_empty",
+            message="NumberValidator が承認した OCR 候補はありません",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=0,
+            ),
+            raw_count=len(raw_numbers),
+            number_validation=number_validation_info,
+        )
+        return None
+    elif validation_result.status == "validated":
+        numbers = list(validation_result.numbers)
+    else:
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="number_validation",
+            code="number_validation_failed",
+            message="NumberValidator の結果形式が不正です",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=0,
+            ),
+            raw_count=len(raw_numbers),
+            number_validation=number_validation_info,
+        )
         return None
 
-    import cv2
+    if not isinstance(numbers, list):
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="number_validation",
+            code="number_validation_failed",
+            message="NumberValidator の結果形式が不正です",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=0,
+            ),
+            raw_count=len(raw_numbers),
+        )
+        return None
+    if not numbers and validation_result.status != "skipped_error":
+        logger.error(
+            "OCR番号検証結果が空のため座標生成を中断 (raw=%d)",
+            len(raw_numbers),
+        )
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="number_validation",
+            code="number_validation_empty",
+            message="NumberValidator が承認した OCR 候補はありません",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=0,
+            ),
+            raw_count=len(raw_numbers),
+            number_validation=number_validation_info,
+        )
+        return None
 
-    img = cv2.imread(image_path)
+    img = _read_image_unicode_safe(image_path)
     if img is None:
         logger.error(f"画像を読み込めません: {image_path}")
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="input",
+            code="image_read_failed",
+            message="マップ画像を読み込めませんでした",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=len(numbers),
+            ),
+        )
         return None
-    image_height, image_width = img.shape[:2]
+    try:
+        image_height, image_width = img.shape[:2]
+        image_height = int(image_height)
+        image_width = int(image_width)
+        if image_height <= 0 or image_width <= 0:
+            raise ValueError("invalid image dimensions")
+    except (AttributeError, TypeError, ValueError, IndexError) as exc:
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="input",
+            code="image_dimensions_invalid",
+            message="マップ画像のサイズが不正です",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=len(numbers),
+            ),
+            exception_type=type(exc).__name__,
+        )
+        return None
 
     def select_horizontal_numbers(source_numbers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         selected: List[Dict[str, Any]] = []
@@ -2350,66 +3012,267 @@ def generate_coordinates_from_map(
             selected.append(item)
         return selected
 
-    horizontal_candidates = select_horizontal_numbers(numbers)
+    try:
+        horizontal_candidates = select_horizontal_numbers(numbers)
+    except Exception as exc:
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="geometry_candidate_filter_failed",
+            message="OCR 候補をグリッド解析用に整理できませんでした",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=len(numbers),
+            ),
+            exception_type=type(exc).__name__,
+        )
+        return None
     if len(horizontal_candidates) < max(12, len(numbers) // 3):
         # Filtered candidates are only used for the coarse pattern estimate;
         # retain the validator-approved list for final geometry resolution.
         horizontal_candidates = numbers
 
     logger.info("[Step 2] OCR結果からグリッド候補を推定")
-    pattern_info = ocr_engine.analyze_grid_pattern(horizontal_candidates)
-    expected_columns = int(catalog_info.get("max_column_number") or pattern_info.get("cols") or 18)
-    row_count_hint = (
-        pattern_info.get("rows")
-        or len(catalog_info.get("horizontal_labels") or [])
-        or 3
-    )
-    preliminary_rows = estimate_row_positions(
-        horizontal_candidates,
-        image_width,
-        image_height,
-        int(row_count_hint),
-        max_value=max(expected_columns, int(row_count_hint)),
-    )
-    x_positions = estimate_column_positions(
-        horizontal_candidates,
-        image_width,
-        expected_columns,
-        row_positions=preliminary_rows,
-        image_height=image_height,
-    )
+    try:
+        pattern_info = ocr_engine.analyze_grid_pattern(horizontal_candidates)
+    except Exception as exc:
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="geometry_pattern_analysis_failed",
+            message="OCR 番号からグリッド候補を推定できませんでした",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=len(numbers),
+            ),
+            exception_type=type(exc).__name__,
+        )
+        return None
+    if not isinstance(pattern_info, Mapping):
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="geometry_result_invalid",
+            message="OCR グリッド解析結果の形式が不正です",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=len(numbers),
+            ),
+        )
+        return None
+    try:
+        expected_columns = int(
+            catalog_info.get("max_column_number")
+            or pattern_info.get("cols")
+            or 18
+        )
+        row_count_hint = (
+            pattern_info.get("rows")
+            or len(catalog_info.get("horizontal_labels") or [])
+            or 3
+        )
+        expected_columns = max(1, expected_columns)
+        row_count_hint = max(1, int(row_count_hint))
+    except (TypeError, ValueError, OverflowError) as exc:
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="geometry_result_invalid",
+            message="OCR グリッド解析結果の数値形式が不正です",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=len(numbers),
+            ),
+            exception_type=type(exc).__name__,
+        )
+        return None
+    try:
+        preliminary_rows = estimate_row_positions(
+            horizontal_candidates,
+            image_width,
+            image_height,
+            int(row_count_hint),
+            max_value=max(expected_columns, int(row_count_hint)),
+        )
+        x_positions = estimate_column_positions(
+            horizontal_candidates,
+            image_width,
+            expected_columns,
+            row_positions=preliminary_rows,
+            image_height=image_height,
+        )
+    except Exception as exc:
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="geometry_grid_estimation_failed",
+            message="画像上の行列位置を推定できませんでした",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=len(numbers),
+            ),
+            exception_type=type(exc).__name__,
+        )
+        return None
     if x_positions:
         pattern_info["x_positions"] = x_positions
         pattern_info["cols"] = len(x_positions)
 
     logger.info("[Step 3] LLMで画像の配置規則を判定")
     calibration_points = (catalog_info.get("calibration_points") or []) if use_calibration else []
-    try:
-        analyzer = PatternAnalyzer(model=model)
-        llm_pattern = analyzer.analyze_pattern(
-            image_path,
-            numbers,
-            catalog_info=catalog_info,
-            calibration_points=calibration_points,
+    pattern_attempt = _resolve_pattern_analyzer_attempt(image_llm_attempts)
+    if pattern_attempt is None:
+        logger.info(
+            "CLI-only image LLM 設定のため PatternAnalyzer LLM をスキップ（geometry fallback を使用）"
         )
-        llm_pattern = merge_catalog_into_llm_pattern(llm_pattern, catalog_info)
-    except Exception as exc:
-        logger.warning(f"LLM配置判定に失敗したためフォールバックを使用: {exc}")
         llm_pattern = build_fallback_pattern(pattern_info, catalog_info)
+    else:
+        try:
+            analyzer = PatternAnalyzer(
+                attempt=pattern_attempt,
+                api_reasoning_effort_map=image_api_reasoning_effort_map,
+            )
+            llm_pattern = analyzer.analyze_pattern(
+                image_path,
+                numbers,
+                catalog_info=catalog_info,
+                calibration_points=calibration_points,
+            )
+            if not isinstance(llm_pattern, Mapping):
+                _write_failure_artifact(
+                    output_json_path,
+                    ocr_engine=ocr_engine,
+                    image_path=image_path,
+                    event_json_path=event_json_path,
+                    map_number=map_number,
+                    stage="geometry",
+                    code="geometry_result_invalid",
+                    message="LLM配置判定結果の形式が不正です",
+                    catalog=catalog_diagnostics,
+                    ocr=_ocr_summary(
+                        ocr_engine,
+                        candidate_count=len(raw_numbers),
+                        validated_count=len(numbers),
+                    ),
+                )
+                return None
+            llm_pattern = merge_catalog_into_llm_pattern(llm_pattern, catalog_info)
+        except Exception as exc:
+            from src.space_locator.number_validator import _sanitize_llm_error_message
 
-    row_count = (
-        llm_pattern.get("rows", {}).get("count")
-        or len(catalog_info.get("horizontal_labels") or [])
-        or pattern_info.get("rows")
-        or 3
-    )
-    y_positions = estimate_row_positions(
-        horizontal_candidates,
-        image_width,
-        image_height,
-        int(row_count),
-        max_value=max(expected_columns, int(row_count)),
-    )
+            logger.warning(
+                "LLM配置判定に失敗したためフォールバックを使用: %s",
+                _sanitize_llm_error_message(exc),
+            )
+            llm_pattern = build_fallback_pattern(pattern_info, catalog_info)
+
+    if not isinstance(llm_pattern, Mapping):
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="geometry_result_invalid",
+            message="LLM配置判定結果の形式が不正です",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=len(numbers),
+            ),
+        )
+        return None
+    try:
+        llm_rows = llm_pattern.get("rows", {})
+        if llm_rows is None:
+            llm_rows = {}
+        if not isinstance(llm_rows, Mapping):
+            raise TypeError("llm rows is not an object")
+        row_count = (
+            llm_rows.get("count")
+            or len(catalog_info.get("horizontal_labels") or [])
+            or pattern_info.get("rows")
+            or 3
+        )
+        row_count = max(1, int(row_count))
+    except (TypeError, ValueError, OverflowError) as exc:
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="geometry_result_invalid",
+            message="LLM配置判定結果の数値形式が不正です",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=len(numbers),
+            ),
+            exception_type=type(exc).__name__,
+        )
+        return None
+    try:
+        y_positions = estimate_row_positions(
+            horizontal_candidates,
+            image_width,
+            image_height,
+            row_count,
+            max_value=max(expected_columns, row_count),
+        )
+    except Exception as exc:
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="geometry_row_estimation_failed",
+            message="画像上の行位置を推定できませんでした",
+            catalog=catalog_diagnostics,
+            ocr=_ocr_summary(
+                ocr_engine,
+                candidate_count=len(raw_numbers),
+                validated_count=len(numbers),
+            ),
+            exception_type=type(exc).__name__,
+        )
+        return None
     if y_positions:
         pattern_info["y_positions"] = y_positions
         pattern_info["rows"] = len(y_positions)
@@ -2419,46 +3282,86 @@ def generate_coordinates_from_map(
     # bboxes and the expanded catalog only.  LLM pattern output and event
     # pin/calibration points remain diagnostics until the explicit post-gate
     # calibration step (evaluation-leak guard).
-    complete_grid = _build_catalog_geometry_grid(
-        numbers,
-        catalog_info,
-        (image_width, image_height),
+    geometry_ocr = _ocr_summary(
+        ocr_engine,
+        candidate_count=len(raw_numbers),
+        validated_count=len(numbers),
     )
-    geometry_quality = _catalog_geometry_quality(
-        numbers,
-        catalog_info,
-        complete_grid,
-        (image_width, image_height),
-    )
-    if not geometry_quality.get("gate", {}).get("passed"):
+    try:
+        complete_grid = _build_catalog_geometry_grid(
+            numbers,
+            catalog_info,
+            (image_width, image_height),
+        )
+    except Exception as exc:
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="geometry_resolution_failed",
+            message="catalog geometry resolver が座標を生成できませんでした",
+            catalog=catalog_diagnostics,
+            ocr=geometry_ocr,
+            exception_type=type(exc).__name__,
+        )
+        return None
+    try:
+        geometry_quality = _catalog_geometry_quality(
+            numbers,
+            catalog_info,
+            complete_grid,
+            (image_width, image_height),
+        )
+    except Exception as exc:
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="geometry_quality_evaluation_failed",
+            message="catalog geometry quality を評価できませんでした",
+            catalog=catalog_diagnostics,
+            ocr=geometry_ocr,
+            exception_type=type(exc).__name__,
+        )
+        return None
+    if not isinstance(geometry_quality, Mapping):
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="geometry_quality_invalid",
+            message="catalog geometry quality の結果形式が不正です",
+            catalog=catalog_diagnostics,
+            ocr=geometry_ocr,
+        )
+        return None
+    gate = geometry_quality.get("gate")
+    if not isinstance(gate, Mapping) or not gate.get("passed"):
         logger.error("catalog geometry quality gate failed: %s", geometry_quality)
-        failure_diagnostics = dict(ocr_engine.diagnostics)
-        failure_diagnostics["error"] = {
-            "code": "catalog_geometry_quality_gate_failed",
-            "message": "catalog geometry coverage/observation quality is below threshold",
-            "geometry_quality": geometry_quality,
-        }
-        try:
-            output_path = Path(output_json_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "image_path": image_path,
-                        "event_json_path": event_json_path,
-                        "map_number": map_number,
-                        "error": "catalog_geometry_quality_gate_failed",
-                        "ocr_diagnostics": failure_diagnostics,
-                        "geometry_quality": geometry_quality,
-                        "complete_grid": [],
-                        "total_spaces": 0,
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-        except OSError:
-            pass
+        _write_failure_artifact(
+            output_json_path,
+            ocr_engine=ocr_engine,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="geometry",
+            code="catalog_geometry_quality_gate_failed",
+            message="catalog geometry coverage/observation quality is below threshold",
+            catalog=catalog_diagnostics,
+            ocr=geometry_ocr,
+            geometry_quality=geometry_quality,
+            complete_grid=[],
+            total_spaces=0,
+        )
         return None
 
     # Resolve deterministic catalog geometry first, then apply calibration as
@@ -2466,42 +3369,62 @@ def generate_coordinates_from_map(
     # the pre-calibration geometry so existing event pins cannot influence the
     # resolver gate.
     if use_calibration:
-        complete_grid, calibration_summary = apply_calibration_points(
-            complete_grid,
-            catalog_info.get("calibration_points") or [],
-            image_width=image_width,
-            image_height=image_height,
-        )
+        try:
+            complete_grid, calibration_summary = apply_calibration_points(
+                complete_grid,
+                catalog_info.get("calibration_points") or [],
+                image_width=image_width,
+                image_height=image_height,
+            )
+        except Exception as exc:
+            _write_failure_artifact(
+                output_json_path,
+                ocr_engine=ocr_engine,
+                image_path=image_path,
+                event_json_path=event_json_path,
+                map_number=map_number,
+                stage="calibration",
+                code="calibration_failed",
+                message="calibration transform の適用に失敗しました",
+                catalog=catalog_diagnostics,
+                ocr=geometry_ocr,
+                geometry_quality=geometry_quality,
+                exception_type=type(exc).__name__,
+            )
+            return None
+        if not isinstance(calibration_summary, Mapping):
+            _write_failure_artifact(
+                output_json_path,
+                ocr_engine=ocr_engine,
+                image_path=image_path,
+                event_json_path=event_json_path,
+                map_number=map_number,
+                stage="calibration",
+                code="calibration_result_invalid",
+                message="calibration transform の結果形式が不正です",
+                catalog=catalog_diagnostics,
+                ocr=geometry_ocr,
+                geometry_quality=geometry_quality,
+            )
+            return None
         if calibration_summary.get("mode") == "rejected":
             logger.error("calibration safety gate failed: %s", calibration_summary)
-            failure_diagnostics = dict(ocr_engine.diagnostics)
-            failure_diagnostics["error"] = {
-                "code": "calibration_safety_gate_failed",
-                "message": "calibration transform was rejected before pin update",
-                "calibration": calibration_summary,
-            }
-            try:
-                output_path = Path(output_json_path)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(output_path, "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "image_path": image_path,
-                            "event_json_path": event_json_path,
-                            "map_number": map_number,
-                            "error": "calibration_safety_gate_failed",
-                            "ocr_diagnostics": failure_diagnostics,
-                            "geometry_quality": geometry_quality,
-                            "calibration": calibration_summary,
-                            "complete_grid": [],
-                            "total_spaces": 0,
-                        },
-                        f,
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-            except OSError:
-                pass
+            _write_failure_artifact(
+                output_json_path,
+                ocr_engine=ocr_engine,
+                image_path=image_path,
+                event_json_path=event_json_path,
+                map_number=map_number,
+                stage="calibration",
+                code="calibration_safety_gate_failed",
+                message="calibration transform was rejected before pin update",
+                catalog=catalog_diagnostics,
+                ocr=geometry_ocr,
+                geometry_quality=geometry_quality,
+                calibration=calibration_summary,
+                complete_grid=[],
+                total_spaces=0,
+            )
             return None
     else:
         calibration_summary = {
@@ -2511,12 +3434,18 @@ def generate_coordinates_from_map(
         }
 
     result = {
+        "schema_version": 2,
+        "status": "success",
+        "stage": "complete",
         "image_path": image_path,
         "event_json_path": event_json_path,
         "map_number": map_number,
+        "ocr": geometry_ocr,
         "ocr_diagnostics": ocr_engine.diagnostics,
         "pattern_info": pattern_info,
         "llm_pattern": llm_pattern,
+        "number_validation": number_validation_info,
+        "warnings": generation_warnings,
         "catalog_info": {
             "order": catalog_info.get("order", []),
             "counts": catalog_info.get("counts", {}),
@@ -2524,15 +3453,35 @@ def generate_coordinates_from_map(
             "vertical_labels": catalog_info.get("vertical_labels", []),
             "max_column_number": catalog_info.get("max_column_number", 0),
             "target_space_count": len(catalog_info.get("spaces", [])),
+            "diagnostics": catalog_diagnostics,
         },
+        "event_catalog": catalog_diagnostics,
         "calibration": calibration_summary,
         "geometry_quality": geometry_quality,
         "complete_grid": complete_grid,
         "total_spaces": len(complete_grid),
     }
 
-    with open(output_json_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+    try:
+        Path(output_json_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+    except (OSError, TypeError, ValueError) as exc:
+        _write_failure_artifact(
+            output_json_path,
+            image_path=image_path,
+            event_json_path=event_json_path,
+            map_number=map_number,
+            stage="update",
+            code="coordinate_artifact_write_failed",
+            message="座標生成 artifact を保存できませんでした",
+            catalog=catalog_diagnostics,
+            ocr=geometry_ocr,
+            geometry_quality=geometry_quality,
+            calibration=calibration_summary,
+            exception_type=type(exc).__name__,
+        )
+        return None
 
     logger.info(f"座標マップを保存: {output_json_path}")
     logger.info(f"生成座標数: {len(complete_grid)}")

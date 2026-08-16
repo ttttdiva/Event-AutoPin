@@ -8,6 +8,9 @@ import {
   type BridgeJobResult,
 } from "./bridge-job";
 import {
+  formatCoordinateGenerationFailure,
+} from "./coordinate-diagnostics";
+import {
   buildEventJsonSnapshot,
   eventJsonDocumentsEqual,
   imageColumnAssetReferences,
@@ -1405,6 +1408,27 @@ function applyOperationEvent(event: OperationEvent): void {
   }
 }
 
+function safeApplyOperationEvent(event: OperationEvent, context = "operation"): void {
+  try {
+    applyOperationEvent(event);
+  } catch (error) {
+    operationState = createOperationState();
+    logToFile(`[${context}] invalid operation transition: ${event.type} ${String(error)}`);
+  }
+}
+
+function releaseMapAutoUiLock(
+  autoBtn: HTMLButtonElement,
+  calibrationBtn: HTMLButtonElement,
+  mutationTabs: HTMLElement[],
+): void {
+  mutationTabs.forEach((tab) => {
+    tab.inert = false;
+  });
+  autoBtn.disabled = false;
+  calibrationBtn.disabled = false;
+}
+
 function waitForOperationIdle(): Promise<void> {
   if (canAutoSave(operationState)) return Promise.resolve();
   if (!operationIdlePromise) {
@@ -2441,33 +2465,6 @@ function formatResult(job: string, response: Record<string, unknown>): string {
   if (bridge?.error) msg += `\nエラー: ${bridge.error}`;
   if (stderr) msg += `\n\n--- ログ ---\n${stderr}`;
   return msg;
-}
-
-function formatOcrDiagnostics(value: unknown): string {
-  if (!value || typeof value !== "object") return "";
-  const diagnostics = value as Record<string, unknown>;
-  const lines: string[] = [];
-  const code = String(diagnostics.error_code || "").trim();
-  const message = String(diagnostics.error_message || "").trim();
-  const returncode = diagnostics.returncode;
-  const model = String(diagnostics.model || "").trim();
-  const device = String(diagnostics.device || "").trim();
-  const venv = diagnostics.venv as Record<string, unknown> | undefined;
-  const stderr = String(diagnostics.stderr || "").trim();
-  const hint = String(diagnostics.recovery_hint || "").trim();
-  if (code) lines.push(`診断コード: ${code}`);
-  if (message) lines.push(`診断メッセージ: ${message}`);
-  if (returncode !== null && returncode !== undefined) {
-    lines.push(`OCR returncode: ${String(returncode)}`);
-  }
-  if (model) lines.push(`OCRモデル: ${model}`);
-  if (device) lines.push(`実行デバイス: ${device}`);
-  if (venv && venv.configured !== undefined) {
-    lines.push(`専用venv: ${venv.configured ? "設定済み" : "未設定（既定環境）"}`);
-  }
-  if (stderr) lines.push(`stderr要約: ${stderr}`);
-  if (hint) lines.push(`復旧方法: ${hint}`);
-  return lines.length ? `\n\n--- OCR診断（安全な要約） ---\n${lines.join("\n")}` : "";
 }
 
 function historyMatchLabel(hit: HistorySearchHit): string {
@@ -8955,22 +8952,39 @@ async function saveMapImageFromDataTransfer(dt: DataTransfer, num: number) {
 
 async function runMapAutoPlacement(useCalibration: boolean) {
   const generation = ++mapAutoPlacementGeneration;
+  logToFile(`[map-auto] click generation=${generation} calibration=${useCalibration}`);
   if (!canStartMapAuto(operationState)) {
     resultEl.textContent =
       "別のイベント処理を実行中です。完了後にマップ自動配置を再実行してください。";
+    logToFile("[map-auto] blocked by operation guard");
     return;
   }
   const eventDir = getActiveEventDir();
   const eventJsonPath = getActiveEventJsonPath();
   if (!eventDir || !eventJsonPath) {
     resultEl.textContent = "サイドバーでイベントを選択してください";
+    logToFile("[map-auto] blocked: event not selected");
     return;
   }
-  const autoBtn = document.getElementById("mapAutoPlaceBtn") as HTMLButtonElement;
+  const mapNumber = currentMapNumber();
+  if (!mapNumber || mapNumber < 1) {
+    resultEl.textContent = "マップ番号が未設定です。マップ画像を追加してください。";
+    logToFile("[map-auto] blocked: map number missing");
+    return;
+  }
+  const autoBtn = document.getElementById("mapAutoPlaceBtn") as HTMLButtonElement | null;
   const calibrationBtn = document.getElementById(
     "mapReprocessWithCalibrationBtn",
-  ) as HTMLButtonElement;
-  applyOperationEvent({ type: "request-map-auto" });
+  ) as HTMLButtonElement | null;
+  if (!autoBtn || !calibrationBtn) {
+    resultEl.textContent = "自動配置ボタンの初期化に失敗しました。アプリを再起動してください。";
+    logToFile("[map-auto] blocked: button elements missing");
+    return;
+  }
+  resultEl.textContent = useCalibration
+    ? `マップ ${mapNumber} を校正点で再処理中...`
+    : `マップ ${mapNumber} のピンを自動配置中...`;
+  safeApplyOperationEvent({ type: "request-map-auto" }, "map-auto");
   markEventDocumentMutated();
   const mutationTabs = ["sidebar", "tab-crawl", "tab-edit", "tab-map"]
     .map((id) => document.getElementById(id) as HTMLElement | null)
@@ -8983,21 +8997,23 @@ async function runMapAutoPlacement(useCalibration: boolean) {
   let backendSucceeded = false;
   let reloadCommitted = false;
   try {
+    logToFile("[map-auto] guard passed");
     const crawlSnapshot = captureCrawlMetaSnapshot();
     cancelCrawlMetaSave();
     await flushCrawlMetaSnapshot(crawlSnapshot, INTERNAL_OPERATION_SAVE);
     const pendingSave = saveNow(INTERNAL_OPERATION_SAVE);
-    // saveNowは最初のawaitまでにsnapshot/revisionを確定する。
     const saveRevision = eventDocumentStateRevision;
     const saveResult = await pendingSave;
     if (!saveResult.ok) {
       resultEl.textContent = `マップ処理前のevent.json保存に失敗しました: ${String(saveResult.error)}`;
+      logToFile(`[map-auto] pre-save failed: ${String(saveResult.error)}`);
       return;
     }
     await eventSaveQueue.flushKey(eventMetaOwnerKey(activeEventSlug || "", eventDir));
     if (eventDocumentStateRevision !== saveRevision) {
       resultEl.textContent =
         "マップ処理前の保存中に編集されたため、自動配置を中止しました。もう一度実行してください。";
+      logToFile("[map-auto] pre-save revision changed");
       return;
     }
     const owner = captureActiveEventDocumentOwner();
@@ -9013,25 +9029,43 @@ async function runMapAutoPlacement(useCalibration: boolean) {
           "自動配置中にイベント切替または編集があったため、取得結果を画面へ反映しませんでした。";
       }
     };
-    const mapNumber = currentMapNumber();
-    resultEl.textContent = useCalibration
-      ? `マップ ${mapNumber} を校正点で再処理中...`
-      : `マップ ${mapNumber} のピンを自動配置中...`;
-    applyOperationEvent({ type: "map-auto-started" });
-    const response = await runJob("auto_place_map_pins", {
+    safeApplyOperationEvent({ type: "map-auto-started" }, "map-auto");
+    const imageConfig = selectedImageConfig();
+    const payload = {
       event_dir: eventDir,
       event_json: eventJsonPath,
       map_number: mapNumber,
       use_calibration: useCalibration,
-      image_llm_model: selectedImageModel() || selectedImageFallbackModel(),
+      image_llm_provider: imageConfig.provider,
+      image_llm_model: imageConfig.model,
+      image_llm_effort: imageConfig.effort,
+      image_fallback_llm_provider: providerConfigValue(selectedImageFallbackProvider()),
+      image_fallback_llm_model: selectedImageFallbackModel(),
+      image_fallback_llm_effort: selectedImageFallbackEffort(),
+      image_api_reasoning_effort_map: selectedImageApiEffortMap(),
       ocr_config: currentOcrConfigPayload(),
-    });
+    };
+    logToFile(`[map-auto] payload built map=${mapNumber} event=${eventJsonPath}`);
+    logToFile("[map-auto] invoking bridge");
+    const response = await rawInvokeBridgeJob<Record<string, unknown>>(
+      "auto_place_map_pins",
+      payload,
+      currentBridgeJobOptions(Number(timeoutMsEl.value || "10800000")),
+    );
+    logToFile(`[map-auto] bridge returned ok=${Boolean(response?.ok)}`);
     const bridge = response?.bridge as Record<string, any> | undefined;
-    if (!response?.ok || bridge?.status !== "ok") {
-      const ocrDiagnostics = formatOcrDiagnostics(bridge?.ocr_diagnostics);
-      resultEl.textContent =
-        `マップピン自動配置に失敗しました: ${bridge?.error || response?.stderr || "不明なエラー"}` +
-        ocrDiagnostics;
+    if (!response || !response.ok || bridge?.status !== "ok") {
+      resultEl.textContent = formatCoordinateGenerationFailure(
+        bridge || response || { error: "不明なエラー" },
+        mapNumber,
+      );
+      logToFile(
+        `[map-auto] bridge failure code=${String(
+          (bridge?.coordinate_generation as Record<string, unknown> | undefined)?.error_code ||
+            bridge?.error_code ||
+            "unknown",
+        )}`,
+      );
       return;
     }
 
@@ -9058,9 +9092,6 @@ async function runMapAutoPlacement(useCalibration: boolean) {
           );
         } catch (error) {
           const message = String(error);
-          // A native CAS miss is transient: reload and reapply to the new
-          // latest document.  Identity/field conflicts are semantic and must
-          // fail instead of holding the UI in an endless recovery loop.
           if (
             message.includes("fingerprint conflict") ||
             message.includes("最新event.jsonを読み込めません")
@@ -9072,7 +9103,7 @@ async function runMapAutoPlacement(useCalibration: boolean) {
       },
       onFailure: (retryCount) => {
         if (operationState.kind === "map-auto-running") {
-          applyOperationEvent({ type: "map-auto-reload-failed" });
+          safeApplyOperationEvent({ type: "map-auto-reload-failed" }, "map-auto");
         }
         resultEl.textContent =
           `自動配置結果の再読み込みに失敗しました。編集と保存をロックしたまま再試行します (${retryCount})...`;
@@ -9080,9 +9111,10 @@ async function runMapAutoPlacement(useCalibration: boolean) {
       wait: async () => {
         await new Promise<void>((resolve) => window.setTimeout(resolve, 1500));
         if (operationState.kind === "map-auto-recovery") {
-          applyOperationEvent({ type: "retry-map-auto-reload" });
+          safeApplyOperationEvent({ type: "retry-map-auto-reload" }, "map-auto");
         }
       },
+      maxAttempts: 20,
     });
     if (!isCurrentOperation()) {
       reportDiscarded();
@@ -9106,20 +9138,41 @@ async function runMapAutoPlacement(useCalibration: boolean) {
     const calibrationText = calibration?.applied
       ? ` / 校正: ${calibration.mode} ${calibration.points}点`
       : "";
-    resultEl.textContent = `マップ ${mapNumber} の自動配置完了: 更新 ${bridge.updated_count ?? 0}件 / 生成 ${bridge.generated_count ?? 0}件${calibrationText}`;
+    const warningMessages = Array.isArray(bridge.warnings)
+      ? bridge.warnings.map((value) => String(value)).filter(Boolean)
+      : [];
+    const warningText = warningMessages.length
+      ? `\n警告: ${warningMessages.join(" ")}`
+      : "";
+    if (warningMessages.length) {
+      logToFile(
+        `[map-auto] number validation skipped provider=${String(
+          (bridge.number_validation as Record<string, unknown> | undefined)?.provider || "",
+        )} model=${String(
+          (bridge.number_validation as Record<string, unknown> | undefined)?.model || "",
+        )} effort=${String(
+          (bridge.number_validation as Record<string, unknown> | undefined)?.effort || "",
+        )} reason=${String(
+          (bridge.number_validation as Record<string, unknown> | undefined)?.reason || "",
+        )}`,
+      );
+    }
+    resultEl.textContent = `マップ ${mapNumber} の自動配置完了: 更新 ${bridge.updated_count ?? 0}件 / 生成 ${bridge.generated_count ?? 0}件${calibrationText}${warningText}`;
+    logToFile("[map-auto] completed");
   } catch (err) {
     resultEl.textContent = `マップピン自動配置エラー: ${String(err)}`;
+    logToFile(`[map-auto] error: ${String(err)}`);
   } finally {
-    const mayUnlock = !backendSucceeded || reloadCommitted;
-    if (mayUnlock && isMapAutoOperation(operationState)) {
-      applyOperationEvent({ type: "finish-map-auto" });
+    if (isMapAutoOperation(operationState)) {
+      safeApplyOperationEvent({ type: "finish-map-auto" }, "map-auto");
+    } else if (operationState.kind !== "idle" || operationState.queuedReprocess !== 0) {
+      operationState = createOperationState();
+      logToFile("[map-auto] forced operation reset in finally");
     }
-    if (mayUnlock) {
-      mutationTabs.forEach((tab) => {
-        tab.inert = false;
-      });
-      autoBtn.disabled = false;
-      calibrationBtn.disabled = false;
+    releaseMapAutoUiLock(autoBtn, calibrationBtn, mutationTabs);
+    if (backendSucceeded && !reloadCommitted) {
+      resultEl.textContent =
+        `${resultEl.textContent}\n自動配置結果の画面反映は完了しませんでした。イベントを再読み込みしてください。`.trim();
     }
   }
 }

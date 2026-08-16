@@ -79,3 +79,49 @@ def test_coordinate_generation_zero_updates_is_failed(tmp_path, monkeypatch):
     assert summary["succeeded"] == 0
     assert summary["failed"] == 1
     assert summary["maps"][0]["error_code"] == "coordinate_update_zero"
+
+
+def _seed_stale_coordinate_artifacts(output: Path) -> tuple[Path, Path]:
+    summary_path = output / "coordinate_generation_summary.json"
+    map_path = output / "coordinates_map_1.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "stage": "ocr",
+                "error": {"code": "stale_previous_run"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    map_path.write_text(json.dumps({"status": "failed", "stage": "ocr"}), encoding="utf-8")
+    return summary_path, map_path
+
+
+def test_coordinate_generation_invalidates_stale_artifacts_before_missing_map_input(tmp_path):
+    generator = _generator(tmp_path)
+    summary_path, map_path = _seed_stale_coordinate_artifacts(Path(generator.config["output_dir"]))
+    generator.config["map_url"] = ""
+    generator.config.pop("map_urls", None)
+
+    assert generator._generate_coordinates() is False
+
+    # A fresh input-stage summary may be written, but it must not contain the
+    # previous run's OCR failure and no per-map artifact may survive.
+    assert map_path.exists() is False
+    saved = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert saved["error"]["code"] == "map_url_missing"
+    assert saved["stage"] == "input"
+
+
+def test_coordinate_generation_invalidates_stale_artifacts_before_missing_event_input(tmp_path):
+    generator = _generator(tmp_path)
+    summary_path, map_path = _seed_stale_coordinate_artifacts(Path(generator.config["output_dir"]))
+    Path(generator.config["output_dir"], "event.json").unlink()
+
+    assert generator._generate_coordinates() is False
+
+    assert map_path.exists() is False
+    saved = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert saved["error"]["code"] == "event_json_missing"
+    assert saved["stage"] == "input"

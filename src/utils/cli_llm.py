@@ -22,6 +22,19 @@ _MAX_ARG_LENGTH = 8000
 _ANTIGRAVITY_MAX_ARG_LENGTH = 24000
 
 
+def _cleanup_antigravity_workspace(workspace_path: Optional[str]) -> None:
+    if not workspace_path:
+        return
+    try:
+        shutil.rmtree(workspace_path, ignore_errors=True)
+    except RecursionError:
+        logger.warning(
+            "Antigravity image workspace cleanup hit recursion; ignoring"
+        )
+    except OSError as exc:
+        logger.warning("Antigravity image workspace cleanup failed: %s", exc)
+
+
 def _resolve_cli_bin(command: str) -> str:
     return shutil.which(command) or command
 
@@ -74,7 +87,15 @@ def _build_command(
             cmd.append("--sandbox")
         effective_model = model or os.getenv("AGY_MODEL")
         if effective_model and effective_model.lower() != "default":
-            cmd.extend(["--model", effective_model])
+            from .antigravity_models import resolve_antigravity_model
+
+            resolved_model = resolve_antigravity_model(effective_model)
+            if resolved_model:
+                cmd.extend(["--model", resolved_model])
+        if effort and str(effort).strip().lower() not in {"", "none", "auto"}:
+            normalized_effort = str(effort).strip().lower()
+            if normalized_effort in {"low", "medium", "high"}:
+                cmd.extend(["--effort", normalized_effort])
         log_file = os.getenv("AGY_LOG_FILE")
         if log_file:
             cmd.extend(["--log-file", log_file])
@@ -286,54 +307,76 @@ def analyze_image_cli(
     cli_model_map: Optional[dict] = None,
     cli_effort_map: Optional[dict] = None,
     timeout: int = 900,
+    extra_instructions: Optional[str] = None,
 ) -> str:
     """CLI LLMで画像を解析する。Antigravity CLIには作業ディレクトリ内の画像パスを渡す。"""
     providers = providers or ["antigravity", "claude"]
     cli_model_map = cli_model_map or {}
     cli_effort_map = cli_effort_map or {}
     image_file = Path(image_path).resolve()
-    temp_workspace = None
+    workspace_path: Optional[str] = None
     cli_image_file = image_file
 
     if "antigravity" in providers:
-        temp_workspace = tempfile.TemporaryDirectory(prefix="antigravity-image-")
+        workspace_path = tempfile.mkdtemp(prefix="antigravity-image-")
         suffix = image_file.suffix or ".jpg"
-        cli_image_file = Path(temp_workspace.name) / f"image{suffix}"
+        cli_image_file = Path(workspace_path) / f"image{suffix}"
         shutil.copy2(image_file, cli_image_file)
 
-    cli_image_prompt = (
-        "この画像だけを読んで、頒布物をJSON配列だけで返してください。"
-        "形式: [{\"name\":string,\"type\":string,\"price\":number|null}]。"
-        "Markdownや説明は禁止。"
+    attachment_hint = (
+        f"Read the image file {cli_image_file.name} and follow the task above."
     )
-    full_prompt = (
-        f"{prompt}\n\n"
-        f"Attached image file: {cli_image_file.name}\n"
-        f"{cli_image_prompt}"
+    prompt_parts = [
+        prompt,
+        "",
+        f"Attached image file: {cli_image_file.name}",
+        attachment_hint,
+    ]
+    if extra_instructions:
+        prompt_parts.append(str(extra_instructions).strip())
+    full_prompt = "\n".join(part for part in prompt_parts if part is not None)
+
+    result = ""
+    try:
+        for provider in providers:
+            logger.info(f"[{provider}] 画像解析: {image_file.name}")
+            provider_cwd = (
+                workspace_path if provider == "antigravity" and workspace_path else None
+            )
+            success, output = execute_cli_prompt(
+                full_prompt,
+                provider=provider,
+                cwd=provider_cwd,
+                timeout=timeout,
+                model=cli_model_map.get(provider),
+                effort=cli_effort_map.get(provider),
+            )
+            if success and output:
+                result = output
+                break
+            logger.warning(f"[{provider}] 画像解析失敗。次のプロバイダを試行")
+    finally:
+        _cleanup_antigravity_workspace(workspace_path)
+
+    if not result:
+        logger.error("すべてのCLI LLMプロバイダで画像解析に失敗")
+    return result
+
+
+def analyze_catalog_image_cli(
+    image_path: str,
+    prompt: str,
+    providers: Optional[List[str]] = None,
+    cli_model_map: Optional[dict] = None,
+    cli_effort_map: Optional[dict] = None,
+    timeout: int = 900,
+) -> str:
+    """お品書き画像向け CLI 解析。caller prompt の object schema をそのまま使う。"""
+    return analyze_image_cli(
+        image_path=image_path,
+        prompt=prompt,
+        providers=providers,
+        cli_model_map=cli_model_map,
+        cli_effort_map=cli_effort_map,
+        timeout=timeout,
     )
-
-    for provider in providers:
-        logger.info(f"[{provider}] 画像解析: {image_file.name}")
-        provider_cwd = (
-            temp_workspace.name
-            if provider == "antigravity" and temp_workspace
-            else None
-        )
-        success, output = execute_cli_prompt(
-            full_prompt,
-            provider=provider,
-            cwd=provider_cwd,
-            timeout=timeout,
-            model=cli_model_map.get(provider),
-            effort=cli_effort_map.get(provider),
-        )
-        if success and output:
-            if temp_workspace:
-                temp_workspace.cleanup()
-            return output
-        logger.warning(f"[{provider}] 画像解析失敗。次のプロバイダを試行")
-
-    if temp_workspace:
-        temp_workspace.cleanup()
-    logger.error("すべてのCLI LLMプロバイダで画像解析に失敗")
-    return ""

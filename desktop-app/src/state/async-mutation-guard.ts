@@ -49,12 +49,16 @@ export async function retryUntilValue<T>(options: {
   attempt: () => Promise<T | null>;
   onFailure: (attempt: number) => void | Promise<void>;
   wait: () => Promise<void>;
+  maxAttempts?: number;
 }): Promise<T> {
   let count = 0;
   for (;;) {
     const value = await options.attempt();
     if (value !== null) return value;
     count += 1;
+    if (options.maxAttempts !== undefined && count >= options.maxAttempts) {
+      throw new Error(`retryUntilValue exceeded maxAttempts=${options.maxAttempts}`);
+    }
     await options.onFailure(count);
     await options.wait();
   }
