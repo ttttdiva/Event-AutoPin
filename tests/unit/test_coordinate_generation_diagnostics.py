@@ -483,6 +483,41 @@ def test_malformed_grid_pattern_writes_geometry_failure_artifact(
     assert payload["error"]["code"] == "geometry_result_invalid"
 
 
+def test_missing_llm_pattern_attempt_uses_geometry_fallback(
+    tmp_path: Path, monkeypatch
+):
+    event = tmp_path / "event.json"
+    output = tmp_path / "fallback.json"
+    _write_event(event)
+    image = np.full((100, 100, 3), 255, dtype=np.uint8)
+    monkeypatch.setattr(generator, "_read_image_unicode_safe", lambda path: image)
+    monkeypatch.setattr(
+        generator,
+        "OCREngine",
+        lambda *args, **kwargs: _FakeOCREngine(result=[_raw_number()]),
+    )
+    monkeypatch.setattr(
+        generator,
+        "NumberValidator",
+        lambda *args, **kwargs: type(
+            "Validator",
+            (),
+            {
+                "validate_numbers": lambda self, image, raw: _validation_validated(raw)
+            },
+        )(),
+    )
+
+    result = generator.generate_coordinates_from_map(
+        str(tmp_path / "map.png"), str(event), str(output), use_calibration=False
+    )
+    assert result is not None
+    assert result["status"] == "success"
+    assert result["complete_grid"][0]["space_id"] == "A01"
+    persisted = json.loads(output.read_text(encoding="utf-8"))
+    assert persisted["status"] == "success"
+
+
 def test_malformed_llm_pattern_writes_geometry_failure_artifact(tmp_path: Path, monkeypatch):
     event = tmp_path / "event.json"
     output = tmp_path / "malformed-llm.json"
@@ -510,7 +545,11 @@ def test_malformed_llm_pattern_writes_geometry_failure_artifact(tmp_path: Path, 
     )
 
     assert generator.generate_coordinates_from_map(
-        str(tmp_path / "map.png"), str(event), str(output), use_calibration=False
+        str(tmp_path / "map.png"),
+        str(event),
+        str(output),
+        use_calibration=False,
+        image_llm_attempts=[{"kind": "api", "provider": "test", "model": "test"}],
     ) is None
     payload = _read_failure(output)
     assert payload["stage"] == "geometry"
