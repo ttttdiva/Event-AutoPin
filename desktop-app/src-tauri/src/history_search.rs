@@ -12,6 +12,14 @@ const MAX_RESULT_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HistorySearchItem {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checked: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HistorySearchResult {
     event_name: String,
     event_date: String,
@@ -24,6 +32,10 @@ pub struct HistorySearchResult {
     matched_text: String,
     matched_titles: Vec<String>,
     score: f64,
+    circle_cut_filename: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    circle_checked: Option<i64>,
+    items: Vec<HistorySearchItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,6 +196,58 @@ fn push_unique(values: &mut Vec<String>, seen: &mut HashSet<String>, value: Stri
     }
 }
 
+fn checked_value(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    value
+        .as_bool()
+        .map(|checked| i64::from(checked))
+}
+
+fn collect_history_items(circle: &Value) -> Vec<HistorySearchItem> {
+    let source_keys: &[&str] = if circle.get("items").and_then(Value::as_array).is_some() {
+        &["items"]
+    } else {
+        &["books", "item_titles", "book_titles"]
+    };
+    let mut items = Vec::new();
+    for key in source_keys {
+        let Some(array) = circle.get(*key).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in array {
+            if let Some(title) = item.as_str() {
+                let title = title.trim();
+                if title.is_empty() {
+                    continue;
+                }
+                items.push(HistorySearchItem {
+                    name: title.to_string(),
+                    checked: None,
+                });
+                continue;
+            }
+            let name = ["name", "title", "book_title", "item_name"]
+                .iter()
+                .find_map(|title_key| {
+                    let title = value_text(item.get(title_key));
+                    (!title.is_empty()).then_some(title)
+                })
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            items.push(HistorySearchItem {
+                name,
+                checked: checked_value(item.get("checked")),
+            });
+        }
+    }
+    items
+}
+
 fn collect_item_titles(circle: &Value) -> Vec<String> {
     let mut titles = Vec::new();
     let mut seen = HashSet::new();
@@ -341,6 +405,9 @@ fn search_events_dir(
                 matched_text,
                 matched_titles: matched_titles.into_iter().map(|(_, title)| title).collect(),
                 score: (score * 10.0).round() / 10.0,
+                circle_cut_filename: value_text(circle.get("circle_cut_filename")),
+                circle_checked: checked_value(circle.get("checked")),
+                items: collect_history_items(circle),
             });
         }
     }
@@ -539,6 +606,119 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("eventsフォルダが見つかりません"));
+    }
+
+    #[test]
+    fn search_includes_circle_cut_items_and_circle_checked() {
+        let events_dir = temp_events_dir("payload");
+        write_event(
+            &events_dir,
+            "legacy",
+            json!({
+                "event": {"name": "旧形式イベント", "date": "2024-01-01"},
+                "circles": [{
+                    "name": "レガシーサークル",
+                    "checked": 1,
+                    "circle_cut_filename": "circles/legacy-cut.jpg",
+                    "items": [{"title": "旧タイトル"}]
+                }]
+            }),
+        );
+        write_event(
+            &events_dir,
+            "modern",
+            json!({
+                "event": {"name": "新形式イベント", "date": "2025-01-01"},
+                "circles": [{
+                    "name": "モダンサークル",
+                    "checked": 0,
+                    "circle_cut_filename": "circles/modern-cut.jpg",
+                    "items": [
+                        {"name": "新刊A", "checked": 1},
+                        {"name": "新刊B", "checked": 0}
+                    ]
+                }]
+            }),
+        );
+
+        let response = search_events_dir(&events_dir, "サークル", 100, test_today()).unwrap();
+        assert_eq!(response.total_matches, 2);
+
+        let legacy = response
+            .results
+            .iter()
+            .find(|result| result.event_name == "旧形式イベント")
+            .expect("legacy result");
+        assert_eq!(legacy.circle_cut_filename, "circles/legacy-cut.jpg");
+        assert_eq!(legacy.circle_checked, Some(1));
+        assert_eq!(legacy.items.len(), 1);
+        assert_eq!(legacy.items[0].name, "旧タイトル");
+        assert!(legacy.items[0].checked.is_none());
+
+        let modern = response
+            .results
+            .iter()
+            .find(|result| result.event_name == "新形式イベント")
+            .expect("modern result");
+        assert_eq!(modern.circle_cut_filename, "circles/modern-cut.jpg");
+        assert_eq!(modern.circle_checked, Some(0));
+        assert_eq!(modern.items.len(), 2);
+        assert_eq!(modern.items[0].name, "新刊A");
+        assert_eq!(modern.items[0].checked, Some(1));
+        assert_eq!(modern.items[1].name, "新刊B");
+        assert_eq!(modern.items[1].checked, Some(0));
+
+        fs::remove_dir_all(events_dir).unwrap();
+    }
+
+    #[test]
+    fn search_payload_does_not_change_match_counts_or_scores() {
+        let events_dir = temp_events_dir("scores");
+        write_event(
+            &events_dir,
+            "event-a",
+            json!({
+                "event": {"name": "スコア確認", "date": "2024-05-03"},
+                "circles": [{
+                    "name": "ことのは工房",
+                    "circle_cut_filename": "circles/cut.jpg",
+                    "items": [{"name": "琴葉かわいいBOOK3", "checked": 1}]
+                }]
+            }),
+        );
+
+        let response = search_events_dir(&events_dir, "ことのは", 100, test_today()).unwrap();
+        assert_eq!(response.total_matches, 1);
+        assert_eq!(response.results[0].matched_by, "circle");
+        assert!(response.results[0].score > 88.0);
+        assert_eq!(response.results[0].circle_cut_filename, "circles/cut.jpg");
+        assert_eq!(response.results[0].items.len(), 1);
+
+        fs::remove_dir_all(events_dir).unwrap();
+    }
+
+    #[test]
+    fn search_items_prefers_items_array_over_legacy_books() {
+        let events_dir = temp_events_dir("items-priority");
+        write_event(
+            &events_dir,
+            "mixed",
+            json!({
+                "event": {"name": "重複確認", "date": "2024-01-01"},
+                "circles": [{
+                    "name": "重複サークル",
+                    "items": [{"name": "新刊のみ", "checked": 1}],
+                    "books": [{"title": "旧books", "checked": 0}]
+                }]
+            }),
+        );
+
+        let response =
+            search_events_dir(&events_dir, "重複サークル", 100, test_today()).unwrap();
+        assert_eq!(response.results[0].items.len(), 1);
+        assert_eq!(response.results[0].items[0].name, "新刊のみ");
+
+        fs::remove_dir_all(events_dir).unwrap();
     }
 
     #[test]

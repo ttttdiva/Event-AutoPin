@@ -59,6 +59,26 @@ import {
   type SaveReceipt,
 } from "./state/revisioned-save-queue";
 import { PurchaseHistoryIndexService } from "./state/purchase-history-index";
+import {
+  PURCHASE_STATUS,
+  PURCHASE_STATUS_VIEWS,
+  getEffectiveItemStatus,
+  nextPurchaseStatus,
+  normalizePurchaseStatus,
+  type PurchaseStatusValue,
+} from "./purchase-status";
+import {
+  buildHistoryPurchaseSummary,
+  findEventSlugByNormalizedDir,
+  historyItemStatusLabel,
+  historyPurchaseSummaryLabel,
+  resolveEventAssetFilePath as resolveSharedEventAssetFilePath,
+  resolveEventImageSrc as resolveSharedEventImageSrc,
+  resolveHistoryOpenAfterSelect,
+  shouldContinueHistoryOpen,
+  renderHistoryItemRowHtml,
+  type HistorySearchItemDto,
+} from "./history-search-ui";
 import { mergeCommittedEventMetaPreservingUnknown } from "./state/event-meta-merge";
 import {
   prepareFullSyncEventDocument,
@@ -162,6 +182,9 @@ type HistorySearchHit = {
   matchedText: string;
   matchedTitles: string[];
   score: number;
+  circleCutFilename: string;
+  circleChecked?: number | null;
+  items: HistorySearchItemDto[];
 };
 
 type HistorySearchResponse = {
@@ -401,73 +424,7 @@ let persistedEventJsonData: EventJsonData | null = null;
 
 // 展開中のサークル行インデックス（-1 = なし）
 let expandedCircleIdx = -1;
-
-const PURCHASE_STATUS = {
-  NOT_YET: 0,
-  BOUGHT: 1,
-  COULDNT_BUY: 2,
-  SKIPPED: 3,
-} as const;
-
-type PurchaseStatusValue =
-  (typeof PURCHASE_STATUS)[keyof typeof PURCHASE_STATUS];
-
-const PURCHASE_STATUS_VIEWS: Record<
-  PurchaseStatusValue,
-  { icon: string; label: string; color: string; bg: string }
-> = {
-  [PURCHASE_STATUS.NOT_YET]: {
-    icon: "○",
-    label: "未購入",
-    color: "#757575",
-    bg: "",
-  },
-  [PURCHASE_STATUS.BOUGHT]: {
-    icon: "✓",
-    label: "買えた",
-    color: "#2e7d32",
-    bg: "rgba(46,125,50,0.12)",
-  },
-  [PURCHASE_STATUS.COULDNT_BUY]: {
-    icon: "✗",
-    label: "買えなかった",
-    color: "#c62828",
-    bg: "rgba(198,40,40,0.12)",
-  },
-  [PURCHASE_STATUS.SKIPPED]: {
-    icon: "−",
-    label: "見送り",
-    color: "#6d4c41",
-    bg: "rgba(109,76,65,0.12)",
-  },
-};
-
-function normalizePurchaseStatus(value: unknown): PurchaseStatusValue {
-  const n = Number(value ?? PURCHASE_STATUS.NOT_YET);
-  if (
-    n === PURCHASE_STATUS.BOUGHT ||
-    n === PURCHASE_STATUS.COULDNT_BUY ||
-    n === PURCHASE_STATUS.SKIPPED
-  ) {
-    return n as PurchaseStatusValue;
-  }
-  return PURCHASE_STATUS.NOT_YET;
-}
-
-function nextPurchaseStatus(value: unknown): PurchaseStatusValue {
-  const current = normalizePurchaseStatus(value);
-  if (current === PURCHASE_STATUS.NOT_YET) return PURCHASE_STATUS.BOUGHT;
-  if (current === PURCHASE_STATUS.BOUGHT) return PURCHASE_STATUS.COULDNT_BUY;
-  if (current === PURCHASE_STATUS.COULDNT_BUY) return PURCHASE_STATUS.SKIPPED;
-  return PURCHASE_STATUS.NOT_YET;
-}
-
-function getEffectiveItemStatus(item: any, circle: any): PurchaseStatusValue {
-  if (item && item.checked !== undefined && item.checked !== null) {
-    return normalizePurchaseStatus(item.checked);
-  }
-  return normalizePurchaseStatus(circle?.checked);
-}
+let historyOpenGeneration = 0;
 
 const purchasedItemKeys = new Set<string>();
 const purchaseHistoryIndexService = new PurchaseHistoryIndexService();
@@ -2214,6 +2171,10 @@ function resolveImageSrc(pathOrUrl: string): string {
   return convertFileSrc(absPath);
 }
 
+function resolveEventImageSrc(eventDir: string, pathOrUrl: string): string {
+  return resolveSharedEventImageSrc(eventDir, pathOrUrl, convertFileSrc);
+}
+
 function getDisplayHeaders(headers: string[]): string[] {
   // 非表示列 + ホール（スペースと結合表示するため個別非表示）
   const hiddenCols = [
@@ -2477,6 +2438,64 @@ function historyScoreLabel(score: number): string {
   return "近い候補";
 }
 
+function renderHistoryCircleCutThumb(
+  eventDir: string,
+  cutFilename: string,
+): string {
+  if (!cutFilename) {
+    return `<span class="history-event-cut history-event-cut-empty" aria-hidden="true"></span>`;
+  }
+  const src = resolveEventImageSrc(eventDir, cutFilename);
+  return `<span class="history-event-cut">
+    <img src="${escapeHtml(src)}" alt="" class="history-event-cut-img" data-fallback="outerhtml" data-fallback-html="<span class='history-event-cut history-event-cut-empty' aria-hidden='true'></span>" />
+  </span>`;
+}
+
+function renderHistoryPurchaseSummaryHtml(hit: HistorySearchHit): string {
+  const summary = buildHistoryPurchaseSummary(
+    hit.items ?? [],
+    hit.circleChecked,
+  );
+  if (!summary.hasItems) {
+    return `<span class="history-purchase-summary history-purchase-summary-empty">${escapeHtml(historyPurchaseSummaryLabel(summary))}</span>`;
+  }
+  const boughtView = PURCHASE_STATUS_VIEWS[PURCHASE_STATUS.BOUGHT];
+  const badges: string[] = [
+    `<span class="history-purchase-summary-main" style="color:${boughtView.color}">${escapeHtml(historyPurchaseSummaryLabel(summary))}</span>`,
+  ];
+  if (summary.couldntBuy > 0) {
+    const view = PURCHASE_STATUS_VIEWS[PURCHASE_STATUS.COULDNT_BUY];
+    badges.push(
+      `<span class="history-purchase-badge" style="color:${view.color}">${view.icon} ${summary.couldntBuy}</span>`,
+    );
+  }
+  if (summary.skipped > 0) {
+    const view = PURCHASE_STATUS_VIEWS[PURCHASE_STATUS.SKIPPED];
+    badges.push(
+      `<span class="history-purchase-badge" style="color:${view.color}">${view.icon} ${summary.skipped}</span>`,
+    );
+  }
+  return `<span class="history-purchase-summary">${badges.join("")}</span>`;
+}
+
+function renderHistoryItemRows(hit: HistorySearchHit): string {
+  const items = hit.items ?? [];
+  if (!items.length) {
+    return `<p class="history-items-empty">アイテム情報なし</p>`;
+  }
+  const circle = { checked: hit.circleChecked };
+  return hit.items
+    .map((item) => {
+      const status = getEffectiveItemStatus(item, circle);
+      const view = PURCHASE_STATUS_VIEWS[status];
+      return `
+        <div class="history-item-row">
+          ${renderHistoryItemRowHtml(item.name || "名前なし", historyItemStatusLabel(status), view.color)}
+        </div>`;
+    })
+    .join("");
+}
+
 function renderHistorySearchResults(response: HistorySearchResponse) {
   const resultsEl = document.getElementById("historySearchResults");
   if (!resultsEl) return;
@@ -2497,6 +2516,7 @@ function renderHistorySearchResults(response: HistorySearchResponse) {
     groups.set(key, group);
   }
 
+  let rowIndex = 0;
   resultsEl.innerHTML = Array.from(groups.values())
     .map((hits) => {
       const best = hits[0];
@@ -2506,6 +2526,8 @@ function renderHistorySearchResults(response: HistorySearchResponse) {
         : "";
       const eventRows = hits
         .map((hit) => {
+          const currentRow = rowIndex++;
+          const itemsPanelId = `history-items-${currentRow}`;
           const place = [hit.hall, hit.space].filter(Boolean).join(" / ");
           const matchedTitles = hit.matchedTitles.length
             ? `<div class="history-matched-titles">${hit.matchedTitles
@@ -2514,16 +2536,40 @@ function renderHistorySearchResults(response: HistorySearchResponse) {
             : "";
           return `
             <li class="history-event-row">
-              <div class="history-event-primary">
-                <strong>${escapeHtml(hit.eventName || "イベント名不明")}</strong>
-                <span>${escapeHtml(hit.eventDate || "日付不明")}</span>
-                ${place ? `<span>${escapeHtml(place)}</span>` : ""}
+              <div class="history-event-row-main">
+                <button
+                  type="button"
+                  class="history-event-open"
+                  data-event-dir="${escapeHtml(hit.eventDir)}"
+                >
+                  ${renderHistoryCircleCutThumb(hit.eventDir, hit.circleCutFilename ?? "")}
+                  <span class="history-event-body">
+                    <span class="history-event-primary">
+                      <strong>${escapeHtml(hit.eventName || "イベント名不明")}</strong>
+                      <span>${escapeHtml(hit.eventDate || "日付不明")}</span>
+                      ${place ? `<span>${escapeHtml(place)}</span>` : ""}
+                    </span>
+                    <span class="history-match-detail">
+                      <span class="history-match-kind">${historyMatchLabel(hit)}</span>
+                      <span>${escapeHtml(hit.matchedText)}</span>
+                    </span>
+                    ${renderHistoryPurchaseSummaryHtml(hit)}
+                    ${matchedTitles}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  class="history-event-expand"
+                  aria-expanded="false"
+                  aria-controls="${itemsPanelId}"
+                  aria-label="アイテム一覧を展開"
+                >
+                  <span aria-hidden="true">▶</span>
+                </button>
               </div>
-              <div class="history-match-detail">
-                <span class="history-match-kind">${historyMatchLabel(hit)}</span>
-                <span>${escapeHtml(hit.matchedText)}</span>
+              <div id="${itemsPanelId}" class="history-event-items" hidden>
+                ${renderHistoryItemRows(hit)}
               </div>
-              ${matchedTitles}
             </li>`;
         })
         .join("");
@@ -2543,6 +2589,54 @@ function renderHistorySearchResults(response: HistorySearchResponse) {
         </article>`;
     })
     .join("");
+}
+
+function findEventSlugByEventDir(eventDir: string): string | null {
+  return findEventSlugByNormalizedDir(eventList, eventDir);
+}
+
+async function openHistoryEventFromSearch(
+  eventDir: string,
+  statusEl: HTMLElement,
+): Promise<void> {
+  const generation = ++historyOpenGeneration;
+  let slug = findEventSlugByEventDir(eventDir);
+  if (!slug) {
+    await loadEventList();
+    if (!shouldContinueHistoryOpen(generation, historyOpenGeneration)) return;
+    slug = findEventSlugByEventDir(eventDir);
+  }
+  if (!slug) {
+    if (!shouldContinueHistoryOpen(generation, historyOpenGeneration)) return;
+    statusEl.textContent =
+      "イベントが見つかりませんでした。プロジェクトを再読み込みしてから再度お試しください。";
+    return;
+  }
+  if (!shouldContinueHistoryOpen(generation, historyOpenGeneration)) return;
+  const ok = await selectEvent(slug);
+  if (!shouldContinueHistoryOpen(generation, historyOpenGeneration)) return;
+  if (resolveHistoryOpenAfterSelect(ok).action === "open-tab") {
+    switchToTabById("tab-edit");
+    return;
+  }
+  statusEl.textContent =
+    "イベントを開けませんでした。処理中または保存に失敗している可能性があります。";
+}
+
+function toggleHistoryEventExpand(button: HTMLButtonElement): void {
+  const expanded = button.getAttribute("aria-expanded") === "true";
+  const panelId = button.getAttribute("aria-controls");
+  const panel = panelId ? document.getElementById(panelId) : null;
+  const icon = button.querySelector<HTMLElement>("[aria-hidden='true']");
+  button.setAttribute("aria-expanded", expanded ? "false" : "true");
+  button.setAttribute(
+    "aria-label",
+    expanded ? "アイテム一覧を展開" : "アイテム一覧を折りたたむ",
+  );
+  if (icon) icon.textContent = expanded ? "▶" : "▼";
+  if (!panel) return;
+  if (expanded) panel.setAttribute("hidden", "");
+  else panel.removeAttribute("hidden");
 }
 
 function initHistorySearch() {
@@ -2595,6 +2689,22 @@ function initHistorySearch() {
       button.textContent = "検索";
       resultsEl.removeAttribute("aria-busy");
     }
+  });
+
+  resultsEl.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    const expandButton = target.closest<HTMLButtonElement>(
+      ".history-event-expand",
+    );
+    if (expandButton) {
+      toggleHistoryEventExpand(expandButton);
+      return;
+    }
+    const openButton = target.closest<HTMLButtonElement>(".history-event-open");
+    if (!openButton) return;
+    const eventDir = openButton.dataset.eventDir;
+    if (!eventDir) return;
+    void openHistoryEventFromSearch(eventDir, statusEl);
   });
 }
 
@@ -6822,11 +6932,10 @@ async function flushActiveEventForLifecycle(): Promise<void> {
       await flushAllEventSavesOrThrow();
       await preflightFullSyncEventUids();
       await flushAllEventSavesOrThrow();
-      try {
-        await invoke("stop_file_server");
-      } catch {
-        // stale server cleanup failures are harmless; start_file_server reports real errors.
-      }
+      // stop_file_server is idempotent when no server is running.  Do not
+      // swallow a real stop/join failure here: the ZIP must not be generated
+      // until the previous worker has released its socket and cleanup lease.
+      await invoke("stop_file_server");
       // ZIP作成完了までevent editor/tabをinertに保ち、preflight済みの一貫した
       // disk snapshotへ後続edit/autosaveを混入させない。
       resultEl.textContent = "全イベント同期ZIPを作成中...";
@@ -6835,7 +6944,7 @@ async function flushActiveEventForLifecycle(): Promise<void> {
       });
     });
   } catch (error) {
-    resultEl.textContent = `全イベント同期前の保存に失敗しました: ${String(error)}`;
+    resultEl.textContent = `全イベント同期の準備または停止に失敗しました: ${String(error)}`;
     return;
   }
 
@@ -7539,6 +7648,14 @@ function switchTab(index: number) {
     }
     onTabActivated(target);
   }
+}
+
+function switchToTabById(tabId: string): void {
+  const buttons = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(".tab-btn"),
+  );
+  const index = buttons.findIndex((button) => button.dataset.tab === tabId);
+  if (index >= 0) switchTab(index);
 }
 
 function getActiveTabIndex(): number {
@@ -8869,19 +8986,7 @@ function imageColumnAssetSubdir(col: string): "circles" | "items" {
 }
 
 function resolveEventAssetFilePath(eventDir: string, ref: string): string {
-  const normalized = String(ref || "").replace(/\\/g, "/");
-  if (
-    !normalized ||
-    normalized.startsWith("file://") ||
-    normalized.startsWith("http://") ||
-    normalized.startsWith("https://") ||
-    normalized.startsWith("/") ||
-    /^[A-Za-z]:\//.test(normalized)
-  ) {
-    return normalized;
-  }
-  const baseDir = normalizeFsPath(eventDir);
-  return baseDir ? `${baseDir}/${normalized}` : normalized;
+  return resolveSharedEventAssetFilePath(eventDir, ref);
 }
 
 async function saveMapImageFromPath(

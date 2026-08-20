@@ -16,6 +16,48 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+fn is_usable_advertised_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    !ip.is_unspecified() && !ip.is_loopback() && !ip.is_link_local()
+}
+
+/// Resolve the IPv4 address that a phone on the local network should use.
+///
+/// Connecting an unbound UDP socket to an external address lets the OS select
+/// the source address for the default route without sending a packet.  The
+/// local-ip-address crate remains a fallback (and a private address is always
+/// preferred) so this continues to work on machines where the route probe is
+/// unavailable.
+fn resolve_advertised_ipv4() -> Result<std::net::Ipv4Addr, String> {
+    let route_ip = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|socket| {
+            socket.connect((std::net::Ipv4Addr::new(8, 8, 8, 8), 80))?;
+            socket.local_addr()
+        })
+        .ok()
+        .and_then(|address| match address {
+            std::net::SocketAddr::V4(address) => Some(*address.ip()),
+            std::net::SocketAddr::V6(_) => None,
+        })
+        .filter(|ip| is_usable_advertised_ipv4(*ip));
+
+    let local_ip = local_ip_address::local_ip()
+        .ok()
+        .and_then(|address| match address {
+            std::net::IpAddr::V4(address) => Some(address),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .filter(|ip| is_usable_advertised_ipv4(*ip));
+
+    route_ip
+        .filter(|ip| ip.is_private())
+        .or_else(|| local_ip.filter(|ip| ip.is_private()))
+        .or(route_ip)
+        .or(local_ip)
+        .ok_or_else(|| {
+            "LAN IPv4アドレスを取得できません（loopback/link-localを除外しました）".to_string()
+        })
+}
+
 use history_search::search_past_participations;
 // Native event I/O is intentionally kept independent from the Python bridge.  The
 // counters are cheap atomics so development builds can expose enough evidence for
@@ -3243,8 +3285,59 @@ mod event_meta_tests {
         zip.finish().unwrap();
     }
 
+    fn file_server_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn file_server_runtime_is_initialized() -> bool {
+        file_server_runtime()
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(true)
+    }
+
+    fn http_get_file(path: &str) -> String {
+        let mut stream = None;
+        for _ in 0..50 {
+            match std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], FILE_SERVER_FIXED_PORT)),
+                Duration::from_millis(100),
+            ) {
+                Ok(candidate) => {
+                    stream = Some(candidate);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let mut stream = stream.expect("固定ポート18721へ接続できません");
+        std::io::Write::write_all(
+            &mut stream,
+            format!("GET /{path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[test]
+    fn resolve_advertised_ipv4_rejects_non_lan_addresses() {
+        assert!(!is_usable_advertised_ipv4(std::net::Ipv4Addr::UNSPECIFIED));
+        assert!(!is_usable_advertised_ipv4(std::net::Ipv4Addr::LOCALHOST));
+        assert!(!is_usable_advertised_ipv4(std::net::Ipv4Addr::new(
+            169, 254, 10, 20
+        )));
+        assert!(is_usable_advertised_ipv4(std::net::Ipv4Addr::new(
+            192, 168, 0, 1
+        )));
+    }
+
     #[test]
     fn start_file_server_removes_cleanup_file_on_stop() {
+        let _test_guard = file_server_test_lock().lock().unwrap();
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3265,15 +3358,163 @@ mod event_meta_tests {
         assert!(zip_path.is_file());
 
         stop_file_server().unwrap();
-        for _ in 0..30 {
-            if !zip_path.exists() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
+        assert!(!zip_path.exists(), "stop完了前にcleanupが返りました");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_server_serves_http_and_stop_deactivates_worker() {
+        let _test_guard = file_server_test_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "eventtrail-file-server-http-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("mobile_export.zip");
+
+        stop_file_server().unwrap();
+        for index in 0..20 {
+            let payload = format!("zip-http-body-{index}");
+            fs::write(&zip_path, payload.as_bytes()).unwrap();
+            let result =
+                start_file_server(zip_path.to_string_lossy().to_string(), Some(false)).unwrap();
+            assert_eq!(
+                result["port"].as_u64(),
+                Some(u64::from(FILE_SERVER_FIXED_PORT))
+            );
+
+            let response = http_get_file("mobile_export.zip");
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "unexpected response: {response}"
+            );
+            assert!(response.ends_with(&payload), "unexpected body: {response}");
+
+            stop_file_server().unwrap();
+            let stopped = http_get_file("mobile_export.zip");
+            assert!(
+                stopped.starts_with("HTTP/1.1 404"),
+                "unexpected stopped response: {stopped}"
+            );
         }
 
-        assert!(!zip_path.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_server_active_replacement_preserves_new_source_cleanup() {
+        let _test_guard = file_server_test_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "eventtrail-file-server-replacement-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("mobile_export.zip");
+        fs::write(&source, b"payload-a").unwrap();
+        stop_file_server().unwrap();
+        start_file_server(source.to_string_lossy().to_string(), Some(true)).unwrap();
+        assert!(http_get_file("mobile_export.zip").ends_with("payload-a"));
+
+        let replacement = dir.join("mobile_export.next.zip");
+        fs::write(&replacement, b"payload-b").unwrap();
+        fs::rename(&replacement, &source).unwrap();
+        start_file_server(source.to_string_lossy().to_string(), Some(true)).unwrap();
+        let response = http_get_file("mobile_export.zip");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.ends_with("payload-b"),
+            "unexpected body: {response}"
+        );
+        assert!(
+            source.exists(),
+            "active replacementが新sourceを削除しました"
+        );
+
+        stop_file_server().unwrap();
+        assert!(
+            !source.exists(),
+            "stop時のgeneration cleanupが実行されませんでした"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn served_file_cleanup_is_generation_safe_for_reused_source_path() {
+        let _test_guard = file_server_test_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "eventtrail-file-server-generation-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("mobile_export.zip");
+        fs::write(&source, b"payload-a").unwrap();
+        let old =
+            Arc::new(ServedFile::new(source.clone(), file_server_generation(), true).unwrap());
+        old.deactivate();
+        fs::write(&source, b"payload-b").unwrap();
+        let new = ServedFile::new(source.clone(), file_server_generation(), true).unwrap();
+        drop(old);
+        assert!(source.exists(), "旧generationが新しいsourceを削除しました");
+        drop(new);
+        assert!(
+            !source.exists(),
+            "新generationのcleanupが実行されませんでした"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_server_returns_fixed_port_bind_error_without_fallback() {
+        let _test_guard = file_server_test_lock().lock().unwrap();
+        if file_server_runtime_is_initialized() {
+            eprintln!("fixed port occupancy test skipped: runtime already initialized");
+            return;
+        }
+        stop_file_server().unwrap();
+        let listener =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, FILE_SERVER_FIXED_PORT));
+
+        let result = start_file_server(
+            std::env::temp_dir()
+                .join("eventtrail-fixed-port-bind-error.zip")
+                .to_string_lossy()
+                .to_string(),
+            Some(false),
+        );
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("固定ポート18721"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("attempts="),
+            "missing retry telemetry: {error}"
+        );
+        assert!(
+            error.contains("elapsed_ms="),
+            "missing elapsed telemetry: {error}"
+        );
+        assert!(
+            error.contains("os_error="),
+            "missing OS error telemetry: {error}"
+        );
+        drop(listener);
     }
 
     #[test]
@@ -6312,7 +6553,7 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
         .ok_or_else(|| "サーバーアドレス取得失敗".to_string())?
         .port();
 
-    let ip = local_ip_address::local_ip().map_err(|e| format!("LAN IP取得失敗: {e}"))?;
+    let ip = resolve_advertised_ipv4()?;
     let upload_url = format!("http://{}:{}/upload", ip, port);
 
     let running = Arc::new(AtomicBool::new(true));
@@ -6475,146 +6716,261 @@ fn stop_receive_server() -> Result<Value, String> {
 
 // ── ファイル配信HTTPサーバー ──
 
-struct FileServerState {
-    flag: Arc<AtomicBool>,
-    cleanup_path: Option<PathBuf>,
+const FILE_SERVER_FIXED_PORT: u16 = 18721;
+
+struct ServedFile {
+    source_path: PathBuf,
+    serve_path: PathBuf,
+    display_name: String,
+    cleanup_source_on_deactivate: bool,
+    source_cleanup_done: std::sync::atomic::AtomicBool,
 }
 
-fn server_running() -> &'static Mutex<Option<FileServerState>> {
-    static FLAG: OnceLock<Mutex<Option<FileServerState>>> = OnceLock::new();
-    FLAG.get_or_init(|| Mutex::new(None))
+impl ServedFile {
+    fn new(
+        source_path: PathBuf,
+        generation: u64,
+        cleanup_source_on_deactivate: bool,
+    ) -> Result<Self, String> {
+        let display_name = source_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let internal_name = format!(
+            ".eventtrail_mobile_server_{}_{}_{}",
+            std::process::id(),
+            generation,
+            display_name
+        );
+        let serve_path = source_path.with_file_name(internal_name);
+
+        let _ = fs::remove_file(&serve_path);
+        if let Err(link_error) = fs::hard_link(&source_path, &serve_path) {
+            if let Err(copy_error) = fs::copy(&source_path, &serve_path) {
+                return Err(format!(
+                    "配信用ZIP staging失敗 {}: hard_link={link_error}; copy={copy_error}",
+                    source_path.display()
+                ));
+            }
+        }
+
+        Ok(Self {
+            source_path,
+            serve_path,
+            display_name,
+            cleanup_source_on_deactivate,
+            source_cleanup_done: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn cleanup_source(&self) {
+        if self.cleanup_source_on_deactivate
+            && !self.source_cleanup_done.swap(true, Ordering::AcqRel)
+        {
+            let _ = fs::remove_file(&self.source_path);
+        }
+    }
+
+    fn deactivate(&self) {
+        self.cleanup_source();
+    }
+
+    fn deactivate_for_replacement(&self, replacement_source: &Path) {
+        if self.cleanup_source_on_deactivate && self.source_path == replacement_source {
+            // The replacement generation owns this source path now.  Mark the
+            // old generation as cleaned without deleting the new source file.
+            self.source_cleanup_done.store(true, Ordering::Release);
+        } else {
+            self.cleanup_source();
+        }
+    }
+}
+
+impl Drop for ServedFile {
+    fn drop(&mut self) {
+        self.cleanup_source();
+        let _ = fs::remove_file(&self.serve_path);
+    }
+}
+
+// The fixed-port listener is intentionally process-lifetime.  stop_file_server
+// deactivates the current generation (and returns 404 for new requests) but
+// does not drop the listener; dropping tiny_http on every QR hand-off can leave
+// Windows TIME_WAIT/accept state and make the next fixed-port bind fail.
+struct FileServerRuntime {
+    active: Arc<Mutex<Option<Arc<ServedFile>>>>,
+    _server: Arc<tiny_http::Server>,
+}
+
+fn file_server_runtime() -> &'static Mutex<Option<FileServerRuntime>> {
+    static RUNTIME: OnceLock<Mutex<Option<FileServerRuntime>>> = OnceLock::new();
+    RUNTIME.get_or_init(|| Mutex::new(None))
+}
+
+fn file_server_lifecycle() -> &'static Mutex<()> {
+    static LIFECYCLE: OnceLock<Mutex<()>> = OnceLock::new();
+    LIFECYCLE.get_or_init(|| Mutex::new(()))
+}
+
+fn file_server_generation() -> u64 {
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    GENERATION.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+fn bind_file_server_once() -> Result<Arc<tiny_http::Server>, String> {
+    let started_at = Instant::now();
+    match tiny_http::Server::http(format!("0.0.0.0:{FILE_SERVER_FIXED_PORT}")) {
+        Ok(server) => Ok(Arc::new(server)),
+        Err(error) => {
+            let os_error = error
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io_error| io_error.raw_os_error());
+            Err(format!(
+                "HTTPサーバー起動失敗: 固定ポート{FILE_SERVER_FIXED_PORT}のbindに失敗しました: reason={error}; attempts=1; elapsed_ms={}; os_error={os_error:?}",
+                started_at.elapsed().as_millis()
+            ))
+        }
+    }
+}
+
+fn respond_file_request(request: tiny_http::Request, served: &ServedFile) {
+    let file = match fs::File::open(&served.serve_path) {
+        Ok(file) => file,
+        Err(_) => {
+            let response = tiny_http::Response::from_string("File not found")
+                .with_status_code(tiny_http::StatusCode(404));
+            let _ = request.respond(response);
+            return;
+        }
+    };
+    let len = file
+        .metadata()
+        .map(|metadata| metadata.len() as usize)
+        .unwrap_or(0);
+    let response = tiny_http::Response::new(
+        tiny_http::StatusCode(200),
+        Vec::new(),
+        file,
+        Some(len),
+        None,
+    )
+    .with_header(
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/zip"[..]).unwrap(),
+    )
+    .with_header(
+        tiny_http::Header::from_bytes(
+            &b"Content-Disposition"[..],
+            format!("attachment; filename=\"{}\"", served.display_name).as_bytes(),
+        )
+        .unwrap(),
+    )
+    .with_header(
+        tiny_http::Header::from_bytes(&b"Content-Length"[..], len.to_string().as_bytes()).unwrap(),
+    );
+    let _ = request.respond(response);
+}
+
+fn start_file_server_worker(
+    server: Arc<tiny_http::Server>,
+    active: Arc<Mutex<Option<Arc<ServedFile>>>>,
+) {
+    thread::spawn(move || loop {
+        match server.recv_timeout(Duration::from_millis(500)) {
+            Ok(Some(request)) => {
+                let served = active.lock().ok().and_then(|guard| guard.clone());
+                if let Some(served) = served {
+                    respond_file_request(request, &served);
+                } else {
+                    let response = tiny_http::Response::from_string("File server is stopped")
+                        .with_status_code(tiny_http::StatusCode(404));
+                    let _ = request.respond(response);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+    });
+}
+
+fn ensure_file_server_runtime() -> Result<Arc<Mutex<Option<Arc<ServedFile>>>>, String> {
+    let mut guard = file_server_runtime()
+        .lock()
+        .map_err(|error| format!("ファイルサーバーruntimeロック取得失敗: {error}"))?;
+    if let Some(runtime) = guard.as_ref() {
+        return Ok(runtime.active.clone());
+    }
+
+    let server = bind_file_server_once()?;
+    let active = Arc::new(Mutex::new(None));
+    start_file_server_worker(server.clone(), active.clone());
+    *guard = Some(FileServerRuntime {
+        active: active.clone(),
+        _server: server,
+    });
+    Ok(active)
 }
 
 #[tauri::command]
 fn start_file_server(file_path: String, cleanup_on_stop: Option<bool>) -> Result<Value, String> {
-    let mut guard = server_running()
+    let _lifecycle_guard = file_server_lifecycle()
         .lock()
-        .map_err(|e| format!("ロック取得失敗: {e}"))?;
-    if let Some(ref state) = *guard {
-        if state.flag.load(Ordering::Relaxed) {
-            return Err(
-                "サーバーは既に起動中です。先に stop_file_server を呼んでください。".to_string(),
-            );
-        }
+        .map_err(|error| format!("ファイルサーバーlifecycleロック取得失敗: {error}"))?;
+    let active = ensure_file_server_runtime()?;
+    let ip = resolve_advertised_ipv4()?;
+
+    // Stage the replacement before touching the active slot.  If staging
+    // fails, the previous generation remains downloadable and its source is
+    // not accidentally removed.
+    let source_path = PathBuf::from(&file_path);
+    let served = Arc::new(ServedFile::new(
+        source_path.clone(),
+        file_server_generation(),
+        cleanup_on_stop.unwrap_or(false),
+    )?);
+    let file_name = served.display_name.clone();
+    let mut slot = active
+        .lock()
+        .map_err(|error| format!("ファイルサーバーactiveロック取得失敗: {error}"))?;
+    let old = slot.replace(served);
+    drop(slot);
+    if let Some(old) = old {
+        old.deactivate_for_replacement(&source_path);
     }
-
-    // 固定ポートを優先（ファイアウォール対策）、使用中なら自動割当にフォールバック
-    if let Some(state) = guard.take() {
-        if let Some(path) = state.cleanup_path {
-            let _ = fs::remove_file(path);
-        }
-    }
-
-    let server = tiny_http::Server::http("0.0.0.0:18721")
-        .or_else(|_| tiny_http::Server::http("0.0.0.0:0"))
-        .map_err(|e| format!("HTTPサーバー起動失敗: {e}"))?;
-    let port = server
-        .server_addr()
-        .to_ip()
-        .ok_or_else(|| "サーバーアドレス取得失敗".to_string())?
-        .port();
-
-    let ip = local_ip_address::local_ip().map_err(|e| format!("LAN IP取得失敗: {e}"))?;
-
-    let file_name = PathBuf::from(&file_path)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let url = format!("http://{}:{}/{}", ip, port, file_name);
-
-    let running = Arc::new(AtomicBool::new(true));
-    let running_clone = running.clone();
-    let serve_path = file_path.clone();
-    let cleanup_path = if cleanup_on_stop.unwrap_or(false) {
-        Some(PathBuf::from(&file_path))
-    } else {
-        None
-    };
-    let cleanup_path_for_thread = cleanup_path.clone();
-
-    // サーバーをバックグラウンドスレッドに移動
-    thread::spawn(move || {
-        // recv_timeout でポーリングしてフラグチェック
-        while running_clone.load(Ordering::Relaxed) {
-            match server.recv_timeout(Duration::from_millis(500)) {
-                Ok(Some(request)) => {
-                    let file = match fs::File::open(&serve_path) {
-                        Ok(f) => f,
-                        Err(_) => {
-                            let resp = tiny_http::Response::from_string("File not found")
-                                .with_status_code(tiny_http::StatusCode(404));
-                            let _ = request.respond(resp);
-                            continue;
-                        }
-                    };
-                    let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-                    let response = tiny_http::Response::new(
-                        tiny_http::StatusCode(200),
-                        Vec::new(),
-                        file,
-                        Some(len),
-                        None,
-                    )
-                    .with_header(
-                        tiny_http::Header::from_bytes(
-                            &b"Content-Type"[..],
-                            &b"application/zip"[..],
-                        )
-                        .unwrap(),
-                    )
-                    .with_header(
-                        tiny_http::Header::from_bytes(
-                            &b"Content-Disposition"[..],
-                            format!("attachment; filename=\"{}\"", file_name).as_bytes(),
-                        )
-                        .unwrap(),
-                    )
-                    .with_header(
-                        tiny_http::Header::from_bytes(
-                            &b"Content-Length"[..],
-                            len.to_string().as_bytes(),
-                        )
-                        .unwrap(),
-                    );
-                    let _ = request.respond(response);
-                }
-                Ok(None) => {} // タイムアウト — ループ継続
-                Err(_) => break,
-            }
-        }
-        if let Some(path) = cleanup_path_for_thread {
-            let _ = fs::remove_file(path);
-        }
-    });
-
-    *guard = Some(FileServerState {
-        flag: running,
-        cleanup_path,
-    });
 
     Ok(json!({
         "status": "ok",
         "ip": ip.to_string(),
-        "port": port,
-        "url": url
+        "port": FILE_SERVER_FIXED_PORT,
+        "url": format!("http://{}:{}/{}", ip, FILE_SERVER_FIXED_PORT, file_name)
     }))
 }
 
 #[tauri::command]
 fn stop_file_server() -> Result<Value, String> {
-    let mut guard = server_running()
+    let _lifecycle_guard = file_server_lifecycle()
         .lock()
-        .map_err(|e| format!("ロック取得失敗: {e}"))?;
-    if let Some(state) = guard.take() {
-        state.flag.store(false, Ordering::Relaxed);
+        .map_err(|error| format!("ファイルサーバーlifecycleロック取得失敗: {error}"))?;
+    let active = file_server_runtime()
+        .lock()
+        .map_err(|error| format!("ファイルサーバーruntimeロック取得失敗: {error}"))?
+        .as_ref()
+        .map(|runtime| runtime.active.clone());
+    if let Some(active) = active {
+        let old = active
+            .lock()
+            .map_err(|error| format!("ファイルサーバーactiveロック取得失敗: {error}"))?
+            .take();
+        if let Some(old) = old {
+            old.deactivate();
+        }
     }
     Ok(json!({"status": "ok"}))
 }
 
 #[tauri::command]
 fn get_local_ip() -> Result<Value, String> {
-    let ip = local_ip_address::local_ip().map_err(|e| format!("LAN IP取得失敗: {e}"))?;
+    let ip = resolve_advertised_ipv4()?;
     Ok(json!({"status": "ok", "ip": ip.to_string()}))
 }
 

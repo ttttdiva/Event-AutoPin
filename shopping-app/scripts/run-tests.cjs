@@ -11,6 +11,7 @@ const testCases = [
   ["lib/database-instrumentation.test.ts"],
   ["lib/database-shared-settings.test.ts"],
   ["lib/event-load-epoch.test.ts", "runEventLoadEpochTests"],
+  ["lib/import-helpers.test.ts", "runImportHelperContractTests"],
   ["lib/map-pin-index.test.ts", "runMapPinIndexTests"],
   ["lib/mutation-epoch.test.ts", "runMutationEpochTests"],
   ["lib/performance-core.test.ts"],

@@ -2,10 +2,10 @@ import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import {
   getEventImportSummary,
-  getEventIds,
+  getLastImportDiff,
   importFromZip,
 } from "./database";
-import type { ImportProgress } from "./database";
+import type { ImportDiffResult, ImportKind, ImportProgress } from "./database";
 
 export interface ImportResult {
   eventName: string;
@@ -17,7 +17,14 @@ export interface ImportResult {
 
 export interface ImportRunResult {
   eventId: number;
+  kind: ImportKind;
   importedEventIds: number[];
+  addedEventIds: number[];
+  changedEventIds: number[];
+  unchangedEventIds: number[];
+  removedEventIds: number[];
+  targetEventIds: number[];
+  failedEventIds: number[];
   eventCount: number;
   isFullSync: boolean;
   summary: ImportResult;
@@ -72,28 +79,77 @@ async function importZipWithSummary(
   zipUri: string,
   onProgress: (p: ImportProgress) => void,
 ): Promise<ImportRunResult> {
-  const beforeIds = new Set(await getEventIds());
   const eventId = await importFromZip(zipUri, onProgress);
-  const afterIds = await getEventIds();
-  const importedEventIds = afterIds.filter((id) => !beforeIds.has(id));
-  const normalizedEventIds =
-    importedEventIds.length > 0 ? importedEventIds : [eventId];
+  // The importer records the manifest-authoritative diff after its transaction
+  // commits.  Never infer full/single from SQLite row IDs: changed events are
+  // deliberately finalized back onto their old IDs and unchanged events add
+  // no rows at all.
+  const diff = getLastImportDiff();
+  const targetEventIds = normalizeTargetEventIds(diff, eventId);
+  const summaryEventId =
+    diff.addedEventIds[0] ?? diff.changedEventIds[0] ??
+    diff.unchangedEventIds[0] ?? targetEventIds[0] ?? eventId;
   const summary =
-    normalizedEventIds.length === 1
-      ? await getImportSummary(normalizedEventIds[0])
+    targetEventIds.length === 1
+      ? await getImportSummary(summaryEventId)
       : {
-          eventName: `${normalizedEventIds.length}件のイベント`,
+          eventName: `${targetEventIds.length}件のイベント`,
           circleCount: 0,
           mapCount: 0,
           imageCount: 0,
           itemCount: 0,
         };
 
+  return buildImportRunResult(eventId, diff, targetEventIds, summary);
+}
+
+function uniqueEventIds(ids: number[]): number[] {
+  return [...new Set(ids.filter((id) => Number.isSafeInteger(id) && id > 0))];
+}
+
+function normalizeTargetEventIds(
+  diff: ImportDiffResult,
+  eventId: number,
+): number[] {
+  const targetEventIds = uniqueEventIds(diff.targetEventIds);
+  if (targetEventIds.length > 0) return targetEventIds;
+  // Keep compatibility with an older native/database module that has not yet
+  // populated targetEventIds while still avoiding the old before/after query.
+  return uniqueEventIds([
+    ...diff.addedEventIds,
+    ...diff.changedEventIds,
+    ...diff.unchangedEventIds,
+    ...diff.importedEventIds,
+    eventId,
+  ]);
+}
+
+export function buildImportRunResult(
+  eventId: number,
+  diff: ImportDiffResult,
+  targetEventIds: number[],
+  summary: ImportResult,
+): ImportRunResult {
+  const kind = diff.kind;
+  const normalizedTargetEventIds = uniqueEventIds(targetEventIds);
+  const importedEventIds = uniqueEventIds(diff.importedEventIds);
+  const addedEventIds = uniqueEventIds(diff.addedEventIds);
+  const changedEventIds = uniqueEventIds(diff.changedEventIds);
+  const unchangedEventIds = uniqueEventIds(diff.unchangedEventIds);
+  const removedEventIds = uniqueEventIds(diff.removedEventIds);
+  const failedEventIds = uniqueEventIds(diff.failedEventIds);
   return {
     eventId,
-    importedEventIds: normalizedEventIds,
-    eventCount: normalizedEventIds.length,
-    isFullSync: normalizedEventIds.length > 1,
+    kind,
+    importedEventIds,
+    addedEventIds,
+    changedEventIds,
+    unchangedEventIds,
+    removedEventIds,
+    targetEventIds: normalizedTargetEventIds,
+    failedEventIds,
+    eventCount: normalizedTargetEventIds.length,
+    isFullSync: kind === "full",
     summary,
   };
 }

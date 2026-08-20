@@ -10,7 +10,10 @@ desktop-app/src/bridge-job.ts
 desktop-app/src/coordinate-diagnostics.ts
 desktop-app/src/coordinate-diagnostics.test.ts
 desktop-app/src/features/cookie-file.ts
+desktop-app/src/history-search-ui.test.ts
+desktop-app/src/history-search-ui.ts
 desktop-app/src/main.ts
+desktop-app/src/purchase-status.ts
 desktop-app/src/state/async-mutation-guard.test.ts
 desktop-app/src/state/async-mutation-guard.ts
 desktop-app/src/state/cookie-drop.test.ts
@@ -132,6 +135,7 @@ shopping-app/lib/map-pin-index.ts
 shopping-app/lib/mutation-epoch.test.ts
 shopping-app/lib/mutation-epoch.ts
 shopping-app/lib/import-helpers.ts
+shopping-app/lib/import-helpers.test.ts
 shopping-app/lib/performance-core.test.ts
 shopping-app/lib/performance-core.ts
 shopping-app/lib/performance.ts

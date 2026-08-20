@@ -1747,34 +1747,53 @@ interface SyncManifestEvent {
 interface SyncBundleManifest {
   format?: string;
   format_version?: number;
+  manifest_version?: number;
+  sync_mode?: string;
   event_count?: number;
   events?: SyncManifestEvent[];
 }
 
+export type ImportKind = "full" | "single";
+
 export interface ImportDiffResult {
+  kind: ImportKind;
   incremental: boolean;
   fallbackReason?: string;
+  /** Event rows staged by the importer (added + changed, live IDs). */
   importedEventIds: number[];
+  /** New event rows that did not replace an existing stable UID. */
+  addedEventIds: number[];
   changedEventIds: number[];
   unchangedEventIds: number[];
   removedEventIds: number[];
+  /** Current event rows covered by the import (removed rows are excluded). */
+  targetEventIds: number[];
+  /** Reserved for a future best-effort importer; successful imports are empty. */
+  failedEventIds: number[];
 }
 
 let lastImportDiff: ImportDiffResult = {
+  kind: "single",
   incremental: false,
   importedEventIds: [],
+  addedEventIds: [],
   changedEventIds: [],
   unchangedEventIds: [],
   removedEventIds: [],
+  targetEventIds: [],
+  failedEventIds: [],
 };
 
 export function getLastImportDiff(): ImportDiffResult {
   return {
     ...lastImportDiff,
     importedEventIds: [...lastImportDiff.importedEventIds],
+    addedEventIds: [...lastImportDiff.addedEventIds],
     changedEventIds: [...lastImportDiff.changedEventIds],
     unchangedEventIds: [...lastImportDiff.unchangedEventIds],
     removedEventIds: [...lastImportDiff.removedEventIds],
+    targetEventIds: [...lastImportDiff.targetEventIds],
+    failedEventIds: [...lastImportDiff.failedEventIds],
   };
 }
 
@@ -2866,7 +2885,7 @@ async function finalizeLegacyFullImport(
   events: SyncManifestEvent[],
   onProgress?: (progress: ImportProgress) => void,
   rootAssetManifest?: AssetManifest | null,
-): Promise<number> {
+): Promise<{ lastEventId: number; importedEventIds: number[] }> {
   // legacy manifest でも reset を先行させず、temp DB/image を検証・構築してから
   // publish する。既存 live は最後まで閉じず、失敗時にも保持する。
   const stageRoot = createImageStageRoot();
@@ -3198,7 +3217,7 @@ async function finalizeLegacyFullImport(
       legacyImagesBackupReady,
     });
     legacyFinalized = true;
-    return lastEventId;
+    return { lastEventId, importedEventIds: [...importedEventIds] };
   } catch (error) {
     let dbRestoreError: unknown = null;
     let rollbackIntentWritten = false;
@@ -4896,14 +4915,25 @@ async function importIncrementalBundle(
     cleanupCompleted = true;
     await database.runAsync("DELETE FROM sync_import_staging WHERE stage_root = ?", stageRoot);
     await database.runAsync("DELETE FROM sync_import_shared_staging WHERE stage_root = ?", stageRoot);
+    const liveImportedEventIds = importedEventIds.map(
+      (eventId) => changedIdentityByStagedId.get(eventId)?.liveEventId ?? eventId,
+    );
+    const changedIdSet = new Set(changedEventIds);
+    const addedEventIds = liveImportedEventIds.filter((eventId) => !changedIdSet.has(eventId));
+    const targetEventIds = [...new Set([
+      ...liveImportedEventIds,
+      ...unchangedEventIds,
+    ])];
     lastImportDiff = {
+      kind: "full",
       incremental: true,
-      importedEventIds: importedEventIds.map(
-        (eventId) => changedIdentityByStagedId.get(eventId)?.liveEventId ?? eventId,
-      ),
-      changedEventIds,
-      unchangedEventIds,
-      removedEventIds,
+      importedEventIds: liveImportedEventIds,
+      addedEventIds,
+      changedEventIds: [...changedEventIds],
+      unchangedEventIds: [...unchangedEventIds],
+      removedEventIds: [...removedEventIds],
+      targetEventIds,
+      failedEventIds: [],
     };
     if (lastEventId == null) throw new Error("同期ZIPにイベントが含まれていません");
     invalidatePurchaseLookupCache();
@@ -4999,6 +5029,14 @@ export async function importFromZip(
       const bundleText = await FileSystem.readAsStringAsync(bundlePath);
       const bundle = JSON.parse(bundleText) as SyncBundleManifest;
       const events = bundle.events ?? [];
+      // A sync_bundle is a full-sync envelope only when its explicit marker is
+      // `full`.  Older full bundles may omit the additive marker and are kept
+      // on the legacy full fallback; a different marker must never enter the
+      // full/incremental path by accident (single-event ZIPs do not contain
+      // sync_bundle.json at all).
+      if (bundle.sync_mode !== undefined && bundle.sync_mode !== "full") {
+        throw new Error(`同期manifestのsync_modeが不正です: ${bundle.sync_mode}`);
+      }
       const rootAssetManifest = await readAssetManifest(extractDir);
       if (events.length && Number((bundle as any).manifest_version ?? 0) >= 2 && !rootAssetManifest) {
         throw new Error("v2 sync manifest asset_manifest.json がありません");
@@ -5029,28 +5067,43 @@ export async function importFromZip(
       // 旧 manifest は uid/hash を持たないため、互換性優先で従来の full sync
       // に安全に fallback する。live DB を中途半端に残さない既存 reset を維持。
       lastImportDiff = {
+        kind: "full",
         incremental: false,
         fallbackReason: hasCompleteSyncHashes(events)
           ? "既存DBにlegacy event（uidなし）がある"
           : "manifestにstable uid/content hashがない",
         importedEventIds: [],
+        addedEventIds: [],
         changedEventIds: [],
         unchangedEventIds: [],
         removedEventIds: [],
+        targetEventIds: [],
+        failedEventIds: [],
       };
-      lastEventId = await finalizeLegacyFullImport(extractDir, events, onProgress, rootAssetManifest);
-      lastImportDiff.importedEventIds = [lastEventId];
-      return lastEventId;
+      const legacyResult = await finalizeLegacyFullImport(
+        extractDir,
+        events,
+        onProgress,
+        rootAssetManifest,
+      );
+      lastImportDiff.importedEventIds = [...legacyResult.importedEventIds];
+      lastImportDiff.addedEventIds = [...legacyResult.importedEventIds];
+      lastImportDiff.targetEventIds = [...legacyResult.importedEventIds];
+      return legacyResult.lastEventId;
     }
 
     const eventId = await importEventFromExtractDir(extractDir, onProgress);
     await importSharedBundleSettings(extractDir);
     lastImportDiff = {
+      kind: "single",
       incremental: false,
       importedEventIds: [eventId],
+      addedEventIds: [eventId],
       changedEventIds: [],
       unchangedEventIds: [],
       removedEventIds: [],
+      targetEventIds: [eventId],
+      failedEventIds: [],
     };
     return eventId;
   } finally {

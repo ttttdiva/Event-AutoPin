@@ -606,20 +606,33 @@ export default function EventListScreen() {
   }
 
   async function finishImport(result: ImportRunResult) {
-    setCurrentEventId(result.eventId);
+    // Full-sync changed rows keep their live IDs and unchanged rows add no
+    // rows, so focus the actual diff target rather than relying on the
+    // importer's last/staged ID. Removed-only syncs do not point at a stale row.
+    const focusEventId =
+      result.addedEventIds[0] ??
+      result.changedEventIds[0] ??
+      result.unchangedEventIds[0] ??
+      null;
+    setCurrentEventId(focusEventId);
     invalidateListLoad();
     await loadData();
     const summary = result.summary;
     if (result.isFullSync) {
       Alert.alert(
         "全イベント同期完了",
-        `${result.eventCount}件のイベントを取り込みました`,
+        `${result.eventCount}件のイベントを同期しました\n` +
+          `追加 ${result.addedEventIds.length}件 / ` +
+          `更新 ${result.changedEventIds.length}件 / ` +
+          `変更なし ${result.unchangedEventIds.length}件 / ` +
+          `削除 ${result.removedEventIds.length}件`,
       );
       return;
     }
     Alert.alert(
       "インポート完了",
-      `${summary.eventName}\n${summary.circleCount}サークル / ${summary.mapCount}マップ / ${summary.itemCount}頒布物`,
+      `${summary.eventName}\n${summary.circleCount}サークル / ${summary.mapCount}マップ / ${summary.itemCount}頒布物\n` +
+        `追加 ${result.addedEventIds.length}件 / 更新 ${result.changedEventIds.length}件`,
     );
   }
 

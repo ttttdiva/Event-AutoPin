@@ -445,12 +445,91 @@ html.dark {
   .history-event-row:last-child {
     @apply border-b-0;
   }
+  .history-event-row-main {
+    @apply flex items-stretch gap-2;
+  }
+  .history-event-open {
+    color: inherit;
+    background: transparent;
+    border: 1px solid transparent;
+    @apply flex flex-1 items-start gap-3 min-w-0 text-left rounded-lg px-1 py-1 cursor-pointer;
+  }
+  .history-event-open:hover {
+    background: var(--bg-hover);
+    border-color: var(--border-subtle);
+  }
+  .history-event-open:focus-visible {
+    outline: 2px solid var(--accent, #4a90d9);
+    outline-offset: 2px;
+  }
+  .history-event-expand {
+    color: var(--text-secondary);
+    background: var(--bg-surface2);
+    border: 1px solid var(--border-default);
+    @apply shrink-0 w-9 rounded-lg cursor-pointer text-sm;
+  }
+  .history-event-expand:hover {
+    background: var(--bg-hover);
+  }
+  .history-event-expand:focus-visible {
+    outline: 2px solid var(--accent, #4a90d9);
+    outline-offset: 2px;
+  }
+  .history-event-body {
+    @apply flex flex-col gap-1.5 min-w-0 flex-1;
+  }
+  .history-event-cut {
+    @apply w-12 h-12 rounded shrink-0 overflow-hidden;
+    background: var(--bg-surface2);
+    border: 1px solid var(--border-subtle);
+  }
+  .history-event-cut-empty {
+    @apply block;
+  }
+  .history-event-cut-img {
+    @apply w-full h-full object-cover block;
+  }
   .history-event-primary {
     @apply flex items-baseline gap-x-3 gap-y-1 flex-wrap;
+  }
+  .history-event-primary > strong {
+    @apply break-words;
   }
   .history-event-primary > span {
     color: var(--text-muted);
     @apply text-xs;
+  }
+  .history-purchase-summary {
+    @apply flex items-center gap-2 flex-wrap text-sm;
+  }
+  .history-purchase-summary-empty,
+  .history-items-empty {
+    color: var(--text-muted);
+    @apply text-xs;
+  }
+  .history-purchase-summary-main {
+    @apply font-semibold;
+  }
+  .history-purchase-badge {
+    @apply text-xs font-medium;
+  }
+  .history-event-items {
+    border-top: 1px solid var(--border-subtle);
+    background: var(--bg-surface);
+    @apply mt-2 pt-2 pl-[3.75rem] pr-1 pb-1;
+  }
+  .history-item-row {
+    @apply flex items-start justify-between gap-3 py-1.5;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .history-item-row:last-child {
+    @apply border-b-0;
+  }
+  .history-item-name {
+    @apply text-sm break-words min-w-0 flex-1;
+  }
+  .history-item-status {
+    @apply text-xs font-semibold whitespace-nowrap shrink-0;
   }
   .history-match-detail {
     color: var(--text-secondary);
