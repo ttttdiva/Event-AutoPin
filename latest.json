@@ -6,9 +6,9 @@
     "notes": "Event AutoPin desktop v0.1.13"
   },
   "mobile": {
-    "version": "1.4.53",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.53/EventAutoPin.apk",
-    "notes": "v1.4.53 リリース",
-    "date": "2026-08-14"
+    "version": "1.4.54",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.54/EventAutoPin.apk",
+    "notes": "Desktop→Mobile同期の安定化",
+    "date": "2026-08-21"
   }
 }
