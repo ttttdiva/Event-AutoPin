@@ -234,7 +234,16 @@ class LLMClient:
             or self.api_reasoning_effort_map.get(model_name)
             or self.reasoning_effort
         )
-        return None if effort == "none" else effort
+        if not effort:
+            return None
+
+        # GPT-5.6 Responses APIでは、明示的なnoneをmediumへフォールバック
+        # させず、そのままpayloadへ渡す。旧モデルのnoneは従来どおり省略する。
+        if effort == "none":
+            return "none" if self._is_gpt56_general_model(model_name) else None
+
+        # xhigh/maxを含め、選択されたeffortは別の値へ変換せず維持する。
+        return effort
 
     def _openai_temperature_for(
         self, model_name: str, temperature: Optional[float]
@@ -247,8 +256,29 @@ class LLMClient:
         return temperature
 
     @staticmethod
-    def _uses_responses_api(model_name: str) -> bool:
-        return model_name == "gpt-5.6-sol"
+    def _is_gpt56_general_model(model_name: str) -> bool:
+        """GPT-5.6 general-purpose familyかどうかを判定する。
+
+        ``gpt-5.6-cyber`` のようなspecialized modelは別契約のため、
+        Sol/Terra/Lunaの既知base IDとそのsnapshotだけを対象にする。
+        """
+        normalized = str(model_name or "").strip().lower()
+        if normalized == "gpt-5.6":
+            return True
+
+        base_models = (
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        )
+        return any(
+            normalized == base or normalized.startswith(f"{base}-")
+            for base in base_models
+        )
+
+    @classmethod
+    def _uses_responses_api(cls, model_name: str) -> bool:
+        return cls._is_gpt56_general_model(model_name)
 
     @staticmethod
     def _response_field(value: Any, name: str, default: Any = None) -> Any:

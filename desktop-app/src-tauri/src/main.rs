@@ -726,6 +726,27 @@ fn static_api_models() -> Vec<Value> {
             "static-suggested",
             "候補",
         ),
+        model_json(
+            "gpt-5.6-sol",
+            "GPT-5.6 Sol",
+            "openai",
+            "static-suggested",
+            "候補",
+        ),
+        model_json(
+            "gpt-5.6-terra",
+            "GPT-5.6 Terra",
+            "openai",
+            "static-suggested",
+            "候補",
+        ),
+        model_json(
+            "gpt-5.6-luna",
+            "GPT-5.6 Luna",
+            "openai",
+            "static-suggested",
+            "候補",
+        ),
         model_json("gpt-5.2", "GPT-5.2", "openai", "static-suggested", "候補"),
         model_json("gpt-5.1", "GPT-5.1", "openai", "static-suggested", "候補"),
         model_json("gpt-5", "GPT-5", "openai", "static-suggested", "候補"),
@@ -7619,7 +7640,24 @@ mod native_event_io_tests {
 
 #[cfg(test)]
 mod agy_model_catalog_tests {
-    use super::parse_agy_models_text;
+    use super::{parse_agy_models_text, static_api_models};
+
+    #[test]
+    fn static_api_models_include_gpt56_family() {
+        let models = static_api_models();
+
+        for expected in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let model = models
+                .iter()
+                .find(|model| model.get("id").and_then(|value| value.as_str()) == Some(expected))
+                .unwrap_or_else(|| panic!("missing static OpenAI model: {expected}"));
+
+            assert_eq!(
+                model.get("provider").and_then(|value| value.as_str()),
+                Some("openai")
+            );
+        }
+    }
 
     #[test]
     fn parse_agy_models_text_reads_tab_separated_output() {

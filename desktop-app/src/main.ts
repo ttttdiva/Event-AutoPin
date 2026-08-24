@@ -102,6 +102,11 @@ import {
   type CookieFileValidationResult,
   type CookieValidationMetadata,
 } from "./features/cookie-file";
+import {
+  GPT_56_API_MODELS,
+  OPENAI_REASONING_EFFORTS,
+  openAiEffortsForModel,
+} from "./openai-model-capabilities";
 
 // 画像読み込みエラーのグローバルハンドラ（CSP対策: インラインonerror不使用）
 document.addEventListener(
@@ -716,7 +721,7 @@ const FALLBACK_MODEL_CATALOG: ModelCatalog = {
     { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", provider: "gemini", source_label: "候補" },
     { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", provider: "gemini", source_label: "候補" },
     { id: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash-Lite", provider: "gemini", source_label: "候補" },
-    { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", provider: "openai", source_label: "候補" },
+    ...GPT_56_API_MODELS.map((model) => ({ ...model })),
     { id: "gpt-5.2", label: "GPT-5.2", provider: "openai", source_label: "候補" },
     { id: "gpt-5.1", label: "GPT-5.1", provider: "openai", source_label: "候補" },
     { id: "gpt-5", label: "GPT-5", provider: "openai", source_label: "候補" },
@@ -730,10 +735,6 @@ const FALLBACK_MODEL_CATALOG: ModelCatalog = {
 let modelCatalog: ModelCatalog = FALLBACK_MODEL_CATALOG;
 
 const DEFAULT_REASONING_EFFORT = "medium";
-const OPENAI_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
-const OPENAI_LATEST_REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh"];
-const OPENAI_51_REASONING_EFFORTS = ["none", "low", "medium", "high"];
-const OPENAI_PRE_51_REASONING_EFFORTS = ["minimal", "low", "medium", "high"];
 const CODEX_REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh"];
 const GEMINI3_REASONING_EFFORTS = ["minimal", "low", "medium", "high"];
 const GEMINI25_FLASH_BUDGETS = ["none", "dynamic", "1024", "8192", "24576"];
@@ -1476,14 +1477,6 @@ function defaultEffortFor(efforts: string[]): string {
 
 function normalizeReasoningEffortFor(value: string | undefined, efforts: string[]): string {
   return value && efforts.includes(value) ? value : defaultEffortFor(efforts);
-}
-
-function openAiEffortsForModel(modelId: string): string[] {
-  if (modelId === "gpt-5-pro" || modelId === "gpt-5.2-pro") return ["high"];
-  if (modelId.startsWith("gpt-5.2")) return OPENAI_LATEST_REASONING_EFFORTS;
-  if (modelId.startsWith("gpt-5.1")) return OPENAI_51_REASONING_EFFORTS;
-  if (modelId.startsWith("gpt-5")) return OPENAI_PRE_51_REASONING_EFFORTS;
-  return OPENAI_REASONING_EFFORTS;
 }
 
 function geminiApiEffortsForModel(modelId: string): string[] {

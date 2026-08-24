@@ -13,6 +13,8 @@ desktop-app/src/features/cookie-file.ts
 desktop-app/src/history-search-ui.test.ts
 desktop-app/src/history-search-ui.ts
 desktop-app/src/main.ts
+desktop-app/src/openai-model-capabilities.test.ts
+desktop-app/src/openai-model-capabilities.ts
 desktop-app/src/purchase-status.ts
 desktop-app/src/state/async-mutation-guard.test.ts
 desktop-app/src/state/async-mutation-guard.ts
