@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "event-autopin-desktop"
-version = "0.1.15"
+version = "0.1.18"
 dependencies = [
  "chrono",
  "local-ip-address",

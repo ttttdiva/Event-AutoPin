@@ -29,10 +29,19 @@ export function mergeCommittedEventMetaPreservingUnknown(
       ? (raw as Record<string, unknown>)
       : {};
   const meta = committedMeta as Record<string, unknown>;
+  const hasDocumentMemo = Object.prototype.hasOwnProperty.call(existing, "memo");
+  const documentMemo = existing.memo;
   const merged: Record<string, unknown> = { ...existing };
   for (const key of EVENT_META_KEYS) {
     if (!Object.prototype.hasOwnProperty.call(meta, key)) delete merged[key];
   }
   Object.assign(merged, meta);
+  // event.memo is owned by the document/editor snapshot.  The coordinator's
+  // committed metadata may be stale after a later user edit/revert.
+  if (hasDocumentMemo) {
+    merged.memo = documentMemo;
+  } else {
+    delete merged.memo;
+  }
   data.event = merged;
 }

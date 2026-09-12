@@ -5,7 +5,12 @@ import {
   getLastImportDiff,
   importFromZip,
 } from "./database";
-import type { ImportDiffResult, ImportKind, ImportProgress } from "./database";
+import type {
+  ImportDiffResult,
+  ImportFromZipOptions,
+  ImportKind,
+  ImportProgress,
+} from "./database";
 
 export interface ImportResult {
   eventName: string;
@@ -43,7 +48,10 @@ export async function handleImportZip(
   if (result.canceled) return null;
 
   const asset = result.assets[0];
-  return importZipWithSummary(asset.uri, onProgress);
+  return importZipWithSummary(asset.uri, onProgress, {
+    // copyToCacheDirectory:true makes this an app-owned temporary copy.
+    deleteSourceAfterUnzip: true,
+  });
 }
 
 export async function handleImportFromQRUrl(
@@ -57,7 +65,9 @@ export async function handleImportFromQRUrl(
     if (downloadResult.status !== 200) {
       throw new Error(`ダウンロード失敗: HTTP ${downloadResult.status}`);
     }
-    return await importZipWithSummary(downloadPath, onProgress);
+    return await importZipWithSummary(downloadPath, onProgress, {
+      deleteSourceAfterUnzip: true,
+    });
   } finally {
     await FileSystem.deleteAsync(downloadPath, { idempotent: true });
   }
@@ -78,8 +88,9 @@ export async function getImportSummary(eventId: number): Promise<ImportResult> {
 async function importZipWithSummary(
   zipUri: string,
   onProgress: (p: ImportProgress) => void,
+  options?: ImportFromZipOptions,
 ): Promise<ImportRunResult> {
-  const eventId = await importFromZip(zipUri, onProgress);
+  const eventId = await importFromZip(zipUri, onProgress, options);
   // The importer records the manifest-authoritative diff after its transaction
   // commits.  Never infer full/single from SQLite row IDs: changed events are
   // deliberately finalized back onto their old IDs and unchanged events add

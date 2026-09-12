@@ -131,7 +131,27 @@ async function run(): Promise<void> {
     if (request === "expo-image-picker") return {};
     if (request === "react-native-zip-archive") return { unzip: async () => undefined, zip: async () => undefined };
     if (request === "./types") return { PURCHASE_STATUS: {} };
-    if (request === "./database-core") return {};
+    if (request === "./database-core") {
+      return {
+        directoryFingerprintsEqual: (left: Array<{ relative: string; size: number; md5: string }>, right: Array<{ relative: string; size: number; md5: string }>) => {
+          if (left.length !== right.length) return false;
+          const canonicalize = (files: Array<{ relative: string; size: number; md5: string }>) => files
+            .map((file) => ({
+              relative: String(file.relative).replace(/\\/g, "/"),
+              size: Number(file.size),
+              md5: String(file.md5).toLowerCase(),
+            }))
+            .sort((a, b) => a.relative.localeCompare(b.relative));
+          const a = canonicalize(left);
+          const b = canonicalize(right);
+          return a.every((file, index) =>
+            file.relative === b[index]?.relative &&
+            file.size === b[index]?.size &&
+            file.md5 === b[index]?.md5,
+          );
+        },
+      };
+    }
     if (request === "./performance") {
       return { __sqlMetricsDevOnly: false, estimateSqlResultBytes: () => 0, recordSqlMetric: () => undefined };
     }

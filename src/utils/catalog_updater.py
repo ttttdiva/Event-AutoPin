@@ -14,6 +14,28 @@ from ..utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+def _fetch_outcome(catalog_info: Any) -> Optional[str]:
+    if not isinstance(catalog_info, dict):
+        return None
+    stats = catalog_info.get("fetch_stats")
+    if isinstance(stats, dict) and stats.get("outcome"):
+        return str(stats["outcome"])
+    if catalog_info.get("fetch_outcome"):
+        return str(catalog_info["fetch_outcome"])
+    return None
+
+
+def is_unresolved_catalog_result(catalog_info: Any) -> bool:
+    if not isinstance(catalog_info, dict):
+        return True
+    outcome = _fetch_outcome(catalog_info)
+    if catalog_info.get("error") or catalog_info.get("status") in {"不明", "エラー", "取得判定不能"}:
+        return True
+    if outcome is None:
+        return True
+    return outcome not in {"catalog_found", "no_catalog_found"}
+
+
 class CatalogUpdater:
     """event.json の circles 配列を直接更新する。"""
 
@@ -40,6 +62,10 @@ class CatalogUpdater:
         circle = self._find_circle(circle_name)
         if circle is None:
             logger.warning(f"Circle not found: {circle_name}")
+            return False
+
+        if is_unresolved_catalog_result(catalog_info):
+            logger.warning("Skipped unresolved catalog result for %s", circle_name)
             return False
 
         twitter_url = catalog_info.get("twitter_url")

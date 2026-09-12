@@ -35,7 +35,6 @@ PRICING = {
     "gpt-5.4-mini": {"input": 1.10, "output": 4.40},
     "gpt-5.3-codex": {"input": 5.00, "output": 15.00},
     "gpt-5-mini": {"input": 0.40, "output": 1.60},
-    "gpt-4o": {"input": 2.50, "output": 10.00},
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     # Grok x_search ツール呼び出し（$5/1000回 = 1回あたり$0.005）
     "_x_search_call": {"per_call": 0.005},

@@ -6,10 +6,54 @@
 """
 
 import os
+import re
 import sys
 import subprocess
+from io import StringIO
 from pathlib import Path
 from typing import List, Dict, Any
+
+
+def is_env_value_configured(content: str, key: str = "OPENAI_API_KEY") -> bool:
+    """環境変数ファイルの最終割当が非空かを厳密に判定する。
+
+    ``python-dotenv`` と同じパーサーを使うことで、引用符・export・コメント・重複
+    キーを正しく扱う。runtimeの ``load_dotenv`` と同じく変数展開も有効にし、重複時は
+    有効な最終割当だけを採用する。値は前後空白を除いて判定するが、実際の ``.env``
+    の内容は変更しない。
+    """
+
+    try:
+        from dotenv import dotenv_values
+    except ImportError:
+        # python-dotenv is a declared dependency, but setup.py should still provide a
+        # useful check when dependencies have not been installed yet. This fallback keeps
+        # the exact-key/last-assignment contract for the common unquoted form.
+        value = None
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            name, separator, raw_value = line.partition("=")
+            if separator and name.strip() == key:
+                value = raw_value.strip()
+                if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0]:
+                    value = value[1:-1]
+
+                # dotenv_values(interpolate=True) と同様、${NAME} は環境変数へ
+                # 展開し、未設定なら空文字にする。既存環境変数で解決する参照は
+                # 設定済みとして扱う。
+                def expand(match: re.Match) -> str:
+                    return os.environ.get(match.group(1), "")
+
+                value = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", expand, value)
+        return bool(value and value.strip())
+
+    values = dotenv_values(stream=StringIO(content), interpolate=True)
+    value = values.get(key)
+    return isinstance(value, str) and bool(value.strip())
 
 
 class SetupTool:
@@ -101,13 +145,12 @@ class SetupTool:
         env_path = self.project_root / '.env'
         
         if env_path.exists():
-            print("  ✅ .envファイルは既に存在します")
-            
-            # APIキーの確認
             with open(env_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-                if 'OPENAI_API_KEY' not in content:
-                    self.warnings.append(".envファイルにOPENAI_API_KEYが設定されていません")
+            if is_env_value_configured(content):
+                print("  ✅ .envファイルは既に存在します")
+            else:
+                self.warnings.append(".envファイルにOPENAI_API_KEYが設定されていません")
         else:
             print("  📝 .envファイルを作成します...")
             

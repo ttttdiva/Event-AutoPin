@@ -117,6 +117,7 @@ twscrape.api.parse_tweets = robust_parse_tweets
 from ..utils.logger import setup_logger
 from ..utils.llm_client import LLMClient
 from ..utils.downloader import Downloader
+from ..utils.llm_attempts import DEFAULT_TEXT_PRIMARY_MODEL
 
 
 # .envファイルを読み込み
@@ -128,9 +129,16 @@ logger = setup_logger(__name__)
 class CatalogTweetResult(list):
     """Catalog tweet list with per-call checked tweet IDs."""
 
-    def __init__(self, *args, checked_tweet_ids: Optional[List[int]] = None):
+    def __init__(
+        self,
+        *args,
+        checked_tweet_ids: Optional[List[int]] = None,
+        fetch_stats: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(*args)
         self.checked_tweet_ids = checked_tweet_ids or []
+        self.fetch_stats = fetch_stats if fetch_stats is not None else {}
+        self.stats = self.fetch_stats
 
 
 class TwitterExtractor:
@@ -138,7 +146,7 @@ class TwitterExtractor:
     
     def __init__(
         self,
-        model="gpt-5.6-sol",
+        model=DEFAULT_TEXT_PRIMARY_MODEL,
         additional_prompt: str = "",
         event_date: str = None,
         cli_providers: Optional[List[str]] = None,
@@ -192,6 +200,7 @@ class TwitterExtractor:
         self.current_account_index = 0  # 現在使用しているアカウントのインデックス
         self.api_instances = []  # 各アカウント用のAPIインスタンス
         self._twscrape_unavailable_reason: Optional[str] = None
+        self._last_fetch_stats: Dict[str, Any] = {}
 
         # お品書き関連キーワード（固定）
         self.catalog_keywords = [
@@ -377,24 +386,42 @@ class TwitterExtractor:
         Returns:
             お品書きツイートのリスト
         """
+        stats: Dict[str, Any] = {
+            "outcome": "not_started",
+            "reason": None,
+            "user_lookup_success_count": 0,
+            "tweet_fetch_success_count": 0,
+            "catalog_tweet_count": 0,
+        }
+        self._last_fetch_stats = stats
         await self.initialize()
 
         # 検索期間を設定（UTC時間として設定）
         start_date = (event_date - timedelta(days=days_before)).replace(tzinfo=timezone.utc)
         end_date = (event_date + timedelta(days=days_after)).replace(tzinfo=timezone.utc)
         
-        catalog_tweets = CatalogTweetResult()
+        catalog_tweets = CatalogTweetResult(fetch_stats=stats)
 
         if self._twscrape_unavailable_reason:
             logger.warning(
                 f"twscrape停止中のため@{username}をスキップ: "
                 f"{self._twscrape_unavailable_reason}"
             )
+            stats.update(
+                outcome="short_circuited",
+                reason="twscrape unavailable",
+            )
             return catalog_tweets
         
         # 複数回試行（アカウントローテーション）
         max_retries = min(3, len(self.api_instances))  # 最大3回またはアカウント数のいずれか小さい方
         last_exception = None
+        user = None
+        tweets = None
+
+        if max_retries == 0:
+            stats.update(outcome="transport_unresolved", reason="no API instances available")
+            return catalog_tweets
         
         for retry in range(max_retries):
             try:
@@ -406,7 +433,15 @@ class TwitterExtractor:
                 user = await api.user_by_login(username)
                 if not user:
                     logger.error(f"User @{username} not found")
+                    if retry < max_retries - 1:
+                        continue
+                    stats.update(
+                        outcome="user_lookup_unresolved",
+                        reason="user lookup returned no user",
+                    )
                     return catalog_tweets
+
+                stats["user_lookup_success_count"] = 1
                 
                 logger.info(f"Found user @{username} (ID: {user.id})")
                 
@@ -438,14 +473,32 @@ class TwitterExtractor:
                         # まだ期間内のツイートを見つけていない場合は継続
                     
                     logger.info(f"Fetched {tweet_count} tweets total, {len(tweets)} within target period")
+
+                    # twscrape 0.20.1 can translate an unavailable GraphQL
+                    # response into a generator that simply yields nothing.
+                    # Do not mistake that transport ambiguity for a confirmed
+                    # empty timeline/no-catalog result.
+                    if tweet_count == 0:
+                        stats.update(
+                            outcome="timeline_unresolved",
+                            reason="user_tweets yielded no parsed tweets",
+                        )
+                        if retry < max_retries - 1:
+                            logger.warning(
+                                f"@{username} のタイムライン取得結果が0件のため別アカウントで再試行します"
+                            )
+                            continue
+                        return catalog_tweets
                     
                     # 成功したらループを抜ける
+                    stats["tweet_fetch_success_count"] = 1
                     break
                     
                 except Exception as e:
                     if self._is_no_account_error(e):
                         logger.warning(f"アカウント {self.current_account_index}/{len(self.api_instances)} でレート制限: {e}")
                         self._mark_twscrape_unavailable(str(e))
+                        stats.update(outcome="transport_unresolved", reason="no account available")
                         return catalog_tweets
                     if self._is_twscrape_unknown_error(e):
                         logger.warning(
@@ -456,6 +509,7 @@ class TwitterExtractor:
                         if retry < max_retries - 1:
                             continue
                         self._mark_twscrape_unavailable(f"{type(e).__name__}: {e}")
+                        stats.update(outcome="timeline_unresolved", reason="timeline request failed")
                         return catalog_tweets
                     else:
                         raise
@@ -465,6 +519,7 @@ class TwitterExtractor:
                 if self._is_no_account_error(e):
                     logger.warning(f"すべてのアカウントが利用不可です: {e}")
                     self._mark_twscrape_unavailable(str(e))
+                    stats.update(outcome="transport_unresolved", reason="no account available")
                     return catalog_tweets
                 if self._is_twscrape_unknown_error(e):
                     logger.warning(
@@ -474,6 +529,7 @@ class TwitterExtractor:
                     if retry < max_retries - 1:
                         continue
                     self._mark_twscrape_unavailable(f"{type(e).__name__}: {e}")
+                    stats.update(outcome="transport_unresolved", reason="user lookup failed")
                     return catalog_tweets
                 if retry < max_retries - 1:
                     logger.warning(f"エラーが発生しました: {e}. 別のアカウントで再試行します...")
@@ -489,8 +545,10 @@ class TwitterExtractor:
             return catalog_tweets  # レート制限の場合は空を返す
         
         # tweetsが定義されていない場合（すべて失敗）
-        if 'tweets' not in locals():
-            return []
+        if tweets is None:
+            if stats.get("outcome") == "not_started":
+                stats.update(outcome="transport_unresolved", reason="no tweets fetched")
+            return catalog_tweets
         
         # リツイートを除外（retweetedTweetプロパティとユーザーIDで判定）
         original_tweets = []
@@ -550,6 +608,7 @@ class TwitterExtractor:
 
         if not keyword_candidates:
             logger.info(f"No keyword-matched tweets for @{username}")
+            stats.update(outcome="no_catalog_found", catalog_tweet_count=0)
             return catalog_tweets
 
         # イベント名が指定されている場合、LLMでバッチ判定
@@ -597,7 +656,11 @@ class TwitterExtractor:
             if best_index is not None and catalog_tweets:
                 best_tweets = [t for t in catalog_tweets if t.get('is_best')]
                 other_tweets = [t for t in catalog_tweets if not t.get('is_best')]
-                catalog_tweets = best_tweets + other_tweets
+                catalog_tweets = CatalogTweetResult(
+                    best_tweets + other_tweets,
+                    checked_tweet_ids=catalog_tweets.checked_tweet_ids,
+                    fetch_stats=stats,
+                )
         else:
             # イベント名なし：キーワードフィルタのみ
             for tweet in keyword_candidates:
@@ -613,6 +676,10 @@ class TwitterExtractor:
                 catalog_tweets.append(tweet_data)
 
         logger.info(f"Found {len(catalog_tweets)} catalog tweets for @{username}")
+        stats.update(
+            outcome="catalog_found" if catalog_tweets else "no_catalog_found",
+            catalog_tweet_count=len(catalog_tweets),
+        )
 
         return catalog_tweets
     
@@ -815,6 +882,21 @@ class TwitterExtractor:
                     username, 
                     event_date
                 )
+
+                fetch_stats = getattr(catalog_tweets, "fetch_stats", None)
+                fetch_outcome = (
+                    fetch_stats.get("outcome")
+                    if isinstance(fetch_stats, dict)
+                    else None
+                )
+                if fetch_outcome not in {"catalog_found", "no_catalog_found"}:
+                    results[circle_name] = {
+                        "status": "取得判定不能",
+                        "reason": fetch_outcome or "fetch_outcome_missing",
+                        "fetch_outcome": fetch_outcome or "fetch_outcome_missing",
+                        "twitter_url": twitter_url,
+                    }
+                    continue
                 
                 # 重複ツイートを除外（他のサークルで既に見つけたツイート）
                 filtered_tweets = []
@@ -831,6 +913,7 @@ class TwitterExtractor:
                 if not catalog_tweets:
                     results[circle_name] = {
                         'status': 'お品書きなし',
+                        'fetch_outcome': fetch_outcome,
                         'twitter_url': twitter_url
                     }
                     continue
@@ -841,6 +924,7 @@ class TwitterExtractor:
                     results[circle_name] = {
                         'status': '不参加/委託',
                         'details': absence_tweet['text'],
+                        'fetch_outcome': fetch_outcome,
                         'twitter_url': twitter_url
                     }
                     continue
@@ -867,6 +951,7 @@ class TwitterExtractor:
                 
                 results[circle_name] = {
                     'status': 'お品書きあり',
+                    'fetch_outcome': fetch_outcome,
                     'catalogs': catalogs,
                     'twitter_url': twitter_url
                 }

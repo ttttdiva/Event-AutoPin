@@ -16,14 +16,30 @@ export type EventJsonData = {
 export type EventMapImage = {
   name: string;
   path: string;
+  reference?: string;
+  map_number?: number;
   modified_ms?: number;
 };
 
-function mapNumberFromImageName(name: string): number | null {
-  const match = name.match(/^map_(\d+)/i);
+export type EventMapReference = {
+  reference: string;
+  map_number?: number;
+};
+
+export type EventMapReferenceInput = string | EventMapReference;
+
+export function mapNumberFromMapName(name: string): number | null {
+  const basename = name.replace(/\\/g, "/").split("/").pop() || name;
+  const match = basename.match(/(?:^|[_-])map_(\d+)/i);
   if (!match) return null;
   const number = Number.parseInt(match[1], 10);
   return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+export function eventMapImageNumber(image: EventMapImage): number | null {
+  const explicit = Number(image.map_number);
+  if (Number.isInteger(explicit) && explicit > 0) return explicit;
+  return mapNumberFromMapName(image.name);
 }
 
 function normalizedMapReference(reference: string): string {
@@ -41,21 +57,31 @@ function normalizedMapReference(reference: string): string {
  */
 export function selectActiveMapImages(
   images: EventMapImage[],
-  preferredReferences: string[] = [],
+  preferredReferences: EventMapReferenceInput[] = [],
 ): EventMapImage[] {
-  const preferred = preferredReferences.map(normalizedMapReference).filter(Boolean);
+  const preferred = preferredReferences
+    .map((entry) =>
+      typeof entry === "string" ? entry : entry?.reference || "",
+    )
+    .map(normalizedMapReference)
+    .filter(Boolean);
   const isPreferred = (image: EventMapImage): boolean => {
-    const name = image.name.toLowerCase();
-    const path = normalizedMapReference(image.path);
-    return preferred.some((reference) =>
-      reference.includes("/")
-        ? path === reference || path.endsWith(`/${reference}`)
-        : name === reference,
-    );
+    const identities = [image.reference, image.path, image.name]
+      .filter((value): value is string => Boolean(value))
+      .map(normalizedMapReference);
+    return preferred.some((reference) => {
+      if (reference.includes("/")) {
+        return identities.some(
+          (identity) =>
+            identity === reference || identity.endsWith(`/${reference}`),
+        );
+      }
+      return identities.some((identity) => identity === reference);
+    });
   };
   const active = new Map<number, EventMapImage>();
   for (const image of images) {
-    const number = mapNumberFromImageName(image.name);
+    const number = eventMapImageNumber(image);
     if (!number) continue;
     const current = active.get(number);
     if (!current) {
@@ -94,6 +120,20 @@ function hasEditedCell(
   return rowValue(row, key) !== rowValue(baselineRow, key);
 }
 
+/** サークルメモはXを優先し、XがなければWebを表示する。 */
+export function circleLinkMemo(circle: {
+  twitter_url?: string | null;
+  website_url?: string | null;
+  pixiv_url?: string | null;
+}): string {
+  return (
+    circle.twitter_url?.trim() ||
+    circle.website_url?.trim() ||
+    circle.pixiv_url?.trim() ||
+    ""
+  );
+}
+
 function parseMemoUrls(value: string): {
   twitterUrl: string;
   websiteUrl: string;
@@ -107,9 +147,15 @@ function parseMemoUrls(value: string): {
     .split("\n")
     .map((part) => part.trim())
     .filter(Boolean)) {
-    if (line.includes("twitter.com") || line.includes("x.com")) {
+    let host = "";
+    try {
+      host = new URL(line).hostname.toLowerCase();
+    } catch {
+      // 自由記入のメモも既存どおり保持する。
+    }
+    if (["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(host)) {
       twitterUrl = twitterUrl || line;
-    } else if (line.includes("pixiv.net")) {
+    } else if (host === "pixiv.net" || host.endsWith(".pixiv.net")) {
       pixivUrl = pixivUrl || line;
     } else if (!websiteUrl) {
       websiteUrl = line;

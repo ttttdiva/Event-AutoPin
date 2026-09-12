@@ -74,4 +74,28 @@ assert(
   (clearedInlineMeta.event.inline_future_field as { preserve: boolean }).preserve,
   "inline metadata clearで未知fieldが失われました",
 );
+
+const revertedMemo = {
+  event: {
+    memo: "元の3行メモ",
+    venue: "snapshot venue",
+    future_field: { preserve: true },
+  },
+};
+mergeCommittedEventMetaPreservingUnknown(revertedMemo, {
+  memo: "TEST_MARKER",
+  venue: "new committed venue",
+});
+assert(
+  revertedMemo.event.memo === "元の3行メモ",
+  "stale committedMeta.memoが新しいdocument memoを上書きしました",
+);
+assert(
+  revertedMemo.event.venue === "new committed venue",
+  "memo以外のcommitted metadata mergeが壊れました",
+);
+assert(
+  revertedMemo.event.future_field.preserve,
+  "memo競合の解決で未知event fieldが失われました",
+);
 console.log("event-meta-merge tests passed");

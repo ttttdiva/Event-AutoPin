@@ -3,8 +3,14 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from src.utils.llm_client import LLMClient
 from src.utils.catalog_image_analyzer import CatalogImageAnalyzer
+from src.utils.reprocess_deadline import (
+    ReprocessDeadline,
+    ReprocessDeadlineExceeded,
+)
 from src.utils.twitter_extractor import CatalogTweetResult
 from src.models import Circle, ItemImage
 from src.processors.twitter_post_processor import TwitterPostProcessor
@@ -193,7 +199,7 @@ def test_process_circle_from_post_url_merges_image_and_text_items(monkeypatch):
         return {"text": "Album A 1000", "media_urls": ["https://pbs.twimg.com/media/catalog.jpg"]}
 
     async def fake_download(circle, _img_url):
-        circle.items = [{"name": "Album A", "type": "音楽", "price": 0, "description": "image"}]
+        circle.items = [{"name": "Album A", "type": "音楽", "price": 0, "description": "image", "image": "catalog.jpg"}]
         circle.item_images = [ItemImage(path="catalog.jpg", source="twitter")]
         return True
 
@@ -721,7 +727,7 @@ def test_download_and_process_image_can_skip_image_analysis(tmp_path):
     assert [img.path for img in circle.item_images] == ["catalog_catalog.jpg"]
 
 
-def test_download_and_process_image_keeps_sample_image_without_items(tmp_path):
+def test_download_and_process_image_rejects_explicit_non_catalog_image(tmp_path):
     processor = object.__new__(TwitterPostProcessor)
     processor.config = SimpleNamespace(skip_catalog_image_analysis=False)
     processor.output_path = tmp_path
@@ -733,8 +739,12 @@ def test_download_and_process_image_keeps_sample_image_without_items(tmp_path):
             return path
 
     class FakeAnalyzer:
-        def analyze_catalog_items(self, _image_path):
-            return []
+        def analyze_catalog_result(self, _image_path):
+            return {
+                "image_type": "sample_page",
+                "is_catalog_image": False,
+                "items": [],
+            }
 
     processor.twitter_extractor = FakeExtractor()
     processor.catalog_analyzer = FakeAnalyzer()
@@ -747,9 +757,119 @@ def test_download_and_process_image_keeps_sample_image_without_items(tmp_path):
         )
     )
 
-    assert result is True
+    assert result is False
     assert circle.items == []
-    assert [img.path for img in circle.item_images] == ["catalog_sample.jpg"]
+    assert circle.item_images == []
+    assert not (tmp_path / "catalog_sample.jpg").exists()
+
+
+def test_download_and_process_image_keeps_explicit_catalog_without_items(tmp_path):
+    processor = object.__new__(TwitterPostProcessor)
+    processor.config = SimpleNamespace(skip_catalog_image_analysis=False)
+    processor.output_path = tmp_path
+
+    class FakeExtractor:
+        async def download_catalog_image(self, _img_url, output_path, filename):
+            path = output_path / filename
+            path.write_bytes(b"image")
+            return path
+
+    class FakeAnalyzer:
+        def analyze_catalog_result(self, _image_path):
+            return {
+                "image_type": "catalog_menu",
+                "is_catalog_image": True,
+                "items": [],
+            }
+
+    processor.twitter_extractor = FakeExtractor()
+    processor.catalog_analyzer = FakeAnalyzer()
+    circle = Circle(name="circle")
+    assert asyncio.run(processor._download_and_process_image(
+        circle, "https://pbs.twimg.com/media/catalog.jpg"
+    )) is True
+    assert [img.path for img in circle.item_images] == ["catalog_catalog.jpg"]
+
+
+def test_merge_catalog_items_preserves_positive_image_price_against_text_zero():
+    processor = object.__new__(TwitterPostProcessor)
+    merged = processor._merge_catalog_items(
+        [{"name": "A", "type": "グッズ", "price": 1500, "checked": 3}],
+        [{"name": "A", "type": "グッズ", "price": 0, "checked": 3}],
+    )
+    assert merged[0]["price"] == 1500
+
+
+def test_merge_catalog_items_accepts_positive_text_price_over_image_zero():
+    processor = object.__new__(TwitterPostProcessor)
+    merged = processor._merge_catalog_items(
+        [{"name": "A", "type": "グッズ", "price": 0, "checked": 3}],
+        [{"name": "A", "type": "グッズ", "price": 1500, "checked": 3}],
+    )
+    assert merged[0]["price"] == 1500
+
+
+def test_new_text_only_item_does_not_inherit_first_image():
+    processor = object.__new__(TwitterPostProcessor)
+    circle = Circle(name="circle")
+    circle.item_images = [ItemImage(path="catalog.jpg", source="twitter")]
+    circle.items = [{"name": "Text Only", "type": "グッズ", "price": 500}]
+    assert processor._apply_default_item_image(circle, overwrite=False) is False
+    assert "image" not in circle.items[0]
+
+
+def test_consolidation_rejects_null_none_and_fabricated_image(monkeypatch):
+    client = object.__new__(LLMClient)
+    client.logger = type("Logger", (), {"warning": lambda *args, **kwargs: None})()
+    monkeypatch.setattr(client, "extract_data", lambda *_a, **_k: '[{"name":"A","type":"グッズ","price":0,"image":null},{"name":"B","type":"グッズ","price":500,"image":"None"},{"name":"C","type":"グッズ","price":500,"image":"fabricated.jpg"}]')
+    result = client.consolidate_catalog_items([
+        {"name": "A", "type": "グッズ", "price": 1500, "image": "catalog.jpg"},
+        {"name": "B", "type": "グッズ", "price": 500},
+        {"name": "C", "type": "グッズ", "price": 500},
+    ])
+    assert result[0]["price"] == 1500
+    assert all("image" not in item for item in result)
+
+
+def test_process_with_twscrape_marks_confirmed_without_items_terminal(monkeypatch):
+    processor = object.__new__(TwitterPostProcessor)
+    processor.config = SimpleNamespace(days_before_event=30, days_after_event=7)
+
+    class FakeLLM:
+        def analyze_catalog_tweet_detail(self, *_args, **_kwargs):
+            return {
+                "classification": "confirmed",
+                "is_existing_only": False,
+                "existing_only_confidence": 0.0,
+                "product_types": ["本"],
+            }
+
+        def extract_catalog_items_from_text(self, *_args, **_kwargs):
+            return []
+
+    class FakeExtractor:
+        llm_client = FakeLLM()
+
+        async def extract_catalog_tweets(self, **_kwargs):
+            return CatalogTweetResult([{
+                "id": 1,
+                "text": "お品書きです",
+                "media": [],
+                "is_absence": False,
+                "is_best": True,
+                "url": "https://x.com/user/status/1",
+            }], checked_tweet_ids=[1])
+
+    processor.twitter_extractor = FakeExtractor()
+    circle = Circle(name="circle", twitter_url="https://x.com/user")
+    result = asyncio.run(processor._process_with_twscrape(
+        circle,
+        "user",
+        SimpleNamespace(strftime=lambda _fmt: "2026-09-13"),
+        "event",
+    ))
+    assert result.catalog_status == "no_extractable_items"
+    assert result.items == []
 
 
 def test_download_and_process_images_merges_items_and_image_refs(tmp_path):
@@ -764,16 +884,20 @@ def test_download_and_process_images_merges_items_and_image_refs(tmp_path):
             return path
 
     class FakeAnalyzer:
-        def analyze_catalog_items(self, image_path):
+        def analyze_catalog_result(self, image_path):
             item_name = image_path.stem.replace("catalog_", "")
-            return [
-                {
-                    "name": item_name,
-                    "type": "髻ｳ讌ｽ",
-                    "price": 1000,
-                    "description": "",
-                }
-            ]
+            return {
+                "image_type": "catalog_menu",
+                "is_catalog_image": True,
+                "items": [
+                    {
+                        "name": item_name,
+                        "type": "髻ｳ讌ｽ",
+                        "price": 1000,
+                        "description": "",
+                    }
+                ],
+            }
 
     processor.twitter_extractor = FakeExtractor()
     processor.catalog_analyzer = FakeAnalyzer()
@@ -799,3 +923,59 @@ def test_download_and_process_images_merges_items_and_image_refs(tmp_path):
         "catalog_album_a.jpg",
         "catalog_album_b.jpg",
     ]
+
+
+def test_direct_post_deadline_does_not_cache_partial_image_result(tmp_path, monkeypatch):
+    processor = object.__new__(TwitterPostProcessor)
+    processor.config = SimpleNamespace(skip_catalog_image_analysis=False)
+    processor.output_path = tmp_path
+    processor._post_reprocess_cache = {}
+    now = [0.0]
+
+    class FakeExtractor:
+        async def download_catalog_image(self, _img_url, output_path, filename):
+            path = output_path / filename
+            path.write_bytes(b"image")
+            return path
+
+    class FakeAnalyzer:
+        def analyze_catalog_result(self, _image_path, deadline=None, **_kwargs):
+            assert deadline is not None
+            now[0] = 1.0
+            deadline.require_time(stage="catalog.ocr_a")
+            raise AssertionError("deadline should have raised")
+
+    async def fake_fetch(_tweet_id, **_kwargs):
+        return {
+            "text": "",
+            "media_urls": ["https://pbs.twimg.com/media/catalog.jpg"],
+        }
+
+    monkeypatch.setattr(processor, "_fetch_tweet_detail", fake_fetch)
+    processor.twitter_extractor = FakeExtractor()
+    processor.catalog_analyzer = FakeAnalyzer()
+    circle = Circle(name="circle")
+    trace = []
+    deadline = ReprocessDeadline(
+        deadline_monotonic=1.0,
+        clock=lambda: now[0],
+    )
+
+    with pytest.raises(ReprocessDeadlineExceeded) as exc_info:
+        asyncio.run(
+            processor.process_circle_from_post_url(
+                circle,
+                "https://x.com/user/status/1234567890",
+                run_id="processor-timeout",
+                trace=trace,
+                deadline=deadline,
+            )
+        )
+
+    assert exc_info.value.stage == "catalog.ocr_a"
+    assert processor._post_reprocess_cache == {}
+    assert any(
+        event["stage"] == "image.analysis"
+        and event["outcome"] == "timeout"
+        for event in trace
+    )

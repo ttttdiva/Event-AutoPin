@@ -90,6 +90,49 @@ function Install-BuiltDesktopExe {
     return $installed
 }
 
+function Get-DesktopVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DesktopDir
+    )
+
+    $packagePath = Join-Path $DesktopDir "package.json"
+    try {
+        $package = Get-Content -Raw -Encoding UTF8 -LiteralPath $packagePath | ConvertFrom-Json
+    }
+    catch {
+        throw "desktop-app/package.json の読み込みに失敗しました: $($_.Exception.Message)"
+    }
+    $version = [string]$package.version
+    if ([string]::IsNullOrWhiteSpace($version)) {
+        throw "desktop-app/package.json にversionがありません: $packagePath"
+    }
+    return $version.Trim()
+}
+
+function Get-ExeSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha256.ComputeHash($stream)
+        $hash = ([System.BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+
+    if ($hash -notmatch '^[0-9a-f]{64}$') {
+        throw "SHA256取得結果が不正です: $Path"
+    }
+    return $hash
+}
+
 $projectRoot = Get-ProjectRoot
 $desktopDir = Join-Path $projectRoot "desktop-app"
 $destination = Join-Path $projectRoot $OutputName
@@ -98,6 +141,7 @@ if (-not (Test-Path -LiteralPath $desktopDir -PathType Container)) {
     throw "desktop-app が見つかりません: $desktopDir"
 }
 
+$desktopVersion = Get-DesktopVersion -DesktopDir $desktopDir
 Assert-DesktopExeNotRunning
 
 Push-Location $desktopDir
@@ -105,6 +149,10 @@ try {
     Write-Host "=== npm install ==="
     npm install
     if ($LASTEXITCODE -ne 0) { throw "npm install に失敗しました (exit=$LASTEXITCODE)" }
+
+    Write-Host "=== npm test ==="
+    npm test
+    if ($LASTEXITCODE -ne 0) { throw "npm test に失敗しました (exit=$LASTEXITCODE)" }
 
     Write-Host "=== Tauri release build (raw) ==="
     npm run tauri:build:raw
@@ -124,6 +172,21 @@ if ($null -eq $source) {
     ) -join ' '
 }
 
+$sourceSize = $source.Length
+$sourceSha256 = Get-ExeSha256 -Path $source.FullName
 Write-Host ("=== 配置: {0} -> {1} ===" -f $source.FullName, $destination)
+Write-Host ("ビルド成果物: path={0}, size={1:N0} bytes, sha256={2}" -f $source.FullName, $sourceSize, $sourceSha256)
 $installed = Install-BuiltDesktopExe -Source $source -Destination $destination
-Write-Host ("完了: {0} ({1:N0} bytes, source={2})" -f $installed.FullName, $installed.Length, $source.Name)
+$installedSha256 = Get-ExeSha256 -Path $installed.FullName
+if ($sourceSha256 -ne $installedSha256) {
+    throw "exe配置後のSHA256検証に失敗しました: source=$sourceSha256 destination=$installedSha256"
+}
+
+Write-Host ("VERSION={0}" -f $desktopVersion)
+Write-Host ("SOURCE_EXE={0}" -f $source.FullName)
+Write-Host ("SOURCE_SIZE_BYTES={0}" -f $sourceSize)
+Write-Host ("SOURCE_SHA256={0}" -f $sourceSha256)
+Write-Host ("INSTALL_EXE={0}" -f $installed.FullName)
+Write-Host ("INSTALL_SIZE_BYTES={0}" -f $installed.Length)
+Write-Host ("INSTALL_SHA256={0}" -f $installedSha256)
+Write-Host "SHA256_MATCH=True"

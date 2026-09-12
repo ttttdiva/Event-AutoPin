@@ -10,12 +10,17 @@ desktop-app/src/bridge-job.ts
 desktop-app/src/coordinate-diagnostics.ts
 desktop-app/src/coordinate-diagnostics.test.ts
 desktop-app/src/features/cookie-file.ts
+desktop-app/src/file-asset-path.ts
 desktop-app/src/history-search-ui.test.ts
 desktop-app/src/history-search-ui.ts
 desktop-app/src/main.ts
 desktop-app/src/openai-model-capabilities.test.ts
 desktop-app/src/openai-model-capabilities.ts
 desktop-app/src/purchase-status.ts
+desktop-app/src/reprocess-runtime.test.ts
+desktop-app/src/reprocess-runtime.ts
+desktop-app/src/reprocess-view.ts
+desktop-app/src/reprocess-priority.ts
 desktop-app/src/state/async-mutation-guard.test.ts
 desktop-app/src/state/async-mutation-guard.ts
 desktop-app/src/state/cookie-drop.test.ts
@@ -25,6 +30,8 @@ desktop-app/src/state/event-document-ownership.test.ts
 desktop-app/src/state/event-document-save-flow.test.ts
 desktop-app/src/state/event-meta-merge.test.ts
 desktop-app/src/state/event-meta-merge.ts
+desktop-app/src/state/event-reload-ownership.test.ts
+desktop-app/src/state/event-reload-ownership.ts
 desktop-app/src/state/event-selection-race.test.ts
 desktop-app/src/state/event-session.test.ts
 desktop-app/src/state/event-session.ts
@@ -134,6 +141,10 @@ shopping-app/lib/event-context.tsx
 shopping-app/lib/event-load-epoch.ts
 shopping-app/lib/map-pin-index.test.ts
 shopping-app/lib/map-pin-index.ts
+shopping-app/lib/map-pin-layout.test.ts
+shopping-app/lib/map-pin-layout.ts
+shopping-app/lib/map-viewport-transform.test.ts
+shopping-app/lib/map-viewport-transform.ts
 shopping-app/lib/mutation-epoch.test.ts
 shopping-app/lib/mutation-epoch.ts
 shopping-app/lib/import-helpers.ts
@@ -222,7 +233,9 @@ src/utils/output_cleanup.py
 src/utils/past_event_enricher.py
 src/utils/pattern_manager.py
 src/utils/progress_logger.py
+src/utils/reprocess_deadline.py
 src/utils/reprocess_helpers.py
+src/utils/reprocess_trace.py
 src/utils/site_parsing_llm.py
 src/utils/twitter_extractor.py
 src/utils/twitter_extractor_v2.py
@@ -253,6 +266,7 @@ tests/unit/test_past_event_enricher.py
 tests/unit/test_pipeline_default_cuts.py
 tests/unit/test_public_dependency_closure.py
 tests/unit/test_reprocess_helpers.py
+tests/unit/test_reprocess_deadline.py
 tests/unit/test_site_parsing_llm.py
 tests/unit/test_sync_public_repo_script.py
 tests/unit/test_twitter_extractor_fail_fast.py

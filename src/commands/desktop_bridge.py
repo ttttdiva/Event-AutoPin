@@ -26,6 +26,30 @@ import yaml
 
 from src.utils.cookie_loader import validate_cookie_file_path
 from src.utils.atomic_json import atomic_write_json
+from src.utils.reprocess_deadline import (
+    POST_REPROCESS_WORK_BUDGET_MS,
+    ReprocessDeadline,
+    ReprocessDeadlineExceeded,
+)
+from src.utils.llm_attempts import (
+    DEFAULT_IMAGE_FALLBACK_EFFORT,
+    DEFAULT_IMAGE_FALLBACK_MODEL,
+    DEFAULT_IMAGE_FALLBACK_PROVIDER,
+    DEFAULT_IMAGE_PRIMARY_EFFORT,
+    DEFAULT_IMAGE_PRIMARY_MODEL,
+    DEFAULT_IMAGE_PRIMARY_PROVIDER,
+    DEFAULT_TEXT_FALLBACK_EFFORT,
+    DEFAULT_TEXT_FALLBACK_MODEL,
+    DEFAULT_TEXT_FALLBACK_PROVIDER,
+    DEFAULT_TEXT_PRIMARY_EFFORT,
+    DEFAULT_TEXT_PRIMARY_MODEL,
+    DEFAULT_TEXT_PRIMARY_PROVIDER,
+)
+from src.utils.reprocess_trace import (
+    call_with_optional_trace,
+    supports_keyword,
+    trace_stage,
+)
 
 
 def _utc_now_iso() -> str:
@@ -349,7 +373,7 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Missing required payload field: url")
 
     # model欄はカンマ区切りの文字列 → modelsリストに変換
-    raw_model = payload.get("model", "gpt-5.6-sol")
+    raw_model = payload.get("model") or DEFAULT_TEXT_PRIMARY_MODEL
     models = (
         [m.strip() for m in raw_model.split(",") if m.strip()]
         if isinstance(raw_model, str)
@@ -369,6 +393,29 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         "output_dir": output_dir,
         "models": models,
         "enable_twitter_catalog": payload.get("enable_twitter_catalog", True),
+        "text_llm_provider": payload.get("text_llm_provider")
+        or DEFAULT_TEXT_PRIMARY_PROVIDER,
+        "api_reasoning_effort": payload.get("api_reasoning_effort")
+        or DEFAULT_TEXT_PRIMARY_EFFORT,
+        "text_fallback_llm_provider": payload.get("text_fallback_llm_provider")
+        or DEFAULT_TEXT_FALLBACK_PROVIDER,
+        "text_fallback_llm_model": payload.get("text_fallback_llm_model")
+        or DEFAULT_TEXT_FALLBACK_MODEL,
+        "text_fallback_llm_effort": payload.get("text_fallback_llm_effort")
+        or DEFAULT_TEXT_FALLBACK_EFFORT,
+        "image_llm_provider": payload.get("image_llm_provider")
+        or DEFAULT_IMAGE_PRIMARY_PROVIDER,
+        "image_llm_model": payload.get("image_llm_model")
+        or DEFAULT_IMAGE_PRIMARY_MODEL,
+        "image_llm_effort": payload.get("image_llm_effort")
+        or DEFAULT_IMAGE_PRIMARY_EFFORT,
+        "image_fallback_llm_provider": payload.get(
+            "image_fallback_llm_provider"
+        ) or DEFAULT_IMAGE_FALLBACK_PROVIDER,
+        "image_fallback_llm_model": payload.get("image_fallback_llm_model")
+        or DEFAULT_IMAGE_FALLBACK_MODEL,
+        "image_fallback_llm_effort": payload.get("image_fallback_llm_effort")
+        or DEFAULT_IMAGE_FALLBACK_EFFORT,
     }
     if len(urls) > 1 and not payload.get("reprocess"):
         config["source_urls"] = urls
@@ -1785,7 +1832,58 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
         return result
 
 
+def _deadline_error_response(
+    payload: Dict[str, Any],
+    exc: ReprocessDeadlineExceeded,
+    run_id: Any = None,
+) -> Dict[str, Any]:
+    response: Dict[str, Any] = {
+        "status": "error",
+        "job": "reprocess_circle_from_post",
+        "timestamp": _utc_now_iso(),
+        "error_code": "deadline_exceeded",
+        "error": "reprocess deadline exceeded",
+        "stage": exc.stage or "python.job",
+        "timeout": True,
+    }
+    if payload.get("event_json"):
+        response["event_json"] = str(payload["event_json"])
+    if payload.get("circle_index") is not None:
+        response["circle_index"] = payload["circle_index"]
+    if run_id is not None:
+        response["run_id"] = run_id
+    return response
+
+
 def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
+    run_id = payload.get("run_id")
+    trace = payload.get("trace")
+    if not callable(trace) and not isinstance(trace, list):
+        trace = None
+    deadline = ReprocessDeadline.from_timeout_ms(
+        payload.get("reprocess_deadline_ms"),
+        default_ms=POST_REPROCESS_WORK_BUDGET_MS,
+        maximum_ms=POST_REPROCESS_WORK_BUDGET_MS,
+    )
+    try:
+        with trace_stage(run_id, "python.job", trace):
+            return _job_reprocess_circle_from_post_impl(
+                payload,
+                run_id=run_id,
+                trace=trace,
+                deadline=deadline,
+            )
+    except ReprocessDeadlineExceeded as exc:
+        return _deadline_error_response(payload, exc, run_id=run_id)
+
+
+def _job_reprocess_circle_from_post_impl(
+    payload: Dict[str, Any],
+    *,
+    run_id: Any = None,
+    trace: Any = None,
+    deadline: Optional[ReprocessDeadline] = None,
+) -> Dict[str, Any]:
     """特定サークルをXポストURLから再処理する。
 
     Required payload:
@@ -1796,8 +1894,10 @@ def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     Optional payload:
         project_root, model, image_llm_provider,
-        catalog_additional_prompt, event_date
+        catalog_additional_prompt, event_date, reprocess_deadline_ms
     """
+    if deadline is not None:
+        deadline.require_time(stage="python.job")
     import re
 
     event_json = payload.get("event_json")
@@ -1882,23 +1982,33 @@ def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     twitter_config = TwitterConfig({
         "enabled": True,
-        "model": payload.get("model", "gemini-pro"),
-        "text_llm_provider": payload.get("text_llm_provider", "api"),
+        "catalog_verification_mode": "compact",
+        "direct_post_text_fallback_only": True,
+        "model": payload.get("model") or DEFAULT_TEXT_PRIMARY_MODEL,
+        "text_llm_provider": payload.get("text_llm_provider")
+        or DEFAULT_TEXT_PRIMARY_PROVIDER,
         "text_llm_cli_models": payload.get("text_llm_cli_models", {}),
         "text_llm_cli_efforts": payload.get("text_llm_cli_efforts", {}),
-        "text_fallback_llm_provider": payload.get("text_fallback_llm_provider"),
-        "text_fallback_llm_model": payload.get("text_fallback_llm_model"),
-        "text_fallback_llm_effort": payload.get("text_fallback_llm_effort"),
+        "text_fallback_llm_provider": payload.get("text_fallback_llm_provider")
+        or DEFAULT_TEXT_FALLBACK_PROVIDER,
+        "text_fallback_llm_model": payload.get("text_fallback_llm_model")
+        or DEFAULT_TEXT_FALLBACK_MODEL,
+        "text_fallback_llm_effort": payload.get("text_fallback_llm_effort")
+        or DEFAULT_TEXT_FALLBACK_EFFORT,
         "output_dir": output_dir,
-        "image_llm_provider": payload.get("image_llm_provider"),
-        "image_llm_model": payload.get("image_llm_model"),
-        "image_llm_effort": payload.get(
-            "image_llm_effort",
-            payload.get("api_reasoning_effort", "medium"),
-        ),
-        "image_fallback_llm_provider": payload.get("image_fallback_llm_provider"),
-        "image_fallback_llm_model": payload.get("image_fallback_llm_model"),
-        "image_fallback_llm_effort": payload.get("image_fallback_llm_effort"),
+        "image_llm_provider": payload.get("image_llm_provider")
+        or DEFAULT_IMAGE_PRIMARY_PROVIDER,
+        "image_llm_model": payload.get("image_llm_model")
+        or DEFAULT_IMAGE_PRIMARY_MODEL,
+        "image_llm_effort": payload.get("image_llm_effort")
+        or DEFAULT_IMAGE_PRIMARY_EFFORT,
+        "image_fallback_llm_provider": payload.get(
+            "image_fallback_llm_provider"
+        ) or DEFAULT_IMAGE_FALLBACK_PROVIDER,
+        "image_fallback_llm_model": payload.get("image_fallback_llm_model")
+        or DEFAULT_IMAGE_FALLBACK_MODEL,
+        "image_fallback_llm_effort": payload.get("image_fallback_llm_effort")
+        or DEFAULT_IMAGE_FALLBACK_EFFORT,
         "image_api_reasoning_effort_map": payload.get(
             "image_api_reasoning_effort_map", {}
         ),
@@ -1923,12 +2033,28 @@ def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
             (img.path, img.source)
             for img in circle_obj.item_images
         ]
-        updated = await processor.process_circle_from_post_url(
-            circle_obj,
-            post_url,
-            event_name,
-            use_text_detail=True,
-        )
+        with trace_stage(run_id, "processor.direct_post", trace):
+            if deadline is not None:
+                deadline.require_time(stage="processor.direct_post")
+            processor_kwargs: Dict[str, Any] = {
+                "use_text_detail": True,
+            }
+            if deadline is not None and supports_keyword(
+                processor.process_circle_from_post_url,
+                "deadline",
+            ):
+                processor_kwargs["deadline"] = deadline
+            updated = await call_with_optional_trace(
+                processor.process_circle_from_post_url,
+                circle_obj,
+                post_url,
+                event_name,
+                **processor_kwargs,
+                run_id=run_id,
+                trace=trace,
+            )
+            if deadline is not None:
+                deadline.require_time(stage="processor.direct_post")
         after_images = [
             (img.path, img.source)
             for img in circle_obj.item_images
@@ -1939,7 +2065,29 @@ def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     run_result = asyncio.run(_run())
+    if deadline is not None:
+        deadline.require_time(stage="processor.direct_post")
     success = bool(run_result.get("updated"))
+
+    # A processor that completed without producing a usable update is a
+    # bridge failure, not a successful run with a memo-only patch.  Keep the
+    # whole result process-local and let the frontend leave live event.json
+    # untouched on this path.
+    if not success:
+        response: Dict[str, Any] = {
+            "status": "error",
+            "job": "reprocess_circle_from_post",
+            "timestamp": _utc_now_iso(),
+            "error_code": "processor_no_update",
+            "error": "ポストから反映可能なサークル情報を取得できませんでした",
+            "stage": "processor.direct_post",
+            "event_json": str(json_path),
+            "circle_index": idx,
+            "requested_circle_index": idx,
+        }
+        if run_id is not None:
+            response["run_id"] = run_id
+        return response
 
     # 更新結果だけを返す。desktop sessionが最新event.jsonへidentity patchを
     # native atomic saveするため、このworkerはlive event.jsonを書き換えない。
@@ -1948,7 +2096,7 @@ def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
         circle_patch["items"] = list(circle_obj.items)
         if circle_obj.catalog_status:
             circle_patch["catalog_status"] = circle_obj.catalog_status
-        if circle_obj.existing_only_status:
+        if circle_obj.existing_only_status or circle_obj.existing_only_status != circle_dict.get("existing_only_status"):
             circle_patch["existing_only_status"] = circle_obj.existing_only_status
         # item_imagesはdictに直す（新規追加分のみ置換ではなく、既存と合体しても良いが
         # 「そのポストで差し替え」の意図を踏まえ item_imagesは新規結果で置換）
@@ -1957,38 +2105,48 @@ def _job_reprocess_circle_from_post(payload: Dict[str, Any]) -> Dict[str, Any]:
                 {"path": img.path, "source": img.source} for img in circle_obj.item_images
             ]
 
-    # memoにポストURLを追記（成功/失敗に関わらず記録）
+    # memoにポストURLを追記（成功したrunだけ。失敗runはpatchを返さない）
     existing_memo = circle_dict.get("memo", "") or ""
     if post_url not in existing_memo:
         circle_patch["memo"] = (existing_memo + "\n" + post_url) if existing_memo else post_url
 
+    if deadline is not None:
+        deadline.require_time(stage="python.return")
     _apply_missing_circle_cut_from_catalog(
         project_root,
         output_dir,
         circle_dict,
         circle_patch,
     )
+    if deadline is not None:
+        deadline.require_time(stage="python.return")
     updated_circle = dict(circle_dict)
     updated_circle.update(circle_patch)
 
-    return {
-        "status": "ok",
-        "job": "reprocess_circle_from_post",
-        "timestamp": _utc_now_iso(),
-        "event_json": str(json_path),
-        "circle_index": idx,
-        "requested_circle_index": idx,
-        "circle_identity": circle_identity,
-        "base_circle": base_circle,
-        "base_fingerprint": base_fingerprint,
-        "circle_patch": circle_patch,
-        "circle_name": updated_circle.get("name", ""),
-        "tweet_id": tweet_id,
-        "post_url": post_url,
-        "image_updated": bool(run_result.get("image_updated")),
-        "items_count": len(updated_circle.get("items", [])),
-        "updated_circle": updated_circle,
-    }
+    with trace_stage(run_id, "python.return", trace):
+        if deadline is not None:
+            deadline.require_time(stage="python.return")
+        response = {
+            "status": "ok",
+            "job": "reprocess_circle_from_post",
+            "timestamp": _utc_now_iso(),
+            "event_json": str(json_path),
+            "circle_index": idx,
+            "requested_circle_index": idx,
+            "circle_identity": circle_identity,
+            "base_circle": base_circle,
+            "base_fingerprint": base_fingerprint,
+            "circle_patch": circle_patch,
+            "circle_name": updated_circle.get("name", ""),
+            "tweet_id": tweet_id,
+            "post_url": post_url,
+            "image_updated": bool(run_result.get("image_updated")),
+            "items_count": len(updated_circle.get("items", [])),
+            "updated_circle": updated_circle,
+        }
+        if run_id is not None:
+            response["run_id"] = run_id
+        return response
 
 
 def _job_reprocess_circle_from_image(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2054,28 +2212,26 @@ def _job_reprocess_circle_from_image(payload: Dict[str, Any]) -> Dict[str, Any]:
     from src.utils.catalog_image_analyzer import CatalogImageAnalyzer
     from src.utils.llm_attempts import api_models_from_attempts, build_image_llm_attempts
 
-    raw_model = payload.get("model", "gemini-pro")
+    raw_model = payload.get("model") or DEFAULT_TEXT_PRIMARY_MODEL
     primary_model = (
         [m.strip() for m in raw_model.split(",") if m.strip()][0]
         if isinstance(raw_model, str) and "," in raw_model
         else raw_model
     )
     image_attempts = build_image_llm_attempts(
-        payload.get("image_llm_provider"),
-        payload.get("image_llm_model") or primary_model,
-        payload.get("image_llm_effort", payload.get("api_reasoning_effort", "medium")),
-        payload.get("image_fallback_llm_provider"),
-        payload.get("image_fallback_llm_model"),
-        payload.get("image_fallback_llm_effort"),
+        payload.get("image_llm_provider") or DEFAULT_IMAGE_PRIMARY_PROVIDER,
+        payload.get("image_llm_model") or DEFAULT_IMAGE_PRIMARY_MODEL,
+        payload.get("image_llm_effort") or DEFAULT_IMAGE_PRIMARY_EFFORT,
+        payload.get("image_fallback_llm_provider") or DEFAULT_IMAGE_FALLBACK_PROVIDER,
+        payload.get("image_fallback_llm_model") or DEFAULT_IMAGE_FALLBACK_MODEL,
+        payload.get("image_fallback_llm_effort") or DEFAULT_IMAGE_FALLBACK_EFFORT,
     )
     has_image_cli = any(attempt.get("kind") == "cli" for attempt in image_attempts)
     analyzer = CatalogImageAnalyzer(
         model=api_models_from_attempts(image_attempts),
         use_cli=has_image_cli,
-        api_reasoning_effort=payload.get(
-            "image_llm_effort",
-            payload.get("api_reasoning_effort", "medium"),
-        ),
+        api_reasoning_effort=payload.get("image_llm_effort")
+        or DEFAULT_IMAGE_PRIMARY_EFFORT,
         api_reasoning_effort_map=payload.get("image_api_reasoning_effort_map", {}),
         attempts=image_attempts,
     )
@@ -3777,22 +3933,21 @@ def _job_parse_site_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
         text_fallback_llm_effort=payload.get(
             "text_fallback_llm_effort", "medium"
         ),
-        image_llm_provider=payload.get("image_llm_provider", "api:gemini"),
+        image_llm_provider=payload.get("image_llm_provider")
+        or DEFAULT_IMAGE_PRIMARY_PROVIDER,
         image_llm_model=payload.get("image_llm_model")
-        or (models[0] if models else "gpt-5.6-sol"),
-        image_llm_effort=payload.get(
-            "image_llm_effort",
-            payload.get("api_reasoning_effort", "medium"),
-        ),
+        or (models[0] if models else DEFAULT_IMAGE_PRIMARY_MODEL),
+        image_llm_effort=payload.get("image_llm_effort")
+        or DEFAULT_IMAGE_PRIMARY_EFFORT,
         image_fallback_llm_provider=payload.get(
-            "image_fallback_llm_provider", "openai"
-        ),
+            "image_fallback_llm_provider"
+        ) or DEFAULT_IMAGE_FALLBACK_PROVIDER,
         image_fallback_llm_model=payload.get(
-            "image_fallback_llm_model", "gpt-5-mini"
-        ),
+            "image_fallback_llm_model"
+        ) or DEFAULT_IMAGE_FALLBACK_MODEL,
         image_fallback_llm_effort=payload.get(
-            "image_fallback_llm_effort", "medium"
-        ),
+            "image_fallback_llm_effort"
+        ) or DEFAULT_IMAGE_FALLBACK_EFFORT,
         image_api_reasoning_effort_map=payload.get(
             "image_api_reasoning_effort_map", {}
         ),
@@ -4095,6 +4250,7 @@ def main() -> int:
     parser = _parser()
     args = parser.parse_args()
 
+    payload: Dict[str, Any] = {}
     try:
         payload = _load_payload(args)
         result = run_job(args.job, payload)
@@ -4103,8 +4259,17 @@ def main() -> int:
             "status": "error",
             "job": args.job,
             "timestamp": _utc_now_iso(),
+            "error_code": type(exc).__name__,
             "error": str(exc),
         }
+        if payload.get("run_id"):
+            result["run_id"] = payload["run_id"]
+        if getattr(exc, "stage", None):
+            result["stage"] = exc.stage
+        if isinstance(exc, ReprocessDeadlineExceeded):
+            result["error_code"] = "deadline_exceeded"
+            result["timeout"] = True
+            result["stage"] = exc.stage or "python.job"
 
     sys.stdout.write(json.dumps(result, ensure_ascii=False))
     sys.stdout.write("\n")

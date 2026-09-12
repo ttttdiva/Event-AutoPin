@@ -30,6 +30,18 @@ sha256:<64桁のSHA-256> relative/path/to/asset.png
 
 ## 実行
 
+### 開発側から同期・commit・pushを一括実行
+
+開発リポジトリのルートで `publish.bat` を実行すると、既存の Publish checkout に対して最新コミットの取得（fast-forwardのみ）、dry-run、機密情報検査、同期、対象ファイルだけのcommit、pushを順に実行します。終了時は結果を読めるようキー入力を待ちます。Git、GitHub CLI（認証済み）、Python 3が必要です。
+
+同期元は **commit済みのHEADと完全一致のmanifest** です。公開対象に未commitの変更があれば停止するので、コード変更は先に開発側でcommitしてください。manifest外の変更やuntrackedファイルは同期しません。新しい公開ファイルは `scripts/public-sync-manifest.txt` に明示してcommitしてください。`events/`、`default_cuts/`、`circle_master.json`、Cookie、学習済みデータ、ローカル設定、エージェント指示などはGit追跡済みでも公開しません。
+
+公開先に未commitの変更、未pushのcommit、分岐した履歴がある場合は停止します。pushだけ失敗した場合は公開先に同期commitが残るため、その差分を確認して公開先から `git push origin HEAD` を実行してください。force pushや自動stashは行いません。
+
+実装は開発側専用の `scripts/publish_public_repo.ps1` です。既定の同期先は下記の `$DestinationRoot` と同じです。変更する場合はこのスクリプトの既定値か `-DestinationRoot` 引数を使います。この入口はソース同期専用で、アプリの動作テスト、APK/EXEのビルド、Release upload、`latest.json` 更新は行いません。成果物をリリースする際は別途release checklistに従います。`.github/` と `latest.json` は既存同期処理と同じく公開先の内容を保持します。
+
+### 同期内容を個別に確認・適用
+
 必ず先にdry-runし、`[dependency-closure]`、`[candidates]`、`[excluded]`、`[scan]`、`[diff]` を確認します。dependency検査もworking treeではなくHEADを読み、uncommitted fileで欠落を隠せません。
 
 ```powershell

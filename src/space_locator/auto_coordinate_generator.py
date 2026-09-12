@@ -1497,6 +1497,66 @@ def _catalog_geometry_group_center(
     )
 
 
+def _catalog_reference_vertical_slope(
+    number: int,
+    track_x: float,
+    models: Sequence[
+        Tuple[str, List[int], float, float, float]
+    ],
+) -> Optional[float]:
+    """Return a signed slope from nearby strongly observed vertical geometry.
+
+    A singleton/sparse track has no usable pitch of its own.  Borrow only the
+    Y-per-number slope from a track backed by at least three OCR observations;
+    the sparse track keeps its own X axis and its own observed Y anchor.
+
+    Ranking uses only OCR geometry/numbering:
+    1. a model whose observed number span contains the target,
+    2. spatially nearest X axis,
+    3. nearest observed number,
+    4. stronger observation count.
+
+    No event pin/calibration data participates.
+    """
+
+    usable = [
+        model
+        for model in models
+        if (
+            len(model[1]) >= 3
+            and math.isfinite(model[2])
+            and math.isfinite(model[3])
+            and math.isfinite(model[4])
+            and abs(model[2]) > 1e-9
+            and model[4] > 0
+            and abs(model[2]) >= model[4] * 0.5
+        )
+    ]
+    if not usable:
+        return None
+
+    pitches = [float(model[4]) for model in usable]
+    if max(pitches) > min(pitches) * 1.5:
+        # A single borrowed scale is unsafe when the available strong tracks
+        # disagree materially.  Let the caller fail closed instead of mixing
+        # unrelated vertical geometries.
+        return None
+
+    chosen = min(
+        usable,
+        key=lambda model: (
+            0
+            if min(model[1]) <= number <= max(model[1])
+            else 1,
+            abs(float(model[3]) - float(track_x)),
+            min(abs(number - observed) for observed in model[1]),
+            -len(model[1]),
+            model[0],
+        ),
+    )
+    return float(chosen[2])
+
+
 def _build_catalog_geometry_grid(
     numbers: Sequence[Mapping[str, Any]],
     catalog_info: Mapping[str, Any],
@@ -1564,6 +1624,85 @@ def _build_catalog_geometry_grid(
     for item in vertical_expected:
         by_prefix_vertical[item["prefix"]].append(item)
     vertical_prefix_order = list(layout["vertical_labels"])
+
+    # Sparse/singleton vertical fragments cannot derive their own pitch. Build
+    # a read-only pool of strong OCR-derived tracks so such fragments can
+    # borrow a signed Y-per-number slope while retaining their own X axis/Y
+    # anchor.
+    vertical_reference_models: List[
+        Tuple[str, List[int], float, float, float]
+    ] = []
+
+    for reference_prefix in vertical_prefix_order:
+        reference_tracks = (
+            layout["vertical"].get(reference_prefix) or []
+        )
+
+        for reference_track in reference_tracks:
+            observations = sorted({
+                int(number): float(candidate["_cy"])
+                for candidate in reference_track
+                for number in [
+                    _catalog_geometry_number(
+                        candidate.get("number")
+                    )
+                ]
+                if number is not None
+            }.items())
+
+            if len(observations) < 3:
+                continue
+
+            observed_numbers = [
+                number for number, _ in observations
+            ]
+
+            slopes = [
+                (right_y - left_y)
+                / (right_number - left_number)
+                for (
+                    (left_number, left_y),
+                    (right_number, right_y),
+                ) in zip(observations[:-1], observations[1:])
+                if right_number != left_number
+            ]
+
+            finite_slopes = [
+                slope
+                for slope in slopes
+                if math.isfinite(slope)
+                and abs(slope) > 1e-9
+            ]
+
+            if not finite_slopes:
+                continue
+
+            slope = statistics.median(finite_slopes)
+            pitch = statistics.median(
+                abs(value) for value in finite_slopes
+            )
+            track_x = statistics.median(
+                float(candidate["_cx"])
+                for candidate in reference_track
+            )
+
+            if (
+                not math.isfinite(slope)
+                or not math.isfinite(pitch)
+                or pitch <= 0
+            ):
+                continue
+
+            vertical_reference_models.append(
+                (
+                    reference_prefix,
+                    observed_numbers,
+                    slope,
+                    track_x,
+                    pitch,
+                )
+            )
+
     for prefix in vertical_prefix_order:
         expected_items = sorted(by_prefix_vertical.get(prefix, []), key=lambda item: item["number"])
         if not expected_items:
@@ -1588,6 +1727,10 @@ def _build_catalog_geometry_grid(
             if number is not None:
                 by_number[number].append(candidate)
         track_models: List[Tuple[List[int], float, float, float, float]] = []
+        zero_slope_fallbacks: Dict[
+            int,
+            Tuple[List[int], float, float, Dict[int, List[Dict[str, Any]]]],
+        ] = {}
         for track in tracks:
             relevant = [item for item in track if int(item["number"]) in by_number]
             observations = sorted({int(item["number"]): float(item["_cy"]) for item in relevant}.items())
@@ -1608,7 +1751,11 @@ def _build_catalog_geometry_grid(
             choices = by_number.get(number) or []
             observation = sorted(
                 choices,
-                key=lambda candidate: (float(candidate.get("_width", 0)), float(candidate.get("_cx", 0)), float(candidate.get("_cy", 0))),
+                key=lambda candidate: (
+                    float(candidate.get("_width", 0)),
+                    float(candidate.get("_cx", 0)),
+                    float(candidate.get("_cy", 0)),
+                ),
             )[0] if choices else None
             # An exact OCR number at a folded endpoint may be a duplicate or a
             # misread from the neighbouring connector.  Validate it against a
@@ -1643,6 +1790,7 @@ def _build_catalog_geometry_grid(
                     float(observation["_cy"]),
                 )
                 continue
+
             sequence_models = [
                 model
                 for model in track_models
@@ -1651,7 +1799,7 @@ def _build_catalog_geometry_grid(
             usable_models = sequence_models or [model for model in track_models if model[0]]
             if not usable_models:
                 continue
-            observed_numbers, slope, intercept, track_x, _ = min(
+            chosen_model = min(
                 usable_models,
                 key=lambda model: (
                     0 if min(model[0]) <= number <= max(model[0]) else 1,
@@ -1659,12 +1807,63 @@ def _build_catalog_geometry_grid(
                     model[3],
                 ),
             )
-            if slope == 0.0:
+            observed_numbers, slope, intercept, track_x, _ = chosen_model
+            chosen_track_index = next(
+                index
+                for index, model in enumerate(track_models)
+                if model is chosen_model
+            )
+            chosen_track_by_number: Dict[
+                int,
+                List[Dict[str, Any]],
+            ] = defaultdict(list)
+            for candidate in tracks[chosen_track_index]:
+                candidate_number = _catalog_geometry_number(
+                    candidate.get("number")
+                )
+                if candidate_number is not None:
+                    chosen_track_by_number[candidate_number].append(candidate)
+            if abs(slope) <= 1e-9:
                 nearest = min(observed_numbers, key=lambda observed: abs(number - observed))
-                nearest_candidates = by_number.get(nearest) or []
-                predicted_y = statistics.median(float(candidate["_cy"]) for candidate in nearest_candidates)
+                nearest_candidates = chosen_track_by_number.get(nearest) or []
+
+                # The old fallback copied nearest_y verbatim for every
+                # missing number, collapsing distinct booths onto one pin.
+                # Keep this sparse track's own observed anchor but borrow a
+                # signed pitch from strongly observed vertical geometry.
+                reference_slope = _catalog_reference_vertical_slope(
+                    number,
+                    track_x,
+                    vertical_reference_models,
+                )
+
+                if not nearest_candidates or reference_slope is None:
+                    # Fail closed: without any observed anchor or independently
+                    # observed vertical pitch, omitting this inferred slot is
+                    # safer than emitting several distinct circles at the same
+                    # point.
+                    continue
+
+                zero_slope_fallbacks[int(number)] = (
+                    list(observed_numbers),
+                    float(reference_slope),
+                    float(track_x),
+                    {
+                        key: list(value)
+                        for key, value in chosen_track_by_number.items()
+                    },
+                )
+
+                anchor_y = statistics.median(
+                    float(candidate["_cy"])
+                    for candidate in nearest_candidates
+                )
+                predicted_y = anchor_y + reference_slope * (number - nearest)
             else:
                 predicted_y = slope * number + intercept
+
+            if not math.isfinite(predicted_y):
+                continue
             centers[(prefix, number)] = (track_x, predicted_y)
 
         # Folded columns commonly end in a detached horizontal 02/01 pair.
@@ -1696,6 +1895,233 @@ def _build_catalog_geometry_grid(
                         )
                     centers[(prefix, 2)] = (midpoint_x - local_pitch / 2.0, endpoint_y)
                     centers[(prefix, 1)] = (midpoint_x + local_pitch / 2.0, endpoint_y)
+
+        # A folded zero-slope track can still produce two distinct inferred
+        # slots at the same rounded point when both slots use their own
+        # rejected OCR token as the nearest anchor.  Re-anchor only the
+        # synthetic zero-slope slots that participate in such a collision,
+        # preferring the smallest deterministic move that clears every other
+        # distinct circle.  Exact observations and grouped members are left
+        # untouched.
+        if zero_slope_fallbacks:
+            expected_by_number = {
+                int(item["number"]): item
+                for item in expected_items
+            }
+            grouped_numbers: set[int] = set()
+            for item in expected_items:
+                raw_space = str(item.get("raw_space") or "")
+                resolved_space = str(
+                    item.get("resolved_space")
+                    or raw_space
+                )
+                members = (
+                    expand_circle_space_ids(
+                        resolved_space,
+                        item.get("hall"),
+                    )
+                    if resolved_space
+                    else []
+                )
+                member_numbers = {
+                    int(member["number"])
+                    for member in members
+                    if member.get("prefix") == prefix
+                }
+                if len(member_numbers) > 1:
+                    grouped_numbers.update(member_numbers)
+
+            def circle_identity(number: int) -> Any:
+                item = expected_by_number[number]
+                identity = item.get("circle_index")
+                if identity is None:
+                    return normalize_space_key(str(item["space_id"]))
+                return (
+                    identity,
+                    item.get("prefix"),
+                    item.get("raw_space"),
+                )
+
+            def current_points() -> Dict[int, Tuple[float, float]]:
+                return {
+                    number: centers[(prefix, number)]
+                    for number in expected_by_number
+                    if (prefix, number) in centers
+                }
+
+            def collision_threshold(
+                points: Mapping[int, Tuple[float, float]],
+            ) -> Tuple[float, bool]:
+                unique_points: List[Tuple[Any, float, float]] = []
+                seen: set[Tuple[Any, int, int]] = set()
+                for number, point in points.items():
+                    if number in grouped_numbers:
+                        continue
+                    identity = circle_identity(number)
+                    key = (
+                        identity,
+                        round(float(point[0])),
+                        round(float(point[1])),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    unique_points.append(
+                        (
+                            identity,
+                            float(round(point[0])),
+                            float(round(point[1])),
+                        )
+                    )
+
+                distances = [
+                    math.hypot(right[1] - left[1], right[2] - left[2])
+                    for index, left in enumerate(unique_points)
+                    for right in unique_points[index + 1:]
+                    if left[0] != right[0]
+                ]
+                positive = [distance for distance in distances if distance > 1.0]
+                if not positive:
+                    return 1.0, False
+                local_pitch = statistics.median(
+                    sorted(positive)[
+                        :max(1, len(unique_points) // 2)
+                    ]
+                )
+                return max(2.0, local_pitch * 0.20), True
+
+            def candidate_for_anchor(
+                number: int,
+                anchor: int,
+                fallback: Tuple[
+                    List[int],
+                    float,
+                    float,
+                    Dict[int, List[Dict[str, Any]]],
+                ],
+            ) -> Optional[Tuple[float, float]]:
+                choices = fallback[3].get(anchor) or []
+                if not choices:
+                    return None
+                anchor_y = statistics.median(
+                    float(candidate["_cy"])
+                    for candidate in choices
+                )
+                point = (
+                    fallback[2],
+                    anchor_y + fallback[1] * (number - anchor),
+                )
+                if not all(math.isfinite(float(value)) for value in point):
+                    return None
+                if not (
+                    0.0 <= point[0] <= image_width
+                    and 0.0 <= point[1] <= image_height
+                ):
+                    return None
+                return point
+
+            for _ in range(max(1, len(zero_slope_fallbacks))):
+                points = current_points()
+                threshold, has_positive = collision_threshold(points)
+                pairs = []
+                point_numbers = sorted(points)
+                for index, left_number in enumerate(point_numbers):
+                    for right_number in point_numbers[index + 1:]:
+                        if (
+                            left_number in grouped_numbers
+                            or right_number in grouped_numbers
+                        ):
+                            continue
+                        if circle_identity(left_number) == circle_identity(right_number):
+                            continue
+                        left_point = points[left_number]
+                        right_point = points[right_number]
+                        distance = math.hypot(
+                            round(right_point[0]) - round(left_point[0]),
+                            round(right_point[1]) - round(left_point[1]),
+                        )
+                        is_near = (
+                            distance <= threshold
+                            if has_positive
+                            else distance <= 1.0
+                        )
+                        if is_near:
+                            pairs.append((distance, left_number, right_number))
+
+                if not pairs:
+                    break
+
+                changed = False
+                for _, left_number, right_number in sorted(pairs):
+                    targets = [
+                        number
+                        for number in (left_number, right_number)
+                        if (
+                            number in zero_slope_fallbacks
+                            and number not in grouped_numbers
+                        )
+                    ]
+                    best_option = None
+                    for target in targets:
+                        fallback = zero_slope_fallbacks[target]
+                        current = points[target]
+                        anchors = sorted(
+                            set(fallback[0]),
+                            key=lambda anchor: (
+                                abs(target - anchor),
+                                anchor,
+                            ),
+                        )
+                        for anchor in anchors:
+                            candidate_point = candidate_for_anchor(
+                                target,
+                                anchor,
+                                fallback,
+                            )
+                            if candidate_point is None:
+                                continue
+                            if (
+                                round(candidate_point[0]) == round(current[0])
+                                and round(candidate_point[1]) == round(current[1])
+                            ):
+                                continue
+                            candidate_collides = False
+                            for other, other_point in points.items():
+                                if other == target:
+                                    continue
+                                if other in grouped_numbers:
+                                    continue
+                                if circle_identity(target) == circle_identity(other):
+                                    continue
+                                distance = math.hypot(
+                                    round(candidate_point[0]) - round(other_point[0]),
+                                    round(candidate_point[1]) - round(other_point[1]),
+                                )
+                                is_near = (
+                                    distance <= threshold
+                                    if has_positive
+                                    else distance <= 1.0
+                                )
+                                if is_near:
+                                    candidate_collides = True
+                                    break
+                            if candidate_collides:
+                                continue
+                            score = (
+                                abs(candidate_point[1] - current[1]),
+                                abs(target - anchor),
+                                anchor,
+                                target,
+                            )
+                            if best_option is None or score < best_option[0]:
+                                best_option = (score, target, candidate_point)
+                    if best_option is not None:
+                        _, target, candidate_point = best_option
+                        centers[(prefix, target)] = candidate_point
+                        changed = True
+                        break
+                if not changed:
+                    break
 
     result: List[Dict[str, Any]] = []
     for item in expected:

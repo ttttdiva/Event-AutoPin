@@ -5,7 +5,8 @@ Twitter Post Processor
 
 import asyncio
 import re
-from typing import List, Dict, Any, Optional
+from functools import partial
+from typing import Awaitable, List, Dict, Any, Optional
 from datetime import datetime
 from pathlib import Path
 import json
@@ -17,25 +18,118 @@ from ..utils.twitter_extractor import TwitterExtractor
 from ..utils.logger import setup_logger
 from ..utils.progress_logger import ProgressLogger
 from ..utils.catalog_image_analyzer import CatalogImageAnalyzer
+from ..utils.reprocess_deadline import ReprocessDeadline, ReprocessDeadlineExceeded
+from ..utils.reprocess_trace import (
+    call_with_optional_trace,
+    supports_keyword,
+    trace_stage,
+)
 from ..utils.url_validation import normalize_twitter_profile_url
 from ..utils.llm_attempts import (
     api_models_from_attempts,
     build_image_llm_attempts,
     build_text_llm_attempts,
+    DEFAULT_IMAGE_FALLBACK_EFFORT,
+    DEFAULT_IMAGE_FALLBACK_MODEL,
+    DEFAULT_IMAGE_FALLBACK_PROVIDER,
+    DEFAULT_IMAGE_PRIMARY_EFFORT,
+    DEFAULT_IMAGE_PRIMARY_MODEL,
+    DEFAULT_IMAGE_PRIMARY_PROVIDER,
+    DEFAULT_TEXT_FALLBACK_EFFORT,
+    DEFAULT_TEXT_FALLBACK_MODEL,
+    DEFAULT_TEXT_FALLBACK_PROVIDER,
+    DEFAULT_TEXT_PRIMARY_EFFORT,
+    DEFAULT_TEXT_PRIMARY_MODEL,
+    DEFAULT_TEXT_PRIMARY_PROVIDER,
 )
 
 logger = setup_logger(__name__)
 
 
+def _call_with_optional_deadline(
+    callable_obj: Any,
+    *args: Any,
+    deadline: Optional[ReprocessDeadline] = None,
+    run_id: Any = None,
+    trace: Any = None,
+    **kwargs: Any,
+) -> Any:
+    if deadline is not None and supports_keyword(callable_obj, "deadline"):
+        kwargs["deadline"] = deadline
+    return call_with_optional_trace(
+        callable_obj,
+        *args,
+        run_id=run_id,
+        trace=trace,
+        **kwargs,
+    )
+
+
+async def _await_with_optional_deadline(
+    awaitable: Awaitable[Any],
+    deadline: Optional[ReprocessDeadline],
+    *,
+    stage: str,
+) -> Any:
+    """Bound an async transport or executor future to the shared budget."""
+
+    if deadline is None:
+        return await awaitable
+    try:
+        timeout = deadline.require_time(stage=stage)
+    except BaseException:
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        raise
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except ReprocessDeadlineExceeded:
+        raise
+    except asyncio.TimeoutError as exc:
+        raise ReprocessDeadlineExceeded(
+            f"reprocess deadline exceeded at {stage}",
+            stage=stage,
+        ) from exc
+
+
+async def _run_in_executor_with_optional_deadline(
+    loop: asyncio.AbstractEventLoop,
+    callable_obj: Any,
+    *args: Any,
+    budget: Optional[ReprocessDeadline],
+    stage: str,
+    **kwargs: Any,
+) -> Any:
+    """Submit a blocking call only after reserving its current budget."""
+
+    call = partial(callable_obj, *args, **kwargs)
+    if budget is None:
+        return await loop.run_in_executor(None, call)
+
+    timeout = budget.require_time(stage=stage)
+    future = loop.run_in_executor(None, call)
+    try:
+        return await asyncio.wait_for(future, timeout=timeout)
+    except ReprocessDeadlineExceeded:
+        raise
+    except asyncio.TimeoutError as exc:
+        raise ReprocessDeadlineExceeded(
+            f"reprocess deadline exceeded at {stage}",
+            stage=stage,
+        ) from exc
+
+
 class TwitterConfig:
     """Twitter処理の設定"""
     def __init__(self, config_dict: Dict[str, Any]):
+        self.continue_on_error = bool(config_dict.get('continue_on_error', False))
         self.enabled = config_dict.get('enabled', False)
         self.days_before_event = config_dict.get('days_before_event', 30)
         self.days_after_event = config_dict.get('days_after_event', 7)
         self.max_workers = 1
         self.rate_limit_seconds = config_dict.get('rate_limit_seconds', 2)
-        raw_model = config_dict.get('model', 'gemini-pro')
+        raw_model = config_dict.get('model') or DEFAULT_TEXT_PRIMARY_MODEL
         self.model = (
             [m.strip() for m in raw_model.split(',') if m.strip()]
             if isinstance(raw_model, str) and ',' in raw_model
@@ -46,21 +140,16 @@ class TwitterConfig:
         self.additional_prompt = config_dict.get('catalog_additional_prompt', '')  # 追加プロンプト
         self.event_date = config_dict.get('event_date')  # YYYY-MM-DD形式
         self.use_grok_search = config_dict.get('use_grok_search', False)
-        self.image_llm_provider = config_dict.get('image_llm_provider') or 'api:gemini'
+        self.image_llm_provider = config_dict.get('image_llm_provider') or DEFAULT_IMAGE_PRIMARY_PROVIDER
         if ':' in self.image_llm_provider:
             self.image_provider_kind, self.image_llm_provider_name = self.image_llm_provider.split(':', 1)
         else:
             self.image_provider_kind = 'api'
             self.image_llm_provider_name = self.image_llm_provider
-        self.image_llm_model = config_dict.get('image_llm_model') or (
-            self.model[0] if isinstance(self.model, list) else self.model
-        )
-        self.image_llm_effort = config_dict.get(
-            'image_llm_effort',
-            config_dict.get('api_reasoning_effort', 'medium'),
-        )
+        self.image_llm_model = config_dict.get('image_llm_model') or DEFAULT_IMAGE_PRIMARY_MODEL
+        self.image_llm_effort = config_dict.get('image_llm_effort') or DEFAULT_IMAGE_PRIMARY_EFFORT
         self.image_fallback_llm_provider = (
-            config_dict.get('image_fallback_llm_provider') or 'openai'
+            config_dict.get('image_fallback_llm_provider') or DEFAULT_IMAGE_FALLBACK_PROVIDER
         )
         if ':' in self.image_fallback_llm_provider:
             _, self.image_fallback_llm_provider_name = (
@@ -69,27 +158,27 @@ class TwitterConfig:
         else:
             self.image_fallback_llm_provider_name = self.image_fallback_llm_provider
         self.image_fallback_llm_model = (
-            config_dict.get('image_fallback_llm_model') or 'gpt-5-mini'
+            config_dict.get('image_fallback_llm_model') or DEFAULT_IMAGE_FALLBACK_MODEL
         )
         self.image_fallback_llm_effort = (
-            config_dict.get('image_fallback_llm_effort') or 'medium'
+            config_dict.get('image_fallback_llm_effort') or DEFAULT_IMAGE_FALLBACK_EFFORT
         )
         self.image_api_reasoning_effort_map = config_dict.get(
             'image_api_reasoning_effort_map',
             {},
         )
-        text_provider = config_dict.get('text_llm_provider', 'api')
+        text_provider = config_dict.get('text_llm_provider') or DEFAULT_TEXT_PRIMARY_PROVIDER
         self.text_llm_provider = text_provider
         self.text_llm_cli_models = config_dict.get('text_llm_cli_models', {})
         self.text_llm_cli_efforts = config_dict.get('text_llm_cli_efforts', {})
         self.text_fallback_llm_provider = (
-            config_dict.get('text_fallback_llm_provider') or 'cli:codex'
+            config_dict.get('text_fallback_llm_provider') or DEFAULT_TEXT_FALLBACK_PROVIDER
         )
         self.text_fallback_llm_model = (
-            config_dict.get('text_fallback_llm_model') or 'gpt-5.5'
+            config_dict.get('text_fallback_llm_model') or DEFAULT_TEXT_FALLBACK_MODEL
         )
         self.text_fallback_llm_effort = (
-            config_dict.get('text_fallback_llm_effort') or 'medium'
+            config_dict.get('text_fallback_llm_effort') or DEFAULT_TEXT_FALLBACK_EFFORT
         )
         text_cli_providers = (
             [text_provider]
@@ -112,7 +201,9 @@ class TwitterConfig:
         self.skip_catalog_image_analysis = bool(
             config_dict.get('skip_catalog_image_analysis', False)
         )
-        self.api_reasoning_effort = config_dict.get('api_reasoning_effort', 'medium')
+        self.catalog_verification_mode = config_dict.get('catalog_verification_mode', 'full')
+        self.direct_post_text_fallback_only = bool(config_dict.get('direct_post_text_fallback_only', False))
+        self.api_reasoning_effort = config_dict.get('api_reasoning_effort') or DEFAULT_TEXT_PRIMARY_EFFORT
         self.api_reasoning_effort_map = config_dict.get(
             'api_reasoning_effort_map',
             {},
@@ -150,6 +241,7 @@ class TwitterPostProcessor:
             config.text_fallback_llm_provider,
             config.text_fallback_llm_model,
             config.text_fallback_llm_effort,
+            primary_effort=config.api_reasoning_effort,
         )
         self.twitter_extractor = TwitterExtractor(
             model=api_models_from_attempts(text_attempts),
@@ -172,6 +264,10 @@ class TwitterPostProcessor:
             config.image_fallback_llm_model,
             config.image_fallback_llm_effort,
         )
+        if config.direct_post_text_fallback_only:
+            # 単発のURL指定は取得済み画像を直接送れるAPIを優先する。
+            # ユーザー設定内のモデルだけを使い、APIが使えない場合はCLIへ戻る。
+            image_attempts.sort(key=lambda attempt: attempt.get("kind") != "api")
         has_image_cli = any(attempt.get("kind") == "cli" for attempt in image_attempts)
         self.catalog_analyzer = CatalogImageAnalyzer(
             model=api_models_from_attempts(image_attempts),
@@ -186,9 +282,18 @@ class TwitterPostProcessor:
         self.last_run_summary: Dict[str, Any] = {
             "status": "not_started",
             "target_count": 0,
+            "attempted_count": 0,
             "processed_count": 0,
             "failed_count": 0,
             "invalid_url_count": 0,
+            "user_lookup_success_count": 0,
+            "tweet_fetch_success_count": 0,
+            "catalog_found_count": 0,
+            "no_catalog_found_count": 0,
+            "transport_failure_count": 0,
+            "timeline_unresolved_count": 0,
+            "user_lookup_unresolved_count": 0,
+            "unresolved_targets": [],
             "reason": None,
         }
 
@@ -230,6 +335,25 @@ class TwitterPostProcessor:
         product_types = detail.get('product_types', []) or []
         circle._product_types = list(product_types) if isinstance(product_types, list) else []
 
+    def _record_unresolved_target(
+        self, circle: Circle, outcome: str, reason: Optional[str] = None
+    ) -> None:
+        """Keep a failed lookup visible without mutating the circle as empty."""
+
+        summary = self.last_run_summary
+        diagnostic = {
+            "circle": str(getattr(circle, "name", ""))[:200],
+            "outcome": str(outcome)[:80],
+            "reason": str(reason or outcome)[:500],
+        }
+        targets = summary.setdefault("unresolved_targets", [])
+        if not any(
+            isinstance(item, dict)
+            and all(item.get(key) == diagnostic[key] for key in diagnostic)
+            for item in targets
+        ):
+            targets.append(diagnostic)
+
     def _apply_direct_post_cache(
         self,
         circle: Circle,
@@ -268,6 +392,22 @@ class TwitterPostProcessor:
                 for img in circle.item_images
             ],
         }
+
+    def _cache_direct_post_result_with_deadline(
+        self,
+        tweet_id: str,
+        circle: Circle,
+        deadline: Optional[ReprocessDeadline] = None,
+    ) -> None:
+        if deadline is not None:
+            deadline.require_time(stage="processor.direct_post")
+        self._cache_direct_post_result(tweet_id, circle)
+        if deadline is not None:
+            try:
+                deadline.require_time(stage="processor.direct_post")
+            except ReprocessDeadlineExceeded:
+                self._post_reprocess_cache.pop(tweet_id, None)
+                raise
 
     @staticmethod
     def _default_items_to_skipped(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -310,9 +450,23 @@ class TwitterPostProcessor:
                 merged.append(text_item)
                 continue
 
+            existing_item = merged[existing_index]
+            incoming_values = {
+                k: v for k, v in text_item.items() if v not in (None, "")
+            }
+            try:
+                existing_price = int(existing_item.get("price", 0) or 0)
+            except (TypeError, ValueError):
+                existing_price = 0
+            try:
+                incoming_price = int(text_item.get("price", 0) or 0)
+            except (TypeError, ValueError):
+                incoming_price = 0
+            if existing_price > 0 and incoming_price <= 0:
+                incoming_values.pop("price", None)
             merged[existing_index] = {
-                **merged[existing_index],
-                **{k: v for k, v in text_item.items() if v not in (None, "")},
+                **existing_item,
+                **incoming_values,
             }
 
         return merged
@@ -321,7 +475,12 @@ class TwitterPostProcessor:
         self,
         items: List[Dict[str, Any]],
         event_name: str = "",
+        run_id: Optional[str] = None,
+        trace: Any = None,
+        deadline: Optional[ReprocessDeadline] = None,
     ) -> List[Dict[str, Any]]:
+        if deadline is not None:
+            deadline.require_time(stage="text.consolidate")
         if len(items) < 2:
             return items
 
@@ -332,12 +491,29 @@ class TwitterPostProcessor:
 
         loop = asyncio.get_event_loop()
         try:
-            consolidated = await loop.run_in_executor(
-                None,
-                consolidate,
-                items,
-                event_name,
-            )
+            with trace_stage(run_id, "text.consolidate", trace):
+                if deadline is not None:
+                    deadline.require_time(stage="text.consolidate")
+                consolidate_kwargs: Dict[str, Any] = {}
+                if deadline is not None and supports_keyword(consolidate, "timeout"):
+                    consolidate_kwargs["timeout"] = deadline.require_time(
+                        stage="text.consolidate"
+                    )
+                if deadline is not None and supports_keyword(consolidate, "deadline"):
+                    consolidate_kwargs["deadline"] = deadline
+                consolidated = await _run_in_executor_with_optional_deadline(
+                    loop,
+                    consolidate,
+                    items,
+                    event_name,
+                    **consolidate_kwargs,
+                    budget=deadline,
+                    stage="text.consolidate",
+                )
+                if deadline is not None:
+                    deadline.require_time(stage="text.consolidate")
+        except ReprocessDeadlineExceeded:
+            raise
         except Exception as e:
             logger.warning(f"Failed to consolidate catalog items for {event_name}: {e}")
             return items
@@ -351,12 +527,26 @@ class TwitterPostProcessor:
         circle: Circle,
         text_items: List[Dict[str, Any]],
         event_name: str = "",
+        run_id: Optional[str] = None,
+        trace: Any = None,
+        deadline: Optional[ReprocessDeadline] = None,
     ) -> bool:
+        if deadline is not None:
+            deadline.require_time(stage="text.items")
         if not text_items:
             return False
         before = json.dumps(circle.items, ensure_ascii=False, sort_keys=True)
         merged = self._merge_catalog_items(circle.items, text_items)
-        circle.items = await self._consolidate_catalog_items(merged, event_name)
+        circle.items = await _call_with_optional_deadline(
+            self._consolidate_catalog_items,
+            merged,
+            event_name,
+            run_id=run_id,
+            trace=trace,
+            deadline=deadline,
+        )
+        if deadline is not None:
+            deadline.require_time(stage="text.items")
         after = json.dumps(circle.items, ensure_ascii=False, sort_keys=True)
         logger.info(
             f"Merged {len(text_items)} text-derived items for {circle.name}; total={len(circle.items)}"
@@ -364,6 +554,8 @@ class TwitterPostProcessor:
         changed = before != after
         if self._apply_default_item_image(circle, overwrite=False):
             changed = True
+        if deadline is not None:
+            deadline.require_time(stage="text.items")
         return changed
 
     @staticmethod
@@ -388,7 +580,7 @@ class TwitterPostProcessor:
             if not isinstance(item, dict):
                 continue
             current_image = item.get("image")
-            if overwrite or not current_image or (replace_paths and current_image in replace_paths):
+            if overwrite or (replace_paths and current_image in replace_paths):
                 if item.get("image") != image_path:
                     item["image"] = image_path
                     changed = True
@@ -409,9 +601,18 @@ class TwitterPostProcessor:
         self.last_run_summary = {
             "status": "running",
             "target_count": 0,
+            "attempted_count": 0,
             "processed_count": 0,
             "failed_count": 0,
             "invalid_url_count": 0,
+            "user_lookup_success_count": 0,
+            "tweet_fetch_success_count": 0,
+            "catalog_found_count": 0,
+            "no_catalog_found_count": 0,
+            "transport_failure_count": 0,
+            "timeline_unresolved_count": 0,
+            "user_lookup_unresolved_count": 0,
+            "unresolved_targets": [],
             "reason": None,
         }
         if not self.config.enabled:
@@ -486,7 +687,11 @@ class TwitterPostProcessor:
         # X/Twitter scraping uses account rotation and checked-tweet bookkeeping.
         # Keep this sequential so per-circle state cannot be mixed.
         results = []
+        continue_on_error = getattr(self.config, "continue_on_error", False)
+        for circle in circles:
+            circle._twitter_processing_succeeded = False
         for i, circle in enumerate(circles_with_twitter):
+            self.last_run_summary["attempted_count"] += 1
             processing_error = None
             try:
                 results.append(
@@ -502,6 +707,16 @@ class TwitterPostProcessor:
                 processing_error = e
 
             if processing_error is not None:
+                if continue_on_error and not getattr(
+                    self.twitter_extractor, "_twscrape_unavailable_reason", None
+                ):
+                    reason = f"{type(processing_error).__name__}: {processing_error}"
+                    self._record_unresolved_target(circle, "processing_error", reason)
+                    logger.error(
+                        f"サークルの再処理に失敗しました: {circle.name}: {reason}。"
+                        "既存データを保持し、次のサークルへ進みます"
+                    )
+                    continue
                 self.last_run_summary.update(
                     status="failed",
                     processed_count=i,
@@ -515,6 +730,30 @@ class TwitterPostProcessor:
                     f"理由={type(processing_error).__name__}: {processing_error}"
                 )
                 break
+
+            fetch_stats = getattr(
+                getattr(self, "twitter_extractor", None), "_last_fetch_stats", {}
+            )
+            if isinstance(fetch_stats, dict):
+                self.last_run_summary["user_lookup_success_count"] += int(
+                    bool(fetch_stats.get("user_lookup_success_count"))
+                )
+                self.last_run_summary["tweet_fetch_success_count"] += int(
+                    bool(fetch_stats.get("tweet_fetch_success_count"))
+                )
+            outcome = fetch_stats.get("outcome") if isinstance(fetch_stats, dict) else None
+            if outcome not in {None, "catalog_found", "no_catalog_found"}:
+                self._record_unresolved_target(circle, outcome, fetch_stats.get("reason"))
+                if outcome.startswith("user_lookup"):
+                    self.last_run_summary["user_lookup_unresolved_count"] += 1
+                elif outcome.startswith("timeline"):
+                    self.last_run_summary["timeline_unresolved_count"] += 1
+                else:
+                    self.last_run_summary["transport_failure_count"] += 1
+            elif outcome == "catalog_found":
+                self.last_run_summary["catalog_found_count"] += 1
+            elif outcome == "no_catalog_found":
+                self.last_run_summary["no_catalog_found_count"] += 1
 
             unavailable_reason = getattr(
                 self.twitter_extractor, "_twscrape_unavailable_reason", None
@@ -533,6 +772,10 @@ class TwitterPostProcessor:
                     f"理由={unavailable_reason}"
                 )
                 break
+
+            circle._twitter_processing_succeeded = outcome in {
+                None, "catalog_found", "no_catalog_found"
+            }
 
         # 結果を統合
         circle_map = {c.name: c for c in circles}
@@ -554,10 +797,18 @@ class TwitterPostProcessor:
         self._print_summary(updated_circles)
 
         if self.last_run_summary["status"] == "running":
+            unresolved_count = len(self.last_run_summary.get("unresolved_targets", []))
             self.last_run_summary.update(
-                status="ok",
-                processed_count=len(circles_with_twitter),
-                failed_count=0,
+                status=("failed" if unresolved_count >= len(circles_with_twitter) else "partial")
+                if unresolved_count
+                else "ok",
+                processed_count=(
+                    sum(bool(c._twitter_processing_succeeded) for c in circles_with_twitter)
+                    if continue_on_error else len(circles_with_twitter)
+                ),
+                failed_count=unresolved_count,
+                reason=("一部のサークルの再処理に失敗しました" if continue_on_error
+                        else "twscrape: unresolved targets") if unresolved_count else None,
             )
 
         return updated_circles
@@ -677,8 +928,11 @@ class TwitterPostProcessor:
         event_name: str,
     ) -> Circle:
         """従来のtwscrape + LLMを使ったサークル処理"""
-        # skip_tweet_ids を取得（再処理時に設定される）
-        skip_tweet_ids = getattr(circle, '_skip_tweet_ids', None)
+        # 永続checked stateと、同一runだけの再取得防止IDを分離する。
+        existing_ids = list(getattr(circle, '_skip_tweet_ids', []) or [])
+        existing_ids += list(getattr(circle, '_checked_tweet_ids', []) or [])
+        run_skip_ids = list(getattr(circle, '_run_skip_tweet_ids', []) or [])
+        skip_tweet_ids = sorted(set(existing_ids + run_skip_ids))
 
         # お品書きツイートを抽出
         catalog_tweets = await self.twitter_extractor.extract_catalog_tweets(
@@ -692,8 +946,7 @@ class TwitterPostProcessor:
 
         # チェック済みツイートIDを記録（checked_tweets.json更新用）
         checked_ids = list(getattr(catalog_tweets, 'checked_tweet_ids', []))
-        # 既存のskip_tweet_idsも合わせて保存（以前のチェック分も含める）
-        existing_ids = skip_tweet_ids or []
+        # direct処理に失敗した一時除外IDは永続保存しない。
         circle._checked_tweet_ids = list(set(existing_ids + checked_ids))
 
         # おしながきツイートと欠席ツイートを分離
@@ -772,13 +1025,18 @@ class TwitterPostProcessor:
 
         text_items = await loop.run_in_executor(
             None,
-            self.twitter_extractor.llm_client.extract_catalog_items_from_text,
-            best_tweet['text'],
-            event_name,
+            lambda: self.twitter_extractor.llm_client.extract_catalog_items_from_text(
+                best_tweet['text'],
+                event_name,
+                known_items=circle.items,
+            ),
         )
         if await self._merge_text_items_into_circle(circle, text_items, event_name):
             if not circle.catalog_status or circle.catalog_status == "preview":
                 circle.catalog_status = "confirmed"
+
+        if circle.catalog_status == "confirmed" and not circle.items:
+            circle.catalog_status = "no_extractable_items"
 
         return circle
 
@@ -788,8 +1046,13 @@ class TwitterPostProcessor:
         post_url: str,
         event_name: str = "",
         use_text_detail: bool = False,
+        run_id: Optional[str] = None,
+        trace: Any = None,
+        deadline: Optional[ReprocessDeadline] = None,
     ) -> bool:
         """memoなどに残っているX投稿URLを直接再処理する"""
+        if deadline is not None:
+            deadline.require_time(stage="processor.direct_post")
         tweet_id = self._extract_tweet_id_from_url(post_url)
         if not tweet_id:
             logger.warning(f"Invalid post URL for direct reprocess: {post_url}")
@@ -798,9 +1061,19 @@ class TwitterPostProcessor:
         cached = self._post_reprocess_cache.get(tweet_id)
         if cached:
             self._apply_direct_post_cache(circle, cached, post_url)
+            if deadline is not None:
+                deadline.require_time(stage="processor.direct_post")
             return True
 
-        tweet_detail = await self._fetch_tweet_detail(tweet_id)
+        tweet_detail = await _call_with_optional_deadline(
+            self._fetch_tweet_detail,
+            tweet_id,
+            run_id=run_id,
+            trace=trace,
+            deadline=deadline,
+        )
+        if deadline is not None:
+            deadline.require_time(stage="twitter.tweet_details")
         updated = False
 
         if post_url and post_url not in (circle.memo or ""):
@@ -813,11 +1086,28 @@ class TwitterPostProcessor:
             img.path for img in previous_item_images if img.path
         }
         image_processed_any = False
+        self._direct_post_text_processed = False
         if media_urls:
             circle.item_images = []
 
         for img_url in media_urls:
-            image_processed = await self._download_and_process_image(circle, img_url)
+            image_kwargs: Dict[str, Any] = {}
+            if (
+                getattr(getattr(self, "config", None), "direct_post_text_fallback_only", False)
+                and supports_keyword(self._download_and_process_image, "post_text")
+            ):
+                image_kwargs["post_text"] = tweet_detail.get("text", "")
+            image_processed = await _call_with_optional_deadline(
+                self._download_and_process_image,
+                circle,
+                img_url,
+                run_id=run_id,
+                trace=trace,
+                deadline=deadline,
+                **image_kwargs,
+            )
+            if deadline is not None:
+                deadline.require_time(stage="image.analysis")
             if image_processed:
                 image_processed_any = True
                 updated = True
@@ -839,15 +1129,38 @@ class TwitterPostProcessor:
                 updated = True
 
         tweet_text = tweet_detail.get("text", "")
+        # URL指定では利用者が投稿を選択済み。画像から商品を取得できた場合は
+        # 投稿の再分類・同じ商品の本文抽出を重ねず、本文だけの投稿に限り補完する。
+        if (
+            getattr(getattr(self, "config", None), "direct_post_text_fallback_only", False)
+            and self._direct_post_text_processed
+        ):
+            use_text_detail = False
         detail_error = False
         if use_text_detail and tweet_text:
             loop = asyncio.get_event_loop()
-            detail = await loop.run_in_executor(
-                None,
-                self.twitter_extractor.llm_client.analyze_catalog_tweet_detail,
-                tweet_text,
-                event_name,
-            )
+            with trace_stage(run_id, "text.detail", trace):
+                if deadline is not None:
+                    deadline.require_time(stage="text.detail")
+                detail_method = (
+                    self.twitter_extractor.llm_client.analyze_catalog_tweet_detail
+                )
+                detail_kwargs: Dict[str, Any] = {}
+                if deadline is not None and supports_keyword(detail_method, "timeout"):
+                    detail_kwargs["timeout"] = deadline.require_time(stage="text.detail")
+                if deadline is not None and supports_keyword(detail_method, "deadline"):
+                    detail_kwargs["deadline"] = deadline
+                detail = await _run_in_executor_with_optional_deadline(
+                    loop,
+                    detail_method,
+                    tweet_text,
+                    event_name,
+                    budget=deadline,
+                    stage="text.detail",
+                    **detail_kwargs,
+                )
+                if deadline is not None:
+                    deadline.require_time(stage="text.detail")
             detail_error = bool(detail.get("error"))
             if not detail_error:
                 previous_status = circle.catalog_status
@@ -863,16 +1176,46 @@ class TwitterPostProcessor:
 
                 if circle.catalog_status == "preview":
                     if not circle.items:
-                        self._cache_direct_post_result(tweet_id, circle)
+                        if deadline is not None:
+                            deadline.require_time(stage="processor.direct_post")
+                        self._cache_direct_post_result_with_deadline(
+                            tweet_id,
+                            circle,
+                            deadline=deadline,
+                        )
                         return True
 
-            text_items = await loop.run_in_executor(
-                None,
-                self.twitter_extractor.llm_client.extract_catalog_items_from_text,
-                tweet_text,
+            with trace_stage(run_id, "text.items", trace):
+                if deadline is not None:
+                    deadline.require_time(stage="text.items")
+                items_method = (
+                    self.twitter_extractor.llm_client.extract_catalog_items_from_text
+                )
+                items_kwargs: Dict[str, Any] = {"known_items": circle.items}
+                if deadline is not None and supports_keyword(items_method, "timeout"):
+                    items_kwargs["timeout"] = deadline.require_time(stage="text.items")
+                if deadline is not None and supports_keyword(items_method, "deadline"):
+                    items_kwargs["deadline"] = deadline
+                text_items = await _run_in_executor_with_optional_deadline(
+                    loop,
+                    items_method,
+                    tweet_text,
+                    event_name,
+                    budget=deadline,
+                    stage="text.items",
+                    **items_kwargs,
+                )
+                if deadline is not None:
+                    deadline.require_time(stage="text.items")
+            if await _call_with_optional_deadline(
+                self._merge_text_items_into_circle,
+                circle,
+                text_items,
                 event_name,
-            )
-            if await self._merge_text_items_into_circle(circle, text_items, event_name):
+                run_id=run_id,
+                trace=trace,
+                deadline=deadline,
+            ):
                 if not circle.catalog_status or circle.catalog_status == "preview":
                     circle.catalog_status = "confirmed"
                 updated = True
@@ -883,23 +1226,66 @@ class TwitterPostProcessor:
             ):
                 updated = True
 
+        if detail_error and not image_processed_any:
+            if deadline is not None:
+                deadline.require_time(stage="text.detail")
+            return False
+
         if circle.items and (circle.item_images or updated):
             if circle.catalog_status == "preview":
                 circle.catalog_status = "confirmed"
-            self._cache_direct_post_result(tweet_id, circle)
+            if deadline is not None:
+                deadline.require_time(stage="processor.direct_post")
+            self._cache_direct_post_result_with_deadline(
+                tweet_id,
+                circle,
+                deadline=deadline,
+            )
             return True
         if use_text_detail and tweet_text and circle.catalog_status == "confirmed" and not detail_error:
             circle.catalog_status = "no_extractable_items"
-            self._cache_direct_post_result(tweet_id, circle)
+            if deadline is not None:
+                deadline.require_time(stage="processor.direct_post")
+            self._cache_direct_post_result_with_deadline(
+                tweet_id,
+                circle,
+                deadline=deadline,
+            )
             return True
+        if deadline is not None:
+            deadline.require_time(stage="processor.direct_post")
         return updated or bool(circle.items)
 
-    async def _fetch_tweet_detail(self, tweet_id: str) -> Dict[str, Any]:
+    async def _fetch_tweet_detail(
+        self,
+        tweet_id: str,
+        run_id: Optional[str] = None,
+        trace: Any = None,
+        deadline: Optional[ReprocessDeadline] = None,
+    ) -> Dict[str, Any]:
         """twscrapeでツイート1件を取得し、本文とメディアURLを返す"""
         try:
-            await self.twitter_extractor.initialize()
-            api = self.twitter_extractor._get_next_api_instance()
-            tweet = await api.tweet_details(int(tweet_id))
+            with trace_stage(run_id, "twitter.initialize", trace):
+                if deadline is not None:
+                    deadline.require_time(stage="twitter.initialize")
+                await _await_with_optional_deadline(
+                    self.twitter_extractor.initialize(),
+                    deadline,
+                    stage="twitter.initialize",
+                )
+                if deadline is not None:
+                    deadline.require_time(stage="twitter.initialize")
+            with trace_stage(run_id, "twitter.tweet_details", trace):
+                if deadline is not None:
+                    deadline.require_time(stage="twitter.tweet_details")
+                api = self.twitter_extractor._get_next_api_instance()
+                tweet = await _await_with_optional_deadline(
+                    api.tweet_details(int(tweet_id)),
+                    deadline,
+                    stage="twitter.tweet_details",
+                )
+                if deadline is not None:
+                    deadline.require_time(stage="twitter.tweet_details")
             if not tweet:
                 return {}
 
@@ -923,6 +1309,8 @@ class TwitterPostProcessor:
                 "url": getattr(tweet, "url", None) or "",
                 "media_urls": media_urls,
             }
+        except ReprocessDeadlineExceeded:
+            raise
         except Exception as e:
             logger.warning(f"ツイート {tweet_id} の取得に失敗: {e}")
         return {}
@@ -939,27 +1327,56 @@ class TwitterPostProcessor:
         circle: Circle,
         img_urls: List[str],
         failure_context: str = "tweet",
+        deadline: Optional[ReprocessDeadline] = None,
     ) -> bool:
+        if deadline is not None:
+            deadline.require_time(stage="media.download")
         image_downloaded = False
         for img_url in img_urls:
-            if await self._download_and_process_image(circle, img_url):
+            if await _call_with_optional_deadline(
+                self._download_and_process_image,
+                circle,
+                img_url,
+                deadline=deadline,
+            ):
                 image_downloaded = True
             else:
                 logger.warning(
                     f"Failed to download image from {failure_context} for {circle.name}: {img_url}"
                 )
+            if deadline is not None:
+                deadline.require_time(stage="image.analysis")
         return image_downloaded
 
-    async def _download_and_process_image(self, circle: Circle, img_url: str) -> bool:
+    async def _download_and_process_image(
+        self,
+        circle: Circle,
+        img_url: str,
+        run_id: Optional[str] = None,
+        trace: Any = None,
+        deadline: Optional[ReprocessDeadline] = None,
+        post_text: str = "",
+    ) -> bool:
         """お品書き画像をダウンロード・分析・リサイズしてサークル情報を更新"""
         original_filename = img_url.split('/')[-1]
         filename = f"catalog_{original_filename}"
 
-        image_path = await self.twitter_extractor.download_catalog_image(
-            img_url, self.output_path, filename
-        )
+        with trace_stage(run_id, "media.download", trace):
+            if deadline is not None:
+                deadline.require_time(stage="media.download")
+            image_path = await _await_with_optional_deadline(
+                self.twitter_extractor.download_catalog_image(
+                    img_url, self.output_path, filename
+                ),
+                deadline,
+                stage="media.download",
+            )
+            if deadline is not None:
+                deadline.require_time(stage="media.download")
 
         if not image_path or not Path(image_path).exists():
+            if deadline is not None:
+                deadline.require_time(stage="media.download")
             return False
 
         image_name = Path(image_path).name
@@ -968,15 +1385,55 @@ class TwitterPostProcessor:
         # お品書き画像からアイテム情報を抽出（リサイズ前）
         detected_items = []
         if self.config.skip_catalog_image_analysis:
+            if deadline is not None:
+                deadline.require_time(stage="image.analysis")
             logger.info(
                 f"Skipped catalog image analysis for {circle.name}: {Path(image_path).name}"
             )
         else:
-            detected_items = await loop.run_in_executor(
-                None,
-                self.catalog_analyzer.analyze_catalog_items,
-                Path(image_path)
-            )
+            with trace_stage(run_id, "image.analysis", trace):
+                if deadline is not None:
+                    deadline.require_time(stage="image.analysis")
+                analysis_kwargs: Dict[str, Any] = {}
+                if post_text and supports_keyword(self.catalog_analyzer.analyze_catalog_result, "post_text"):
+                    analysis_kwargs["post_text"] = post_text
+                if supports_keyword(self.catalog_analyzer.analyze_catalog_result, "verification_mode"):
+                    analysis_kwargs["verification_mode"] = getattr(
+                        self.config, "catalog_verification_mode", "full",
+                    )
+                analysis = await _run_in_executor_with_optional_deadline(
+                    loop,
+                    lambda: _call_with_optional_deadline(
+                        self.catalog_analyzer.analyze_catalog_result,
+                        Path(image_path),
+                        run_id=run_id,
+                        trace=trace,
+                        deadline=deadline,
+                        **analysis_kwargs,
+                    ),
+                    budget=deadline,
+                    stage="image.analysis",
+                )
+                if deadline is not None:
+                    deadline.require_time(stage="image.analysis")
+            classification = analysis.get("is_catalog_image")
+            if classification is False:
+                Path(image_path).unlink(missing_ok=True)
+                logger.info(
+                    f"Rejected explicit non-catalog Twitter image for {circle.name}: {image_name}"
+                )
+                return False
+            if classification is not True:
+                raise RuntimeError("catalog image classification unresolved")
+            detected_items = list(analysis.get("items") or [])
+            if detected_items and getattr(self.config, "direct_post_text_fallback_only", False):
+                self._direct_post_text_processed = True
+                circle.catalog_status = "confirmed"
+                if isinstance(analysis.get("is_existing_only"), bool):
+                    circle.existing_only_status = "既刊のみ" if analysis["is_existing_only"] else None
+
+        if deadline is not None:
+            deadline.require_time(stage="image.analysis")
 
         # itemsリストに設定（name, type, price を含む）
         if detected_items:
@@ -1001,6 +1458,8 @@ class TwitterPostProcessor:
         }
         if image_key not in existing_images:
             circle.item_images.append(ItemImage(path=image_name, source='twitter'))
+        if deadline is not None:
+            deadline.require_time(stage="image.analysis")
         logger.info(f"Downloaded and processed catalog image for {circle.name}: {Path(image_path).name}")
         return True
 

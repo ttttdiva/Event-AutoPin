@@ -620,12 +620,13 @@ def _merge_context_results(
                 "origin": [origin_x, origin_y],
                 "size": crop_size,
                 "elapsed_sec": round(time.monotonic() - started, 3),
+                "appended_element_count": 0,
                 **_safe_inference_error(exc, "context_inference_failed"),
             })
             continue
         raw = str(output.get("raw_output") or "")
         valid_elements = [element for element in output.get("elements", []) if _valid_numeric_element(element)]
-        diagnostics.append({
+        diagnostic = {
             "tier": tier,
             "rectangle_index": index,
             "origin": [origin_x, origin_y],
@@ -635,8 +636,10 @@ def _merge_context_results(
             "crop_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "raw_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest() if raw else None,
             "element_count": len(output.get("elements", [])),
+            "appended_element_count": 0,
             "numeric_count": _unique_numeric_element_count(valid_elements),
-        })
+        }
+        diagnostics.append(diagnostic)
         for element in output.get("elements", []):
             if not _valid_numeric_element(element):
                 continue
@@ -646,6 +649,7 @@ def _merge_context_results(
             shifted["y1"] = float(element["y1"]) + origin_y
             shifted["y2"] = float(element["y2"]) + origin_y
             merged.append(shifted)
+            diagnostic["appended_element_count"] += 1
     return merged
 
 

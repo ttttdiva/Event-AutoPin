@@ -11,6 +11,7 @@ import re
 import ast
 
 from .api_cost_tracker import get_cost_tracker
+from .reprocess_deadline import ReprocessDeadline
 
 
 _GENERIC_EVENT_KEYWORDS = {
@@ -357,6 +358,7 @@ class LLMClient:
         contents: List[Dict[str, Any]],
         temperature: Optional[float] = None,
         reasoning_effort: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -376,7 +378,7 @@ class LLMClient:
             params={"key": api_key},
             headers={"Content-Type": "application/json"},
             json=body,
-            timeout=180,
+            timeout=180 if timeout is None else timeout,
         )
         response.raise_for_status()
         data = response.json()
@@ -392,12 +394,25 @@ class LLMClient:
         ).strip()
         return text, data.get("usageMetadata") or {}
 
+    @staticmethod
+    def _client_with_timeout(client: Any, timeout: Optional[float]) -> Any:
+        """Return an OpenAI client with a per-call timeout when supported."""
+
+        if timeout is None:
+            return client
+        with_options = getattr(client, "with_options", None)
+        if callable(with_options):
+            return with_options(timeout=timeout)
+        return client
+
     def _extract_with_cli_provider(
         self,
         prompt: str,
         provider: str,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        timeout: Optional[float] = None,
+        deadline: Optional[ReprocessDeadline] = None,
     ) -> Optional[str]:
         from .cli_llm import execute_cli_prompt
 
@@ -407,12 +422,17 @@ class LLMClient:
             label += f" ({model})"
         self.logger.info(f"{label} でLLM判定を試行中...")
 
+        effective_timeout = (
+            deadline.require_time() if deadline is not None else timeout
+        )
         cli_kwargs: Dict[str, Any] = {
             "provider": provider,
             "cwd": self.cli_cwd,
-            "timeout": self.cli_timeout,
+            "timeout": self.cli_timeout if effective_timeout is None else effective_timeout,
             "model": model,
         }
+        if timeout is not None or deadline is not None:
+            cli_kwargs["raise_on_timeout"] = True
         effort = effort if effort is not None else self.cli_effort_map.get(provider)
         if effort is not None:
             cli_kwargs["effort"] = effort
@@ -431,7 +451,12 @@ class LLMClient:
         self.logger.info(f"{label} でLLM判定に成功しました")
         return content
 
-    def _extract_with_cli(self, prompt: str) -> Optional[str]:
+    def _extract_with_cli(
+        self,
+        prompt: str,
+        timeout: Optional[float] = None,
+        deadline: Optional[ReprocessDeadline] = None,
+    ) -> Optional[str]:
         if not self.cli_providers:
             return None
 
@@ -444,12 +469,17 @@ class LLMClient:
                 label += f" ({model})"
             self.logger.info(f"{label} でLLM判定を試行中...")
 
+            effective_timeout = (
+                deadline.require_time() if deadline is not None else timeout
+            )
             cli_kwargs: Dict[str, Any] = {
                 "provider": provider,
                 "cwd": self.cli_cwd,
-                "timeout": self.cli_timeout,
+                "timeout": self.cli_timeout if effective_timeout is None else effective_timeout,
                 "model": model,
             }
+            if timeout is not None or deadline is not None:
+                cli_kwargs["raise_on_timeout"] = True
             effort = self.cli_effort_map.get(provider)
             if effort is not None:
                 cli_kwargs["effort"] = effort
@@ -475,16 +505,23 @@ class LLMClient:
         prompt: str,
         temperature: float = 0.1,
         reasoning_effort: Optional[str] = None,
+        timeout: Optional[float] = None,
+        deadline: Optional[ReprocessDeadline] = None,
     ) -> str:
         last_error = None
         for index, attempt in enumerate(self.attempts):
             try:
+                effective_timeout = (
+                    deadline.require_time() if deadline is not None else timeout
+                )
                 if attempt.get("kind") == "cli":
                     content = self._extract_with_cli_provider(
                         prompt,
                         attempt.get("provider", ""),
                         attempt.get("model"),
                         attempt.get("effort"),
+                        timeout=effective_timeout,
+                        deadline=deadline,
                     )
                     if content is None:
                         raise RuntimeError("CLI LLM処理に失敗しました")
@@ -498,8 +535,15 @@ class LLMClient:
                     reasoning_effort=attempt.get("effort") or reasoning_effort or self.reasoning_effort,
                     api_reasoning_effort_map=self.api_reasoning_effort_map,
                 )
-                return api_client.extract_data(prompt, temperature=temperature)
+                return api_client.extract_data(
+                    prompt,
+                    temperature=temperature,
+                    timeout=effective_timeout,
+                    deadline=deadline,
+                )
             except Exception as e:
+                if deadline is not None:
+                    deadline.require_time()
                 last_error = e
                 self.logger.error(f"LLM試行 {index + 1} が失敗しました: {e}")
                 if index < len(self.attempts) - 1:
@@ -508,6 +552,8 @@ class LLMClient:
 
         if last_error is None:
             raise RuntimeError("CLI/API LLM処理に失敗しました")
+        if deadline is not None:
+            deadline.require_time()
         raise last_error
 
     def extract_data(
@@ -515,6 +561,8 @@ class LLMClient:
         prompt: str,
         temperature: float = 0.1,
         reasoning_effort: Optional[str] = None,
+        timeout: Optional[float] = None,
+        deadline: Optional[ReprocessDeadline] = None,
     ) -> str:
         """データ抽出のためのLLM呼び出し（フォールバック対応）"""
         if self.attempts:
@@ -522,11 +570,20 @@ class LLMClient:
                 prompt,
                 temperature,
                 reasoning_effort,
+                timeout,
+                deadline,
             )
 
         last_error = None
 
-        cli_content = self._extract_with_cli(prompt)
+        effective_timeout = (
+            deadline.require_time() if deadline is not None else timeout
+        )
+        cli_content = self._extract_with_cli(
+            prompt,
+            timeout=effective_timeout,
+            deadline=deadline,
+        )
         if cli_content is not None:
             return cli_content
         if self.cli_providers:
@@ -534,6 +591,9 @@ class LLMClient:
 
         for i, client_info in enumerate(self.clients):
             try:
+                effective_timeout = (
+                    deadline.require_time() if deadline is not None else timeout
+                )
                 self.logger.info(f"モデル {client_info['model']} で処理を試行中...")
                 effective_reasoning_effort = self._api_reasoning_effort_for(
                     client_info["model"],
@@ -554,6 +614,7 @@ class LLMClient:
                         [{"parts": [{"text": full_prompt}]}],
                         temperature=temperature,
                         reasoning_effort=effective_reasoning_effort,
+                        timeout=effective_timeout,
                     )
                     # トークン追跡
                     if usage_metadata:
@@ -563,7 +624,11 @@ class LLMClient:
                             usage_metadata.get("candidatesTokenCount", 0),
                         )
                 elif self._uses_responses_api(client_info["model"]):
-                    response = client_info["client"].responses.create(
+                    client = self._client_with_timeout(
+                        client_info["client"],
+                        effective_timeout,
+                    )
+                    response = client.responses.create(
                         model=client_info["model"],
                         instructions=(
                             "あなたはHTMLを解析してデータを抽出する専門家です。"
@@ -603,7 +668,11 @@ class LLMClient:
                     if effective_reasoning_effort and client_info["api_type"] == "openai":
                         api_kwargs["reasoning_effort"] = effective_reasoning_effort
 
-                    response = client_info["client"].chat.completions.create(
+                    client = self._client_with_timeout(
+                        client_info["client"],
+                        effective_timeout,
+                    )
+                    response = client.chat.completions.create(
                         **api_kwargs
                     )
                     content = response.choices[0].message.content.strip()
@@ -631,6 +700,8 @@ class LLMClient:
                 return content
 
             except Exception as e:
+                if deadline is not None:
+                    deadline.require_time()
                 last_error = e
                 self.logger.error(f"モデル {client_info['model']} でエラー: {e}")
 
@@ -644,6 +715,8 @@ class LLMClient:
         self.logger.error(f"すべてのモデルで処理に失敗しました")
         if last_error is None:
             raise RuntimeError("CLI/API LLM処理に失敗しました")
+        if deadline is not None:
+            deadline.require_time()
         raise last_error
 
     def analyze_structure(
@@ -683,13 +756,21 @@ HTML:
             }
 
     def analyze_image(
-        self, image_path: str, prompt: str, model: Optional[str] = None
+        self,
+        image_path: str,
+        prompt: str,
+        model: Optional[str] = None,
+        timeout: Optional[float] = None,
+        deadline: Optional[ReprocessDeadline] = None,
     ) -> str:
         """画像を解析してテキスト情報を抽出（フォールバック対応）"""
         last_error = None
 
         for i, client_info in enumerate(self.clients):
             try:
+                effective_timeout = (
+                    deadline.require_time() if deadline is not None else timeout
+                )
                 self.logger.info(f"モデル {client_info['model']} で画像解析を試行中...")
                 effective_reasoning_effort = self._api_reasoning_effort_for(
                     client_info["model"],
@@ -705,6 +786,11 @@ HTML:
                         base64_image = base64.b64encode(image_file.read()).decode(
                             "utf-8"
                         )
+                    gemini_kwargs: Dict[str, Any] = {
+                        "reasoning_effort": effective_reasoning_effort,
+                    }
+                    if effective_timeout is not None:
+                        gemini_kwargs["timeout"] = effective_timeout
                     content, usage_metadata = self._generate_gemini_content(
                         client_info["model"],
                         client_info["api_key"],
@@ -721,7 +807,7 @@ HTML:
                                 ]
                             }
                         ],
-                        reasoning_effort=effective_reasoning_effort,
+                        **gemini_kwargs,
                     )
                     # トークン追跡
                     if usage_metadata:
@@ -744,7 +830,11 @@ HTML:
                     if self._uses_responses_api(model_name):
                         image_suffix = os.path.splitext(image_path)[1].lower()
                         mime_type = "image/png" if image_suffix == ".png" else "image/jpeg"
-                        response = client_info["client"].responses.create(
+                        client = self._client_with_timeout(
+                            client_info["client"],
+                            effective_timeout,
+                        )
+                        response = client.responses.create(
                             model=model_name,
                             instructions="画像を解析して、指定されたJSON形式で回答してください。",
                             input=[
@@ -797,7 +887,11 @@ HTML:
                         if effective_reasoning_effort:
                             api_kwargs["reasoning_effort"] = effective_reasoning_effort
 
-                        response = client_info["client"].chat.completions.create(
+                        client = self._client_with_timeout(
+                            client_info["client"],
+                            effective_timeout,
+                        )
+                        response = client.chat.completions.create(
                             **api_kwargs
                         )
 
@@ -820,6 +914,8 @@ HTML:
                 return content
 
             except Exception as e:
+                if deadline is not None:
+                    deadline.require_time()
                 last_error = e
                 self.logger.error(
                     f"モデル {client_info['model']} で画像解析エラー: {e}"
@@ -833,6 +929,8 @@ HTML:
 
         # すべてのモデルで失敗
         self.logger.error(f"すべてのモデルで画像解析に失敗しました")
+        if deadline is not None:
+            deadline.require_time()
         raise last_error
 
     def extract_event_keywords(self, event_info: str) -> List[str]:
@@ -1333,6 +1431,8 @@ HTML:
         self,
         tweet_text: str,
         event_name: str = "",
+        timeout: Optional[float] = None,
+        deadline: Optional[ReprocessDeadline] = None,
     ) -> Dict[str, Any]:
         """
         おしながきツイート1件に対して、分類・既刊判定・頒布物種別を1回のLLM呼び出しで統合判定。
@@ -1397,7 +1497,12 @@ HTML:
 """
 
         try:
-            result_text = self.extract_data(prompt, temperature=0.1)
+            result_text = self.extract_data(
+                prompt,
+                temperature=0.1,
+                timeout=timeout,
+                deadline=deadline,
+            )
             try:
                 result = json.loads(result_text)
                 self.logger.info(
@@ -1418,6 +1523,18 @@ HTML:
                     "reason": "LLMレスポンスのパースに失敗",
                     "error": True,
                 }
+        except TimeoutError as e:
+            if timeout is not None:
+                raise
+            self.logger.error(f"Error in analyze_catalog_tweet_detail: {e}")
+            return {
+                "classification": "confirmed",
+                "is_existing_only": False,
+                "existing_only_confidence": 0.0,
+                "product_types": [],
+                "reason": f"LLM判定エラー: {str(e)}",
+                "error": True,
+            }
         except Exception as e:
             self.logger.error(f"Error in analyze_catalog_tweet_detail: {e}")
             return {
@@ -1433,6 +1550,9 @@ HTML:
         self,
         tweet_text: str,
         event_name: str = "",
+        known_items: Optional[List[Dict[str, Any]]] = None,
+        timeout: Optional[float] = None,
+        deadline: Optional[ReprocessDeadline] = None,
     ) -> List[Dict[str, Any]]:
         """
         X投稿本文だけで頒布物の品名・価格が具体的に分かる場合だけitemsを抽出する。
@@ -1441,12 +1561,25 @@ HTML:
         from .catalog_image_analyzer import CatalogImageAnalyzer
 
         tags_list = "、".join(CatalogImageAnalyzer.ITEM_TAGS)
+        known_items_section = ""
+        if known_items:
+            known_items_section = (
+                "\n既に画像等から確認済みのitems:\n```json\n"
+                + json.dumps(known_items, ensure_ascii=False, indent=2)
+                + "\n```\n"
+                + "既知itemsと同じ商品を説明的な別名で追加しないでください。\n"
+                + "『ステッカー』『トート』『グッズ』等のカテゴリ/構成物だけを別商品化しないでください。\n"
+                + "セット構成物は単品販売が本文で明示される場合だけ別itemにしてください。\n"
+                + "既知itemの説明文を別商品にしないでください。\n"
+                + "追加itemは本文上で独立頒布物であることが明確な場合だけ許可します。\n"
+            )
         prompt = f"""以下は同人イベントのX投稿本文です。
 本文だけから、買い物リストに入れられる具体的な頒布物を抽出してください。
 {f'イベント名: {event_name}' if event_name else ''}
 
 投稿本文:
 {tweet_text}
+{known_items_section}
 
 抽出ルール:
 - 品名、価格、頒布物内容が本文中に具体的に書かれている場合だけitemsにする
@@ -1462,7 +1595,12 @@ JSON配列だけで返してください:
 ]
 """
         try:
-            result_text = self.extract_data(prompt, temperature=0.1)
+            result_text = self.extract_data(
+                prompt,
+                temperature=0.1,
+                timeout=timeout,
+                deadline=deadline,
+            )
             json_match = re.search(r'\[[\s\S]*\]', result_text or "")
             if not json_match:
                 return []
@@ -1491,6 +1629,11 @@ JSON配列だけで返してください:
                     "checked": 3,
                 })
             return items
+        except TimeoutError as e:
+            if timeout is not None:
+                raise
+            self.logger.warning(f"Failed to extract catalog items from text: {e}")
+            return []
         except Exception as e:
             self.logger.warning(f"Failed to extract catalog items from text: {e}")
             return []
@@ -1499,6 +1642,8 @@ JSON配列だけで返してください:
         self,
         items: List[Dict[str, Any]],
         event_name: str = "",
+        timeout: Optional[float] = None,
+        deadline: Optional[ReprocessDeadline] = None,
     ) -> List[Dict[str, Any]]:
         """
         画像由来と本文由来のitemsを同一頒布物単位に統合する。
@@ -1509,6 +1654,26 @@ JSON配列だけで返してください:
         from .catalog_image_analyzer import CatalogImageAnalyzer
 
         tags_list = "、".join(CatalogImageAnalyzer.ITEM_TAGS)
+        allowed_input_images = {
+            value.strip()
+            for source_item in items
+            if isinstance(source_item, dict)
+            for value in [source_item.get("image")]
+            if isinstance(value, str) and value.strip()
+        }
+        positive_price_by_name: Dict[str, int] = {}
+        for source_item in items:
+            if not isinstance(source_item, dict):
+                continue
+            name = str(source_item.get("name", "")).strip()
+            try:
+                price = int(source_item.get("price", 0) or 0)
+            except (TypeError, ValueError):
+                price = 0
+            if name and price > 0:
+                positive_price_by_name[name] = max(
+                    positive_price_by_name.get(name, 0), price
+                )
         items_json = json.dumps(items, ensure_ascii=False, indent=2)
         prompt = f"""以下は同人イベントのお品書き処理で抽出された頒布物候補です。
 画像解析由来と投稿本文由来が混在しており、同じ頒布物が表記ゆれで重複している可能性があります。
@@ -1535,7 +1700,12 @@ JSON配列だけで返してください:
 ]
 """
         try:
-            result_text = self.extract_data(prompt, temperature=0.1)
+            result_text = self.extract_data(
+                prompt,
+                temperature=0.1,
+                timeout=timeout,
+                deadline=deadline,
+            )
             json_match = re.search(r'\[[\s\S]*\]', result_text or "")
             if not json_match:
                 return []
@@ -1556,6 +1726,8 @@ JSON配列だけで返してください:
                     price = int(raw.get("price", 0) or 0)
                 except (TypeError, ValueError):
                     price = 0
+                if price <= 0 and name in positive_price_by_name:
+                    price = positive_price_by_name[name]
                 try:
                     checked = int(raw.get("checked", 3) or 3)
                 except (TypeError, ValueError):
@@ -1567,11 +1739,17 @@ JSON配列だけで返してください:
                     "description": str(raw.get("description", "")).strip(),
                     "checked": checked,
                 }
-                image = str(raw.get("image", "")).strip()
-                if image:
+                raw_image = raw.get("image")
+                image = raw_image.strip() if isinstance(raw_image, str) else ""
+                if image in allowed_input_images:
                     item["image"] = image
                 normalized.append(item)
             return normalized
+        except TimeoutError as e:
+            if timeout is not None:
+                raise
+            self.logger.warning(f"Failed to consolidate catalog items: {e}")
+            return []
         except Exception as e:
             self.logger.warning(f"Failed to consolidate catalog items: {e}")
             return []

@@ -453,6 +453,13 @@ space, name, penname, hall, twitter_url, website_url, pixiv_url, genre, descript
 
                 circle = self._create_circle_from_dict(circle_data)
                 if circle:
+                    # テキスト化すると「X」「Web」だけになるため、hrefも回収する。
+                    links = {}
+                    for cell in cells:
+                        for key, url in self._extract_link_fields(cell).items():
+                            links.setdefault(key, url)
+                    for key in ('twitter_url', 'website_url', 'pixiv_url'):
+                        setattr(circle, key, links.get(key))
                     circles.append(circle)
 
         return circles

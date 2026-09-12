@@ -24,6 +24,18 @@ from src.utils.api_cost_tracker import get_cost_tracker
 from src.utils.llm_attempts import (
     api_models_from_attempts,
     build_text_llm_attempts,
+    DEFAULT_IMAGE_FALLBACK_EFFORT,
+    DEFAULT_IMAGE_FALLBACK_MODEL,
+    DEFAULT_IMAGE_FALLBACK_PROVIDER,
+    DEFAULT_IMAGE_PRIMARY_EFFORT,
+    DEFAULT_IMAGE_PRIMARY_MODEL,
+    DEFAULT_IMAGE_PRIMARY_PROVIDER,
+    DEFAULT_TEXT_FALLBACK_EFFORT,
+    DEFAULT_TEXT_FALLBACK_MODEL,
+    DEFAULT_TEXT_FALLBACK_PROVIDER,
+    DEFAULT_TEXT_PRIMARY_EFFORT,
+    DEFAULT_TEXT_PRIMARY_MODEL,
+    DEFAULT_TEXT_PRIMARY_PROVIDER,
 )
 from src.processors import TwitterPostProcessor, TwitterConfig
 from src.utils.pattern_manager import PatternManager
@@ -155,7 +167,7 @@ class CircleListGenerator:
                 return models
 
         # 従来形式: model 文字列
-        model = self.config.get("model", "gpt-5.6-sol")
+        model = self.config.get("model") or DEFAULT_TEXT_PRIMARY_MODEL
         self.logger.info(f"単一モデル設定を使用: {model}")
         return model
 
@@ -195,13 +207,14 @@ class CircleListGenerator:
         site_parsing_config = None
         sp_raw = self.config.get("site_parsing")
         if sp_raw and isinstance(sp_raw, dict):
-            site_reasoning_effort = sp_raw.get(
-                "reasoning_effort",
-                sp_raw.get("api_reasoning_effort", "medium"),
+            site_reasoning_effort = (
+                sp_raw.get("reasoning_effort")
+                or sp_raw.get("api_reasoning_effort")
+                or DEFAULT_TEXT_PRIMARY_EFFORT
             )
             site_parsing_config = SiteParsingConfig(
-                codex_model=sp_raw.get("codex_model", "gpt-5.4"),
-                api_model=sp_raw.get("api_model", "gpt-5.6-sol"),
+                codex_model=sp_raw.get("codex_model") or DEFAULT_TEXT_FALLBACK_MODEL,
+                api_model=sp_raw.get("api_model") or DEFAULT_TEXT_PRIMARY_MODEL,
                 reasoning_effort=site_reasoning_effort,
                 api_reasoning_effort=site_reasoning_effort,
                 prefer_cli=sp_raw.get("prefer_cli", True),
@@ -222,11 +235,11 @@ class CircleListGenerator:
             )
 
         llm_model = models if isinstance(models, str) else models[0]
-        image_provider = self.config.get("image_llm_provider") or "api:gemini"
-        image_model = self.config.get("image_llm_model") or llm_model
-        image_effort = self.config.get(
-            "image_llm_effort", self.config.get("api_reasoning_effort", "medium")
-        )
+        text_provider = self.config.get("text_llm_provider") or DEFAULT_TEXT_PRIMARY_PROVIDER
+        text_effort = self.config.get("api_reasoning_effort") or DEFAULT_TEXT_PRIMARY_EFFORT
+        image_provider = self.config.get("image_llm_provider") or DEFAULT_IMAGE_PRIMARY_PROVIDER
+        image_model = self.config.get("image_llm_model") or DEFAULT_IMAGE_PRIMARY_MODEL
+        image_effort = self.config.get("image_llm_effort") or DEFAULT_IMAGE_PRIMARY_EFFORT
 
         return SiteConfig(
             site_type=site_type,
@@ -237,33 +250,28 @@ class CircleListGenerator:
             retry_count=3,
             use_llm=True,
             llm_model=llm_model,
-            text_llm_provider=self.config.get("text_llm_provider", "api"),
+            text_llm_provider=text_provider,
             text_llm_cli_models=self.config.get("text_llm_cli_models", {}),
             text_llm_cli_efforts=self.config.get("text_llm_cli_efforts", {}),
             text_llm_cli_timeout=self.config.get("text_llm_cli_timeout", 900),
-            api_reasoning_effort=self.config.get("api_reasoning_effort", "medium"),
+            api_reasoning_effort=text_effort,
             api_reasoning_effort_map=self.config.get("api_reasoning_effort_map", {}),
             text_fallback_llm_provider=self.config.get(
-                "text_fallback_llm_provider", "cli:codex"
-            ),
-            text_fallback_llm_model=self.config.get(
-                "text_fallback_llm_model", "gpt-5.5"
-            ),
-            text_fallback_llm_effort=self.config.get(
-                "text_fallback_llm_effort", "medium"
-            ),
+                "text_fallback_llm_provider"
+            ) or DEFAULT_TEXT_FALLBACK_PROVIDER,
+            text_fallback_llm_model=self.config.get("text_fallback_llm_model")
+            or DEFAULT_TEXT_FALLBACK_MODEL,
+            text_fallback_llm_effort=self.config.get("text_fallback_llm_effort")
+            or DEFAULT_TEXT_FALLBACK_EFFORT,
             image_llm_provider=image_provider,
             image_llm_model=image_model,
             image_llm_effort=image_effort,
-            image_fallback_llm_provider=self.config.get(
-                "image_fallback_llm_provider", "openai"
-            ),
-            image_fallback_llm_model=self.config.get(
-                "image_fallback_llm_model", "gpt-5-mini"
-            ),
-            image_fallback_llm_effort=self.config.get(
-                "image_fallback_llm_effort", "medium"
-            ),
+            image_fallback_llm_provider=self.config.get("image_fallback_llm_provider")
+            or DEFAULT_IMAGE_FALLBACK_PROVIDER,
+            image_fallback_llm_model=self.config.get("image_fallback_llm_model")
+            or DEFAULT_IMAGE_FALLBACK_MODEL,
+            image_fallback_llm_effort=self.config.get("image_fallback_llm_effort")
+            or DEFAULT_IMAGE_FALLBACK_EFFORT,
             image_api_reasoning_effort_map=self.config.get(
                 "image_api_reasoning_effort_map", {}
             ),
@@ -361,6 +369,7 @@ class CircleListGenerator:
                         site_config.text_fallback_llm_provider,
                         site_config.text_fallback_llm_model,
                         site_config.text_fallback_llm_effort,
+                        primary_effort=site_config.api_reasoning_effort,
                     )
                     self.logger.info(f"Text LLM attempts: {text_attempts}")
                     llm_client = LLMClient(
@@ -468,8 +477,8 @@ class CircleListGenerator:
                         "rate_limit_seconds": 2,
                         "model": self._get_model_config(),  # 同じモデル設定を使用
                         "text_llm_provider": self.config.get(
-                            "text_llm_provider", "api"
-                        ),
+                            "text_llm_provider"
+                        ) or DEFAULT_TEXT_PRIMARY_PROVIDER,
                         "text_llm_cli_models": self.config.get(
                             "text_llm_cli_models", {}
                         ),
@@ -478,13 +487,13 @@ class CircleListGenerator:
                         ),
                         "text_fallback_llm_provider": self.config.get(
                             "text_fallback_llm_provider"
-                        ),
+                        ) or DEFAULT_TEXT_FALLBACK_PROVIDER,
                         "text_fallback_llm_model": self.config.get(
                             "text_fallback_llm_model"
-                        ),
+                        ) or DEFAULT_TEXT_FALLBACK_MODEL,
                         "text_fallback_llm_effort": self.config.get(
                             "text_fallback_llm_effort"
-                        ),
+                        ) or DEFAULT_TEXT_FALLBACK_EFFORT,
                         "output_dir": self.config["output_dir"],
                         "debug_limit": self.config.get(
                             "debug_limit", None
@@ -517,26 +526,26 @@ class CircleListGenerator:
                             "skip_catalog_image_analysis", False
                         ),
                         "api_reasoning_effort": self.config.get(
-                            "api_reasoning_effort", "medium"
-                        ),
+                            "api_reasoning_effort"
+                        ) or DEFAULT_TEXT_PRIMARY_EFFORT,
                         "api_reasoning_effort_map": self.config.get(
                             "api_reasoning_effort_map", {}
                         ),
-                        "image_llm_provider": self.config.get("image_llm_provider"),
-                        "image_llm_model": self.config.get("image_llm_model"),
-                        "image_llm_effort": self.config.get(
-                            "image_llm_effort",
-                            self.config.get("api_reasoning_effort", "medium"),
-                        ),
+                        "image_llm_provider": self.config.get("image_llm_provider")
+                        or DEFAULT_IMAGE_PRIMARY_PROVIDER,
+                        "image_llm_model": self.config.get("image_llm_model")
+                        or DEFAULT_IMAGE_PRIMARY_MODEL,
+                        "image_llm_effort": self.config.get("image_llm_effort")
+                        or DEFAULT_IMAGE_PRIMARY_EFFORT,
                         "image_fallback_llm_provider": self.config.get(
                             "image_fallback_llm_provider"
-                        ),
+                        ) or DEFAULT_IMAGE_FALLBACK_PROVIDER,
                         "image_fallback_llm_model": self.config.get(
                             "image_fallback_llm_model"
-                        ),
+                        ) or DEFAULT_IMAGE_FALLBACK_MODEL,
                         "image_fallback_llm_effort": self.config.get(
                             "image_fallback_llm_effort"
-                        ),
+                        ) or DEFAULT_IMAGE_FALLBACK_EFFORT,
                         "image_api_reasoning_effort_map": self.config.get(
                             "image_api_reasoning_effort_map", {}
                         ),
@@ -596,6 +605,17 @@ class CircleListGenerator:
                         file=sys.stderr,
                         flush=True,
                     )
+
+                    unresolved_targets = twitter_summary.get("unresolved_targets", [])
+                    if unresolved_targets or twitter_summary.get("status") in {
+                        "failed",
+                        "partial",
+                    }:
+                        self.logger.error(
+                            "❌ Twitter未解決対象があるためevent.json保存を中止します: "
+                            f"{len(unresolved_targets)}件"
+                        )
+                        return False
 
                     # checked_tweets.json を保存（チェック済みツイートID記録）
                     self._save_checked_tweets(updated_circles, output_dir)
@@ -727,11 +747,12 @@ class CircleListGenerator:
                     "days_before_event": self.config.get("days_before", 30),
                     "days_after_event": self.config.get("days_after", 7),
                     "max_workers": 1,
+                    "continue_on_error": True,
                     "rate_limit_seconds": 2,
                     "model": self._get_model_config(),
                     "text_llm_provider": self.config.get(
-                        "text_llm_provider", "api"
-                    ),
+                        "text_llm_provider"
+                    ) or DEFAULT_TEXT_PRIMARY_PROVIDER,
                     "text_llm_cli_models": self.config.get(
                         "text_llm_cli_models", {}
                     ),
@@ -740,13 +761,13 @@ class CircleListGenerator:
                     ),
                     "text_fallback_llm_provider": self.config.get(
                         "text_fallback_llm_provider"
-                    ),
+                    ) or DEFAULT_TEXT_FALLBACK_PROVIDER,
                     "text_fallback_llm_model": self.config.get(
                         "text_fallback_llm_model"
-                    ),
+                    ) or DEFAULT_TEXT_FALLBACK_MODEL,
                     "text_fallback_llm_effort": self.config.get(
                         "text_fallback_llm_effort"
-                    ),
+                    ) or DEFAULT_TEXT_FALLBACK_EFFORT,
                     "output_dir": output_dir,
                     "debug_limit": self.config.get("debug_limit", None),
                     "catalog_additional_prompt": self.config.get(
@@ -777,26 +798,26 @@ class CircleListGenerator:
                         "skip_catalog_image_analysis", False
                     ),
                     "api_reasoning_effort": self.config.get(
-                        "api_reasoning_effort", "medium"
-                    ),
+                        "api_reasoning_effort"
+                    ) or DEFAULT_TEXT_PRIMARY_EFFORT,
                     "api_reasoning_effort_map": self.config.get(
                         "api_reasoning_effort_map", {}
                     ),
-                    "image_llm_provider": self.config.get("image_llm_provider"),
-                    "image_llm_model": self.config.get("image_llm_model"),
-                    "image_llm_effort": self.config.get(
-                        "image_llm_effort",
-                        self.config.get("api_reasoning_effort", "medium"),
-                    ),
+                    "image_llm_provider": self.config.get("image_llm_provider")
+                    or DEFAULT_IMAGE_PRIMARY_PROVIDER,
+                    "image_llm_model": self.config.get("image_llm_model")
+                    or DEFAULT_IMAGE_PRIMARY_MODEL,
+                    "image_llm_effort": self.config.get("image_llm_effort")
+                    or DEFAULT_IMAGE_PRIMARY_EFFORT,
                     "image_fallback_llm_provider": self.config.get(
                         "image_fallback_llm_provider"
-                    ),
+                    ) or DEFAULT_IMAGE_FALLBACK_PROVIDER,
                     "image_fallback_llm_model": self.config.get(
                         "image_fallback_llm_model"
-                    ),
+                    ) or DEFAULT_IMAGE_FALLBACK_MODEL,
                     "image_fallback_llm_effort": self.config.get(
                         "image_fallback_llm_effort"
-                    ),
+                    ) or DEFAULT_IMAGE_FALLBACK_EFFORT,
                     "image_api_reasoning_effort_map": self.config.get(
                         "image_api_reasoning_effort_map", {}
                     ),
@@ -825,38 +846,22 @@ class CircleListGenerator:
                 if memo_catalog_urls:
                     circle._memo_catalog_urls = memo_catalog_urls
                 circle_checked = checked_tweets.get(c["name"], {})
-                skip_ids = circle_checked.get("checked_tweet_ids", [])
-                if skip_ids and not memo_catalog_urls:
+                skip_ids = self._normalize_checked_tweet_ids(
+                    circle_checked.get("checked_tweet_ids"), c["name"]
+                )
+                if skip_ids:
                     circle._skip_tweet_ids = skip_ids
                 circles_to_process.append(circle)
 
             import asyncio
 
-            async def _run_reprocess_targets():
-                search_targets = []
-                for circle in circles_to_process:
-                    direct_urls = getattr(circle, "_memo_catalog_urls", [])
-                    for post_url in direct_urls:
-                        await twitter_processor.process_circle_from_post_url(
-                            circle,
-                            post_url,
-                            event.name,
-                            use_text_detail=True,
-                        )
-                        if circle.items:
-                            break
-                    if not direct_urls:
-                        search_targets.append(circle)
-
-                if search_targets:
-                    await twitter_processor.process_circles(
-                        search_targets,
-                        event,
-                        debug_limit=len(search_targets),
-                    )
-                return circles_to_process
-
-            updated_circles = asyncio.run(_run_reprocess_targets())
+            updated_circles = asyncio.run(
+                self._run_reprocess_targets(
+                    circles_to_process,
+                    twitter_processor,
+                    event,
+                )
+            )
             twitter_summary = dict(twitter_processor.last_run_summary)
             if twitter_summary.get("status") == "failed":
                 self.logger.error(
@@ -872,6 +877,32 @@ class CircleListGenerator:
                 file=sys.stderr,
                 flush=True,
             )
+
+            unresolved_targets = twitter_summary.get("unresolved_targets", [])
+            has_failures = bool(unresolved_targets) or twitter_summary.get("status") in {
+                "failed",
+                "partial",
+            }
+            if has_failures:
+                # 途中で失敗したサークルの品目・checked stateは保存せず、
+                # 正常終了したサークルだけ既存event.jsonへ反映する。
+                updated_circles = [
+                    circle for circle in updated_circles
+                    if getattr(circle, "_twitter_processing_succeeded", False)
+                ]
+                self.logger.warning(
+                    "⚠️ 一部のサークルが未解決です。"
+                    f"成功した{len(updated_circles)}件を保存し、"
+                    "失敗したサークルの既存データを保持します"
+                )
+                twitter_summary["saved_successful_count"] = len(updated_circles)
+                # 保存の有無をGUIにも機械可読な結果として通知する。
+                print(
+                    "TWITTER_PROCESSING_RESULT="
+                    + json.dumps(twitter_summary, ensure_ascii=False),
+                    file=sys.stderr,
+                    flush=True,
+                )
 
             reprocess_progress.update(1, "Twitter処理完了")
 
@@ -963,11 +994,85 @@ class CircleListGenerator:
                     )
 
             get_cost_tracker().log_summary()
-            return not coordinate_requested or coordinate_ok
+            return (not has_failures or bool(updated_circles)) and (
+                not coordinate_requested or coordinate_ok
+            )
 
         except Exception as e:
             self.logger.error(f"再処理中にエラー: {e}", exc_info=True)
             return False
+
+    async def _run_reprocess_targets(
+        self, circles_to_process: List[Any], twitter_processor: Any, event: Any
+    ) -> List[Any]:
+        """再処理対象を保存URL優先・timeline fallback付きで処理する。"""
+        search_targets = []
+        for circle in circles_to_process:
+            direct_urls = getattr(circle, "_memo_catalog_urls", []) or []
+            run_skip_ids = set(getattr(circle, "_skip_tweet_ids", []) or [])
+
+            for post_url in direct_urls:
+                raw_tweet_id = twitter_processor._extract_tweet_id_from_url(post_url)
+                try:
+                    tweet_id = int(raw_tweet_id) if raw_tweet_id else None
+                except (TypeError, ValueError):
+                    tweet_id = None
+
+                if tweet_id is not None and tweet_id in run_skip_ids:
+                    self.logger.info(
+                        f"チェック済みX投稿を再処理対象から除外: "
+                        f"{circle.name} status/{tweet_id}"
+                    )
+                    continue
+
+                processed = await twitter_processor.process_circle_from_post_url(
+                    circle,
+                    post_url,
+                    event.name,
+                    use_text_detail=True,
+                )
+
+                # 同じrunのtimeline fallbackで同一投稿を再取得させない。
+                if tweet_id is not None:
+                    run_skip_ids.add(tweet_id)
+                    circle._run_skip_tweet_ids = sorted(run_skip_ids)
+
+                # 正常に処理できたdirect postだけ永続checked stateへ追加する。
+                if processed is True and tweet_id is not None:
+                    checked_ids = set(
+                        getattr(circle, "_checked_tweet_ids", []) or []
+                    )
+                    checked_ids.add(tweet_id)
+                    circle._checked_tweet_ids = sorted(checked_ids)
+
+                if circle.items:
+                    circle._twitter_processing_succeeded = processed is True
+                    break
+
+            # 保存URLがない場合だけでなく、保存URLで品目を得られなかった
+            # 場合もtimeline検索へ進め、新しい投稿を拾えるようにする。
+            if not circle.items:
+                search_targets.append(circle)
+
+        if search_targets:
+            await twitter_processor.process_circles(
+                search_targets,
+                event,
+                debug_limit=len(search_targets),
+            )
+        return circles_to_process
+
+    def _normalize_checked_tweet_ids(self, raw_ids, circle_name: str) -> List[int]:
+        """保存済みIDの文字列・整数を揃え、不正値と重複を除く。"""
+        normalized = set()
+        for raw_id in raw_ids or []:
+            try:
+                normalized.add(int(raw_id))
+            except (TypeError, ValueError):
+                self.logger.warning(
+                    f"不正なchecked_tweet_idを無視します: {circle_name}"
+                )
+        return sorted(normalized)
 
     def _load_checked_tweets(self, output_dir: str) -> dict:
         """checked_tweets.json を読み込む
@@ -1015,12 +1120,14 @@ class CircleListGenerator:
 
             # 既存のIDとマージ
             circle_data = existing.get(circle.name, {})
-            old_ids = set(circle_data.get("checked_tweet_ids", []))
-            new_ids = old_ids | set(checked_ids)
+            new_ids = self._normalize_checked_tweet_ids(
+                list(circle_data.get("checked_tweet_ids") or []) + list(checked_ids),
+                circle.name,
+            )
 
             existing[circle.name] = {
                 "twitter_url": circle.twitter_url or circle_data.get("twitter_url", ""),
-                "checked_tweet_ids": sorted(new_ids),
+                "checked_tweet_ids": new_ids,
                 "last_checked": datetime.now().isoformat(),
             }
             updated_count += 1

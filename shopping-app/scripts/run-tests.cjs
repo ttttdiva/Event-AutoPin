@@ -13,6 +13,8 @@ const testCases = [
   ["lib/event-load-epoch.test.ts", "runEventLoadEpochTests"],
   ["lib/import-helpers.test.ts", "runImportHelperContractTests"],
   ["lib/map-pin-index.test.ts", "runMapPinIndexTests"],
+  ["lib/map-pin-layout.test.ts", "runMapPinLayoutTests"],
+  ["lib/map-viewport-transform.test.ts", "runMapViewportTransformTests"],
   ["lib/mutation-epoch.test.ts", "runMutationEpochTests"],
   ["lib/performance-core.test.ts"],
   ["lib/text-collation.test.ts", "runTextCollationTests"],

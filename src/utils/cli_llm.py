@@ -13,13 +13,114 @@ import shutil
 import subprocess
 import tempfile
 import time
+import signal
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+from .reprocess_deadline import ReprocessDeadlineExceeded
 
 logger = logging.getLogger(__name__)
 
 _MAX_ARG_LENGTH = 8000
 _ANTIGRAVITY_MAX_ARG_LENGTH = 24000
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
+_ORIGINAL_SUBPROCESS_POPEN = subprocess.Popen
+_PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate a timed-out CLI and its descendants, then fall back locally."""
+
+    pid = getattr(proc, "pid", None)
+    if pid:
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS,
+                )
+            else:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (FileNotFoundError, OSError, ValueError, subprocess.SubprocessError) as exc:
+            logger.debug("CLI process-tree cleanup failed for pid %s: %s", pid, exc)
+
+    try:
+        proc.kill()
+    except (OSError, ProcessLookupError, AttributeError):
+        pass
+
+
+def _reap_process(proc: subprocess.Popen) -> None:
+    """Drain pipes after termination so a timed-out child cannot keep handles open."""
+
+    try:
+        proc.communicate(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except (OSError, ProcessLookupError, AttributeError):
+            pass
+        try:
+            proc.communicate(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.warning("CLI process pipes did not close during cleanup")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+
+
+def _run_cli_command(
+    cmd: List[str],
+    *,
+    input_data: Optional[str],
+    cwd: Optional[str],
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    """Run a CLI with process-tree cleanup while retaining patched-run compatibility."""
+
+    # Existing integrations/tests replace subprocess.run.  Keep that contract
+    # intact, while the real subprocess path uses a PID we can terminate.
+    if (
+        subprocess.run is not _ORIGINAL_SUBPROCESS_RUN
+        and subprocess.Popen is _ORIGINAL_SUBPROCESS_POPEN
+    ):
+        return subprocess.run(
+            cmd,
+            input=input_data,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=False,
+            encoding="utf-8",
+            timeout=timeout,
+        )
+
+    popen_kwargs = {
+        "cwd": cwd,
+        "stdin": subprocess.PIPE if input_data is not None else None,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+    }
+    if os.name == "nt":
+        creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if creation_flags:
+            popen_kwargs["creationflags"] = creation_flags
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    try:
+        stdout, stderr = proc.communicate(input=input_data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(proc)
+        _reap_process(proc)
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 def _cleanup_antigravity_workspace(workspace_path: Optional[str]) -> None:
@@ -102,6 +203,7 @@ def _build_command(
         print_timeout = os.getenv("AGY_PRINT_TIMEOUT")
         if print_timeout:
             cmd.extend(["--print-timeout", print_timeout.strip()])
+        cmd.extend(["--output-format", "json"])
         if prompt or force_prompt_flag:
             cmd.extend(["-p", prompt])
         return cmd
@@ -159,7 +261,25 @@ def _parse_output(provider: str, raw_output: str) -> str:
         return output
 
     if provider == "antigravity":
-        return output
+        try:
+            data = json.loads(output)
+        except (json.JSONDecodeError, TypeError):
+            return output
+
+        if not isinstance(data, dict):
+            return output
+
+        status = str(data.get("status") or "").upper()
+        response = str(data.get("response") or "").strip()
+
+        if status and status != "SUCCESS":
+            error = str(data.get("error") or "").strip()
+            raise RuntimeError(
+                f"Antigravity CLI status={status}"
+                + (f": {error}" if error else "")
+            )
+
+        return response
 
     return output
 
@@ -168,10 +288,12 @@ def execute_cli_prompt(
     prompt: str,
     provider: str = "antigravity",
     cwd: Optional[str] = None,
-    timeout: int = 900,
+    timeout: float = 900,
     model: Optional[str] = None,
     effort: Optional[str] = None,
     auto_approve: Optional[bool] = None,
+    raise_on_timeout: bool = False,
+    timeout_stage: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """CLI LLMにプロンプトを実行し、可能な限りモデル応答だけを返す。"""
     use_stdin = provider == "codex" or (
@@ -231,14 +353,10 @@ def execute_cli_prompt(
 
         for attempt in range(max_retries):
             try:
-                result = subprocess.run(
+                result = _run_cli_command(
                     cmd,
-                    input=prompt if use_stdin else None,
+                    input_data=prompt if use_stdin else None,
                     cwd=cwd,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    encoding="utf-8",
                     timeout=timeout,
                 )
 
@@ -251,7 +369,23 @@ def execute_cli_prompt(
                                 raw_output = file_output
                         except OSError as e:
                             logger.warning(f"[{provider}] 出力ファイルの読み取りに失敗: {e}")
-                    output = _parse_output(provider, raw_output)
+                    try:
+                        output = _parse_output(provider, raw_output)
+                    except Exception as exc:
+                        stderr = (result.stderr or "").strip()
+                        message = str(exc)
+                        if stderr:
+                            message += f"\nSTDERR: {stderr}"
+                        return False, message
+
+                    if not str(output or "").strip():
+                        stderr = (result.stderr or "").strip()
+                        message = "CLI returned an empty response"
+                        if stderr:
+                            message += f"\nSTDERR: {stderr}"
+                        logger.warning(f"[{provider}] {message}")
+                        return False, message
+
                     logger.info(f"[{provider}] 実行成功: {len(output)} chars")
                     return True, output
 
@@ -281,6 +415,11 @@ def execute_cli_prompt(
                 return False, f"CLI not found: {cmd[0]}"
             except subprocess.TimeoutExpired:
                 logger.error(f"[{provider}] タイムアウト ({timeout}s)")
+                if raise_on_timeout:
+                    raise ReprocessDeadlineExceeded(
+                        f"CLI timeout ({timeout}s)",
+                        stage=timeout_stage,
+                    )
                 return False, f"Timeout ({timeout}s)"
             except Exception as e:
                 logger.error(f"[{provider}] 予期しないエラー: {e}")
@@ -306,8 +445,10 @@ def analyze_image_cli(
     providers: Optional[List[str]] = None,
     cli_model_map: Optional[dict] = None,
     cli_effort_map: Optional[dict] = None,
-    timeout: int = 900,
+    timeout: float = 900,
     extra_instructions: Optional[str] = None,
+    raise_on_timeout: bool = False,
+    timeout_stage: Optional[str] = None,
 ) -> str:
     """CLI LLMで画像を解析する。Antigravity CLIには作業ディレクトリ内の画像パスを渡す。"""
     providers = providers or ["antigravity", "claude"]
@@ -324,12 +465,14 @@ def analyze_image_cli(
         shutil.copy2(image_file, cli_image_file)
 
     attachment_hint = (
-        f"Read the image file {cli_image_file.name} and follow the task above."
+        f"Read this exact image file by its absolute path: {cli_image_file}. "
+        "Do not use another file with the same basename or an image from a previous task. "
+        "If this file cannot be read, report the error instead of guessing its contents."
     )
     prompt_parts = [
         prompt,
         "",
-        f"Attached image file: {cli_image_file.name}",
+        f"Attached image file: {cli_image_file}",
         attachment_hint,
     ]
     if extra_instructions:
@@ -343,14 +486,18 @@ def analyze_image_cli(
             provider_cwd = (
                 workspace_path if provider == "antigravity" and workspace_path else None
             )
-            success, output = execute_cli_prompt(
-                full_prompt,
-                provider=provider,
-                cwd=provider_cwd,
-                timeout=timeout,
-                model=cli_model_map.get(provider),
-                effort=cli_effort_map.get(provider),
-            )
+            execute_kwargs = {
+                "provider": provider,
+                "cwd": provider_cwd,
+                "timeout": timeout,
+                "model": cli_model_map.get(provider),
+                "effort": cli_effort_map.get(provider),
+                "auto_approve": True if provider == "antigravity" else None,
+            }
+            if raise_on_timeout:
+                execute_kwargs["raise_on_timeout"] = True
+                execute_kwargs["timeout_stage"] = timeout_stage
+            success, output = execute_cli_prompt(full_prompt, **execute_kwargs)
             if success and output:
                 result = output
                 break
@@ -369,7 +516,9 @@ def analyze_catalog_image_cli(
     providers: Optional[List[str]] = None,
     cli_model_map: Optional[dict] = None,
     cli_effort_map: Optional[dict] = None,
-    timeout: int = 900,
+    timeout: float = 900,
+    raise_on_timeout: bool = False,
+    timeout_stage: Optional[str] = None,
 ) -> str:
     """お品書き画像向け CLI 解析。caller prompt の object schema をそのまま使う。"""
     return analyze_image_cli(
@@ -379,4 +528,6 @@ def analyze_catalog_image_cli(
         cli_model_map=cli_model_map,
         cli_effort_map=cli_effort_map,
         timeout=timeout,
+        raise_on_timeout=raise_on_timeout,
+        timeout_stage=timeout_stage,
     )

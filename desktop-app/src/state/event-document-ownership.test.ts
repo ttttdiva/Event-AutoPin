@@ -1,5 +1,6 @@
 import {
   buildEventJsonSnapshot,
+  circleLinkMemo,
   collectEventAssetReferences,
   eventJsonDocumentsEqual,
   runImageDeletionTransaction,
@@ -358,7 +359,78 @@ function testActiveMapSelectionKeepsOrphanButUsesOneReferencePerNumber(): void {
     explicit[0].name === "map_01.jpg",
     "明示preferred refが最新mtimeより優先されませんでした",
   );
+
+  const canonical = [
+    {
+      name: "ev02_map_01.jpg",
+      path: "fixture/ev02_map_01.jpg",
+      reference: "ev02_map_01.jpg",
+      map_number: 1,
+      modified_ms: 1,
+    },
+    {
+      name: "map_01.png",
+      path: "fixture/maps/map_01.png",
+      modified_ms: 9999,
+    },
+    {
+      name: "custom_map_02.webp",
+      path: "fixture/maps/custom_map_02.webp",
+      reference: "maps/custom_map_02.webp",
+      map_number: 2,
+      modified_ms: 1,
+    },
+  ];
+  const canonicalActive = selectActiveMapImages(canonical, [
+    { reference: "ev02_map_01.jpg", map_number: 1 },
+  ]);
+  assert(
+    canonicalActive[0].name === "ev02_map_01.jpg",
+    "canonical map_number/referenceがmtimeの新しいlegacy mapに負けました",
+  );
+  assert(
+    canonicalActive[1].name === "custom_map_02.webp" &&
+      canonicalActive[1].map_number === 2,
+    "明示map_number付きcustom_map_02がmap 2として選択されませんでした",
+  );
 }
+
+function testCircleLinkMemo(): void {
+  const cases = [
+    { circle: { twitter_url: "https://x.com/circle", website_url: "https://circle.example/" }, expected: "https://x.com/circle" },
+    { circle: { twitter_url: "https://twitter.com/circle" }, expected: "https://twitter.com/circle" },
+    { circle: { website_url: "https://circle.wix.com/home" }, expected: "https://circle.wix.com/home" },
+    { circle: { twitter_url: " \n", website_url: " https://circle.example/ " }, expected: "https://circle.example/" },
+    { circle: { pixiv_url: "https://www.pixiv.net/users/123" }, expected: "https://www.pixiv.net/users/123" },
+    { circle: {}, expected: "" },
+  ];
+  for (const { circle, expected } of cases) {
+    assert(circleLinkMemo(circle) === expected, "サークルメモのX優先・Web補完が不正です");
+    const source: EventJsonData = { circles: [{ name: "サークル", ...circle }] };
+    const baseline: TableState = {
+      headers: ["サークル名", "サークルメモ"],
+      rows: [{ サークル名: "サークル", サークルメモ: circleLinkMemo(circle) }],
+    };
+    const edited = clone(baseline);
+    edited.rows[0]["サークル名"] = "変更後";
+    const saved = buildEventJsonSnapshot(source, edited, baseline);
+    assert(
+      saved.circles?.[0].twitter_url === circle.twitter_url &&
+        saved.circles?.[0].website_url === circle.website_url,
+      "別の列の保存で元のリンク情報が失われました",
+    );
+    assert(circleLinkMemo(saved.circles![0]) === expected, "保存後のメモが変わりました");
+  }
+
+  const baseline: TableState = { headers: ["サークルメモ"], rows: [{ サークルメモ: "" }] };
+  const edited = clone(baseline);
+  edited.rows[0]["サークルメモ"] = "https://circle.wix.com/home";
+  const saved = buildEventJsonSnapshot({ circles: [{ name: "Webのみ" }] }, edited, baseline);
+  assert(saved.circles?.[0].website_url === "https://circle.wix.com/home", "Webのメモを保存できません");
+  assert(saved.circles?.[0].twitter_url === "", "WebのメモをXと誤判定しました");
+}
+
+testCircleLinkMemo();
 
 function deferred<T>() {
   let resolve!: (value: T) => void;

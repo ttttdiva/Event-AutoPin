@@ -670,6 +670,328 @@ def _elements_to_numbers(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return candidates
 
 
+def _select_context_elements_by_candidate_budget(
+    result: Dict[str, Any],
+    expected_candidate_count: Optional[int],
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Context fallback結果をcandidate単位で選択する。
+
+    Context cropは互いに大きくoverlapするため、全callを無条件に連結すると
+    同じ物理番号に対する別table hypothesisが大量に混在する。
+
+    runnerが記録した appended_element_count からbase/context境界を厳密に
+    復元し、各context callを実際に _elements_to_numbers() へ変換した上で、
+    expected candidate countへ最も大きく進めるcallだけをgreedyに採用する。
+
+    event固有prefix・番号・座標・geometry qualityは使用しない。
+    provenanceが不完全な旧payloadでは既存挙動へ安全にfallbackする。
+    """
+
+    raw_elements = result.get("elements") or []
+    if not isinstance(raw_elements, list):
+        return [], {
+            "applied": False,
+            "reason": "elements_not_list",
+        }
+
+    elements = list(raw_elements)
+
+    try:
+        expected = int(expected_candidate_count or 0)
+    except (TypeError, ValueError):
+        expected = 0
+
+    if expected <= 0:
+        return elements, {
+            "applied": False,
+            "reason": "expected_candidate_count_unavailable",
+            "raw_element_count": len(elements),
+        }
+
+    context = result.get("context_fallback")
+    if not isinstance(context, dict):
+        return elements, {
+            "applied": False,
+            "reason": "context_fallback_unavailable",
+            "raw_element_count": len(elements),
+        }
+
+    calls = context.get("calls")
+    if not isinstance(calls, list) or not calls:
+        return elements, {
+            "applied": False,
+            "reason": "context_calls_unavailable",
+            "raw_element_count": len(elements),
+        }
+
+    try:
+        declared_call_count = int(context.get("call_count", len(calls)))
+    except (TypeError, ValueError):
+        declared_call_count = len(calls)
+
+    # callsはrunner側でbounded保存される。境界復元に全callが必要なので、
+    # truncationが疑われる場合は選択処理を行わない。
+    if declared_call_count != len(calls):
+        return elements, {
+            "applied": False,
+            "reason": "context_calls_truncated",
+            "raw_element_count": len(elements),
+            "call_count": declared_call_count,
+            "stored_call_count": len(calls),
+        }
+
+    parsed_calls: List[Dict[str, Any]] = []
+    context_element_count = 0
+
+    for order, call in enumerate(calls):
+        if not isinstance(call, dict):
+            return elements, {
+                "applied": False,
+                "reason": "invalid_context_call",
+                "raw_element_count": len(elements),
+                "call_order": order,
+            }
+
+        if "appended_element_count" not in call:
+            return elements, {
+                "applied": False,
+                "reason": "appended_element_count_missing",
+                "raw_element_count": len(elements),
+                "call_order": order,
+            }
+
+        try:
+            appended = int(call.get("appended_element_count") or 0)
+        except (TypeError, ValueError):
+            return elements, {
+                "applied": False,
+                "reason": "invalid_appended_element_count",
+                "raw_element_count": len(elements),
+                "call_order": order,
+            }
+
+        if appended < 0:
+            return elements, {
+                "applied": False,
+                "reason": "negative_appended_element_count",
+                "raw_element_count": len(elements),
+                "call_order": order,
+            }
+
+        raw_count = call.get("element_count")
+        try:
+            raw_count_int = int(raw_count) if raw_count is not None else None
+        except (TypeError, ValueError):
+            raw_count_int = None
+
+        if raw_count_int is not None and appended > raw_count_int:
+            return elements, {
+                "applied": False,
+                "reason": "appended_exceeds_raw",
+                "raw_element_count": len(elements),
+                "call_order": order,
+            }
+
+        parsed_calls.append(
+            {
+                "order": order,
+                "tier": str(call.get("tier") or ""),
+                "rectangle_index": call.get("rectangle_index"),
+                "appended_element_count": appended,
+            }
+        )
+        context_element_count += appended
+
+    base_count = len(elements) - context_element_count
+    if base_count < 0:
+        return elements, {
+            "applied": False,
+            "reason": "context_count_exceeds_elements",
+            "raw_element_count": len(elements),
+            "context_element_count": context_element_count,
+        }
+
+    base_elements = elements[:base_count]
+    cursor = base_count
+    segments: List[Dict[str, Any]] = []
+
+    for call in parsed_calls:
+        count = int(call["appended_element_count"])
+        end = cursor + count
+
+        if end > len(elements):
+            return elements, {
+                "applied": False,
+                "reason": "context_reconstruction_overflow",
+                "raw_element_count": len(elements),
+            }
+
+        if count > 0:
+            segments.append(
+                {
+                    **call,
+                    "start": cursor,
+                    "end": end,
+                    "elements": elements[cursor:end],
+                }
+            )
+
+        cursor = end
+
+    if cursor != len(elements):
+        return elements, {
+            "applied": False,
+            "reason": "context_reconstruction_inexact",
+            "raw_element_count": len(elements),
+            "reconstructed_total": cursor,
+        }
+
+    selected_elements = list(base_elements)
+    selected_calls: List[Dict[str, Any]] = []
+    remaining = list(segments)
+
+    current_candidate_count = len(_elements_to_numbers(selected_elements))
+    base_candidate_count = current_candidate_count
+
+    evaluations: List[Dict[str, Any]] = []
+
+    def numeric_shape(
+        elements_to_score: List[Dict[str, Any]],
+    ) -> tuple[int, int, int, int]:
+        grouped_values: Dict[tuple[str, str], set[int]] = {}
+        for candidate in _elements_to_numbers(elements_to_score):
+            try:
+                number = int(str(candidate.get("number") or ""))
+            except (TypeError, ValueError):
+                continue
+            prefix = str(candidate.get("prefix") or "").strip()
+            group_identity = str(
+                candidate.get("group_identity", candidate.get("group_id", ""))
+                or ""
+            ).strip()
+            grouped_values.setdefault((prefix, group_identity), set()).add(number)
+        if not grouped_values:
+            return (0, 0, 0, 0)
+
+        longest_run = 0
+        adjacent_pairs = 0
+        gaps = 0
+        for values in grouped_values.values():
+            ordered = sorted(values)
+            current_run = 1
+            for left, right in zip(ordered[:-1], ordered[1:]):
+                if right == left + 1:
+                    adjacent_pairs += 1
+                    current_run += 1
+                else:
+                    gaps += max(0, right - left - 1)
+                    longest_run = max(longest_run, current_run)
+                    current_run = 1
+            longest_run = max(longest_run, current_run)
+        return (
+            longest_run,
+            adjacent_pairs,
+            -gaps,
+            -len(grouped_values),
+        )
+
+    # Once the selected evidence reaches the expected catalog-scale candidate
+    # count, adding more heavily-overlapping context hypotheses has no recall
+    # objective and only increases ambiguity.
+    while remaining and current_candidate_count < expected:
+        current_progress = min(current_candidate_count, expected)
+
+        best_segment: Optional[Dict[str, Any]] = None
+        best_trial_elements: Optional[List[Dict[str, Any]]] = None
+        best_trial_count = current_candidate_count
+        best_rank: Optional[tuple[int, ...]] = None
+
+        round_evaluations: List[Dict[str, Any]] = []
+
+        for segment in remaining:
+            trial_elements = selected_elements + list(segment["elements"])
+            trial_candidate_count = len(_elements_to_numbers(trial_elements))
+
+            progress = min(trial_candidate_count, expected)
+            gain = progress - current_progress
+            overproduction = max(0, trial_candidate_count - expected)
+
+            # Primary: expected countへ最大限進む。
+            # Tie: expected超過が少ない方を選ぶ。
+            # Further ties prefer a compact numeric hypothesis, then runner
+            # order.  This avoids locking onto a same-sized distractor crop.
+            shape = numeric_shape(trial_elements)
+            rank = (
+                gain,
+                -overproduction,
+                shape[0],
+                shape[1],
+                shape[2],
+                shape[3],
+                -int(segment["order"]),
+            )
+
+            round_evaluations.append(
+                {
+                    "order": segment["order"],
+                    "tier": segment["tier"],
+                    "rectangle_index": segment["rectangle_index"],
+                    "trial_candidate_count": trial_candidate_count,
+                    "gain": gain,
+                    "overproduction": overproduction,
+                }
+            )
+
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
+                best_segment = segment
+                best_trial_elements = trial_elements
+                best_trial_count = trial_candidate_count
+
+        evaluations.extend(round_evaluations)
+
+        if (
+            best_segment is None
+            or best_trial_elements is None
+            or best_rank is None
+            or best_rank[0] <= 0
+        ):
+            break
+
+        selected_elements = best_trial_elements
+        current_candidate_count = best_trial_count
+
+        selected_calls.append(
+            {
+                "order": best_segment["order"],
+                "tier": best_segment["tier"],
+                "rectangle_index": best_segment["rectangle_index"],
+                "appended_element_count": best_segment["appended_element_count"],
+                "candidate_count_after": current_candidate_count,
+            }
+        )
+
+        remaining = [
+            segment
+            for segment in remaining
+            if segment is not best_segment
+        ]
+
+    return selected_elements, {
+        "applied": True,
+        "mode": "candidate_budget",
+        "expected_candidate_count": expected,
+        "raw_element_count": len(elements),
+        "base_element_count": base_count,
+        "context_element_count": context_element_count,
+        "selected_element_count": len(selected_elements),
+        "base_candidate_count": base_candidate_count,
+        "selected_candidate_count": current_candidate_count,
+        "selected_calls": selected_calls,
+        "evaluations": evaluations,
+    }
+
+
 class OCREngine:
     """OCRを使った番号検出エンジン"""
 
@@ -925,7 +1247,13 @@ class OCREngine:
             return []
 
         elements = first_result.get("elements") or []
-        numbers = _elements_to_numbers(elements)
+        selected_elements, context_selection = (
+            _select_context_elements_by_candidate_budget(
+                first_result,
+                expected_candidate_count,
+            )
+        )
+        numbers = _elements_to_numbers(selected_elements)
         self.last_run.update(
             {
                 "model": payload.get("model"),
@@ -934,10 +1262,12 @@ class OCREngine:
                 "strategy": first_result.get("strategy", self.config.strategy),
                 "attempts": first_result.get("attempts", []),
                 "element_count": len(elements),
+                "selected_element_count": len(selected_elements),
                 "number_count": len(numbers),
                 "tile_decision": first_result.get("tile_decision"),
                 "tile_fallback": first_result.get("tile_fallback"),
                 "context_fallback": first_result.get("context_fallback"),
+                "context_selection": context_selection,
             }
         )
         if not numbers:

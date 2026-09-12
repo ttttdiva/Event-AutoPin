@@ -1,4 +1,5 @@
 from bs4 import BeautifulSoup
+import pytest
 
 from src.adapters.generic_adapter import GenericAdapter
 from src.models import SiteConfig, SiteType
@@ -109,3 +110,31 @@ def test_no_llm_mode_keeps_legacy_table_fallback():
 
     assert len(circles) == 1
     assert circles[0].name == "サークルA"
+
+
+@pytest.mark.parametrize("use_llm", [True, False])
+@pytest.mark.parametrize("header", ["SNSリンク", "Twitter / Web"])
+def test_shared_sns_column_keeps_web_only_and_both_links(use_llm, header):
+    adapter = GenericAdapter(
+        SiteConfig(
+            site_type=SiteType.CUSTOM,
+            base_url="https://new.example/catalog",
+            event_name="イベント",
+            use_llm=use_llm,
+        ),
+        llm_client=HeaderMappingLLMClient(),
+    )
+    html = f"""
+    <table><tr><th>配置</th><th>サークル名</th><th>{header}</th></tr>
+    <tr><td>A-01</td><td>Webのみ</td><td><a href="https://circle.example/">Web</a></td></tr>
+    <tr><td>A-02</td><td>両方</td><td><a href="https://circle.example/">Web</a>
+    <a href="https://x.com/circle">X</a></td></tr></table>
+    """
+
+    circles = adapter.extract_circles(BeautifulSoup(html, "html.parser"))
+
+    assert len(circles) == 2
+    assert circles[0].twitter_url is None
+    assert circles[0].website_url == "https://circle.example/"
+    assert circles[1].twitter_url == "https://x.com/circle"
+    assert circles[1].website_url == "https://circle.example/"

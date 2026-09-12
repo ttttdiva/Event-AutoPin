@@ -41,22 +41,32 @@ import {
   startUiMetric,
 } from "@/lib/performance";
 import { buildMapPinIndex, selectMapPins } from "@/lib/map-pin-index";
+import {
+  calculatePinDisplayGeometry,
+  getMapPinSpaceSpan,
+  isPointInsideMapPinTouchTarget,
+  type MapPinOrientation,
+} from "@/lib/map-pin-layout";
+import {
+  calculateFocalPinchTransform,
+  viewportPointToMapPoint,
+} from "@/lib/map-viewport-transform";
 
-const DEFAULT_PIN_WIDTH = 77;
-const DEFAULT_PIN_HEIGHT = 24;
-const DEFAULT_PIN_OFFSET_X = 0;
-const DEFAULT_PIN_OFFSET_Y = 0;
-const MIN_PIN_DIMENSION = 10;
-const MAX_PIN_DIMENSION = 160;
-const MIN_PIN_OFFSET = -160;
-const MAX_PIN_OFFSET = 160;
+const DEFAULT_PIN_MAP_WIDTH = 77;
+const DEFAULT_PIN_MAP_HEIGHT = 24;
+const DEFAULT_PIN_MAP_OFFSET_X = 0;
+const DEFAULT_PIN_MAP_OFFSET_Y = 0;
+const MIN_PIN_MAP_DIMENSION = 10;
+const MAX_PIN_MAP_DIMENSION = 160;
+const MIN_PIN_MAP_OFFSET = -160;
+const MAX_PIN_MAP_OFFSET = 160;
 const MIN_PIN_TOUCH_SIZE = 28;
-const PIN_DIMENSION_STEP = 2;
-const PIN_OFFSET_STEP = 2;
+const MIN_MAP_SCALE = 0.5;
+const MAX_MAP_SCALE = 5;
+const PIN_MAP_DIMENSION_STEP = 2;
+const PIN_MAP_OFFSET_STEP = 2;
 const PIN_FILL_ALPHA = 0.36;
 const PIN_OUTLINE_ALPHA = 0.76;
-
-type PinOrientation = "vertical" | "horizontal";
 
 export interface MapViewHandle {
   /** 指定サークルのピン位置にマップをアニメーション移動 */
@@ -104,23 +114,6 @@ function withAlpha(hex: string, alpha: number): string {
   const g = parseInt(normalized.slice(2, 4), 16);
   const b = parseInt(normalized.slice(4, 6), 16);
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
-
-function normalizeSpaceNumberText(value: string): string {
-  return value.replace(/[０-９]/g, (char) =>
-    String.fromCharCode(char.charCodeAt(0) - 0xfee0),
-  );
-}
-
-function getSpaceSpan(space: string | null): number {
-  if (!space) return 1;
-  const normalized = normalizeSpaceNumberText(space);
-  const target = normalized.includes("-")
-    ? normalized.slice(normalized.indexOf("-") + 1)
-    : normalized;
-  const numbers = target.match(/\d+/g);
-  if (!numbers || numbers.length <= 1) return 1;
-  return clamp(numbers.length, 1, 4);
 }
 
 /** ドラッグ移動可能なピンコンポーネント */
@@ -338,12 +331,12 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
       number | null
     >(null);
     const [currentScale, setCurrentScale] = useState(1);
-    const [pinScreenWidth, setPinScreenWidth] = useState(DEFAULT_PIN_WIDTH);
-    const [pinScreenHeight, setPinScreenHeight] = useState(DEFAULT_PIN_HEIGHT);
-    const [pinOffsetX, setPinOffsetX] = useState(DEFAULT_PIN_OFFSET_X);
-    const [pinOffsetY, setPinOffsetY] = useState(DEFAULT_PIN_OFFSET_Y);
+    const [pinMapWidth, setPinMapWidth] = useState(DEFAULT_PIN_MAP_WIDTH);
+    const [pinMapHeight, setPinMapHeight] = useState(DEFAULT_PIN_MAP_HEIGHT);
+    const [pinMapOffsetX, setPinMapOffsetX] = useState(DEFAULT_PIN_MAP_OFFSET_X);
+    const [pinMapOffsetY, setPinMapOffsetY] = useState(DEFAULT_PIN_MAP_OFFSET_Y);
     const [pinOrientation, setPinOrientation] =
-      useState<PinOrientation>("vertical");
+      useState<MapPinOrientation>("vertical");
     const [pendingFocusCircleId, setPendingFocusCircleId] = useState<
       number | null
     >(null);
@@ -401,6 +394,11 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
     const translateY = useSharedValue(0);
     const savedTranslateX = useSharedValue(0);
     const savedTranslateY = useSharedValue(0);
+    const pinchStartScale = useSharedValue(1);
+    const pinchStartTranslateX = useSharedValue(0);
+    const pinchStartTranslateY = useSharedValue(0);
+    const pinchStartFocalX = useSharedValue(0);
+    const pinchStartFocalY = useSharedValue(0);
 
     // 画像の表示サイズ（コンテナにフィット）
     const displaySize = useMemo(() => {
@@ -467,10 +465,24 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
           return false;
         }
 
+        const geometry = calculatePinDisplayGeometry({
+          naturalSize,
+          displaySize,
+          normalizedX: circle.pinX,
+          normalizedY: circle.pinY,
+          pinWidth: pinMapWidth,
+          pinHeight: pinMapHeight,
+          pinOffsetX: pinMapOffsetX,
+          pinOffsetY: pinMapOffsetY,
+          span: getMapPinSpaceSpan(circle.space),
+          orientation: pinOrientation,
+        });
+        if (!geometry) return false;
+
         setHighlightedCircleId(circleId);
         const targetScale = 2;
-        const pinScreenX = circle.pinX * displaySize.w + pinOffsetX;
-        const pinScreenY = circle.pinY * displaySize.h + pinOffsetY;
+        const pinScreenX = geometry.centerX;
+        const pinScreenY = geometry.centerY;
         const centerOffsetX =
           containerSize.width / 2 - pinScreenX * targetScale;
         const centerOffsetY =
@@ -498,8 +510,11 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
         translateY,
         savedTranslateX,
         savedTranslateY,
-        pinOffsetX,
-        pinOffsetY,
+        pinMapWidth,
+        pinMapHeight,
+        pinMapOffsetX,
+        pinMapOffsetY,
+        pinOrientation,
       ],
     );
 
@@ -558,27 +573,77 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
 
     const updateScaleJS = useCallback((s: number) => setCurrentScale(s), []);
 
+    const getPinDisplayGeometry = useCallback(
+      (circle: Circle) => {
+        if (!naturalSize || circle.pinX == null || circle.pinY == null) {
+          return null;
+        }
+        return calculatePinDisplayGeometry({
+          naturalSize,
+          displaySize,
+          normalizedX: circle.pinX,
+          normalizedY: circle.pinY,
+          pinWidth: pinMapWidth,
+          pinHeight: pinMapHeight,
+          pinOffsetX: pinMapOffsetX,
+          pinOffsetY: pinMapOffsetY,
+          span: getMapPinSpaceSpan(circle.space),
+          orientation: pinOrientation,
+        });
+      },
+      [
+        naturalSize,
+        displaySize,
+        pinMapWidth,
+        pinMapHeight,
+        pinMapOffsetX,
+        pinMapOffsetY,
+        pinOrientation,
+      ],
+    );
+
     const pinchGesture = Gesture.Pinch()
+      .onStart((e) => {
+        pinchStartScale.value = scale.value;
+        pinchStartTranslateX.value = translateX.value;
+        pinchStartTranslateY.value = translateY.value;
+        pinchStartFocalX.value = e.focalX;
+        pinchStartFocalY.value = e.focalY;
+      })
       .onUpdate((e) => {
-        scale.value = savedScale.value * e.scale;
+        const next = calculateFocalPinchTransform({
+          startScale: pinchStartScale.value,
+          startTranslateX: pinchStartTranslateX.value,
+          startTranslateY: pinchStartTranslateY.value,
+          startFocalX: pinchStartFocalX.value,
+          startFocalY: pinchStartFocalY.value,
+          currentFocalX: e.focalX,
+          currentFocalY: e.focalY,
+          gestureScale: e.scale,
+          minScale: MIN_MAP_SCALE,
+          maxScale: MAX_MAP_SCALE,
+        });
+        scale.value = next.scale;
+        translateX.value = next.translateX;
+        translateY.value = next.translateY;
       })
       .onEnd(() => {
-        if (scale.value < 0.5) {
-          scale.value = withTiming(0.5);
-          savedScale.value = 0.5;
-          runOnJS(updateScaleJS)(0.5);
-        } else if (scale.value > 5) {
-          scale.value = withTiming(5);
-          savedScale.value = 5;
-          runOnJS(updateScaleJS)(5);
-        } else {
-          savedScale.value = scale.value;
-          runOnJS(updateScaleJS)(scale.value);
-        }
+        savedScale.value = scale.value;
+        savedTranslateX.value = translateX.value;
+        savedTranslateY.value = translateY.value;
+        runOnJS(updateScaleJS)(scale.value);
       });
 
     const panGesture = Gesture.Pan()
       .minPointers(1)
+      .maxPointers(1)
+      .onTouchesDown((e, manager) => {
+        if (e.numberOfTouches > 1) {
+          savedTranslateX.value = translateX.value;
+          savedTranslateY.value = translateY.value;
+          manager.fail();
+        }
+      })
       .onUpdate((e) => {
         translateX.value = savedTranslateX.value + e.translationX;
         translateY.value = savedTranslateY.value + e.translationY;
@@ -632,10 +697,62 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
       setHighlightedCircleId(null);
     }, []);
 
+    const clearHighlightIfBlankJS = useCallback(
+      (
+        viewportX: number,
+        viewportY: number,
+        currentScale: number,
+        currentTranslateX: number,
+        currentTranslateY: number,
+      ) => {
+        if (!naturalSize) {
+          clearHighlightJS();
+          return;
+        }
+        const mapPoint = viewportPointToMapPoint(
+          { x: viewportX, y: viewportY },
+          {
+            scale: currentScale,
+            translateX: currentTranslateX,
+            translateY: currentTranslateY,
+          },
+        );
+        if (!mapPoint) {
+          clearHighlightJS();
+          return;
+        }
+        const minimumTouchSizeInMapSpace = MIN_PIN_TOUCH_SIZE / currentScale;
+        for (const circle of pinsForMap) {
+          const geometry = getPinDisplayGeometry(circle);
+          if (!geometry) continue;
+          if (
+            isPointInsideMapPinTouchTarget(
+              geometry,
+              mapPoint.x,
+              mapPoint.y,
+              minimumTouchSizeInMapSpace,
+            )
+          ) {
+            return;
+          }
+        }
+        clearHighlightJS();
+      },
+      [naturalSize, pinsForMap, getPinDisplayGeometry, clearHighlightJS],
+    );
+
     const singleTapGesture = Gesture.Tap()
       .numberOfTaps(1)
-      .onEnd(() => {
-        runOnJS(clearHighlightJS)();
+      .onEnd((e, success) => {
+        if (success) {
+          runOnJS(clearHighlightIfBlankJS)(
+            e.x,
+            e.y,
+            scale.value,
+            translateX.value,
+            translateY.value,
+          );
+        }
       });
 
     const composedGesture = Gesture.Race(
@@ -669,7 +786,7 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
       delta: number,
     ) {
       setter((value) =>
-        clamp(value + delta, MIN_PIN_DIMENSION, MAX_PIN_DIMENSION),
+        clamp(value + delta, MIN_PIN_MAP_DIMENSION, MAX_PIN_MAP_DIMENSION),
       );
     }
 
@@ -677,7 +794,7 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
       setter: Dispatch<SetStateAction<number>>,
       delta: number,
     ) {
-      setter((value) => clamp(value + delta, MIN_PIN_OFFSET, MAX_PIN_OFFSET));
+      setter((value) => clamp(value + delta, MIN_PIN_MAP_OFFSET, MAX_PIN_MAP_OFFSET));
     }
 
     function handlePinPress(circle: Circle) {
@@ -767,13 +884,13 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                   { color: colors.textSecondary },
                 ]}
               >
-                幅{pinScreenWidth}
+                幅{pinMapWidth}
               </Text>
               <Pressable
                 onPress={() =>
                   adjustPinDimension(
-                    setPinScreenWidth,
-                    -PIN_DIMENSION_STEP,
+                    setPinMapWidth,
+                    -PIN_MAP_DIMENSION_STEP,
                   )
                 }
                 style={[
@@ -793,8 +910,8 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
               <Pressable
                 onPress={() =>
                   adjustPinDimension(
-                    setPinScreenWidth,
-                    PIN_DIMENSION_STEP,
+                    setPinMapWidth,
+                    PIN_MAP_DIMENSION_STEP,
                   )
                 }
                 style={[
@@ -817,13 +934,13 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                   { color: colors.textSecondary },
                 ]}
               >
-                高{pinScreenHeight}
+                高{pinMapHeight}
               </Text>
               <Pressable
                 onPress={() =>
                   adjustPinDimension(
-                    setPinScreenHeight,
-                    -PIN_DIMENSION_STEP,
+                    setPinMapHeight,
+                    -PIN_MAP_DIMENSION_STEP,
                   )
                 }
                 style={[
@@ -843,8 +960,8 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
               <Pressable
                 onPress={() =>
                   adjustPinDimension(
-                    setPinScreenHeight,
-                    PIN_DIMENSION_STEP,
+                    setPinMapHeight,
+                    PIN_MAP_DIMENSION_STEP,
                   )
                 }
                 style={[
@@ -887,10 +1004,10 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                   { color: colors.textSecondary },
                 ]}
               >
-                X{pinOffsetX}
+                X{pinMapOffsetX}
               </Text>
               <Pressable
-                onPress={() => adjustPinOffset(setPinOffsetX, -PIN_OFFSET_STEP)}
+                onPress={() => adjustPinOffset(setPinMapOffsetX, -PIN_MAP_OFFSET_STEP)}
                 style={[
                   styles.filterChip,
                   { borderColor: colors.textSecondary, paddingHorizontal: 8 },
@@ -906,7 +1023,7 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                 </Text>
               </Pressable>
               <Pressable
-                onPress={() => adjustPinOffset(setPinOffsetX, PIN_OFFSET_STEP)}
+                onPress={() => adjustPinOffset(setPinMapOffsetX, PIN_MAP_OFFSET_STEP)}
                 style={[
                   styles.filterChip,
                   { borderColor: colors.textSecondary, paddingHorizontal: 8 },
@@ -927,10 +1044,10 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                   { color: colors.textSecondary },
                 ]}
               >
-                Y{pinOffsetY}
+                Y{pinMapOffsetY}
               </Text>
               <Pressable
-                onPress={() => adjustPinOffset(setPinOffsetY, -PIN_OFFSET_STEP)}
+                onPress={() => adjustPinOffset(setPinMapOffsetY, -PIN_MAP_OFFSET_STEP)}
                 style={[
                   styles.filterChip,
                   { borderColor: colors.textSecondary, paddingHorizontal: 8 },
@@ -946,7 +1063,7 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                 </Text>
               </Pressable>
               <Pressable
-                onPress={() => adjustPinOffset(setPinOffsetY, PIN_OFFSET_STEP)}
+                onPress={() => adjustPinOffset(setPinMapOffsetY, PIN_MAP_OFFSET_STEP)}
                 style={[
                   styles.filterChip,
                   { borderColor: colors.textSecondary, paddingHorizontal: 8 },
@@ -968,6 +1085,9 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
         {/* マップ本体 */}
         <View style={styles.mapArea} onLayout={handleContainerLayout}>
           <GestureDetector gesture={composedGesture}>
+            <View
+              style={{ width: displaySize.w, height: displaySize.h }}
+            >
             <Animated.View
               style={[
                 {
@@ -1032,25 +1152,13 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                 />
               )}
               {/* ピン描画: 正規化座標 × 表示サイズ */}
-              {pinsForMap.map((circle) => {
+              {naturalSize &&
+                pinsForMap.map((circle) => {
                 if (circle.pinX == null || circle.pinY == null) return null;
                 const priority = getColor(circle.priorityColor);
-                const span = getSpaceSpan(circle.space);
-                const baseWidth = pinScreenWidth;
-                const baseHeight = pinScreenHeight;
-                const pinWidth =
-                  pinOrientation === "horizontal"
-                    ? baseWidth * span
-                    : baseWidth;
-                const pinHeight =
-                  pinOrientation === "vertical"
-                    ? baseHeight * span
-                    : baseHeight;
+                const geometry = getPinDisplayGeometry(circle);
+                if (!geometry) return null;
                 const isHighlighted = circle.id === activeHighlight;
-                const pinLeft =
-                  circle.pinX * displaySize.w + pinOffsetX - pinWidth / 2;
-                const pinTop =
-                  circle.pinY * displaySize.h + pinOffsetY - pinHeight / 2;
                 const bw = Math.max(
                   isHighlighted ? 1.5 / currentScale : 0.7 / currentScale,
                   StyleSheet.hairlineWidth,
@@ -1078,10 +1186,10 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                   : undefined;
                 const commonPinProps = {
                   key: circle.id,
-                  width: pinWidth,
-                  height: pinHeight,
-                  left: pinLeft,
-                  top: pinTop,
+                  width: geometry.width,
+                  height: geometry.height,
+                  left: geometry.left,
+                  top: geometry.top,
                   fillColor,
                   outlineColor,
                   bw,
@@ -1095,27 +1203,43 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                 ) : (
                   <StaticPin {...commonPinProps} />
                 );
-              })}
+                })}
               {/* ツールチップ: タップしたピンのサークル情報 + サークルカット画像 */}
-              {activeHighlight != null &&
+              {naturalSize &&
+                activeHighlight != null &&
                 (() => {
                   const c = pinsForMap.find((p) => p.id === activeHighlight);
                   if (!c || c.pinX == null || c.pinY == null) return null;
+                  const geometry = getPinDisplayGeometry(c);
+                  if (!geometry) return null;
                   const priority = getColor(c.priorityColor);
-                  const tipTop = c.pinY * displaySize.h + pinOffsetY;
+                  const tipTop = geometry.centerY;
                   const hasImage =
                     c.circleCutFilename &&
                     (c.circleCutFilename.startsWith("file://") ||
                       c.circleCutFilename.startsWith("/"));
+                  const spaceLabel = `${c.hall ?? ""}${c.space ?? ""}`.trim();
+                  const penname = c.penname?.trim() ?? "";
                   const popupW = 220;
-                  const popupH = hasImage ? 116 : 40;
-                  const gap = Math.max(
+                  const popupTextRows =
+                    1 +
+                    (spaceLabel.length > 0 ? 1 : 0) +
+                    (penname.length > 0 ? 1 : 0);
+                  const popupH = hasImage
+                    ? 84 + popupTextRows * 14 + 16
+                    : penname.length > 0
+                      ? 72
+                      : 56;
+                  const gapScreen = Math.max(
                     10,
-                    Math.max(pinScreenWidth, pinScreenHeight) * 0.75,
+                    Math.max(geometry.width, geometry.height) *
+                      currentScale *
+                      0.75,
                   );
-                  const pinX = c.pinX * displaySize.w + pinOffsetX;
-                  const pinY = c.pinY * displaySize.h + pinOffsetY;
-                  const showBelow = pinY - (popupH + gap) / currentScale < 0;
+                  const pinX = geometry.centerX;
+                  const pinY = geometry.centerY;
+                  const showBelow =
+                    pinY - (popupH + gapScreen) / currentScale < 0;
                   const minLeft = (popupW / 2 + 8) / currentScale;
                   const maxLeft = displaySize.w - minLeft;
                   const clampedLeft = Math.max(minLeft, Math.min(maxLeft, pinX));
@@ -1126,8 +1250,8 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                         position: "absolute",
                         left: clampedLeft,
                         top: showBelow
-                          ? tipTop + gap / currentScale
-                          : tipTop - (popupH + gap) / currentScale,
+                          ? tipTop + gapScreen / currentScale
+                          : tipTop - (popupH + gapScreen) / currentScale,
                         transform: [
                           { translateX: -popupW / 2 },
                           { scale: 1 / currentScale },
@@ -1159,20 +1283,46 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                           cachePolicy="memory-disk"
                         />
                       )}
+                      {spaceLabel.length > 0 && (
+                        <Text
+                          style={{
+                            color: "#fff",
+                            fontSize: 10,
+                            textAlign: "center",
+                          }}
+                          numberOfLines={1}
+                        >
+                          {spaceLabel}
+                        </Text>
+                      )}
                       <Text
                         style={{
                           color: "#fff",
                           fontSize: 11,
                           fontWeight: "600",
+                          textAlign: "center",
                         }}
                         numberOfLines={1}
                       >
-                        {(c.hall ?? "") + (c.space ?? "")} {c.name}
+                        {c.name}
                       </Text>
+                      {penname.length > 0 && (
+                        <Text
+                          style={{
+                            color: "#fff",
+                            fontSize: 10,
+                            textAlign: "center",
+                          }}
+                          numberOfLines={1}
+                        >
+                          {penname}
+                        </Text>
+                      )}
                     </View>
                   );
                 })()}
             </Animated.View>
+            </View>
           </GestureDetector>
         </View>
       </GestureHandlerRootView>

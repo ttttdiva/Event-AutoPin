@@ -23,17 +23,22 @@ import {
   recordSqlMetric,
 } from "./performance";
 import {
+  appendDirectorySiblingSuffix,
   advanceImportPublishPhase,
   assertSqlBindCount,
+  buildIncrementalEventGraphDeleteStatements,
   buildLegacyBootstrapBookkeeping,
   buildImportPublishPlan,
   buildSharedBundleFingerprint,
+  createAsyncOnce,
+  directoryFingerprintsEqual,
   isPathContainedBy,
   isSafeRelativeArchivePath,
   normalizeLookupKey,
   sha256Hex,
   isAssetMappingComplete,
   matchStableIdentityRows,
+  shouldDeleteOwnedImportSource,
   shouldRollbackPublishedFiles,
   type ImportPublishPhase,
 } from "./database-core";
@@ -135,6 +140,120 @@ function rawDatabase(database: SQLite.SQLiteDatabase): SQLite.SQLiteDatabase {
   return rawDatabaseByProxy.get(database as unknown as object) ?? database;
 }
 
+function createDatabaseCloseOnce(
+  database: SQLite.SQLiteDatabase,
+  label: string,
+): () => Promise<void> {
+  return createAsyncOnce(async () => {
+    console.info(`[ImportSQLite] ${label}_close_start`);
+    try {
+      await database.closeAsync();
+      console.info(`[ImportSQLite] ${label}_close_complete`);
+    } catch (error) {
+      console.error(
+        `[ImportSQLite] ${label}_close_failed`,
+        String((error as any)?.message ?? error),
+      );
+      throw error;
+    }
+  });
+}
+
+/**
+ * Event AutoPin が所有する SQLite connection の共通 open 経路。
+ *
+ * expo-sqlite 16.0.10 Android の closeDatabase() はデフォルトで
+ * maybeFinalizeAllStatements() を実行するが、FTS/native 側ですでに管理されて
+ * いる statement を再 finalize して SIGABRT になる実機事例がある。
+ *
+ * live/stage/backup/recovery を同じ close policy に揃え、明示的に寿命を管理している
+ * connection で Expo の close-time automatic orphan-statement finalization を無効化する。
+ */
+async function openEventTrailDatabaseAsync(
+  databaseName: string,
+): Promise<SQLite.SQLiteDatabase> {
+  return SQLite.openDatabaseAsync(databaseName, {
+    finalizeUnusedStatementsBeforeClosing: false,
+  });
+}
+
+async function openLegacyTemporaryDatabaseAsync(
+  databaseName: string,
+): Promise<SQLite.SQLiteDatabase> {
+  return openEventTrailDatabaseAsync(databaseName);
+}
+
+async function openLegacyStageDatabaseAsync(
+  databaseName: string,
+): Promise<SQLite.SQLiteDatabase> {
+  return instrumentDatabase(
+    await openLegacyTemporaryDatabaseAsync(databaseName),
+  );
+}
+
+export const databaseSqliteLifecycleTestHooks = {
+  openEventTrailDatabaseAsync,
+  openLegacyTemporaryDatabaseAsync,
+  openLegacyStageDatabaseAsync,
+};
+
+async function withDatabaseClosed<T>(
+  database: SQLite.SQLiteDatabase,
+  label: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const closeDatabase = createDatabaseCloseOnce(database, label);
+  let primaryError: unknown = null;
+  try {
+    return await operation();
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    try {
+      await closeDatabase();
+    } catch (closeError) {
+      if (primaryError) {
+        console.error(
+          `[ImportSQLite] ${label}_close_failed_after_primary_error`,
+          String((closeError as any)?.message ?? closeError),
+        );
+      } else {
+        throw closeError;
+      }
+    }
+  }
+}
+
+async function readIntegrityCheckExplicit(
+  database: SQLite.SQLiteDatabase,
+): Promise<string | null> {
+  const statement = await database.prepareAsync("PRAGMA integrity_check");
+  try {
+    const result = await statement.executeAsync<{ integrity_check: string }>();
+    const row = await result.getFirstAsync();
+    return row?.integrity_check ?? null;
+  } finally {
+    await statement.finalizeAsync();
+  }
+}
+
+async function verifyDirectoryCandidateForMove(
+  path: string,
+  label: string,
+): Promise<DirectoryFileFingerprint[]> {
+  const info = await FileSystem.getInfoAsync(path);
+  if (!info.exists || !(info as any).isDirectory) {
+    throw new Error(`${label} がありません: ${path}`);
+  }
+  const first = await listDirectoryFiles(path);
+  const second = await listDirectoryFiles(path);
+  if (!directoryFingerprintsEqual(first, second)) {
+    throw new Error(`${label} の検証中に内容が変化しました: ${path}`);
+  }
+  return second;
+}
+
 async function tableColumns(
   database: SQLite.SQLiteDatabase,
   table: string,
@@ -164,7 +283,7 @@ export async function getDatabase(): Promise<SQLite.SQLiteDatabase> {
   if (db) return db;
   if (!dbInitPromise) {
     dbInitPromise = (async () => {
-      const rawDatabase = await SQLite.openDatabaseAsync(DB_NAME);
+      const rawDatabase = await openEventTrailDatabaseAsync(DB_NAME);
       const database = instrumentDatabase(rawDatabase);
       await initDatabase(database);
       db = database;
@@ -1730,6 +1849,10 @@ export interface ImportProgress {
   phase: "download" | "events" | "maps" | "circles";
 }
 
+export interface ImportFromZipOptions {
+  deleteSourceAfterUnzip?: boolean;
+}
+
 interface SyncManifestEvent {
   slug?: string;
   path: string;
@@ -1960,22 +2083,12 @@ export async function copyDirectoryVerified(source: string, destination: string)
     await ensureDirectory(destination.slice(0, destination.lastIndexOf("/") + 1));
     await copyDirectory(source, destination);
     const copied = await listDirectoryFiles(destination);
-    if (copied.length !== fingerprint.length || copied.some((entry, i) =>
-      entry.relative !== fingerprint[i].relative || entry.size !== fingerprint[i].size || entry.md5 !== fingerprint[i].md5
-    )) {
+    if (!directoryFingerprintsEqual(fingerprint, copied)) {
       throw new Error(`画像 backup の完全検証に失敗しました: ${destination}`);
     }
   } catch (error) {
     await FileSystem.deleteAsync(destination, { idempotent: true }).catch(() => undefined);
     throw error;
-  }
-}
-
-async function copyStagedEventDirectories(stageRoot: string, destination: string): Promise<void> {
-  await ensureDirectory(destination);
-  for (const entry of await FileSystem.readDirectoryAsync(stageRoot)) {
-    if (!/^\d+$/.test(entry)) continue;
-    await copyDirectoryVerified(`${normalizeDir(stageRoot)}${entry}/`, `${normalizeDir(destination)}${entry}/`);
   }
 }
 
@@ -2021,6 +2134,7 @@ interface ImportStageJournal {
   legacyCutsBackup?: string;
   legacyHadLiveCuts?: boolean;
   legacyCutsBackupReady?: boolean;
+  legacyCutsPublishAttempted?: boolean;
   legacyCutsPublished?: boolean;
   sharedCutsBackup?: string;
   sharedCutsHadLive?: boolean;
@@ -2158,11 +2272,20 @@ async function recoverImportStageRoot(database: SQLite.SQLiteDatabase, stageRoot
   // なら live DB transaction は commit 済みなので forward cleanup のみ行う。
   if (allFinalized || cleanupFinalized || (!journalCorrupt && journal?.phase === "finalized" && durableRows.length === 0)) {
     if (journal?.kind === "legacy" && journal.legacyDbBackupName && journal.legacyDbBackupReady) {
-      const backupDb = await SQLite.openDatabaseAsync(journal.legacyDbBackupName);
-      const check = await backupDb.getFirstAsync<{ integrity_check: string }>("PRAGMA integrity_check");
-      const schema = await backupDb.getFirstAsync<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'");
-      await backupDb.closeAsync();
-      if (check?.integrity_check !== "ok" || schema?.name !== "events") throw new Error("legacy DB backup cleanup verification failed");
+      const backupDb = await openLegacyTemporaryDatabaseAsync(
+        journal.legacyDbBackupName,
+      );
+      await withDatabaseClosed(
+        backupDb,
+        "recovery_legacy_backup_db",
+        async () => {
+          const check = await readIntegrityCheckExplicit(backupDb);
+          const schema = await backupDb.getFirstAsync<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'");
+          if (check !== "ok" || schema?.name !== "events") {
+            throw new Error("legacy DB backup cleanup verification failed");
+          }
+        },
+      );
     }
     const cleanupIds = new Set<number>([
       ...(journal?.cleanupEventIds ?? []).map(Number),
@@ -2199,11 +2322,20 @@ async function recoverImportStageRoot(database: SQLite.SQLiteDatabase, stageRoot
     if (journal.legacyDbBackupName && !journal.legacyDbBackupReady && journal.phase !== "db_published" && journal.phase !== "finalized") return;
     if (journal.phase === "db_published" || journal.phase === "finalized") {
         if (journal.legacyDbBackupName && journal.legacyDbBackupReady) {
-          const backupDb = await SQLite.openDatabaseAsync(journal.legacyDbBackupName);
-          const check = await backupDb.getFirstAsync<{ integrity_check: string }>("PRAGMA integrity_check");
-          const schema = await backupDb.getFirstAsync<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'");
-          await backupDb.closeAsync();
-          if (check?.integrity_check !== "ok" || schema?.name !== "events") throw new Error("legacy DB backup cleanup verification failed");
+          const backupDb = await openLegacyTemporaryDatabaseAsync(
+            journal.legacyDbBackupName,
+          );
+          await withDatabaseClosed(
+            backupDb,
+            "recovery_legacy_published_backup_db",
+            async () => {
+              const check = await readIntegrityCheckExplicit(backupDb);
+              const schema = await backupDb.getFirstAsync<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'");
+              if (check !== "ok" || schema?.name !== "events") {
+                throw new Error("legacy DB backup cleanup verification failed");
+              }
+            },
+          );
         }
         await FileSystem.deleteAsync(stageRoot, { idempotent: true });
         if (journal.legacyImagesBackup) await FileSystem.deleteAsync(journal.legacyImagesBackup, { idempotent: true });
@@ -2221,26 +2353,32 @@ async function recoverImportStageRoot(database: SQLite.SQLiteDatabase, stageRoot
         return;
       }
       if (journal.legacyDbBackupName && journal.legacyDbBackupReady) {
-        const backupDb = await SQLite.openDatabaseAsync(journal.legacyDbBackupName);
-        const backupCheck = await backupDb.getFirstAsync<{ integrity_check: string }>("PRAGMA integrity_check");
-        if (backupCheck?.integrity_check !== "ok") throw new Error("legacy DB backup is corrupt or missing");
-        const backupSchema = await backupDb.getFirstAsync<{ name: string }>(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+        const backupDb = await openLegacyTemporaryDatabaseAsync(
+          journal.legacyDbBackupName,
         );
-        if (backupSchema?.name !== "events") throw new Error("legacy DB backup schema is missing");
-        await SQLite.backupDatabaseAsync({ sourceDatabase: backupDb, destDatabase: rawDatabase(database) });
-        await backupDb.closeAsync();
+        await withDatabaseClosed(
+          backupDb,
+          "recovery_legacy_restore_backup_db",
+          async () => {
+            const backupCheck = await readIntegrityCheckExplicit(backupDb);
+            if (backupCheck !== "ok") throw new Error("legacy DB backup is corrupt or missing");
+            const backupSchema = await backupDb.getFirstAsync<{ name: string }>(
+              "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            );
+            if (backupSchema?.name !== "events") throw new Error("legacy DB backup schema is missing");
+            await SQLite.backupDatabaseAsync({ sourceDatabase: rawDatabase(backupDb), destDatabase: rawDatabase(database) });
+          },
+        );
       }
-      if (journal.legacyImagesBackup) {
-        const backupInfo = await FileSystem.getInfoAsync(journal.legacyImagesBackup);
-        if (backupInfo.exists && journal.legacyImagesBackupReady) await restoreDirectoryFromBackup(journal.legacyImagesBackup, IMAGES_DIR);
-        else if (journal.legacyHadLiveImages) throw new Error("legacy live images backup is missing");
+      if (journal.legacyImagesBackup && journal.legacyImagesBackupReady) {
+        await restoreDirectoryFromBackup(journal.legacyImagesBackup, IMAGES_DIR);
       } else if (journal.legacyHadLiveImages) {
-        throw new Error("legacy live images backup marker is missing");
+        throw new Error("legacy live images backup is missing");
       } else {
         // Fresh install had no previous live image tree.  Remove only the
         // imported numeric dirs; never infer arbitrary names from a corrupt
-        // journal.
+        // journal.  This is also safe when publish was never attempted because
+        // those directories still live below stageRoot.
         for (const eventId of journal.importedEventIds) {
           await FileSystem.deleteAsync(`${IMAGES_DIR}${Number(eventId)}/`, { idempotent: true });
         }
@@ -2250,12 +2388,17 @@ async function recoverImportStageRoot(database: SQLite.SQLiteDatabase, stageRoot
       // the process died between delete and move and the `cutsPublished`
       // marker was not flushed yet).  On a fresh install there is no preimage,
       // so removing the partial tree is safe.
-      if (journal.legacyCutsBackup && journal.legacyCutsBackupReady) {
-        await restoreDirectoryFromBackup(journal.legacyCutsBackup, DEFAULT_CUTS_DIR);
-      } else if (journal.legacyHadLiveCuts) {
-        throw new Error("legacy default cuts backup is missing");
-      } else if (journal.legacyCutsStage) {
-        await FileSystem.deleteAsync(DEFAULT_CUTS_DIR, { idempotent: true });
+      const cutsWasPublishAttempted =
+        journal.legacyCutsPublishAttempted === true ||
+        journal.legacyCutsPublished === true;
+      if (cutsWasPublishAttempted) {
+        if (journal.legacyCutsBackup && journal.legacyCutsBackupReady) {
+          await restoreDirectoryFromBackup(journal.legacyCutsBackup, DEFAULT_CUTS_DIR);
+        } else if (journal.legacyHadLiveCuts) {
+          throw new Error("legacy default cuts backup is missing");
+        } else {
+          await FileSystem.deleteAsync(DEFAULT_CUTS_DIR, { idempotent: true });
+        }
       }
       // Cleanup only after every verified restore succeeds; stageRoot/journal
       // remains as durable evidence if any delete fails and startup retries.
@@ -2395,7 +2538,9 @@ async function publishStagedImageDir(
   // backup_dir を source of truth として old live を restore する。backup は
   // 一時ディレクトリへ完全検証してから rename するため、partial backup を
   // recovery が有効な preimage として扱うことはない。
-  const backupTemp = backupDir ? `${backupDir}.tmp` : null;
+  const backupTemp = backupDir
+    ? appendDirectorySiblingSuffix(backupDir, ".tmp")
+    : null;
   let backupReady = !backupDir;
   try {
     await updateImportStageMarker(database, stagingEventId, "backup_intent", backupDir);
@@ -2439,15 +2584,25 @@ async function restoreDirectoryFromBackup(backupDir: string, liveDir: string): P
   if (!backupInfo.exists || !(backupInfo as any).isDirectory) throw new Error(`画像 backup がありません: ${backupDir}`);
   // Verify both the backup and a fresh temporary restore before touching live.
   const fingerprint = await listDirectoryFiles(backupDir);
-  const restoreTemp = `${liveDir}.restore_${Date.now()}/`;
-  await copyDirectoryVerified(backupDir, restoreTemp);
-  const restoredFingerprint = await listDirectoryFiles(restoreTemp);
-  if (JSON.stringify(fingerprint) !== JSON.stringify(restoredFingerprint)) {
-    await FileSystem.deleteAsync(restoreTemp, { idempotent: true }).catch(() => undefined);
-    throw new Error(`画像 backup restore の検証に失敗しました: ${backupDir}`);
+  const restoreTemp = appendDirectorySiblingSuffix(
+    liveDir,
+    `.restore_${Date.now()}`,
+  );
+  let moved = false;
+  try {
+    await copyDirectoryVerified(backupDir, restoreTemp);
+    const restoredFingerprint = await listDirectoryFiles(restoreTemp);
+    if (!directoryFingerprintsEqual(fingerprint, restoredFingerprint)) {
+      throw new Error(`画像 backup restore の検証に失敗しました: ${backupDir}`);
+    }
+    await FileSystem.deleteAsync(liveDir, { idempotent: true });
+    await FileSystem.moveAsync({ from: restoreTemp, to: liveDir });
+    moved = true;
+  } finally {
+    if (!moved) {
+      await FileSystem.deleteAsync(restoreTemp, { idempotent: true }).catch(() => undefined);
+    }
   }
-  await FileSystem.deleteAsync(liveDir, { idempotent: true });
-  await FileSystem.moveAsync({ from: restoreTemp, to: liveDir });
 }
 
 const SHARED_CUT_SNAPSHOT_MANIFEST = "snapshot.json";
@@ -2791,7 +2946,14 @@ async function finalizeIncrementalDb(
     // state at COMMIT, so no route can observe a half-renamed event graph.
     await txDb.execAsync("PRAGMA defer_foreign_keys = ON");
     // 旧 changed/missing 行を同一 transaction 内で削除してから、staging UID を
-    // stable UID に昇格する。unique index により二重 live UID は残らない。
+    // stable UID に昇格する。
+    //
+    // withExclusiveTransactionAsync の transaction connection は
+    // PRAGMA foreign_keys のconnection-local stateを共有する保証がないため、
+    // DELETE FROM events のON DELETE CASCADEには依存しない。
+    // 旧子graphを明示削除してからparentを消すことで、後段の
+    // staged event_id -> live event_id identity restore時に
+    // asset_local_map等の旧PKが残って衝突することを防ぐ。
     for (const eventId of deleteIds) {
       if (itemFtsAvailable) {
         await txDb.runAsync(
@@ -2799,7 +2961,9 @@ async function finalizeIncrementalDb(
           eventId,
         );
       }
-      await txDb.runAsync("DELETE FROM events WHERE id = ?", eventId);
+      for (const statement of buildIncrementalEventGraphDeleteStatements(eventId)) {
+        await txDb.runAsync(statement.sql, ...statement.params);
+      }
       await txDb.runAsync("UPDATE sync_import_cleanup SET phase = 'finalized' WHERE event_id = ? AND stage_root = ?", eventId, stageRoot);
     }
     for (const stagedEventId of publishIds) {
@@ -2890,7 +3054,8 @@ async function finalizeLegacyFullImport(
   // publish する。既存 live は最後まで閉じず、失敗時にも保持する。
   const stageRoot = createImageStageRoot();
   const stageDatabaseName = `eventtrail_legacy_stage_${Date.now()}.db`;
-  const stageDb = instrumentDatabase(await SQLite.openDatabaseAsync(stageDatabaseName));
+  const stageDb = await openLegacyStageDatabaseAsync(stageDatabaseName);
+  const closeStageDb = createDatabaseCloseOnce(stageDb, "legacy_stage_db");
   const previousDb = db;
   const previousPromise = dbInitPromise;
   const oldImagesBackup = `${normalizeDir(FileSystem.cacheDirectory ?? stageRoot)}eventtrail_legacy_old_live_${Date.now()}/`;
@@ -2900,6 +3065,7 @@ async function finalizeLegacyFullImport(
   const legacyImagesStage = `${normalizeDir(stageRoot)}__legacy_live/`;
   let lastEventId: number | null = null;
   const importedEventIds: number[] = [];
+  let primaryError: unknown = null;
   const bootstrapBookkeeping = buildLegacyBootstrapBookkeeping(events.map((event) => ({
     syncUid: manifestUid(event),
     contentHash: manifestContentHash(event),
@@ -2913,8 +3079,8 @@ async function finalizeLegacyFullImport(
   let legacyCutsPublished = false;
   let cutsPublishAttempted = false;
   let legacyCutsRollbackCompleted = false;
-  const legacyHadLiveImages = (await FileSystem.getInfoAsync(IMAGES_DIR)).exists;
-  const legacyHadLiveCuts = (await FileSystem.getInfoAsync(DEFAULT_CUTS_DIR)).exists;
+  let legacyHadLiveImages = false;
+  let legacyHadLiveCuts = false;
   let legacyDbBackupReady = false;
   let legacyImagesBackupReady = false;
   let legacyCutsBackupReady = false;
@@ -2923,8 +3089,12 @@ async function finalizeLegacyFullImport(
   let dbRestoreVerified = false;
   let dbRestoreFailed = false;
   let dbRestoredToOld = false;
-  await ensureDirectory(stageRoot);
+  let temporaryDatabaseCloseFailed = false;
+  let closeOwnedLegacyDestination: (() => Promise<void>) | null = null;
   try {
+    await ensureDirectory(stageRoot);
+    legacyHadLiveImages = (await FileSystem.getInfoAsync(IMAGES_DIR)).exists;
+    legacyHadLiveCuts = (await FileSystem.getInfoAsync(DEFAULT_CUTS_DIR)).exists;
     // A durable journal is mandatory before any stage mutation.  If writing it
     // fails, catch/finally closes the temporary DB while preserving the stage
     // directory for an explicit retry.
@@ -2944,6 +3114,7 @@ async function finalizeLegacyFullImport(
       legacyCutsBackup: oldCutsBackup,
       legacyHadLiveCuts,
       legacyCutsBackupReady,
+      legacyCutsPublishAttempted: cutsPublishAttempted,
       legacyCutsPublished,
     });
     // Stage DB の schema を init するため一時的に db 参照を差し替える。
@@ -2962,7 +3133,7 @@ async function finalizeLegacyFullImport(
         eventDirFromManifestPath(extractDir, events[i].path),
         onProgress,
         events[i],
-        stageRoot,
+        legacyImagesStage,
         `__legacy_stage__${Date.now()}_${i}`,
         null,
         stageRoot,
@@ -2990,11 +3161,11 @@ async function finalizeLegacyFullImport(
 
     // Stage DB が持つ画像参照を live root へ rewrite してから、画像 publish と
     // SQLite backup を順序付ける。旧 live 画像は backup して failure で戻す。
-    await stageDb.runAsync("UPDATE events SET event_image_filename = REPLACE(event_image_filename, ?, ?) WHERE event_image_filename LIKE ?", stageRoot, IMAGES_DIR, `${stageRoot}%`);
-    await stageDb.runAsync("UPDATE event_maps SET filename = REPLACE(filename, ?, ?) WHERE filename LIKE ?", stageRoot, IMAGES_DIR, `${stageRoot}%`);
-    await stageDb.runAsync("UPDATE circles SET circle_cut_filename = REPLACE(circle_cut_filename, ?, ?) WHERE circle_cut_filename LIKE ?", stageRoot, IMAGES_DIR, `${stageRoot}%`);
-    await stageDb.runAsync("UPDATE item_images SET filename = REPLACE(filename, ?, ?) WHERE filename LIKE ?", stageRoot, IMAGES_DIR, `${stageRoot}%`);
-    await stageDb.runAsync("UPDATE asset_local_map SET local_path = REPLACE(local_path, ?, ?) WHERE local_path LIKE ?", stageRoot, IMAGES_DIR, `${stageRoot}%`);
+    await stageDb.runAsync("UPDATE events SET event_image_filename = REPLACE(event_image_filename, ?, ?) WHERE event_image_filename LIKE ?", legacyImagesStage, IMAGES_DIR, `${legacyImagesStage}%`);
+    await stageDb.runAsync("UPDATE event_maps SET filename = REPLACE(filename, ?, ?) WHERE filename LIKE ?", legacyImagesStage, IMAGES_DIR, `${legacyImagesStage}%`);
+    await stageDb.runAsync("UPDATE circles SET circle_cut_filename = REPLACE(circle_cut_filename, ?, ?) WHERE circle_cut_filename LIKE ?", legacyImagesStage, IMAGES_DIR, `${legacyImagesStage}%`);
+    await stageDb.runAsync("UPDATE item_images SET filename = REPLACE(filename, ?, ?) WHERE filename LIKE ?", legacyImagesStage, IMAGES_DIR, `${legacyImagesStage}%`);
+    await stageDb.runAsync("UPDATE asset_local_map SET local_path = REPLACE(local_path, ?, ?) WHERE local_path LIKE ?", legacyImagesStage, IMAGES_DIR, `${legacyImagesStage}%`);
     if (importedEventIds.length !== bootstrapBookkeeping.length) {
       throw new Error("full bootstrap manifest/event mapping mismatch");
     }
@@ -3020,20 +3191,71 @@ async function finalizeLegacyFullImport(
     // any live image/DB publish.  A failure therefore leaves live state
     // untouched and is compensated by importSharedBundleSettings itself.
     await importSharedBundleSettings(extractDir, legacyCutsStage);
+    const legacyImagesFingerprint = await verifyDirectoryCandidateForMove(
+      legacyImagesStage,
+      "legacy image candidate",
+    );
+    const cutsStageInfo = await FileSystem.getInfoAsync(legacyCutsStage);
+    const legacyCutsFingerprint =
+      cutsStageInfo.exists && (cutsStageInfo as any).isDirectory
+        ? await verifyDirectoryCandidateForMove(
+            legacyCutsStage,
+            "legacy default cuts candidate",
+          )
+        : null;
     const liveInfo = await FileSystem.getInfoAsync(IMAGES_DIR);
     // Always snapshot the current live SQLite file, even when the module had
     // not initialized `db` yet.  Opening DB_NAME here creates an empty but
     // integrity-checkable preimage on a fresh install and avoids a publish
     // failure window with no same-process restore source.
-    const destination = previousDb ?? await SQLite.openDatabaseAsync(DB_NAME);
+    const destination =
+      previousDb ??
+      instrumentDatabase(await openEventTrailDatabaseAsync(DB_NAME));
+    if (!previousDb) {
+      closeOwnedLegacyDestination = createDatabaseCloseOnce(
+        destination,
+        "legacy_destination",
+      );
+      // A database opened lazily before the first getDatabase() call may be a
+      // newly-created file.  Initialize it before taking the rollback
+      // snapshot so recovery can validate the expected schema.
+      await initDatabase(destination, { recover: false });
+    }
     legacyDestination = destination;
     {
-      const oldDb = await SQLite.openDatabaseAsync(legacyDbBackupName);
-      await SQLite.backupDatabaseAsync({ sourceDatabase: rawDatabase(destination), destDatabase: oldDb });
-      const integrity = await oldDb.getFirstAsync<{ integrity_check: string }>("PRAGMA integrity_check");
-      await oldDb.closeAsync();
-      if (integrity?.integrity_check !== "ok") throw new Error("legacy DB backup integrity check failed");
-      legacyDbBackupReady = true;
+      const oldDb = await openLegacyTemporaryDatabaseAsync(legacyDbBackupName);
+      const closeOldDb = createDatabaseCloseOnce(oldDb, "legacy_old_db");
+      let oldDbOperationError: unknown = null;
+      console.info("[LegacyFullImport] old_db_backup_start");
+      try {
+        await SQLite.backupDatabaseAsync({
+          sourceDatabase: rawDatabase(destination),
+          destDatabase: rawDatabase(oldDb),
+        });
+        const integrity = await readIntegrityCheckExplicit(oldDb);
+        if (integrity !== "ok") {
+          throw new Error("legacy DB backup integrity check failed");
+        }
+        legacyDbBackupReady = true;
+        console.info("[LegacyFullImport] old_db_backup_complete");
+      } catch (error) {
+        oldDbOperationError = error;
+        throw error;
+      } finally {
+        try {
+          await closeOldDb();
+        } catch (closeError) {
+          temporaryDatabaseCloseFailed = true;
+          if (oldDbOperationError) {
+            console.error(
+              "[LegacyFullImport] legacy_old_db_close_failed_after_primary_error",
+              String((closeError as any)?.message ?? closeError),
+            );
+          } else {
+            throw closeError;
+          }
+        }
+      }
     }
     legacyPhase = "image_publish_intent";
     await writeImportStageJournal(stageRoot, {
@@ -3049,24 +3271,30 @@ async function finalizeLegacyFullImport(
       legacyCutsBackup: oldCutsBackup,
       legacyHadLiveCuts,
       legacyCutsBackupReady,
+      legacyCutsPublishAttempted: cutsPublishAttempted,
       legacyCutsPublished,
       legacyHadLiveImages,
       legacyDbBackupReady,
       legacyImagesBackupReady,
     });
     if (liveInfo.exists) {
-      const oldBackupTemp = `${oldImagesBackup}.tmp`;
+      const oldBackupTemp = appendDirectorySiblingSuffix(
+        oldImagesBackup,
+        ".tmp",
+      );
       await copyDirectoryVerified(IMAGES_DIR, oldBackupTemp);
       await FileSystem.moveAsync({ from: oldBackupTemp, to: oldImagesBackup });
       legacyImagesBackupReady = true;
     }
-    const cutsStageInfo = await FileSystem.getInfoAsync(legacyCutsStage);
     if (cutsStageInfo.exists && (cutsStageInfo as any).isDirectory) {
       // Keep the old default-cut tree in place while the staged tree is being
       // verified.  A verified copy is the durable rollback preimage; only
       // after its marker is written do we remove the old live tree.
       if (legacyHadLiveCuts) {
-        const oldCutsBackupTemp = `${oldCutsBackup}.tmp`;
+        const oldCutsBackupTemp = appendDirectorySiblingSuffix(
+          oldCutsBackup,
+          ".tmp",
+        );
         await copyDirectoryVerified(DEFAULT_CUTS_DIR, oldCutsBackupTemp);
         await FileSystem.moveAsync({ from: oldCutsBackupTemp, to: oldCutsBackup });
         legacyCutsBackupReady = true;
@@ -3106,28 +3334,74 @@ async function finalizeLegacyFullImport(
       legacyCutsBackup: oldCutsBackup,
       legacyHadLiveCuts,
       legacyCutsBackupReady,
+      legacyCutsPublishAttempted: cutsPublishAttempted,
       legacyCutsPublished,
       legacyHadLiveImages,
       legacyDbBackupReady,
       legacyImagesBackupReady,
     });
-    // Build/verify the complete new image tree before touching live.  A copy
-    // failure cannot leave a half-published IMAGES_DIR.
-      await FileSystem.deleteAsync(legacyImagesStage, { idempotent: true });
-      await copyStagedEventDirectories(stageRoot, legacyImagesStage);
+    // New image bytes were already verified while building legacyImagesStage.
+    // Re-hash immediately before publish, then move that exact candidate
+    // instead of duplicating the whole tree a second time.
     imagesPublishAttempted = true;
-      await FileSystem.deleteAsync(IMAGES_DIR, { idempotent: true });
+    await FileSystem.deleteAsync(IMAGES_DIR, { idempotent: true });
     await FileSystem.moveAsync({ from: legacyImagesStage, to: IMAGES_DIR });
+    const publishedImagesFingerprint = await listDirectoryFiles(IMAGES_DIR);
+    if (
+      !directoryFingerprintsEqual(
+        legacyImagesFingerprint,
+        publishedImagesFingerprint,
+      )
+    ) {
+      throw new Error("legacy image candidate publish verification failed");
+    }
     imagesPublished = true;
     if (cutsStageInfo.exists && (cutsStageInfo as any).isDirectory) {
-      const cutsLiveStage = `${normalizeDir(stageRoot)}__legacy_cuts_live/`;
-      await FileSystem.deleteAsync(cutsLiveStage, { idempotent: true });
-      await copyDirectoryVerified(legacyCutsStage, cutsLiveStage);
       cutsPublishAttempted = true;
+      await writeImportStageJournal(stageRoot, {
+        version: 1,
+        kind: "legacy",
+        phase: legacyPhase,
+        importedEventIds: [...importedEventIds],
+        published: [],
+        legacyDbBackupName,
+        legacyStageDbName: stageDatabaseName,
+        legacyImagesBackup: oldImagesBackup,
+        legacyCutsStage,
+        legacyCutsBackup: oldCutsBackup,
+        legacyHadLiveCuts,
+        legacyCutsBackupReady,
+        legacyCutsPublishAttempted: true,
+        legacyCutsPublished,
+        legacyHadLiveImages,
+        legacyDbBackupReady,
+        legacyImagesBackupReady,
+      });
       await FileSystem.deleteAsync(DEFAULT_CUTS_DIR, { idempotent: true });
-      await FileSystem.moveAsync({ from: cutsLiveStage, to: DEFAULT_CUTS_DIR });
+      await FileSystem.moveAsync({
+        from: legacyCutsStage,
+        to: DEFAULT_CUTS_DIR,
+      });
       const publishedCutsInfo = await FileSystem.getInfoAsync(DEFAULT_CUTS_DIR);
-      if (!publishedCutsInfo.exists || !(publishedCutsInfo as any).isDirectory) throw new Error("default cuts publish に失敗しました");
+      if (
+        !publishedCutsInfo.exists ||
+        !(publishedCutsInfo as any).isDirectory
+      ) {
+        throw new Error("default cuts publish に失敗しました");
+      }
+      const publishedCutsFingerprint =
+        await listDirectoryFiles(DEFAULT_CUTS_DIR);
+      if (
+        !legacyCutsFingerprint ||
+        !directoryFingerprintsEqual(
+          legacyCutsFingerprint,
+          publishedCutsFingerprint,
+        )
+      ) {
+        throw new Error(
+          "legacy default cuts candidate publish verification failed",
+        );
+      }
       legacyCutsPublished = true;
     }
     legacyPhase = "images_published";
@@ -3144,6 +3418,7 @@ async function finalizeLegacyFullImport(
       legacyCutsBackup: oldCutsBackup,
       legacyHadLiveCuts,
       legacyCutsBackupReady,
+      legacyCutsPublishAttempted: cutsPublishAttempted,
       legacyCutsPublished,
       legacyHadLiveImages,
       legacyDbBackupReady,
@@ -3163,6 +3438,7 @@ async function finalizeLegacyFullImport(
       legacyCutsBackup: oldCutsBackup,
       legacyHadLiveCuts,
       legacyCutsBackupReady,
+      legacyCutsPublishAttempted: cutsPublishAttempted,
       legacyCutsPublished,
       legacyHadLiveImages,
       legacyDbBackupReady,
@@ -3188,6 +3464,7 @@ async function finalizeLegacyFullImport(
       legacyCutsBackup: oldCutsBackup,
       legacyHadLiveCuts,
       legacyCutsBackupReady,
+      legacyCutsPublishAttempted: cutsPublishAttempted,
       legacyCutsPublished,
       legacyHadLiveImages,
       legacyDbBackupReady,
@@ -3195,6 +3472,7 @@ async function finalizeLegacyFullImport(
     });
     db = instrumentDatabase(destination);
     dbInitPromise = Promise.resolve(db);
+    closeOwnedLegacyDestination = null;
     importRowIdSeeds.clear();
     await destination.runAsync("DELETE FROM sync_import_staging WHERE stage_root = ?", stageRoot);
     legacyPhase = "finalized";
@@ -3211,6 +3489,7 @@ async function finalizeLegacyFullImport(
       legacyCutsBackup: oldCutsBackup,
       legacyHadLiveCuts,
       legacyCutsBackupReady,
+      legacyCutsPublishAttempted: cutsPublishAttempted,
       legacyCutsPublished,
       legacyHadLiveImages,
       legacyDbBackupReady,
@@ -3219,6 +3498,7 @@ async function finalizeLegacyFullImport(
     legacyFinalized = true;
     return { lastEventId, importedEventIds: [...importedEventIds] };
   } catch (error) {
+    primaryError = error;
     let dbRestoreError: unknown = null;
     let rollbackIntentWritten = false;
     // Record rollback intent before touching the old DB.  If the process dies
@@ -3250,12 +3530,40 @@ async function finalizeLegacyFullImport(
     if (!rollbackIntentWritten) throw new Error("legacy rollback intent marker missing");
     if (dbPublishAttempted && legacyDestination && legacyDbBackupReady) {
       try {
-        const backupDb = await SQLite.openDatabaseAsync(legacyDbBackupName);
-        const backupCheck = await backupDb.getFirstAsync<{ integrity_check: string }>("PRAGMA integrity_check");
-        if (backupCheck?.integrity_check !== "ok") throw new Error("legacy DB backup is corrupt");
-      await SQLite.backupDatabaseAsync({ sourceDatabase: backupDb, destDatabase: rawDatabase(legacyDestination) });
+        const backupDb = await openLegacyTemporaryDatabaseAsync(legacyDbBackupName);
+        const closeBackupDb = createDatabaseCloseOnce(
+          backupDb,
+          "legacy_rollback_backup_db",
+        );
+        let rollbackBackupOperationError: unknown = null;
+        try {
+          const backupCheck = await readIntegrityCheckExplicit(backupDb);
+          if (backupCheck !== "ok") {
+            throw new Error("legacy DB backup is corrupt");
+          }
+          await SQLite.backupDatabaseAsync({
+            sourceDatabase: rawDatabase(backupDb),
+            destDatabase: rawDatabase(legacyDestination),
+          });
+        } catch (restoreError) {
+          rollbackBackupOperationError = restoreError;
+          throw restoreError;
+        } finally {
+          try {
+            await closeBackupDb();
+          } catch (closeError) {
+            temporaryDatabaseCloseFailed = true;
+            if (rollbackBackupOperationError) {
+              console.error(
+                "[LegacyFullImport] rollback_backup_db_close_failed_after_primary_error",
+                String((closeError as any)?.message ?? closeError),
+              );
+            } else {
+              throw closeError;
+            }
+          }
+        }
         const restoredCheck = await legacyDestination.getFirstAsync<{ integrity_check: string }>("PRAGMA integrity_check");
-        await backupDb.closeAsync();
         if (restoredCheck?.integrity_check !== "ok") throw new Error("legacy DB restore integrity check failed");
         dbRestoreVerified = true;
         dbRestoredToOld = true;
@@ -3266,10 +3574,6 @@ async function finalizeLegacyFullImport(
         dbInitPromise = null;
       }
     }
-    if (!dbPublishAttempted && legacyDestination && legacyDestination !== previousDb) {
-      await legacyDestination.closeAsync().catch(() => undefined);
-    }
-    await stageDb.closeAsync().catch(() => undefined);
     let imagesRollbackOk = !imagesPublished;
     const shouldRestorePublishedFiles = shouldRollbackPublishedFiles(
       dbRestoredToOld,
@@ -3319,21 +3623,90 @@ async function finalizeLegacyFullImport(
     }
     legacyRollbackCompleted = imagesRollbackOk && cutsRollbackOk;
     if (dbRestoreError) {
+      if (closeOwnedLegacyDestination) {
+        try {
+          await closeOwnedLegacyDestination();
+          closeOwnedLegacyDestination = null;
+        } catch (closeError) {
+          temporaryDatabaseCloseFailed = true;
+          console.error(
+            "[LegacyFullImport] legacy_destination_close_failed_after_restore_error",
+            String((closeError as any)?.message ?? closeError),
+          );
+        }
+      }
       throw new Error(`${String((error as any)?.message ?? error)}; DB rollback failed: ${String((dbRestoreError as any)?.message ?? dbRestoreError)}`);
     }
-    db = previousDb;
-    dbInitPromise = previousPromise;
+    if (previousDb) {
+      db = previousDb;
+      dbInitPromise = previousPromise;
+    } else if (legacyDestination) {
+      // The destination is owned by this bootstrap attempt.  Do not expose it
+      // as the singleton on a failed attempt; finally closes it once and the
+      // next getDatabase() call reopens and initializes the live DB.
+      db = null;
+      dbInitPromise = null;
+    } else {
+      db = null;
+      dbInitPromise = null;
+    }
     importRowIdSeeds.clear();
     throw error;
   } finally {
-    await stageDb.closeAsync().catch(() => undefined);
-    if (legacyFinalized || (legacyRollbackCompleted && !dbRestoreFailed && (!dbPublishAttempted || dbRestoreVerified))) {
+    let stageDbCloseError: unknown = null;
+    let destinationCloseError: unknown = null;
+    try {
+      await closeStageDb();
+    } catch (closeError) {
+      temporaryDatabaseCloseFailed = true;
+      stageDbCloseError = closeError;
+      console.error(
+        "[LegacyFullImport] legacy_stage_db_close_failed",
+        String((closeError as any)?.message ?? closeError),
+      );
+    }
+    if (closeOwnedLegacyDestination) {
+      try {
+        await closeOwnedLegacyDestination();
+        closeOwnedLegacyDestination = null;
+      } catch (closeError) {
+        temporaryDatabaseCloseFailed = true;
+        destinationCloseError = closeError;
+        console.error(
+          "[LegacyFullImport] legacy_destination_close_failed",
+          String((closeError as any)?.message ?? closeError),
+        );
+      }
+    }
+    if (!legacyFinalized) {
+      // Never leave the global singleton pointing at the temporary stage or at
+      // a destination that may have been closed during rollback.
+      db = previousDb;
+      dbInitPromise = previousPromise;
+    }
+    if (
+      !temporaryDatabaseCloseFailed &&
+      (
+        legacyFinalized ||
+        (
+          legacyRollbackCompleted &&
+          !dbRestoreFailed &&
+          (!dbPublishAttempted || dbRestoreVerified)
+        )
+      )
+    ) {
       await FileSystem.deleteAsync(stageRoot, { idempotent: true });
       await FileSystem.deleteAsync(oldImagesBackup, { idempotent: true });
       await FileSystem.deleteAsync(oldCutsBackup, { idempotent: true });
       await FileSystem.deleteAsync(legacyCutsStage, { idempotent: true });
       await SQLite.deleteDatabaseAsync(stageDatabaseName).catch(() => undefined);
       await SQLite.deleteDatabaseAsync(legacyDbBackupName).catch(() => undefined);
+    }
+    if (stageDbCloseError && primaryError == null) {
+      throw stageDbCloseError;
+    }
+    if (destinationCloseError && primaryError == null && !stageDbCloseError) {
+      throw destinationCloseError;
     }
   }
 }
@@ -4258,6 +4631,7 @@ function parseImportStageJournal(value: unknown): ImportStageJournal | null {
     if (candidate.legacyCutsBackup !== undefined && typeof candidate.legacyCutsBackup !== "string") return null;
     if (candidate.legacyHadLiveCuts !== undefined && typeof candidate.legacyHadLiveCuts !== "boolean") return null;
     if (candidate.legacyCutsBackupReady !== undefined && typeof candidate.legacyCutsBackupReady !== "boolean") return null;
+    if (candidate.legacyCutsPublishAttempted !== undefined && typeof candidate.legacyCutsPublishAttempted !== "boolean") return null;
     if (candidate.legacyCutsPublished !== undefined && typeof candidate.legacyCutsPublished !== "boolean") return null;
   }
   if (candidate.sharedCutsBackup !== undefined && typeof candidate.sharedCutsBackup !== "string") return null;
@@ -5011,9 +5385,15 @@ async function importIncrementalBundle(
 export async function importFromZip(
   zipFilePath: string,
   onProgress?: (progress: ImportProgress) => void,
+  options: ImportFromZipOptions = {},
 ): Promise<number> {
   // ネイティブ側でZIP展開（JSヒープを使わない）
   const extractDir = `${FileSystem.cacheDirectory}zip_extract_${Date.now()}/`;
+  const deleteOwnedSourceAfterUnzip = shouldDeleteOwnedImportSource(
+    FileSystem.cacheDirectory,
+    zipFilePath,
+    options.deleteSourceAfterUnzip === true,
+  );
   const sourcePath = zipFilePath
     .replace(/^file:\/\/\//, "/")
     .replace(/^file:\/\//, "");
@@ -5021,6 +5401,20 @@ export async function importFromZip(
     .replace(/^file:\/\/\//, "/")
     .replace(/^file:\/\//, "");
   await unzip(sourcePath, extractPath);
+  if (deleteOwnedSourceAfterUnzip) {
+    try {
+      await FileSystem.deleteAsync(zipFilePath, { idempotent: true });
+      console.info("[ImportZip] owned_source_cache_cleanup_complete");
+    } catch (error) {
+      // Source cleanup is an optimization only.  Extraction already succeeded,
+      // therefore a cache deletion failure must not turn a valid import into a
+      // failed transaction.
+      console.warn(
+        "[ImportZip] owned_source_cache_cleanup_failed",
+        String((error as any)?.message ?? error),
+      );
+    }
+  }
 
   try {
     const bundlePath = `${extractDir}sync_bundle.json`;

@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Dict, Any
 from bs4 import BeautifulSoup
 import logging
+from urllib.parse import urlparse
 
 from ..models import Circle, Event, EventMap, SiteConfig
 
@@ -151,13 +152,10 @@ class BaseSiteAdapter(ABC):
                     field = field_map[i]
                     text = cell.get_text(strip=True)
 
-                    # リンクフィールドはhrefを優先
+                    # 共通のSNS列でも、列名ではなくリンク先でX/Webを判別する。
                     if field in ('twitter_url', 'website_url', 'pixiv_url'):
-                        link = cell.find('a', href=True)
-                        if link:
-                            circle_data[field] = link['href']
-                        elif text and text.startswith('http'):
-                            circle_data[field] = text
+                        for key, url in self._extract_link_fields(cell).items():
+                            circle_data.setdefault(key, url)
                     elif field == 'space_raw':
                         # "と-16" などはスペース番号そのもの。ホール列が明示されていない
                         # テーブルでは推定分割せず、そのままスペースとして保持する。
@@ -171,15 +169,8 @@ class BaseSiteAdapter(ABC):
                 for i, cell in enumerate(cells):
                     if i in field_map:
                         continue
-                    link = cell.find('a', href=True)
-                    if link:
-                        href = link['href']
-                        if ('twitter.com' in href or 'x.com' in href) and 'twitter_url' not in circle_data:
-                            circle_data['twitter_url'] = href
-                        elif 'pixiv' in href and 'pixiv_url' not in circle_data:
-                            circle_data['pixiv_url'] = href
-                        elif href.startswith('http') and 'website_url' not in circle_data:
-                            circle_data['website_url'] = href
+                    for key, url in self._extract_link_fields(cell).items():
+                        circle_data.setdefault(key, url)
 
                 # サークル名が存在する場合のみ追加
                 if circle_data.get('name'):
@@ -190,12 +181,40 @@ class BaseSiteAdapter(ABC):
                         hall=circle_data.get('hall'),
                         twitter_url=circle_data.get('twitter_url'),
                         website_url=circle_data.get('website_url'),
+                        pixiv_url=circle_data.get('pixiv_url'),
                         description=circle_data.get('description'),
                         genres=[circle_data['genre']] if circle_data.get('genre') else [],
                     )
                     all_circles.append(circle)
 
         return all_circles
+
+    @staticmethod
+    def _extract_link_fields(element) -> Dict[str, str]:
+        """同じ欄の全リンクを確認し、XとWebを別々に保持する。"""
+        links = [link['href'].strip() for link in element.find_all('a', href=True)]
+        if not links:
+            links = element.get_text(' ', strip=True).split()
+
+        fields: Dict[str, str] = {}
+        for url in links:
+            if url.startswith('//'):
+                url = 'https:' + url
+            try:
+                parsed = urlparse(url)
+                host = (parsed.hostname or '').lower()
+            except ValueError:
+                continue
+            if parsed.scheme.lower() not in {'http', 'https'} or not host:
+                continue
+            if host in {'x.com', 'www.x.com', 'twitter.com', 'www.twitter.com'}:
+                field = 'twitter_url'
+            elif host == 'pixiv.net' or host.endswith('.pixiv.net'):
+                field = 'pixiv_url'
+            else:
+                field = 'website_url'
+            fields.setdefault(field, url)
+        return fields
 
     def has_candidate_circle_table(self, soup: BeautifulSoup) -> bool:
         """列名が未知でも、複数行・複数列の候補テーブルがあるかを返す。"""

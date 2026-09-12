@@ -9,6 +9,7 @@ from src.space_locator.auto_coordinate_generator import (
     analyze_space_catalog_from_event,
     generate_coordinates_from_map,
 )
+from src.space_locator import auto_coordinate_generator as acg
 from src.space_locator.number_validator import NumberValidationResult
 
 
@@ -81,7 +82,10 @@ def test_catalog_geometry_global_lattice_and_range_center() -> None:
     grid = _build_catalog_geometry_grid(numbers, catalog, (1000, 500))
     by_id = {item["space_id"]: item for item in grid}
 
-    assert list(by_id) == ["A01", "A02", "A03", "B01", "B02", "B03", "C01", "C02", "C03"]
+    # C is inferred as a sparse vertical track with no independently observed
+    # vertical pitch.  The geometry resolver now fails closed for its missing
+    # slots instead of collapsing C02/C03 onto C01.
+    assert list(by_id) == ["A01", "A02", "A03", "B01", "B02", "B03", "C01"]
     assert by_id["B02"]["x"] == by_id["B03"]["x"]
     assert by_id["B02"]["x"] == 260
     assert by_id["B02"]["y"] == by_id["B03"]["y"] == 300
@@ -240,6 +244,300 @@ def test_catalog_geometry_rejects_exact_endpoint_inconsistent_with_track_pitch()
     assert by_id["V03"]["y"] == 440
 
 
+def test_catalog_geometry_zero_slope_singleton_borrows_observed_vertical_pitch(
+    monkeypatch,
+) -> None:
+    catalog = {
+        "order": ["A", "E"],
+        "horizontal_labels": [],
+        "vertical_labels": ["A", "E"],
+        "spaces": [
+            *[
+                _space(f"A{number:02d}", "A", number)
+                for number in range(1, 5)
+            ],
+            *[
+                _space(f"E{number:02d}", "E", number)
+                for number in range(1, 5)
+            ],
+        ],
+    }
+
+    strong_track = [
+        {
+            "number": f"{number:02d}",
+            "_cx": 110.0,
+            "_cy": 100.0 + (number - 1) * 40.0,
+            "_width": 20.0,
+            "_height": 20.0,
+        }
+        for number in range(1, 5)
+    ]
+
+    singleton_track = [
+        {
+            "number": "01",
+            "_cx": 310.0,
+            "_cy": 500.0,
+            "_width": 20.0,
+            "_height": 20.0,
+        }
+    ]
+
+    monkeypatch.setattr(
+        acg,
+        "_catalog_infer_layout",
+        lambda *args, **kwargs: {
+            "horizontal_labels": [],
+            "vertical_labels": ["A", "E"],
+            "horizontal": {},
+            "vertical": {
+                "A": [strong_track],
+                "E": [singleton_track],
+            },
+        },
+    )
+
+    grid = acg._build_catalog_geometry_grid(
+        [],
+        catalog,
+        (1000, 1000),
+    )
+    by_id = {
+        item["space_id"]: item
+        for item in grid
+    }
+
+    assert [
+        by_id[f"E{number:02d}"]["x"]
+        for number in range(1, 5)
+    ] == [310, 310, 310, 310]
+
+    assert [
+        by_id[f"E{number:02d}"]["y"]
+        for number in range(1, 5)
+    ] == [500, 540, 580, 620]
+
+    assert len({
+        (
+            by_id[f"E{number:02d}"]["x"],
+            by_id[f"E{number:02d}"]["y"],
+        )
+        for number in range(1, 5)
+    }) == 4
+
+
+def test_catalog_geometry_zero_slope_without_reference_pitch_fails_closed(
+    monkeypatch,
+) -> None:
+    catalog = {
+        "order": ["E"],
+        "horizontal_labels": [],
+        "vertical_labels": ["E"],
+        "spaces": [
+            _space(f"E{number:02d}", "E", number)
+            for number in range(1, 5)
+        ],
+    }
+
+    singleton_track = [
+        {
+            "number": "01",
+            "_cx": 310.0,
+            "_cy": 500.0,
+            "_width": 20.0,
+            "_height": 20.0,
+        }
+    ]
+
+    monkeypatch.setattr(
+        acg,
+        "_catalog_infer_layout",
+        lambda *args, **kwargs: {
+            "horizontal_labels": [],
+            "vertical_labels": ["E"],
+            "horizontal": {},
+            "vertical": {
+                "E": [singleton_track],
+            },
+        },
+    )
+
+    grid = acg._build_catalog_geometry_grid(
+        [],
+        catalog,
+        (1000, 1000),
+    )
+
+    assert [
+        item["space_id"]
+        for item in grid
+    ] == ["E01"]
+
+
+def test_catalog_reference_vertical_slope_fails_closed_on_scale_mismatch() -> None:
+    assert acg._catalog_reference_vertical_slope(
+        2,
+        100.0,
+        [
+            ("near", [1, 2, 3], 40.0, 100.0, 40.0),
+            ("far", [1, 2, 3], 80.0, 500.0, 80.0),
+        ],
+    ) is None
+
+
+def test_catalog_geometry_zero_slope_collision_reanchors_synthetic_slots(
+    monkeypatch,
+) -> None:
+    catalog = {
+        "order": ["A", "E"],
+        "horizontal_labels": [],
+        "vertical_labels": ["A", "E"],
+        "spaces": [
+            *[
+                _space(f"A{number:02d}", "A", number)
+                for number in range(1, 5)
+            ],
+            *[
+                _space(f"E{number:02d}", "E", number)
+                for number in range(1, 7)
+            ],
+        ],
+    }
+
+    strong_track = [
+        {
+            "number": f"{number:02d}",
+            "_cx": 110.0,
+            "_cy": 100.0 + (number - 1) * 40.0,
+            "_width": 20.0,
+            "_height": 20.0,
+        }
+        for number in range(1, 5)
+    ]
+    folded_track = [
+        {
+            "number": f"{number:02d}",
+            "_cx": 310.0,
+            "_cy": y,
+            "_width": 20.0,
+            "_height": 20.0,
+        }
+        for number, y in enumerate(
+            [500.0, 540.0, 620.0, 620.0, 560.0, 520.0],
+            start=1,
+        )
+    ]
+
+    monkeypatch.setattr(
+        acg,
+        "_catalog_infer_layout",
+        lambda *args, **kwargs: {
+            "horizontal_labels": [],
+            "vertical_labels": ["A", "E"],
+            "horizontal": {},
+            "vertical": {
+                "A": [strong_track],
+                "E": [folded_track],
+            },
+        },
+    )
+
+    grid = acg._build_catalog_geometry_grid(
+        [],
+        catalog,
+        (1000, 1000),
+    )
+    by_id = {item["space_id"]: item for item in grid}
+
+    assert list(by_id) == [
+        f"A{number:02d}"
+        for number in range(1, 5)
+    ] + [
+        f"E{number:02d}"
+        for number in range(1, 7)
+    ]
+    assert len({
+        (by_id[item]["x"], by_id[item]["y"])
+        for item in by_id
+    }) == 10
+    assert by_id["E03"]["y"] != 620 or by_id["E04"]["y"] != 620
+
+
+def test_catalog_geometry_zero_slope_reanchor_uses_selected_track_anchors(
+    monkeypatch,
+) -> None:
+    catalog = {
+        "order": ["A", "E"],
+        "horizontal_labels": [],
+        "vertical_labels": ["A", "E"],
+        "spaces": [
+            *[
+                _space(f"A{number:02d}", "A", number)
+                for number in range(1, 5)
+            ],
+            *[
+                _space(f"E{number:02d}", "E", number)
+                for number in range(1, 5)
+            ],
+        ],
+    }
+
+    strong_track = [
+        {
+            "number": f"{number:02d}",
+            "_cx": 110.0,
+            "_cy": 100.0 + (number - 1) * 40.0,
+            "_width": 20.0,
+            "_height": 20.0,
+        }
+        for number in range(1, 5)
+    ]
+    selected_track = [
+        {
+            "number": f"{number:02d}",
+            "_cx": 310.0,
+            "_cy": 500.0,
+            "_width": 20.0,
+            "_height": 20.0,
+        }
+        for number in (1, 2, 4)
+    ]
+    other_track = [
+        {
+            "number": f"{number:02d}",
+            "_cx": 350.0,
+            "_cy": 700.0,
+            "_width": 20.0,
+            "_height": 20.0,
+        }
+        for number in (1, 2, 4)
+    ]
+
+    monkeypatch.setattr(
+        acg,
+        "_catalog_infer_layout",
+        lambda *args, **kwargs: {
+            "horizontal_labels": [],
+            "vertical_labels": ["A", "E"],
+            "horizontal": {},
+            "vertical": {
+                "A": [strong_track],
+                "E": [selected_track, other_track],
+            },
+        },
+    )
+
+    grid = acg._build_catalog_geometry_grid(
+        [],
+        catalog,
+        (1000, 1000),
+    )
+    by_id = {item["space_id"]: item for item in grid}
+
+    assert (by_id["E03"]["x"], by_id["E03"]["y"]) == (310, 540)
+
+
 def test_catalog_geometry_quality_gate_rejects_low_observation_coverage() -> None:
     catalog = {
         "order": ["A"],
@@ -251,7 +549,7 @@ def test_catalog_geometry_quality_gate_rejects_low_observation_coverage() -> Non
     grid = _build_catalog_geometry_grid(numbers, catalog, (1000, 500))
     quality = _catalog_geometry_quality(numbers, catalog, grid, (1000, 500))
 
-    assert quality["coverage"] == 1.0
+    assert quality["coverage"] == 0.333333
     assert quality["observed_coverage"] < 0.5
     assert quality["gate"]["passed"] is False
 

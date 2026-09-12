@@ -94,6 +94,256 @@ def test_extract_numbers_passes_expected_candidate_count_and_keeps_diagnostics(t
     assert engine.diagnostics["last_run"]["context_fallback"]["rectangle_count"] == 4
 
 
+def test_context_candidate_budget_selects_best_context_segment(
+    tmp_path,
+    monkeypatch,
+):
+    image_path = tmp_path / "map.png"
+    _write_image(image_path)
+
+    ocr_python = tmp_path / (
+        "python.exe" if ocr_engine.os.name == "nt" else "python"
+    )
+    ocr_python.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        ocr_engine,
+        "_resolve_ocr_python",
+        lambda *args, **kwargs: ocr_python,
+    )
+
+    def element(number: int, x: int, y: int) -> dict:
+        return {
+            "text": f"{number:02d}",
+            "x1": x,
+            "y1": y,
+            "x2": x + 10,
+            "y2": y + 10,
+        }
+
+    base = [
+        element(1, 10, 10),
+        element(2, 30, 10),
+        element(3, 50, 10),
+        element(4, 70, 10),
+    ]
+
+    # total=6: useful but insufficient
+    segment_0 = [
+        element(5, 10, 100),
+        element(6, 30, 100),
+    ]
+
+    # total=12: reaches expected but overshoots by 2
+    segment_1 = [
+        element(number, 10 + (number - 5) * 20, 200)
+        for number in range(5, 13)
+    ]
+
+    # total=10 exactly: same capped progress as segment_1,
+    # therefore lower overproduction must win.
+    segment_2 = [
+        element(number, 10 + (number - 5) * 20, 300)
+        for number in range(5, 11)
+    ]
+
+    def fake_run(command, **kwargs):
+        output_json = Path(
+            command[command.index("--output-json") + 1]
+        )
+
+        elements = base + segment_0 + segment_1 + segment_2
+
+        output_json.write_text(
+            json.dumps(
+                {
+                    "model": "baidu/Unlimited-OCR",
+                    "revision": (
+                        "ee63731b6461c8afcdcc7b15352e7d2ffecc2ead"
+                    ),
+                    "device": "cuda",
+                    "results": [
+                        {
+                            "elements": elements,
+                            "context_fallback": {
+                                "enabled": True,
+                                "call_count": 3,
+                                "calls": [
+                                    {
+                                        "tier": "A",
+                                        "rectangle_index": 0,
+                                        "element_count": 2,
+                                        "appended_element_count": 2,
+                                    },
+                                    {
+                                        "tier": "A",
+                                        "rectangle_index": 1,
+                                        "element_count": 8,
+                                        "appended_element_count": 8,
+                                    },
+                                    {
+                                        "tier": "A",
+                                        "rectangle_index": 2,
+                                        "element_count": 6,
+                                        "appended_element_count": 6,
+                                    },
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        ocr_engine.subprocess,
+        "run",
+        fake_run,
+    )
+
+    engine = OCREngine()
+    numbers = engine.extract_numbers_with_coordinates(
+        str(image_path),
+        expected_candidate_count=10,
+    )
+
+    assert [item["number"] for item in numbers] == [
+        "01",
+        "02",
+        "03",
+        "04",
+        "05",
+        "06",
+        "07",
+        "08",
+        "09",
+        "10",
+    ]
+
+    selection = engine.diagnostics["last_run"]["context_selection"]
+
+    assert selection["applied"] is True
+    assert selection["base_candidate_count"] == 4
+    assert selection["selected_candidate_count"] == 10
+    assert selection["selected_calls"] == [
+        {
+            "order": 2,
+            "tier": "A",
+            "rectangle_index": 2,
+            "appended_element_count": 6,
+            "candidate_count_after": 10,
+        }
+    ]
+
+
+def test_context_candidate_budget_prefers_compact_numeric_hypothesis_on_tie():
+    def element(number: int, x: int) -> dict:
+        return {
+            "text": f"{number:02d}",
+            "x1": x,
+            "y1": 10,
+            "x2": x + 10,
+            "y2": 20,
+        }
+
+    base = [element(number, number * 20) for number in range(1, 5)]
+    distractor = [
+        {
+            "text": f"{prefix}-01",
+            "x1": (90 + index) * 20,
+            "y1": 10,
+            "x2": (90 + index) * 20 + 10,
+            "y2": 20,
+        }
+        for index, prefix in enumerate("ABCDEF")
+    ]
+    useful = [element(number, number * 20) for number in range(5, 11)]
+    result = {
+        "elements": base + distractor + useful,
+        "context_fallback": {
+            "enabled": True,
+            "call_count": 2,
+            "calls": [
+                {
+                    "tier": "A",
+                    "rectangle_index": 0,
+                    "element_count": 6,
+                    "appended_element_count": 6,
+                },
+                {
+                    "tier": "A",
+                    "rectangle_index": 1,
+                    "element_count": 6,
+                    "appended_element_count": 6,
+                },
+            ],
+        },
+    }
+
+    selected, diagnostics = (
+        ocr_engine._select_context_elements_by_candidate_budget(
+            result,
+            10,
+        )
+    )
+
+    assert [item["number"] for item in ocr_engine._elements_to_numbers(selected)] == [
+        f"{number:02d}"
+        for number in range(1, 11)
+    ]
+    assert diagnostics["selected_calls"][0]["rectangle_index"] == 1
+
+
+def test_context_candidate_budget_preserves_legacy_payload_without_provenance():
+    result = {
+        "elements": [
+            {
+                "text": "01",
+                "x1": 10,
+                "y1": 10,
+                "x2": 20,
+                "y2": 20,
+            },
+            {
+                "text": "02",
+                "x1": 30,
+                "y1": 10,
+                "x2": 40,
+                "y2": 20,
+            },
+        ],
+        "context_fallback": {
+            "enabled": True,
+            "calls": [
+                {
+                    "tier": "A",
+                    "rectangle_index": 0,
+                    "element_count": 1,
+                }
+            ],
+        },
+    }
+
+    selected, diagnostics = (
+        ocr_engine._select_context_elements_by_candidate_budget(
+            result,
+            10,
+        )
+    )
+
+    assert selected == result["elements"]
+    assert diagnostics["applied"] is False
+    assert diagnostics["reason"] == "appended_element_count_missing"
+
+
 def test_extract_numbers_returns_empty_on_runner_failure(tmp_path, monkeypatch):
     image_path = tmp_path / "map.png"
     _write_image(image_path)

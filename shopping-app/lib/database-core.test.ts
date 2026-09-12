@@ -1,10 +1,14 @@
 import {
+  appendDirectorySiblingSuffix,
   advanceImportPublishPhase,
   benchmarkSummaryQueryCount,
+  buildIncrementalEventGraphDeleteStatements,
   buildSharedBundleFingerprint,
   buildLegacyBootstrapBookkeeping,
   buildImportPublishPlan,
   computeSyncDiff,
+  createAsyncOnce,
+  directoryFingerprintsEqual,
   advanceImageMutationPhase,
   assertSqlBindCount,
   isPathContainedBy,
@@ -13,6 +17,7 @@ import {
   sha256Hex,
   isAssetMappingComplete,
   matchStableIdentityRows,
+  shouldDeleteOwnedImportSource,
   shouldRollbackPublishedFiles,
   countSqlPlaceholders,
   stableSourceIdentityKeys,
@@ -23,7 +28,7 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
-export function runDatabaseCoreTests(): void {
+export async function runDatabaseCoreTests(): Promise<void> {
   assert(normalizeLookupKey(" ＡＢ　C ") === "abc", "NFKC/空白除去");
   const diff = computeSyncDiff(
     {
@@ -90,10 +95,119 @@ export function runDatabaseCoreTests(): void {
   assert(isPathContainedBy("file:///cache/extract/", "file:///cache/extract/events/a"), "extract containment");
   assert(!isPathContainedBy("file:///cache/extract/", "file:///cache/extract-other/events/a"), "extract sibling escape");
 
+  assert(
+    appendDirectorySiblingSuffix("file:///cache/old/", ".tmp") ===
+      "file:///cache/old.tmp/",
+    "directory temp must be a sibling, not a child",
+  );
+  assert(
+    appendDirectorySiblingSuffix("file:///cache/live/", ".restore_1") ===
+      "file:///cache/live.restore_1/",
+    "restore temp must be outside the live directory",
+  );
+
+  assert(
+    directoryFingerprintsEqual(
+      [
+        { relative: "b\\two.jpg", size: 2, md5: "AABB" },
+        { relative: "a/one.jpg", size: 1, md5: "CCDD" },
+      ],
+      [
+        { relative: "a/one.jpg", size: 1, md5: "ccdd" },
+        { relative: "b/two.jpg", size: 2, md5: "aabb" },
+      ],
+    ),
+    "directory fingerprints are canonical and order independent",
+  );
+  assert(
+    !directoryFingerprintsEqual(
+      [{ relative: "a.jpg", size: 1, md5: "aa" }],
+      [{ relative: "a.jpg", size: 2, md5: "aa" }],
+    ),
+    "directory fingerprints reject size drift",
+  );
+
+  assert(
+    shouldDeleteOwnedImportSource(
+      "file:///data/user/0/com.eventtrail.go/cache/",
+      "file:///data/user/0/com.eventtrail.go/cache/document_picker_a.zip",
+      true,
+    ),
+    "owned picker cache copy can be deleted after unzip",
+  );
+  assert(
+    !shouldDeleteOwnedImportSource(
+      "file:///data/user/0/com.eventtrail.go/cache/",
+      "file:///data/user/0/com.eventtrail.go/files/source.zip",
+      true,
+    ),
+    "document source outside cache must be preserved",
+  );
+  assert(
+    !shouldDeleteOwnedImportSource(
+      "file:///data/user/0/com.eventtrail.go/cache/",
+      "content://provider/source.zip",
+      true,
+    ),
+    "content URI must never be treated as owned cache",
+  );
+
+  let closeCalls = 0;
+  const closeOnce = createAsyncOnce(async () => {
+    closeCalls += 1;
+  });
+  await Promise.all([closeOnce(), closeOnce(), closeOnce()]);
+  await closeOnce();
+  assert(closeCalls === 1, "async close operation must execute exactly once");
+
+  let rejectedCloseCalls = 0;
+  const rejectedCloseOnce = createAsyncOnce(async () => {
+    rejectedCloseCalls += 1;
+    throw new Error("close failed");
+  });
+  await rejectedCloseOnce().catch(() => undefined);
+  await rejectedCloseOnce().catch(() => undefined);
+  assert(rejectedCloseCalls === 1, "rejected close must not invoke native close twice");
+
   const plan = buildImportPublishPlan([10, 10, 11], [2, 2], [3]);
   assert(JSON.stringify(plan.publishEventIds) === JSON.stringify([10, 11]), "publish plan dedupe");
   assert(JSON.stringify(plan.deleteEventIds) === JSON.stringify([2, 3]), "delete plan order");
   assert(JSON.stringify(plan.rollbackEventIds) === JSON.stringify([10, 11]), "rollback plan");
+
+  const graphDeletes = buildIncrementalEventGraphDeleteStatements(42);
+  assert(
+    JSON.stringify(graphDeletes.map((step) => step.sql)) === JSON.stringify([
+      "DELETE FROM item_images WHERE circle_id IN (SELECT id FROM circles WHERE event_id = ?)",
+      "DELETE FROM items WHERE circle_id IN (SELECT id FROM circles WHERE event_id = ?)",
+      "DELETE FROM circles WHERE event_id = ?",
+      "DELETE FROM event_maps WHERE event_id = ?",
+      "DELETE FROM asset_local_map WHERE event_id = ?",
+      "DELETE FROM events WHERE id = ?",
+    ]),
+    "incremental delete must explicitly remove the complete old event graph before the parent event",
+  );
+  assert(
+    graphDeletes.every(
+      (step) => step.params.length === 1 && step.params[0] === 42,
+    ),
+    "incremental event graph deletes must target exactly the old live event",
+  );
+  assert(
+    graphDeletes[graphDeletes.length - 1].sql ===
+      "DELETE FROM events WHERE id = ?",
+    "parent event must be deleted last",
+  );
+  let invalidGraphDeleteRejected = false;
+  try {
+    buildIncrementalEventGraphDeleteStatements(0);
+  } catch {
+    invalidGraphDeleteRejected = true;
+  }
+  assert(
+    invalidGraphDeleteRejected,
+    "incremental graph delete must reject invalid event IDs",
+  );
+
   assert(advanceImportPublishPhase("staging", "publishing") === "publishing", "publish transition");
   let invalidTransition = false;
   try { advanceImportPublishPhase("finalized", "rolled_back"); } catch { invalidTransition = true; }

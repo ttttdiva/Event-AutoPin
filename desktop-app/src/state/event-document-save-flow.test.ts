@@ -7,6 +7,7 @@
 } from "./event-document";
 import { cloneJsonSnapshot, RevisionedSaveQueue } from "./revisioned-save-queue";
 import { KeyedSerialExecutor } from "./async-mutation-guard";
+import { mergeCommittedEventMetaPreservingUnknown } from "./event-meta-merge";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
@@ -106,6 +107,52 @@ async function testQueuedRevertAndFailedRetry(): Promise<void> {
     "失敗後のqueueがidleへ戻りませんでした",
   );
   assert(failedWrites.length === 1, "失敗編集以外の不要writeが発生しました");
+}
+
+async function testQueuedRevertPreservesDocumentMemoAgainstCommittedMeta(): Promise<void> {
+  let persisted: EventJsonData = {
+    event: { memo: "元の3行メモ", venue: "initial venue" },
+  };
+  let committedMeta: Record<string, unknown> | null = null;
+  const writes: EventJsonData[] = [];
+  const queue = new RevisionedSaveQueue<EventJsonData>(async ({ snapshot }) => {
+    const data = clone(snapshot);
+    if (committedMeta) {
+      mergeCommittedEventMetaPreservingUnknown(data, committedMeta);
+    }
+    writes.push(clone(data));
+    persisted = clone(data);
+    committedMeta = clone(data.event ?? {});
+  });
+
+  const first = queue.enqueue({
+    event: { memo: "TEST_MARKER", venue: "marker venue" },
+  });
+  await first.completed;
+  const reverted = queue.enqueue({
+    event: {
+      memo: "元の3行メモ",
+      venue: "snapshot venue",
+      future_field: { preserve: true },
+    },
+  });
+  await reverted.completed;
+  await queue.flush();
+
+  assert(writes.length === 2, `memo往復の保存回数が2ではありません: ${writes.length}`);
+  assert(writes[0].event.memo === "TEST_MARKER", "marker保存payloadが不正です");
+  assert(
+    writes[1].event.memo === "元の3行メモ",
+    "committedMetaのstale memoがrevert payloadを上書きしました",
+  );
+  assert(
+    writes[1].event.venue === "marker venue",
+    "memo以外のcommitted metadata mergeが維持されませんでした",
+  );
+  assert(
+    persisted.event.memo === "元の3行メモ",
+    "最終persisted文書のmemoが元へ戻りませんでした",
+  );
 }
 
 async function testFailedDeletionDoesNotRollbackNewerQueuedEdit(): Promise<void> {
@@ -543,6 +590,7 @@ async function testPublishedUploadIsNotFailedByUiRecovery(): Promise<void> {
 
 void Promise.all([
   testQueuedRevertAndFailedRetry(),
+  testQueuedRevertPreservesDocumentMemoAgainstCommittedMeta(),
   testFailedDeletionDoesNotRollbackNewerQueuedEdit(),
   testSameSlugReloadWaitsForSaveBarrier(),
   testDroppedItemImageRejectsReorderedTarget(),

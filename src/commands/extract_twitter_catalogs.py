@@ -40,7 +40,7 @@ except ImportError:
     pass  # loguruがインストールされていない場合は無視
 
 from src.utils.twitter_extractor import TwitterExtractor
-from src.utils.catalog_updater import CatalogUpdater
+from src.utils.catalog_updater import CatalogUpdater, is_unresolved_catalog_result
 from src.utils.logger import setup_logger
 
 
@@ -114,6 +114,12 @@ async def main():
         # 更新器を初期化
         logger.info("イベントデータを更新します...")
         updater = CatalogUpdater(args.event_file)
+
+        if any(is_unresolved_catalog_result(info) for info in results.values()):
+            logger.error(
+                "未解決のTwitter取得結果があるためevent.json保存を中止します"
+            )
+            return 2
         
         # Twitter URLカラムがない場合は追加
         updater.add_twitter_url_column()

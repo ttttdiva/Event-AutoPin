@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import sys
 import threading
@@ -35,6 +36,7 @@ from src.commands.desktop_bridge import (
     _load_payload,
     run_job,
 )
+from src.utils.reprocess_deadline import ReprocessDeadlineExceeded
 
 
 def test_twitter_processing_resultをstderrマーカーから復元できる():
@@ -762,7 +764,7 @@ class TestBuildMainConfig:
             }
         )
         assert config["url"] == "https://example.com"
-        assert config["models"] == ["gpt-5.6-sol"]
+        assert config["models"] == ["gpt-5.6-luna"]
         assert config["enable_twitter_catalog"] is True
         assert Path(config["output_dir"]).is_absolute()
 
@@ -772,10 +774,10 @@ class TestBuildMainConfig:
                 "url": "https://example.com",
                 "output_dir": str(tmp_path / "out"),
                 "project_root": str(tmp_path),
-                "model": "gpt-5-mini, gpt-4o , gemini-pro",
+                "model": "gpt-5-mini, gpt-5.6-terra , gemini-pro",
             }
         )
-        assert config["models"] == ["gpt-5-mini", "gpt-4o", "gemini-pro"]
+        assert config["models"] == ["gpt-5-mini", "gpt-5.6-terra", "gemini-pro"]
 
     def test_相対パスはproject_rootで解決される(self, tmp_path: Path):
         config = _build_main_config(
@@ -1697,6 +1699,224 @@ class TestReprocessCircleFromPost:
         assert result["updated_circle"]["items"] == [
             {"name": "New Book", "image": "new_a.jpg"}
         ]
+
+    def test_success_returns_run_id_without_leaking_deadline_or_run_id_into_patch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        event_json = tmp_path / "event.json"
+        event_json.write_text(
+            json.dumps(
+                {
+                    "event": {"name": "Event"},
+                    "circles": [{
+                        "name": "Circle A",
+                        "space": "A-01",
+                        "memo": "old",
+                        "items": [],
+                        "item_images": [],
+                    }],
+                    "metadata": {},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        before_hash = hashlib.sha256(event_json.read_bytes()).hexdigest()
+
+        import src.processors.twitter_post_processor as tpp
+
+        class FakeProcessor:
+            def __init__(self, _config):
+                pass
+
+            async def process_circle_from_post_url(
+                self, circle, _post_url, _event_name, **kwargs
+            ):
+                assert kwargs["run_id"] == "run-success"
+                assert kwargs["deadline"] is not None
+                circle.items = [{"name": "New Book", "price": 500}]
+                circle.catalog_status = "confirmed"
+                return True
+
+        monkeypatch.setattr(tpp, "TwitterPostProcessor", FakeProcessor)
+        result = _job_reprocess_circle_from_post(
+            {
+                "event_json": str(event_json),
+                "circle_index": 0,
+                "circle_identity": {"name": "Circle A", "space": "A-01"},
+                "post_url": "https://x.com/user/status/1234567890",
+                "output_dir": str(tmp_path),
+                "project_root": str(tmp_path),
+                "run_id": "run-success",
+                "reprocess_deadline_ms": 5000,
+            }
+        )
+
+        assert result["status"] == "ok"
+        assert result["run_id"] == "run-success"
+        assert "run_id" not in json.dumps(result["circle_patch"])
+        assert "reprocess_deadline" not in json.dumps(result["circle_patch"])
+        assert "run_id" not in json.dumps(result["updated_circle"])
+        assert "reprocess_deadline" not in json.dumps(result["updated_circle"])
+        assert hashlib.sha256(event_json.read_bytes()).hexdigest() == before_hash
+
+    def test_deadline_failure_returns_typed_error_without_patch_or_live_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        event_json = tmp_path / "event.json"
+        event_json.write_text(
+            json.dumps(
+                {
+                    "event": {"name": "Event"},
+                    "circles": [{
+                        "name": "Circle A",
+                        "space": "A-01",
+                        "memo": "old",
+                        "items": [{"name": "Existing"}],
+                        "item_images": [],
+                    }],
+                    "metadata": {},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        before_hash = hashlib.sha256(event_json.read_bytes()).hexdigest()
+
+        import src.processors.twitter_post_processor as tpp
+
+        class FakeProcessor:
+            def __init__(self, _config):
+                pass
+
+            async def process_circle_from_post_url(
+                self, circle, _post_url, _event_name, **_kwargs
+            ):
+                circle.items.append({"name": "Partial"})
+                raise ReprocessDeadlineExceeded(stage="catalog.ocr_a")
+
+        monkeypatch.setattr(tpp, "TwitterPostProcessor", FakeProcessor)
+        trace = []
+        result = _job_reprocess_circle_from_post(
+            {
+                "event_json": str(event_json),
+                "circle_index": 0,
+                "circle_identity": {"name": "Circle A", "space": "A-01"},
+                "post_url": "https://x.com/user/status/1234567890",
+                "output_dir": str(tmp_path),
+                "project_root": str(tmp_path),
+                "run_id": "run-timeout",
+                "reprocess_deadline_ms": 5000,
+                "trace": trace,
+            }
+        )
+
+        assert result["status"] == "error"
+        assert result["error_code"] == "deadline_exceeded"
+        assert result["stage"] == "catalog.ocr_a"
+        assert result["run_id"] == "run-timeout"
+        assert "circle_patch" not in result
+        assert "updated_circle" not in result
+        assert hashlib.sha256(event_json.read_bytes()).hexdigest() == before_hash
+        assert any(
+            event["stage"] == "processor.direct_post"
+            and event["outcome"] == "timeout"
+            for event in trace
+        )
+
+    def test_processor_no_update_is_error_without_memo_patch_or_live_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        event_json = tmp_path / "event.json"
+        event_json.write_text(
+            json.dumps(
+                {
+                    "event": {"name": "Event"},
+                    "circles": [{
+                        "name": "Circle A",
+                        "space": "A-01",
+                        "memo": "old",
+                        "items": [{"name": "Existing"}],
+                        "item_images": [],
+                    }],
+                    "metadata": {},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        before = event_json.read_bytes()
+
+        import src.processors.twitter_post_processor as tpp
+
+        class FakeProcessor:
+            def __init__(self, _config):
+                pass
+
+            async def process_circle_from_post_url(self, *_args, **_kwargs):
+                return False
+
+        monkeypatch.setattr(tpp, "TwitterPostProcessor", FakeProcessor)
+        result = _job_reprocess_circle_from_post(
+            {
+                "event_json": str(event_json),
+                "circle_index": 0,
+                "circle_identity": {"name": "Circle A", "space": "A-01"},
+                "post_url": "https://x.com/user/status/1234567890",
+                "output_dir": str(tmp_path),
+                "project_root": str(tmp_path),
+                "run_id": "run-no-update",
+            }
+        )
+
+        assert result["status"] == "error"
+        assert result["error_code"] == "processor_no_update"
+        assert result["run_id"] == "run-no-update"
+        assert "circle_patch" not in result
+        assert "updated_circle" not in result
+        assert event_json.read_bytes() == before
+
+    def test_processor_exception_keeps_live_event_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        event_json = tmp_path / "event.json"
+        event_json.write_text(
+            json.dumps(
+                {
+                    "event": {"name": "Event"},
+                    "circles": [{"name": "Circle A", "space": "A-01", "memo": "old"}],
+                    "metadata": {},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        before = event_json.read_bytes()
+
+        import src.processors.twitter_post_processor as tpp
+
+        class FakeProcessor:
+            def __init__(self, _config):
+                pass
+
+            async def process_circle_from_post_url(self, *_args, **_kwargs):
+                raise RuntimeError("processor exploded")
+
+        monkeypatch.setattr(tpp, "TwitterPostProcessor", FakeProcessor)
+        with pytest.raises(RuntimeError, match="processor exploded"):
+            _job_reprocess_circle_from_post(
+                {
+                    "event_json": str(event_json),
+                    "circle_index": 0,
+                    "circle_identity": {"name": "Circle A", "space": "A-01"},
+                    "post_url": "https://x.com/user/status/1234567890",
+                    "output_dir": str(tmp_path),
+                    "project_root": str(tmp_path),
+                    "run_id": "run-error",
+                }
+            )
+
+        assert event_json.read_bytes() == before
 
 
 class TestReprocessCircleFromImage:

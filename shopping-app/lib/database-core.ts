@@ -169,6 +169,54 @@ export function isPathContainedBy(basePath: string, candidatePath: string): bool
   return candidate === base || candidate.startsWith(`${base === "/" ? "" : base}/`);
 }
 
+/**
+ * Directory URI/path の末尾 slash の外側へ sibling suffix を付ける。
+ *
+ * `file:///cache/old/` + `.tmp` を `file:///cache/old/.tmp` にすると
+ * temporary directory が old directory 自身の子になり、親削除時に
+ * rollback source まで失われる。
+ */
+export function appendDirectorySiblingSuffix(
+  path: string,
+  suffix: string,
+): string {
+  return `${String(path).replace(/\/+$/, "")}${suffix}/`;
+}
+
+/**
+ * 非idempotentなasync native resource closeを一度だけ実行する。
+ *
+ * 成功・失敗を問わず同じPromiseを再利用するため、最初のcloseがrejectしても
+ * 二度目のnative closeを呼ばない。
+ */
+export function createAsyncOnce(
+  operation: () => Promise<void>,
+): () => Promise<void> {
+  let operationPromise: Promise<void> | null = null;
+  return () => {
+    if (!operationPromise) {
+      operationPromise = operation();
+    }
+    return operationPromise;
+  };
+}
+
+/**
+ * import sourceをnative unzip成功後に削除してよいか判定する。
+ *
+ * 呼び出し側がownershipを宣言していても、実際にapp cache directory配下の
+ * strict childでなければ削除しない。
+ */
+export function shouldDeleteOwnedImportSource(
+  cacheDirectory: string | null | undefined,
+  sourcePath: string,
+  requested: boolean,
+): boolean {
+  if (!requested || !cacheDirectory || !sourcePath) return false;
+  if (!isPathContainedBy(cacheDirectory, sourcePath)) return false;
+  return !isPathContainedBy(sourcePath, cacheDirectory);
+}
+
 export type ImportPublishPhase = "staging" | "publishing" | "finalized" | "rolled_back";
 
 /** Incremental import の DB/image publish state machine。rollback 判定を純粋化する。 */
@@ -203,6 +251,55 @@ export interface ImportPublishPlan {
   publishEventIds: number[];
   deleteEventIds: number[];
   rollbackEventIds: number[];
+}
+
+export interface IncrementalEventGraphDeleteStatement {
+  sql: string;
+  params: [number];
+}
+
+/**
+ * Incremental publish 前に旧 live event graph を明示削除する。
+ *
+ * withExclusiveTransactionAsync は通常の live connection と別 connection を
+ * 使用し得るため、ON DELETE CASCADE / PRAGMA foreign_keys のconnection-local
+ * stateへ依存しない。
+ *
+ * items_fts は runtime availability に依存するため呼び出し側で先に削除する。
+ * FK childをすべて消してから最後にparent eventを削除する。
+ */
+export function buildIncrementalEventGraphDeleteStatements(
+  eventId: number,
+): IncrementalEventGraphDeleteStatement[] {
+  if (!Number.isSafeInteger(eventId) || eventId <= 0) {
+    throw new Error(`invalid incremental delete event id: ${eventId}`);
+  }
+  return [
+    {
+      sql: "DELETE FROM item_images WHERE circle_id IN (SELECT id FROM circles WHERE event_id = ?)",
+      params: [eventId],
+    },
+    {
+      sql: "DELETE FROM items WHERE circle_id IN (SELECT id FROM circles WHERE event_id = ?)",
+      params: [eventId],
+    },
+    {
+      sql: "DELETE FROM circles WHERE event_id = ?",
+      params: [eventId],
+    },
+    {
+      sql: "DELETE FROM event_maps WHERE event_id = ?",
+      params: [eventId],
+    },
+    {
+      sql: "DELETE FROM asset_local_map WHERE event_id = ?",
+      params: [eventId],
+    },
+    {
+      sql: "DELETE FROM events WHERE id = ?",
+      params: [eventId],
+    },
+  ];
 }
 
 /** 重複を除去した publish/delete/rollback 対象を作る。順序は入力順を保持する。 */
@@ -260,6 +357,34 @@ export interface SharedBundleFileFingerprint {
   relative: string;
   size: number;
   md5: string;
+}
+
+/**
+ * Directory tree fingerprintの完全一致判定。
+ *
+ * FileSystem列挙順、path separator、MD5大文字小文字には依存しない。
+ */
+export function directoryFingerprintsEqual(
+  left: readonly SharedBundleFileFingerprint[],
+  right: readonly SharedBundleFileFingerprint[],
+): boolean {
+  if (left.length !== right.length) return false;
+  const canonicalize = (files: readonly SharedBundleFileFingerprint[]) =>
+    files
+      .map((file) => ({
+        relative: String(file.relative).replace(/\\/g, "/"),
+        size: Number(file.size),
+        md5: String(file.md5).toLowerCase(),
+      }))
+      .sort((a, b) => a.relative.localeCompare(b.relative));
+  const a = canonicalize(left);
+  const b = canonicalize(right);
+  return a.every(
+    (file, index) =>
+      file.relative === b[index]?.relative &&
+      file.size === b[index]?.size &&
+      file.md5 === b[index]?.md5,
+  );
 }
 
 function canonicalJsonValue(value: unknown): unknown {

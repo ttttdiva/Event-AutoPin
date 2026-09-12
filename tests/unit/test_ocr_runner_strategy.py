@@ -424,9 +424,54 @@ def test_context_exception_diagnostic_omits_untrusted_message_and_continues(tmp_
     error = diagnostics[0]
     assert error["error_code"] == "context_inference_failed"
     assert error["type"] == "RuntimeError"
+    assert diagnostics[0]["appended_element_count"] == 0
+    assert diagnostics[1]["element_count"] == 1
+    assert diagnostics[1]["appended_element_count"] == 1
     serialized = str(error)
     assert len(serialized) < 500
     assert token not in serialized
     assert windows_path not in serialized
     assert posix_path not in serialized
     assert merged == [{"text": "12", "x1": 101.0, "y1": 202.0, "x2": 105.0, "y2": 208.0}]
+
+
+def test_context_diagnostic_distinguishes_raw_from_appended_elements(tmp_path, monkeypatch):
+    path = tmp_path / "context.png"
+    Image.new("RGB", (100, 120), "white").save(path)
+
+    def infer(*args, **kwargs):
+        return {
+            "elements": [
+                {"text": "12", "x1": 10, "y1": 20, "x2": 30, "y2": 40},
+                {"text": "image", "x1": 40, "y1": 20, "x2": 60, "y2": 40},
+                {"text": "", "x1": 70, "y1": 20, "x2": 90, "y2": 40},
+            ]
+        }
+
+    monkeypatch.setattr(runner, "infer_image", infer)
+
+    args = argparse.Namespace(max_length=4096)
+    diagnostics = []
+    merged = runner._merge_context_results(
+        [path],
+        [(100, 200)],
+        None,
+        None,
+        args,
+        runner.DEFAULT_PROMPT,
+        diagnostics,
+        "A",
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["element_count"] == 3
+    assert diagnostics[0]["appended_element_count"] == 1
+    assert merged == [
+        {
+            "text": "12",
+            "x1": 110.0,
+            "y1": 220.0,
+            "x2": 130.0,
+            "y2": 240.0,
+        }
+    ]

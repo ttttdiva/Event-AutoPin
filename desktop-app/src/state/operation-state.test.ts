@@ -92,4 +92,11 @@ state = transitionOperationState(state, { type: "start-reprocess" });
 state = transitionOperationState(state, { type: "abort-reprocess" });
 assertState(state, "idle", 0);
 
+// timeout/error/cancel後も直ちに次の再処理を開始できる。
+state = transitionOperationState(state, { type: "enqueue-reprocess" });
+state = transitionOperationState(state, { type: "start-reprocess" });
+state = transitionOperationState(state, { type: "dequeue-reprocess" });
+state = transitionOperationState(state, { type: "finish-reprocess" });
+assertState(state, "idle", 0);
+
 console.log("operation-state tests passed");

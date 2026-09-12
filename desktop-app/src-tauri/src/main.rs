@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Write;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -443,7 +443,13 @@ fn fetch_antigravity_cli_models(dotenv: &HashMap<String, String>) -> (Vec<Value>
 }
 
 #[tauri::command]
-fn list_model_catalog(project_root: String) -> Result<Value, String> {
+async fn list_model_catalog(project_root: String) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || list_model_catalog_sync(project_root))
+        .await
+        .map_err(|e| format!("モデル一覧取得タスクが失敗しました: {e}"))?
+}
+
+fn list_model_catalog_sync(project_root: String) -> Result<Value, String> {
     let dotenv = read_dotenv(&project_root);
     let config_text =
         fs::read_to_string(PathBuf::from(&project_root).join("config.yaml")).unwrap_or_default();
@@ -535,7 +541,8 @@ fn read_dotenv(project_root: &str) -> HashMap<String, String> {
     let Ok(text) = fs::read_to_string(path) else {
         return values;
     };
-    for line in text.lines() {
+    for segment in split_env_lines(&text) {
+        let (line, _) = split_env_line_ending(segment);
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -954,10 +961,50 @@ fn resolve_python_exe(python_exe: &str, project_root: &str) -> String {
     python_exe.to_string()
 }
 
+const TWSCRAPE_REQUIRED_VERSION: &str = "0.20.1";
+const TWSCRAPE_REQUIREMENT: &str = "twscrape==0.20.1";
+const LEGACY_TWSCRAPE_PATCH_SIGNATURE: &str =
+    "async def _patched_parse_anim_idx(text: str) -> list:";
+
+fn twscrape_version_check_script() -> &'static str {
+    r#"
+import importlib.metadata as metadata
+import sys
+
+try:
+    installed = metadata.version("twscrape")
+except metadata.PackageNotFoundError:
+    print("twscrape is not installed", file=sys.stderr)
+    raise SystemExit(1)
+except Exception as error:
+    print(f"twscrape version lookup failed: {type(error).__name__}", file=sys.stderr)
+    raise SystemExit(1)
+
+if installed == "0.20.1":
+    raise SystemExit(0)
+
+print(
+    f"twscrape version must be exactly 0.20.1; found {installed!r}",
+    file=sys.stderr,
+)
+raise SystemExit(1)
+"#
+}
+
 fn upgrade_legacy_twscrape_patch_source(source: &str) -> Option<String> {
+    // The other replacements are only safe for the old local patch.  In
+    // particular, do not rewrite a current twscrape source just because it
+    // happens to contain one of the old call forms.
+    if !source
+        .lines()
+        .any(|line| line.trim() == LEGACY_TWSCRAPE_PATCH_SIGNATURE)
+    {
+        return None;
+    }
+
     let upgraded = source
         .replace(
-            "async def _patched_parse_anim_idx(text: str) -> list:",
+            LEGACY_TWSCRAPE_PATCH_SIGNATURE,
             "async def _patched_parse_anim_idx(text: str, clt=None) -> list:",
         )
         .replace(
@@ -991,7 +1038,7 @@ fn migrate_legacy_twscrape_patches(project_root: &str) -> Result<(), String> {
 }
 
 fn ensure_twscrape_runtime(python_exe: &str, project_root: &str) -> Result<(), String> {
-    let version_check = "import importlib.metadata as m; p=tuple(int(x) for x in m.version('twscrape').split('.')[:3]); raise SystemExit(0 if (0,19,1)<=p<(0,20,0) else 1)";
+    let version_check = twscrape_version_check_script();
     let is_compatible = Command::new(python_exe)
         .args(["-c", version_check])
         .current_dir(project_root)
@@ -1008,7 +1055,7 @@ fn ensure_twscrape_runtime(python_exe: &str, project_root: &str) -> Result<(), S
                 "pip",
                 "install",
                 "--disable-pip-version-check",
-                "twscrape>=0.19.1,<0.20",
+                TWSCRAPE_REQUIREMENT,
             ])
             .current_dir(project_root)
             .output()
@@ -1016,14 +1063,13 @@ fn ensure_twscrape_runtime(python_exe: &str, project_root: &str) -> Result<(), S
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
-                "twscrape対応版の自動更新に失敗しました。ネットワーク接続を確認して再実行してください。\n{}",
+                "twscrape=={TWSCRAPE_REQUIRED_VERSION}の自動更新に失敗しました。ネットワーク接続を確認して再実行してください。\n{}",
                 truncate_log_value(&stderr, 4000)
             ));
         }
     }
 
-    // v0.1.5以前のPythonソースが残るEXE自動更新環境でも、0.19系の
-    // parse_anim_idx(text, client)シグネチャで動作するよう既知の旧パッチだけを移行する。
+    // v0.1.5以前のPythonソースが残るEXE自動更新環境でも、旧パッチだけを移行する。
     migrate_legacy_twscrape_patches(project_root)
 }
 
@@ -1039,18 +1085,307 @@ fn requires_twscrape_runtime(job: &str, payload: &Value) -> bool {
 fn terminate_process_tree(child: &mut std::process::Child) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
-    let _ = Command::new("taskkill")
+    let mut killer = match Command::new("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn()
+    {
+        Ok(killer) => killer,
+        Err(_) => {
+            let _ = child.kill();
+            return;
+        }
+    };
+    let deadline = Instant::now() + Duration::from_millis(BRIDGE_CLEANUP_WAIT_MS);
+    loop {
+        match killer.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                let _ = killer.kill();
+                let _ = killer.wait();
+                break;
+            }
+        }
+    }
     let _ = child.kill();
 }
 
 #[cfg(not(target_os = "windows"))]
 fn terminate_process_tree(child: &mut std::process::Child) {
     let _ = child.kill();
+}
+
+type PythonBridgeCancellationRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+
+const POST_REPROCESS_WORK_BUDGET_MS: u64 = 600_000;
+const POST_REPROCESS_BRIDGE_GRACE_MS: u64 = 20_000;
+const POST_REPROCESS_BRIDGE_TIMEOUT_MS: u64 =
+    POST_REPROCESS_WORK_BUDGET_MS + POST_REPROCESS_BRIDGE_GRACE_MS;
+const BRIDGE_CLEANUP_WAIT_MS: u64 = 5_000;
+
+#[derive(Default)]
+struct PythonBridgeCancellationState {
+    active_runs: PythonBridgeCancellationRegistry,
+}
+
+struct PythonBridgeRunRegistration {
+    active_runs: PythonBridgeCancellationRegistry,
+    run_id: String,
+    cancellation: Arc<AtomicBool>,
+}
+
+impl PythonBridgeRunRegistration {
+    fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancellation)
+    }
+}
+
+impl Drop for PythonBridgeRunRegistration {
+    fn drop(&mut self) {
+        let mut active_runs = match self.active_runs.lock() {
+            Ok(active_runs) => active_runs,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if active_runs
+            .get(&self.run_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.cancellation))
+        {
+            active_runs.remove(&self.run_id);
+        }
+    }
+}
+
+impl PythonBridgeCancellationState {
+    fn register(&self, run_id: &str) -> Result<PythonBridgeRunRegistration, String> {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut active_runs = match self.active_runs.lock() {
+            Ok(active_runs) => active_runs,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if active_runs.contains_key(run_id) {
+            return Err("Python bridge run is already active".to_string());
+        }
+        active_runs.insert(run_id.to_string(), Arc::clone(&cancellation));
+        Ok(PythonBridgeRunRegistration {
+            active_runs: Arc::clone(&self.active_runs),
+            run_id: run_id.to_string(),
+            cancellation,
+        })
+    }
+
+    fn cancel(&self, run_id: &str) -> Value {
+        let cancellation = match self.active_runs.lock() {
+            Ok(active_runs) => active_runs.get(run_id).cloned(),
+            Err(poisoned) => poisoned.into_inner().get(run_id).cloned(),
+        };
+        let acknowledged = cancellation.is_some();
+        if let Some(cancellation) = cancellation {
+            cancellation.store(true, Ordering::SeqCst);
+        }
+
+        let mut response = if acknowledged {
+            json!({
+                "ok": true,
+                "acknowledged": true,
+                "status": "cancellation_requested",
+            })
+        } else {
+            json!({
+                "ok": false,
+                "acknowledged": false,
+                "status": "unknown_run",
+            })
+        };
+        if let Some(run_id) = safe_bridge_run_id(run_id) {
+            response["run_id"] = Value::String(run_id.to_string());
+        }
+        response
+    }
+}
+
+fn safe_bridge_run_id(run_id: &str) -> Option<&str> {
+    if run_id.is_empty() || run_id.len() > 128 {
+        return None;
+    }
+    if run_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        Some(run_id)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PythonBridgeTermination {
+    TimedOut,
+    Cancelled,
+}
+
+fn python_bridge_termination(
+    cancellation_requested: bool,
+    timeout_reached: bool,
+) -> Option<PythonBridgeTermination> {
+    if cancellation_requested {
+        Some(PythonBridgeTermination::Cancelled)
+    } else if timeout_reached {
+        Some(PythonBridgeTermination::TimedOut)
+    } else {
+        None
+    }
+}
+
+fn python_bridge_termination_response(
+    termination: PythonBridgeTermination,
+    timeout_ms: u64,
+    stderr: String,
+    run_id: Option<&str>,
+) -> Value {
+    match termination {
+        PythonBridgeTermination::TimedOut => {
+            let mut response = json!({
+                "ok": false,
+                "timedOut": true,
+                "cancelled": false,
+                "exit_code": null,
+                "stderr": stderr,
+                "bridge": {
+                    "status": "error",
+                    "code": "timeout",
+                    "error": format!("Timed out after {} ms", timeout_ms)
+                }
+            });
+            if let Some(run_id) = run_id.and_then(safe_bridge_run_id) {
+                response["run_id"] = Value::String(run_id.to_string());
+            }
+            response
+        }
+        PythonBridgeTermination::Cancelled => {
+            let mut response = json!({
+                "ok": false,
+                "cancelled": true,
+                "timedOut": false,
+                "exit_code": null,
+                "stderr": stderr,
+                "bridge": {"status": "error", "code": "cancelled"}
+            });
+            if let Some(run_id) = run_id.and_then(safe_bridge_run_id) {
+                response["run_id"] = Value::String(run_id.to_string());
+            }
+            response
+        }
+    }
+}
+
+struct PythonBridgeCleanupGuard {
+    child: Option<Child>,
+    payload_file: Option<PathBuf>,
+    stderr_thread: Option<thread::JoinHandle<String>>,
+    stdout_thread: Option<thread::JoinHandle<String>>,
+    #[cfg(target_os = "windows")]
+    process_job: Option<windows_process_job::ProcessJob>,
+}
+
+impl PythonBridgeCleanupGuard {
+    fn new(payload_file: Option<PathBuf>) -> Self {
+        Self {
+            child: None,
+            payload_file,
+            stderr_thread: None,
+            stdout_thread: None,
+            #[cfg(target_os = "windows")]
+            process_job: None,
+        }
+    }
+
+    fn finish(mut self) -> Result<(String, String), String> {
+        if let Some(child) = self.child.as_mut() {
+            reap_bridge_child(child);
+        }
+        self.child.take();
+        #[cfg(target_os = "windows")]
+        {
+            self.process_job.take();
+        }
+
+        let stderr = self
+            .stderr_thread
+            .take()
+            .map(join_bridge_reader)
+            .unwrap_or_default();
+        let stdout = self
+            .stdout_thread
+            .take()
+            .map(join_bridge_reader)
+            .unwrap_or_default();
+        Ok((stderr, stdout))
+    }
+}
+
+impl Drop for PythonBridgeCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            terminate_process_tree(child);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.process_job.take();
+        }
+        if let Some(child) = self.child.as_mut() {
+            reap_bridge_child(child);
+        }
+        if let Some(reader) = self.stderr_thread.take() {
+            let _ = join_bridge_reader(reader);
+        }
+        if let Some(reader) = self.stdout_thread.take() {
+            let _ = join_bridge_reader(reader);
+        }
+        if let Some(payload_file) = self.payload_file.take() {
+            let _ = fs::remove_file(payload_file);
+        }
+    }
+}
+
+fn reap_bridge_child(child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_millis(BRIDGE_CLEANUP_WAIT_MS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            _ => break,
+        }
+    }
+    terminate_process_tree(child);
+    let reap_deadline = Instant::now() + Duration::from_millis(BRIDGE_CLEANUP_WAIT_MS);
+    while Instant::now() < reap_deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+        }
+    }
+}
+
+fn join_bridge_reader(reader: thread::JoinHandle<String>) -> String {
+    let deadline = Instant::now() + Duration::from_millis(BRIDGE_CLEANUP_WAIT_MS);
+    while !reader.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    if reader.is_finished() {
+        reader.join().unwrap_or_default()
+    } else {
+        // Dropping JoinHandle detaches the reader.  The child/process-job
+        // cleanup above has already closed the only process tree we own, so
+        // cleanup itself cannot wait forever on a descendant-held pipe.
+        String::new()
+    }
 }
 
 fn run_python_bridge_sync(
@@ -1060,6 +1395,8 @@ fn run_python_bridge_sync(
     job: String,
     payload: Value,
     timeout_ms: u64,
+    cancellation: Option<Arc<AtomicBool>>,
+    run_id: Option<String>,
 ) -> Result<Value, String> {
     let resolved_python = resolve_python_exe(&python_exe, &project_root);
     if requires_twscrape_runtime(&job, &payload) {
@@ -1109,103 +1446,136 @@ fn run_python_bridge_sync(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = cmd
+    let mut cleanup = PythonBridgeCleanupGuard::new(payload_file);
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to execute Python bridge: {e}"))?;
+    cleanup.child = Some(child);
     PYTHON_BRIDGE_SPAWN_COUNT.fetch_add(1, Ordering::Relaxed);
     #[cfg(target_os = "windows")]
-    let _process_job = match windows_process_job::ProcessJob::for_child(&child) {
-        Ok(job) => Some(job),
-        Err(e) => {
-            append_internal_log(
-                &project_root,
-                &format!("run_python_bridge process job setup failed: {e}"),
-            );
-            None
-        }
-    };
+    {
+        cleanup.process_job = match windows_process_job::ProcessJob::for_child(
+            cleanup
+                .child
+                .as_ref()
+                .expect("bridge child was just assigned"),
+        ) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                append_internal_log(
+                    &project_root,
+                    &format!("run_python_bridge process job setup failed: {e}"),
+                );
+                None
+            }
+        };
+    }
+    let run_id_log = run_id
+        .as_deref()
+        .and_then(safe_bridge_run_id)
+        .map(|run_id| format!(", run_id={run_id}"))
+        .unwrap_or_default();
     append_internal_log(
         &project_root,
         &format!(
-            "run_python_bridge start: job={job}, python={}, timeout_ms={timeout_ms}",
-            resolved_python
+            "run_python_bridge start: job={job}, python={}, timeout_ms={timeout_ms}{run_id_log}",
+            resolved_python,
         ),
     );
 
     // stderrを別スレッドで1行ずつ読み、Tauriイベントとして送信
-    let stderr_pipe = child
-        .stderr
-        .take()
+    let stderr_pipe = cleanup
+        .child
+        .as_mut()
+        .and_then(|child| child.stderr.take())
         .ok_or_else(|| "Failed to capture stderr".to_string())?;
     let stderr_thread = {
         let win = window.clone();
-        thread::spawn(move || {
-            let reader = BufReader::new(stderr_pipe);
-            let mut lines = Vec::new();
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    let _ = win.emit("pipeline-log", &line);
-                    lines.push(line);
+        thread::Builder::new()
+            .spawn(move || {
+                let reader = BufReader::new(stderr_pipe);
+                let mut lines = Vec::new();
+                for line in reader.lines() {
+                    if let Ok(line) = line {
+                        let _ = win.emit("pipeline-log", &line);
+                        lines.push(line);
+                    }
                 }
-            }
-            lines.join("\n")
-        })
+                lines.join("\n")
+            })
+            .map_err(|e| format!("Failed to start stderr reader: {e}"))?
     };
+    cleanup.stderr_thread = Some(stderr_thread);
 
     // stdoutを別スレッドで読み取り（デッドロック防止）
-    let stdout_pipe = child
-        .stdout
-        .take()
+    let stdout_pipe = cleanup
+        .child
+        .as_mut()
+        .and_then(|child| child.stdout.take())
         .ok_or_else(|| "Failed to capture stdout".to_string())?;
-    let stdout_thread = thread::spawn(move || {
-        let mut buf = String::new();
-        let mut reader = BufReader::new(stdout_pipe);
-        let _ = reader.read_to_string(&mut buf);
-        buf
-    });
+    let stdout_thread = thread::Builder::new()
+        .spawn(move || {
+            let mut buf = String::new();
+            let mut reader = BufReader::new(stdout_pipe);
+            let _ = reader.read_to_string(&mut buf);
+            buf
+        })
+        .map_err(|e| format!("Failed to start stdout reader: {e}"))?;
+    cleanup.stdout_thread = Some(stdout_thread);
 
     // タイムアウト付きでプロセス完了を待つ
     let start = Instant::now();
-    let mut timed_out = false;
+    let termination = loop {
+        let cancellation_requested = cancellation
+            .as_ref()
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        let timeout_reached = start.elapsed() > Duration::from_millis(timeout_ms);
 
-    loop {
-        if start.elapsed() > Duration::from_millis(timeout_ms) {
-            timed_out = true;
-            terminate_process_tree(&mut child);
-            break;
+        if let Some(termination) =
+            python_bridge_termination(cancellation_requested, timeout_reached)
+        {
+            terminate_process_tree(
+                cleanup
+                    .child
+                    .as_mut()
+                    .expect("bridge child was just assigned"),
+            );
+            break Some(termination);
         }
 
-        match child.try_wait() {
-            Ok(Some(_)) => break,
+        match cleanup
+            .child
+            .as_mut()
+            .expect("bridge child was just assigned")
+            .try_wait()
+        {
+            Ok(Some(_)) => break None,
             Ok(None) => thread::sleep(Duration::from_millis(100)),
             Err(e) => return Err(format!("Failed while waiting for Python bridge: {e}")),
         }
-    }
+    };
 
-    let _ = child.wait();
-    // 一時ペイロードファイルを削除
-    if let Some(ref pf) = payload_file {
-        let _ = fs::remove_file(pf);
-    }
-    let stderr = stderr_thread.join().unwrap_or_default();
-    let stdout = stdout_thread.join().unwrap_or_default().trim().to_string();
+    let (stderr, stdout) = cleanup.finish()?;
+    let stdout = stdout.trim().to_string();
+    let timed_out = termination == Some(PythonBridgeTermination::TimedOut);
+    let cancelled = termination == Some(PythonBridgeTermination::Cancelled);
     append_internal_log(
         &project_root,
         &format!(
-            "run_python_bridge finished: job={job}, timed_out={timed_out}, stderr=\n{}\nstdout=\n{}",
+            "run_python_bridge finished: job={job}, timed_out={timed_out}, cancelled={cancelled}{run_id_log}, stderr=\n{}\nstdout=\n{}",
             truncate_log_value(&stderr, 12000),
             truncate_log_value(&stdout, 12000)
         ),
     );
 
-    if timed_out {
-        return Ok(json!({
-            "ok": false,
-            "timedOut": true,
-            "exit_code": null,
-            "stderr": stderr,
-            "bridge": {"status": "error", "error": format!("Timed out after {} ms", timeout_ms)}
-        }));
+    if let Some(termination) = termination {
+        return Ok(python_bridge_termination_response(
+            termination,
+            timeout_ms,
+            stderr,
+            run_id.as_deref(),
+        ));
     }
 
     if stdout.is_empty() {
@@ -1220,10 +1590,89 @@ fn run_python_bridge_sync(
     Ok(json!({
         "ok": parsed.get("status").and_then(|s| s.as_str()) == Some("ok"),
         "timedOut": false,
+        "cancelled": false,
         "exit_code": parsed.get("returncode"),
         "bridge": parsed,
         "stderr": stderr,
     }))
+}
+
+#[cfg(test)]
+mod python_bridge_cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn registry_acknowledges_cancel_and_removes_run_on_drop() {
+        let state = PythonBridgeCancellationState::default();
+        let registration = state.register("run-1").unwrap();
+        let cancellation = registration.cancellation_flag();
+
+        assert!(!cancellation.load(Ordering::SeqCst));
+        let acknowledgement = state.cancel("run-1");
+        assert_eq!(acknowledgement["ok"], true);
+        assert_eq!(acknowledgement["acknowledged"], true);
+        assert_eq!(acknowledgement["status"], "cancellation_requested");
+        assert!(cancellation.load(Ordering::SeqCst));
+
+        drop(registration);
+        let unknown = state.cancel("run-1");
+        assert_eq!(unknown["ok"], false);
+        assert_eq!(unknown["acknowledged"], false);
+        assert_eq!(unknown["status"], "unknown_run");
+    }
+
+    #[test]
+    fn unknown_run_cancel_is_safe() {
+        let state = PythonBridgeCancellationState::default();
+
+        let response = state.cancel("missing-run");
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["acknowledged"], false);
+        assert_eq!(response["status"], "unknown_run");
+    }
+
+    #[test]
+    fn timeout_and_cancel_use_one_exclusive_termination_decision() {
+        assert_eq!(
+            python_bridge_termination(false, true),
+            Some(PythonBridgeTermination::TimedOut)
+        );
+        assert_eq!(
+            python_bridge_termination(true, false),
+            Some(PythonBridgeTermination::Cancelled)
+        );
+        assert_eq!(
+            python_bridge_termination(true, true),
+            Some(PythonBridgeTermination::Cancelled)
+        );
+        assert_eq!(python_bridge_termination(false, false), None);
+
+        let timeout = python_bridge_termination_response(
+            PythonBridgeTermination::TimedOut,
+            100,
+            String::new(),
+            Some("run-1"),
+        );
+        assert_eq!(timeout["ok"], false);
+        assert_eq!(timeout["timedOut"], true);
+        assert!(!timeout["cancelled"].as_bool().unwrap_or(false));
+        assert_eq!(timeout["bridge"]["code"], "timeout");
+        assert_eq!(timeout["run_id"], "run-1");
+
+        let cancelled = python_bridge_termination_response(
+            PythonBridgeTermination::Cancelled,
+            100,
+            String::new(),
+            Some("run-1"),
+        );
+        assert_eq!(cancelled["ok"], false);
+        assert_eq!(cancelled["cancelled"], true);
+        assert_eq!(cancelled["timedOut"], false);
+        assert_eq!(cancelled["bridge"]["status"], "error");
+        assert_eq!(cancelled["bridge"]["code"], "cancelled");
+        assert_eq!(cancelled["run_id"], "run-1");
+    }
 }
 
 const COOKIE_MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -2116,12 +2565,65 @@ async fn run_python_bridge(
     job: String,
     payload: Value,
     timeout_ms: u64,
+    state: tauri::State<'_, PythonBridgeCancellationState>,
 ) -> Result<Value, String> {
+    let run_id = payload
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|run_id| !run_id.is_empty())
+        .and_then(safe_bridge_run_id)
+        .map(str::to_string);
+    let effective_timeout_ms = if job == "reprocess_circle_from_post" {
+        timeout_ms.min(POST_REPROCESS_BRIDGE_TIMEOUT_MS)
+    } else {
+        timeout_ms
+    };
+    let registration = match run_id.as_deref() {
+        Some(run_id) => Some(state.register(run_id)?),
+        None => None,
+    };
+    let cancellation = registration
+        .as_ref()
+        .map(PythonBridgeRunRegistration::cancellation_flag);
+
     tokio::task::spawn_blocking(move || {
-        run_python_bridge_sync(window, python_exe, project_root, job, payload, timeout_ms)
+        let _registration = registration;
+        run_python_bridge_sync(
+            window,
+            python_exe,
+            project_root,
+            job,
+            payload,
+            effective_timeout_ms,
+            cancellation,
+            run_id,
+        )
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))?
+}
+
+fn cancel_python_bridge_impl(
+    run_id: String,
+    state: tauri::State<'_, PythonBridgeCancellationState>,
+) -> Result<Value, String> {
+    Ok(state.cancel(&run_id))
+}
+
+#[tauri::command]
+fn cancel_reprocess_bridge(
+    run_id: String,
+    state: tauri::State<'_, PythonBridgeCancellationState>,
+) -> Result<Value, String> {
+    cancel_python_bridge_impl(run_id, state)
+}
+
+#[tauri::command]
+fn cancel_python_bridge(
+    run_id: String,
+    state: tauri::State<'_, PythonBridgeCancellationState>,
+) -> Result<Value, String> {
+    cancel_python_bridge_impl(run_id, state)
 }
 
 #[tauri::command]
@@ -2608,10 +3110,96 @@ fn normalize_event_meta_for_dir(meta: Value, event_dir: &Path) -> Value {
     meta
 }
 
-/// Return the event-level map references that should win over an orphaned map
-/// file with the same number.  References are deliberately read as strings from
-/// the raw `Value`; this keeps unknown event fields and legacy map shapes intact.
-fn preferred_event_map_references_from_data(data: &Value) -> Vec<String> {
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum EventMapReferenceInput {
+    Legacy(String),
+    Detailed {
+        #[serde(alias = "filename")]
+        reference: Option<String>,
+        map_number: Option<u32>,
+    },
+}
+
+fn normalize_event_map_reference(reference: &str) -> Option<String> {
+    let normalized = reference
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.ends_with('/')
+        || normalized.contains("://")
+    {
+        return None;
+    }
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return None;
+    }
+    let components: Vec<&str> = normalized.split('/').collect();
+    if components.iter().any(|component| {
+        component.is_empty()
+            || *component == "."
+            || *component == ".."
+            || component.contains(':')
+    }) {
+        return None;
+    }
+    Some(components.join("/"))
+}
+
+fn legacy_map_number_from_name(name: &str) -> Option<u32> {
+    let basename = name.replace('\\', "/");
+    let basename = basename.rsplit('/').next().unwrap_or(&basename);
+    let lowered = basename.to_ascii_lowercase();
+    let mut search_from = 0;
+    while let Some(relative) = lowered[search_from..].find("map_") {
+        let start = search_from + relative;
+        if start == 0 || !lowered.as_bytes()[start - 1].is_ascii_alphanumeric() {
+            let digits_start = start + 4;
+            let digit_count = lowered[digits_start..]
+                .as_bytes()
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            if digit_count > 0 {
+                if let Ok(number) = lowered[digits_start..digits_start + digit_count].parse() {
+                    if number > 0 {
+                        return Some(number);
+                    }
+                }
+            }
+        }
+        search_from = start + 4;
+        if search_from >= lowered.len() {
+            break;
+        }
+    }
+    None
+}
+
+fn event_map_reference_parts(
+    input: &EventMapReferenceInput,
+) -> Option<(String, Option<u32>)> {
+    let (reference, explicit_number) = match input {
+        EventMapReferenceInput::Legacy(reference) => (reference.clone(), None),
+        EventMapReferenceInput::Detailed {
+            reference,
+            map_number,
+        } => (reference.clone()?, *map_number),
+    };
+    let reference = normalize_event_map_reference(&reference)?;
+    let number = explicit_number
+        .filter(|number| *number > 0)
+        .or_else(|| legacy_map_number_from_name(&reference));
+    Some((reference, number))
+}
+
+/// Return event-level map references with their explicit numbers preserved.
+/// Reading the raw `Value` keeps unknown event fields and legacy map shapes intact.
+fn preferred_event_map_references_from_data(data: &Value) -> Vec<EventMapReferenceInput> {
     let Some(maps) = data
         .get("event")
         .and_then(|event| event.get("maps"))
@@ -2622,14 +3210,22 @@ fn preferred_event_map_references_from_data(data: &Value) -> Vec<String> {
 
     maps.iter()
         .filter_map(|entry| {
-            entry.as_str().map(str::to_string).or_else(|| {
-                entry
-                    .get("filename")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
+            if let Some(reference) = entry.as_str() {
+                return Some(EventMapReferenceInput::Legacy(reference.to_string()));
+            }
+            let object = entry.as_object()?;
+            let reference = object
+                .get("filename")
+                .or_else(|| object.get("reference"))
+                .and_then(Value::as_str)?;
+            Some(EventMapReferenceInput::Detailed {
+                reference: Some(reference.to_string()),
+                map_number: object
+                    .get("map_number")
+                    .and_then(Value::as_u64)
+                    .and_then(|number| u32::try_from(number).ok()),
             })
         })
-        .filter(|reference| !reference.trim().is_empty())
         .collect()
 }
 
@@ -3059,8 +3655,28 @@ mod event_meta_tests {
     }
 
     #[test]
-    fn leaves_current_twscrape_source_unchanged() {
-        assert!(upgrade_legacy_twscrape_patch_source("from twscrape import API\n").is_none());
+    fn leaves_twscrape_0201_current_source_unchanged() {
+        let current = r#"from twscrape import API, gather
+
+async def parse_anim_idx(text: str, clt: HttpClient) -> list[int]:
+    text = await get_tw_page_text(url, clt)
+"#;
+        assert!(upgrade_legacy_twscrape_patch_source(current).is_none());
+
+        let current_with_legacy_call_shape = r#"async def _patched_parse_anim_idx(text: str, clt=None) -> list:
+    js_text = await xclid.get_tw_page_text(url)
+    return await _original_parse_anim_idx(text)
+"#;
+        assert!(upgrade_legacy_twscrape_patch_source(current_with_legacy_call_shape).is_none());
+    }
+
+    #[test]
+    fn twscrape_runtime_check_requires_exact_release_without_integer_parsing() {
+        let script = twscrape_version_check_script();
+
+        assert!(script.contains("importlib.metadata"));
+        assert!(script.contains("installed == \"0.20.1\""));
+        assert!(!script.contains("int(x"));
     }
 
     #[test]
@@ -3194,7 +3810,9 @@ mod event_meta_tests {
 
         let preferred = list_event_map_images(
             dir.to_string_lossy().to_string(),
-            Some(vec!["maps/map_01.jpg".to_string()]),
+            Some(vec![EventMapReferenceInput::Legacy(
+                "maps/map_01.jpg".to_string(),
+            )]),
         )
         .unwrap();
         assert_eq!(
@@ -3204,6 +3822,71 @@ mod event_meta_tests {
         );
         assert!(old.exists(), "旧jpg孤児を物理削除しました");
         assert!(new.exists(), "新active pngが存在しません");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_event_map_images_resolves_canonical_reference_before_legacy_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "eventtrail-map-canonical-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("maps")).unwrap();
+        fs::write(dir.join("ev02_map_01.jpg"), b"canonical").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        fs::write(dir.join("maps/map_01.png"), b"legacy").unwrap();
+
+        let result = list_event_map_images(
+            dir.to_string_lossy().to_string(),
+            Some(vec![EventMapReferenceInput::Detailed {
+                reference: Some("ev02_map_01.jpg".to_string()),
+                map_number: Some(1),
+            }]),
+        )
+        .unwrap();
+        let map = &result["maps"][0];
+        assert_eq!(map["name"].as_str(), Some("ev02_map_01.jpg"));
+        assert_eq!(map["reference"].as_str(), Some("ev02_map_01.jpg"));
+        assert_eq!(map["map_number"].as_u64(), Some(1));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_event_map_images_uses_explicit_number_and_falls_back_safely() {
+        let dir = std::env::temp_dir().join(format!(
+            "eventtrail-map-reference-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("maps")).unwrap();
+        fs::write(dir.join("maps/custom_art.webp"), b"custom").unwrap();
+        fs::write(dir.join("map_03.jpg"), b"fallback").unwrap();
+
+        let explicit = list_event_map_images(
+            dir.to_string_lossy().to_string(),
+            Some(vec![EventMapReferenceInput::Detailed {
+                reference: Some("maps/custom_art.webp".to_string()),
+                map_number: Some(2),
+            }]),
+        )
+        .unwrap();
+        assert_eq!(explicit["maps"][0]["name"].as_str(), Some("custom_art.webp"));
+        assert_eq!(explicit["maps"][0]["reference"].as_str(), Some("maps/custom_art.webp"));
+        assert_eq!(explicit["maps"][0]["map_number"].as_u64(), Some(2));
+
+        let unsafe_reference = list_event_map_images(
+            dir.to_string_lossy().to_string(),
+            Some(vec![EventMapReferenceInput::Detailed {
+                reference: Some("../outside.jpg".to_string()),
+                map_number: Some(4),
+            }]),
+        )
+        .unwrap();
+        assert_eq!(unsafe_reference["maps"][0]["name"].as_str(), Some("map_03.jpg"));
+        assert_eq!(unsafe_reference["maps"][0]["map_number"].as_u64(), Some(3));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4527,49 +5210,124 @@ fn rename_event_dir(
 #[tauri::command]
 fn list_event_map_images(
     event_dir: String,
-    preferred_refs: Option<Vec<String>>,
+    preferred_refs: Option<Vec<EventMapReferenceInput>>,
 ) -> Result<Value, String> {
     let dir = PathBuf::from(&event_dir);
-    let preferred_names: HashSet<String> = preferred_refs
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|reference| {
-            let components: Vec<String> = reference
-                .replace('\\', "/")
-                .split('/')
-                .filter(|component| !component.is_empty() && *component != ".")
-                .map(|component| component.to_ascii_lowercase())
-                .collect();
-            if components.is_empty() || components.iter().any(|component| component == "..") {
-                None
-            } else {
-                Some(components.join("/"))
-            }
-        })
-        .collect();
-    // 同じmap番号の孤児ファイルが複数extensionで残っていても、最新mtimeの
-    // 1件だけをactiveとして返す。明示preferredを最優先し、物理ファイル自体は保持する。
-    let mut active_by_number: HashMap<u32, (bool, std::time::SystemTime, bool, String, PathBuf)> =
-        HashMap::new();
+    // Canonical event.maps references are resolved before any legacy directory scan.
+    // This keeps an event-owned asset such as ev02_map_01.jpg ahead of an orphaned
+    // maps/map_01.png, regardless of mtime.  All paths remain backend paths; only
+    // the frontend WebView boundary normalizes recognized verbatim prefixes.
+    let inputs = preferred_refs.unwrap_or_default();
+    let mut preferred_names = HashSet::new();
+    let mut active_by_number: HashMap<
+        u32,
+        (
+            u8,
+            std::time::SystemTime,
+            bool,
+            String,
+            String,
+            PathBuf,
+        ),
+    > = HashMap::new();
+    let mut consider = |number: u32,
+                        modified: std::time::SystemTime,
+                        source_rank: u8,
+                        preferred_dir: bool,
+                        name: String,
+                        reference: String,
+                        path: PathBuf| {
+        let replace = active_by_number.get(&number).map_or(true, |current| {
+            source_rank > current.0
+                || (source_rank == current.0
+                    && (modified > current.1
+                        || (modified == current.1
+                            && (preferred_dir > current.2
+                                || (preferred_dir == current.2
+                                    && name.as_str() > current.3.as_str())))))
+        });
+        if replace {
+            active_by_number.insert(
+                number,
+                (
+                    source_rank,
+                    modified,
+                    preferred_dir,
+                    name,
+                    reference,
+                    path,
+                ),
+            );
+        }
+    };
+
+    for input in &inputs {
+        let Some((reference, number)) = event_map_reference_parts(input) else {
+            continue;
+        };
+        let Some(number) = number else {
+            continue;
+        };
+        preferred_names.insert(reference.to_ascii_lowercase());
+        let candidate = dir.join(&reference);
+        let Ok(metadata) = fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(canonical_dir) = fs::canonicalize(&dir).ok() else {
+            continue;
+        };
+        let Some(canonical_candidate) = fs::canonicalize(&candidate).ok() else {
+            continue;
+        };
+        if !canonical_candidate.starts_with(&canonical_dir) {
+            continue;
+        }
+        let Some(name) = candidate
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let preferred_dir = reference
+            .split('/')
+            .next()
+            .map(|component| component.eq_ignore_ascii_case("maps"))
+            .unwrap_or(false);
+        consider(
+            number,
+            modified,
+            2,
+            preferred_dir,
+            name,
+            reference,
+            candidate,
+        );
+    }
+
+    // Same-number orphan files across extensions remain physically untouched;
+    // only one active candidate is returned.  Explicit frontend preferences are
+    // lower priority than a resolved event.maps reference, but higher than mtime.
     let mut scan_dir = |scan_path: PathBuf, preferred_dir: bool| {
         if scan_path.exists() {
             if let Ok(entries) = fs::read_dir(&scan_path) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     let lower = name.to_ascii_lowercase();
-                    if !lower.starts_with("map_")
-                        || !(lower.ends_with(".jpg")
-                            || lower.ends_with(".jpeg")
-                            || lower.ends_with(".png")
-                            || lower.ends_with(".webp"))
+                    if !(lower.ends_with(".jpg")
+                        || lower.ends_with(".jpeg")
+                        || lower.ends_with(".png")
+                        || lower.ends_with(".webp"))
                     {
                         continue;
                     }
-                    let Some(number) = lower
-                        .strip_prefix("map_")
-                        .and_then(|tail| tail.split('.').next())
-                        .and_then(|digits| digits.parse::<u32>().ok())
-                    else {
+                    let Some(number) = legacy_map_number_from_name(&name) else {
                         continue;
                     };
                     let modified = entry
@@ -4577,46 +5335,37 @@ fn list_event_map_images(
                         .and_then(|metadata| metadata.modified())
                         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                     let reference = if preferred_dir {
-                        format!("maps/{lower}")
+                        format!("maps/{name}")
                     } else {
-                        lower.clone()
+                        name.clone()
                     };
-                    let explicitly_preferred = preferred_names.contains(&reference);
-                    let replace = active_by_number.get(&number).map_or(true, |current| {
-                        explicitly_preferred > current.0
-                            || (explicitly_preferred == current.0
-                                && (modified > current.1
-                                    || (modified == current.1
-                                        && (preferred_dir > current.2
-                                            || (preferred_dir == current.2
-                                                && name.as_str() > current.3.as_str())))))
-                    });
-                    if replace {
-                        active_by_number.insert(
-                            number,
-                            (
-                                explicitly_preferred,
-                                modified,
-                                preferred_dir,
-                                name,
-                                entry.path(),
-                            ),
-                        );
-                    }
+                    let explicitly_preferred = preferred_names
+                        .contains(&reference.to_ascii_lowercase());
+                    consider(
+                        number,
+                        modified,
+                        u8::from(explicitly_preferred),
+                        preferred_dir,
+                        name,
+                        reference,
+                        entry.path(),
+                    );
                 }
             }
         }
     };
     scan_dir(dir.clone(), false);
     scan_dir(dir.join("maps"), true);
-    let mut active: Vec<(u32, std::time::SystemTime, String, PathBuf)> = active_by_number
+    let mut active: Vec<(u32, std::time::SystemTime, String, String, PathBuf)> = active_by_number
         .into_iter()
-        .map(|(number, (_, modified, _, name, path))| (number, modified, name, path))
+        .map(|(number, (_, modified, _, name, reference, path))| {
+            (number, modified, name, reference, path)
+        })
         .collect();
     active.sort_by_key(|entry| entry.0);
     let maps: Vec<Value> = active
         .into_iter()
-        .map(|(_, modified, name, path)| {
+        .map(|(number, modified, name, reference, path)| {
             let modified_ms = modified
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -4624,6 +5373,8 @@ fn list_event_map_images(
             json!({
                 "name": name,
                 "path": path.to_string_lossy().to_string().replace("\\", "/"),
+                "reference": reference,
+                "map_number": number,
                 "modified_ms": modified_ms
             })
         })
@@ -7016,7 +7767,8 @@ fn load_env_keys(project_root: String) -> Result<EnvKeys, String> {
         return Ok(keys);
     }
     let text = fs::read_to_string(&path).map_err(|e| format!(".env読み込み失敗: {e}"))?;
-    for line in text.lines() {
+    for segment in split_env_lines(&text) {
+        let (line, _) = split_env_line_ending(segment);
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -7035,42 +7787,299 @@ fn load_env_keys(project_root: String) -> Result<EnvKeys, String> {
     Ok(keys)
 }
 
-/// .env ファイルにAPIキーを保存する（既存の未知キーは保持）
-#[tauri::command]
-fn save_env_keys(project_root: String, keys: EnvKeys) -> Result<Value, String> {
-    let path = PathBuf::from(&project_root).join(".env");
-    let known = ["OPENAI_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY"];
+fn split_env_lines(existing: &str) -> Vec<&str> {
+    let bytes = existing.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
 
-    // 既存ファイルから未知の行を保持
-    let mut other_lines: Vec<String> = Vec::new();
-    if path.exists() {
-        let text = fs::read_to_string(&path).map_err(|e| format!(".env読み込み失敗: {e}"))?;
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                other_lines.push(line.to_string());
-                continue;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\n' => {
+                index += 1;
+                segments.push(&existing[start..index]);
+                start = index;
             }
-            if let Some((k, _)) = trimmed.split_once('=') {
-                if !known.contains(&k.trim()) {
-                    other_lines.push(line.to_string());
+            b'\r' => {
+                index += 1;
+                if index < bytes.len() && bytes[index] == b'\n' {
+                    index += 1;
                 }
-            } else {
-                other_lines.push(line.to_string());
+                segments.push(&existing[start..index]);
+                start = index;
             }
+            _ => index += 1,
         }
     }
 
-    let mut output = other_lines.join("\n");
-    if !output.is_empty() && !output.ends_with('\n') {
-        output.push('\n');
+    if start < existing.len() {
+        segments.push(&existing[start..]);
     }
-    output.push_str(&format!("OPENAI_API_KEY={}\n", keys.openai_api_key));
-    output.push_str(&format!("GEMINI_API_KEY={}\n", keys.gemini_api_key));
-    output.push_str(&format!("XAI_API_KEY={}\n", keys.xai_api_key));
+    segments
+}
 
-    fs::write(&path, output).map_err(|e| format!(".env書き込み失敗: {e}"))?;
+fn split_env_line_ending(segment: &str) -> (&str, &str) {
+    if let Some(line) = segment.strip_suffix("\r\n") {
+        (line, "\r\n")
+    } else if let Some(line) = segment.strip_suffix('\n') {
+        (line, "\n")
+    } else if let Some(line) = segment.strip_suffix('\r') {
+        (line, "\r")
+    } else {
+        (segment, "")
+    }
+}
+
+/// .env ファイルにAPIキーを保存する（既存の未知キーは保持）
+///
+/// 管理対象キーの値が空白だけの場合は行を出力しない。既存の行を更新するときは
+/// 値が変わっていない限り行全体をそのまま残すため、既存の値のバイト列・コメント・
+/// 改行形式を保つ。管理対象キーの重複行は最初の1行だけを採用し、空にされたキーは
+/// すべての既存行を削除する。
+fn update_env_contents(existing: &str, keys: &EnvKeys) -> String {
+    const KNOWN: [&str; 3] = ["OPENAI_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY"];
+
+    let values = [
+        keys.openai_api_key.as_str(),
+        keys.gemini_api_key.as_str(),
+        keys.xai_api_key.as_str(),
+    ];
+    let configured = values.map(|value| !value.trim().is_empty());
+
+    // 既存ファイルの改行形式を、新規行を追加するときにも使う。ファイルが空、または
+    // 改行を含まない場合は、従来の出力と同じLFを既定値にする。
+    let line_ending = if existing.contains("\r\n") {
+        "\r\n"
+    } else if existing.contains('\n') {
+        "\n"
+    } else if existing.contains('\r') {
+        "\r"
+    } else {
+        "\n"
+    };
+
+    let mut output = String::with_capacity(existing.len() + 128);
+    let mut seen = [false; 3];
+
+    // 行末のバイト列を含めたまま走査する。これにより未知キー、コメント、空行、
+    // CRLF/LF/CRなどを再構成せず、そのまま保存できる。
+    for segment in split_env_lines(existing) {
+        let (line, ending) = split_env_line_ending(segment);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            output.push_str(segment);
+            continue;
+        }
+
+        let managed_index = line
+            .split_once('=')
+            .and_then(|(key, _)| KNOWN.iter().position(|known| *known == key.trim()));
+
+        let Some(index) = managed_index else {
+            output.push_str(segment);
+            continue;
+        };
+
+        // 空白だけの値は既存の行も含めて削除する。空の値を新しい代入として書き出す
+        // ことはなく、以後の保存でも同じ結果になる。
+        if !configured[index] {
+            continue;
+        }
+
+        // 重複した管理対象キーは1行に正規化する。
+        if seen[index] {
+            continue;
+        }
+        seen[index] = true;
+
+        let existing_value = line
+            .split_once('=')
+            .map(|(_, value)| value)
+            .unwrap_or_default();
+        if existing_value == values[index] {
+            // 値が同じなら、キー周辺の空白やインラインコメントなども含めて元の
+            // バイト列を保持する（load→saveの無変更サイクルを完全に冪等化）。
+            output.push_str(segment);
+        } else {
+            output.push_str(KNOWN[index]);
+            output.push('=');
+            output.push_str(values[index]);
+            output.push_str(ending);
+        }
+    }
+
+    // 既存に無かった非空キーだけを末尾へ追加する。既存の末尾に改行がなければ、
+    // 追加前に1つだけ改行を挿入して、既存行のバイト列を変えない。
+    for (index, key) in KNOWN.iter().enumerate() {
+        if !configured[index] || seen[index] {
+            continue;
+        }
+        if !output.is_empty() && !output.ends_with('\n') && !output.ends_with('\r') {
+            output.push_str(line_ending);
+        }
+        output.push_str(key);
+        output.push('=');
+        output.push_str(values[index]);
+        output.push_str(line_ending);
+        seen[index] = true;
+    }
+
+    output
+}
+
+#[tauri::command]
+fn save_env_keys(project_root: String, keys: EnvKeys) -> Result<Value, String> {
+    let path = PathBuf::from(&project_root).join(".env");
+    let existing = if path.exists() {
+        fs::read_to_string(&path).map_err(|e| format!(".env読み込み失敗: {e}"))?
+    } else {
+        String::new()
+    };
+    let output = update_env_contents(&existing, &keys);
+
+    // 内容が同一なら書き換えない。値が未変更の保存操作でmtimeまで変えず、外部
+    // watcherを不要に起こさない。
+    if output != existing {
+        fs::write(&path, output).map_err(|e| format!(".env書き込み失敗: {e}"))?;
+    }
     Ok(json!({"status": "ok"}))
+}
+
+#[cfg(test)]
+mod env_key_tests {
+    use super::{load_env_keys, read_dotenv, save_env_keys, update_env_contents, EnvKeys};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "event-autopin-env-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn keys(openai: &str, gemini: &str, xai: &str) -> EnvKeys {
+        EnvKeys {
+            openai_api_key: openai.to_string(),
+            gemini_api_key: gemini.to_string(),
+            xai_api_key: xai.to_string(),
+        }
+    }
+
+    #[test]
+    fn absent_file_with_empty_values_stays_empty() {
+        assert_eq!(update_env_contents("", &keys("", "", "")), "");
+    }
+
+    #[test]
+    fn clearing_existing_nonempty_assignment_removes_it() {
+        let existing = "# keep this comment\nOPENAI_API_KEY=old-value\nOTHER=value\n";
+        let updated = update_env_contents(existing, &keys("", "", ""));
+        assert_eq!(updated, "# keep this comment\nOTHER=value\n");
+    }
+
+    #[test]
+    fn whitespace_only_values_are_not_serialized() {
+        let existing = "OPENAI_API_KEY=old\nGEMINI_API_KEY=\t\nXAI_API_KEY=   \n";
+        let updated = update_env_contents(existing, &keys(" \t ", "\t", "\n"));
+        assert_eq!(updated, "");
+        assert!(!updated.contains("OPENAI_API_KEY="));
+        assert!(!updated.contains("GEMINI_API_KEY="));
+        assert!(!updated.contains("XAI_API_KEY="));
+    }
+
+    #[test]
+    fn nonempty_values_are_written_once_and_keep_input_bytes() {
+        let existing = "OPENAI_API_KEY=old\nOPENAI_API_KEY=duplicate\n# marker\n";
+        let updated = update_env_contents(existing, &keys("  new-value  ", "", ""));
+        assert_eq!(updated.matches("OPENAI_API_KEY=").count(), 1);
+        assert!(updated.contains("OPENAI_API_KEY=  new-value  \n"));
+        assert!(updated.contains("# marker\n"));
+    }
+
+    #[test]
+    fn comments_unknown_lines_and_original_nonempty_bytes_are_preserved() {
+        let existing = "# heading\r\nOTHER = keep-me\r\nOPENAI_API_KEY =  old-value  \r\n";
+        let updated = update_env_contents(existing, &keys("  old-value  ", "", ""));
+        assert_eq!(updated, existing);
+    }
+
+    #[test]
+    fn nonempty_payload_rewrites_when_original_value_bytes_differ() {
+        let existing = "OPENAI_API_KEY= old-value \n";
+        let updated = update_env_contents(existing, &keys("old-value", "", ""));
+        assert_eq!(updated, "OPENAI_API_KEY=old-value\n");
+    }
+
+    #[test]
+    fn lone_cr_update_preserves_unknown_and_comment_bytes() {
+        let existing = "# heading\rUNKNOWN=keep\rOPENAI_API_KEY=old\r";
+        let updated = update_env_contents(existing, &keys("new", "", ""));
+        assert_eq!(updated, "# heading\rUNKNOWN=keep\rOPENAI_API_KEY=new\r");
+    }
+
+    #[test]
+    fn lone_cr_clear_removes_only_managed_assignment() {
+        let existing = "# heading\rOPENAI_API_KEY=old\rUNKNOWN=keep\r";
+        let updated = update_env_contents(existing, &keys("", "", ""));
+        assert_eq!(updated, "# heading\rUNKNOWN=keep\r");
+    }
+
+    #[test]
+    fn lone_cr_repeated_save_cycles_are_idempotent() {
+        let existing = "# heading\rUNKNOWN=keep\r";
+        let configured = keys("new", "new-gemini", "");
+        let first = update_env_contents(existing, &configured);
+        let second = update_env_contents(&first, &configured);
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn lone_cr_load_and_save_round_trip_uses_each_line_without_corruption() {
+        let root = temp_root("round-trip");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(".env");
+        fs::write(
+            &path,
+            "# heading\rOPENAI_API_KEY=old\rUNKNOWN=keep\rGEMINI_API_KEY=\r",
+        )
+        .unwrap();
+
+        let root_text = root.to_string_lossy().to_string();
+        let loaded = load_env_keys(root_text.clone()).unwrap();
+        assert_eq!(loaded.openai_api_key, "old");
+        assert_eq!(loaded.gemini_api_key, "");
+        assert_eq!(
+            read_dotenv(&root_text).get("UNKNOWN").map(String::as_str),
+            Some("keep")
+        );
+
+        save_env_keys(root_text.clone(), keys("new", "", "")).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# heading\rOPENAI_API_KEY=new\rUNKNOWN=keep\r"
+        );
+        let repeated = fs::read_to_string(&path).unwrap();
+        save_env_keys(root_text, keys("new", "", "")).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), repeated);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repeated_save_cycles_are_idempotent() {
+        let existing = "# heading\nOTHER=keep\n";
+        let configured = keys("new-openai", "new-gemini", "");
+        let first = update_env_contents(existing, &configured);
+        let second = update_env_contents(&first, &configured);
+        let third = update_env_contents(&second, &configured);
+        assert_eq!(second, first);
+        assert_eq!(third, second);
+    }
 }
 
 // ==================== 自動更新 ====================
@@ -7682,8 +8691,11 @@ claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n";
 fn main() {
     tauri::Builder::default()
         .manage(CookieStageState::default())
+        .manage(PythonBridgeCancellationState::default())
         .invoke_handler(tauri::generate_handler![
             run_python_bridge,
+            cancel_reprocess_bridge,
+            cancel_python_bridge,
             validate_cookie_file,
             stage_cookie_file,
             cleanup_staged_cookie_file,

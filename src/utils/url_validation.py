@@ -1,6 +1,7 @@
 """外部プロフィールURLの検証・正規化。"""
 
 import re
+import unicodedata
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -24,7 +25,7 @@ def normalize_twitter_profile_url(value: object) -> Optional[str]:
     if not isinstance(value, str):
         return None
 
-    raw = value.strip()
+    raw = unicodedata.normalize("NFKC", value.strip())
     if not raw:
         return None
 

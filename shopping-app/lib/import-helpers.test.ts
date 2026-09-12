@@ -21,6 +21,8 @@ function loadBuildImportRunResult(): (eventId: number, diff: ImportDiffResult, t
     _load: (request: string, parent: unknown, isMain: boolean) => unknown;
   };
   const originalLoad = Module._load;
+  const helpersPath = runtimeRequire.resolve("./import-helpers");
+  delete runtimeRequire.cache[helpersPath];
   Module._load = function mockLoad(request: string, parent: unknown, isMain: boolean) {
     if (request === "expo-document-picker" || request === "expo-file-system/legacy") return {};
     if (request === "./database") {
@@ -38,6 +40,76 @@ function loadBuildImportRunResult(): (eventId: number, diff: ImportDiffResult, t
     };
     return helpers.buildImportRunResult;
   } finally {
+    delete runtimeRequire.cache[helpersPath];
+    Module._load = originalLoad;
+  }
+}
+
+async function assertDocumentPickerCacheOwnership(): Promise<void> {
+  const runtimeRequire = eval("require") as NodeRequire;
+  const Module = runtimeRequire("module") as {
+    _load: (request: string, parent: unknown, isMain: boolean) => unknown;
+  };
+  const originalLoad = Module._load;
+  const helpersPath = runtimeRequire.resolve("./import-helpers");
+  delete runtimeRequire.cache[helpersPath];
+  let capturedOptions: { deleteSourceAfterUnzip?: boolean } | undefined;
+
+  Module._load = function mockLoad(request: string, parent: unknown, isMain: boolean) {
+    if (request === "expo-document-picker") {
+      return {
+        getDocumentAsync: async () => ({
+          canceled: false,
+          assets: [{ uri: "file:///cache/document-picker-full-sync.zip" }],
+        }),
+      };
+    }
+    if (request === "expo-file-system/legacy") {
+      return {
+        cacheDirectory: "file:///cache/",
+      };
+    }
+    if (request === "./database") {
+      return {
+        importFromZip: async (
+          _uri: string,
+          _onProgress: unknown,
+          options?: { deleteSourceAfterUnzip?: boolean },
+        ) => {
+          capturedOptions = options;
+          return 7;
+        },
+        getLastImportDiff: () =>
+          makeDiff({
+            kind: "single",
+            incremental: false,
+            importedEventIds: [7],
+            addedEventIds: [7],
+            targetEventIds: [7],
+          }),
+        getEventImportSummary: async () => ({
+          eventName: "テスト",
+          circleCount: 1,
+          mapCount: 1,
+          imageCount: 1,
+          itemCount: 1,
+        }),
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+
+  try {
+    const helpers = runtimeRequire("./import-helpers") as {
+      handleImportZip: (onProgress: () => void) => Promise<unknown>;
+    };
+    await helpers.handleImportZip(() => undefined);
+    assert(
+      capturedOptions?.deleteSourceAfterUnzip === true,
+      "DocumentPicker cache copy must be released after native unzip",
+    );
+  } finally {
+    delete runtimeRequire.cache[helpersPath];
     Module._load = originalLoad;
   }
 }
@@ -57,7 +129,7 @@ function makeDiff(overrides: Partial<ImportDiffResult>): ImportDiffResult {
   };
 }
 
-export function runImportHelperContractTests(): void {
+export async function runImportHelperContractTests(): Promise<void> {
   const buildImportRunResult = loadBuildImportRunResult();
   const summary = {
     eventName: "同期イベント",
@@ -110,4 +182,6 @@ export function runImportHelperContractTests(): void {
     summary,
   );
   assert(!single.isFullSync && single.eventCount === 1, "single import does not depend on ID delta size");
+
+  await assertDocumentPickerCacheOwnership();
 }

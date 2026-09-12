@@ -2,6 +2,21 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List
 from enum import Enum
 
+from ..utils.llm_attempts import (
+    DEFAULT_IMAGE_FALLBACK_EFFORT,
+    DEFAULT_IMAGE_FALLBACK_MODEL,
+    DEFAULT_IMAGE_FALLBACK_PROVIDER,
+    DEFAULT_IMAGE_PRIMARY_EFFORT,
+    DEFAULT_IMAGE_PRIMARY_MODEL,
+    DEFAULT_IMAGE_PRIMARY_PROVIDER,
+    DEFAULT_TEXT_FALLBACK_EFFORT,
+    DEFAULT_TEXT_FALLBACK_MODEL,
+    DEFAULT_TEXT_FALLBACK_PROVIDER,
+    DEFAULT_TEXT_PRIMARY_EFFORT,
+    DEFAULT_TEXT_PRIMARY_MODEL,
+    DEFAULT_TEXT_PRIMARY_PROVIDER,
+)
+
 
 class SiteType(Enum):
     """サイトタイプの列挙"""
@@ -59,10 +74,10 @@ class PaginationConfig:
 class SiteParsingConfig:
     """サイトパース専用の高性能モデル設定"""
 
-    codex_model: str = "gpt-5.4"
-    api_model: str = "gpt-5.6-sol"
-    reasoning_effort: str = "medium"  # none/minimal/low/medium/high/xhigh
-    api_reasoning_effort: str = "medium"  # none/low/medium/high/xhigh
+    codex_model: str = DEFAULT_TEXT_FALLBACK_MODEL
+    api_model: str = DEFAULT_TEXT_PRIMARY_MODEL
+    reasoning_effort: str = DEFAULT_TEXT_PRIMARY_EFFORT  # none/minimal/low/medium/high/xhigh
+    api_reasoning_effort: str = DEFAULT_TEXT_PRIMARY_EFFORT  # none/low/medium/high/xhigh
     prefer_cli: bool = True
     cli_timeout: int = 900
 
@@ -92,35 +107,35 @@ class SiteConfig:
 
     # LLM設定
     use_llm: bool = True
-    llm_model: str = "gpt-5.6-sol"
-    text_llm_provider: str = "api"
+    llm_model: str = DEFAULT_TEXT_PRIMARY_MODEL
+    text_llm_provider: str = DEFAULT_TEXT_PRIMARY_PROVIDER
     text_llm_cli_models: Dict[str, str] = field(default_factory=dict)
     text_llm_cli_efforts: Dict[str, str] = field(default_factory=dict)
     text_llm_cli_timeout: int = 900
-    api_reasoning_effort: str = "medium"
+    api_reasoning_effort: str = DEFAULT_TEXT_PRIMARY_EFFORT
     api_reasoning_effort_map: Dict[str, str] = field(default_factory=dict)
-    text_fallback_llm_provider: str = "cli:codex"
-    text_fallback_llm_model: str = "gpt-5.5"
-    text_fallback_llm_effort: str = "medium"
-    image_llm_provider: str = "api:gemini"
-    image_llm_model: Optional[str] = None
-    image_llm_effort: str = "medium"
-    image_fallback_llm_provider: str = "openai"
-    image_fallback_llm_model: str = "gpt-5-mini"
-    image_fallback_llm_effort: str = "medium"
+    text_fallback_llm_provider: str = DEFAULT_TEXT_FALLBACK_PROVIDER
+    text_fallback_llm_model: str = DEFAULT_TEXT_FALLBACK_MODEL
+    text_fallback_llm_effort: str = DEFAULT_TEXT_FALLBACK_EFFORT
+    image_llm_provider: str = DEFAULT_IMAGE_PRIMARY_PROVIDER
+    image_llm_model: Optional[str] = DEFAULT_IMAGE_PRIMARY_MODEL
+    image_llm_effort: str = DEFAULT_IMAGE_PRIMARY_EFFORT
+    image_fallback_llm_provider: str = DEFAULT_IMAGE_FALLBACK_PROVIDER
+    image_fallback_llm_model: str = DEFAULT_IMAGE_FALLBACK_MODEL
+    image_fallback_llm_effort: str = DEFAULT_IMAGE_FALLBACK_EFFORT
     image_api_reasoning_effort_map: Dict[str, str] = field(default_factory=dict)
 
     @property
     def image_provider_kind(self) -> str:
-        provider = self.image_llm_provider or "api:gemini"
+        provider = self.image_llm_provider or DEFAULT_IMAGE_PRIMARY_PROVIDER
         return provider.split(":", 1)[0] if ":" in provider else "api"
 
     @property
     def image_llm_provider_name(self) -> str:
-        provider = self.image_llm_provider or "api:gemini"
+        provider = self.image_llm_provider or DEFAULT_IMAGE_PRIMARY_PROVIDER
         return provider.split(":", 1)[1] if ":" in provider else provider
 
-    # サイトパース専用モデル設定（Codex CLI / GPT-5.4 API）
+    # サイトパース専用モデル設定（Codex CLI / GPT-5.6 API）
     site_parsing_config: Optional[SiteParsingConfig] = None
 
     # Cookie設定

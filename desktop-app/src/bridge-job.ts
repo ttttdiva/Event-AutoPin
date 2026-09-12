@@ -3,6 +3,8 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/tauri";
 /** Python bridgeへ渡す汎用レスポンス。UIの表示状態は含めない。 */
 export type BridgeJobResult<T = Record<string, unknown>> = {
   ok?: boolean;
+  timedOut?: boolean;
+  cancelled?: boolean;
   bridge?: T;
   stderr?: string;
   stdout?: string;

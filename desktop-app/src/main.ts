@@ -1,5 +1,8 @@
 import "./styles.css";
-import { invoke as tauriInvoke, convertFileSrc } from "@tauri-apps/api/tauri";
+import {
+  invoke as tauriInvoke,
+  convertFileSrc as tauriConvertFileSrc,
+} from "@tauri-apps/api/tauri";
 import { listen } from "@tauri-apps/api/event";
 import { appWindow } from "@tauri-apps/api/window";
 import { open as dialogOpen } from "@tauri-apps/api/dialog";
@@ -8,18 +11,39 @@ import {
   type BridgeJobResult,
 } from "./bridge-job";
 import {
+  attachReprocessRuntimePayload,
+  classifyBridgeTerminalOutcome,
+  createReprocessRunId,
+  extractReprocessErrorMessage,
+  formatReprocessTelemetry,
+  timeoutMsForReprocessSource,
+  telemetryOutcomeForBridgeTerminal,
+  reprocessProgressLabel,
+  type ReprocessBridgeResultLike,
+  type ReprocessBridgeTerminalOutcome,
+  type ReprocessTelemetryOutcome,
+  type ReprocessTelemetryStage,
+} from "./reprocess-runtime";
+import { makeReprocessViewReadOnly } from "./reprocess-view";
+import { ReprocessPriorityEdits } from "./reprocess-priority";
+import {
   formatCoordinateGenerationFailure,
 } from "./coordinate-diagnostics";
 import {
   buildEventJsonSnapshot,
+  circleLinkMemo,
   eventJsonDocumentsEqual,
   imageColumnAssetReferences,
+  eventMapImageNumber,
+  mapNumberFromMapName,
   runImageDeletionTransaction,
   selectActiveMapImages,
   type EventMapImage,
+  type EventMapReference,
   type EventJsonData,
   type TableState,
 } from "./state/event-document";
+import { normalizeFilePathForWebview } from "./file-asset-path";
 import {
   createAsyncMutationGuard,
   KeyedSerialExecutor,
@@ -84,6 +108,16 @@ import {
   prepareFullSyncEventDocument,
   reconcileSessionEventDocument,
 } from "./state/event-session";
+import {
+  eventJsonPathForDir,
+  eventPathsEqual,
+  eventSessionOwnerMatches,
+  externalEventOwnerMatches,
+  normalizeEventPath,
+  shouldSaveBeforeEventReload,
+  type EventReloadMode,
+  type ExternalEventReloadOwner,
+} from "./state/event-reload-ownership";
 import {
   tablePrefixHeight as calculateTablePrefixHeight,
   tableDataStartIndex,
@@ -544,9 +578,6 @@ function circlesToTableState(data: any): TableState {
   const rows: Record<string, string>[] = circles.map((c: any) => {
     const tags = [...(c.genres || []), ...(c.tags || [])];
     const penname = c.penname || "";
-    const memoParts = [c.twitter_url, c.website_url, c.pixiv_url].filter(
-      Boolean,
-    );
     const itemImagePaths = catalogImagePathsForCircle(c);
     const itemCount = (c.items && c.items.length) || 0;
 
@@ -561,7 +592,7 @@ function circlesToTableState(data: any): TableState {
       スペース: c.space || "",
       サークル名: c.name || "",
       ジャンル: (c.genres || []).join(", "),
-      サークルメモ: memoParts.join("\n") || "",
+      サークルメモ: circleLinkMemo(c),
       アイテムメモ: (c.memo ? c.memo.replace(/^【[^】]*】\n?/, "") : "") || "",
       ペンネーム: penname,
       アイテムタグ: uniqueItemTags.join(", "),
@@ -580,6 +611,9 @@ function circlesToTableState(data: any): TableState {
 }
 
 const resultEl = document.getElementById("result") as HTMLPreElement;
+const cancelReprocessBtn = document.getElementById(
+  "cancelReprocessBtn",
+) as HTMLButtonElement;
 const progressEl = document.getElementById(
   "crawlProgress",
 ) as HTMLProgressElement;
@@ -733,6 +767,46 @@ const FALLBACK_MODEL_CATALOG: ModelCatalog = {
 };
 
 let modelCatalog: ModelCatalog = FALLBACK_MODEL_CATALOG;
+let modelCatalogLoaded = false;
+
+const DEFAULT_MODEL_SELECTIONS = {
+  text: {
+    provider: "api:openai",
+    model: "gpt-5.6-luna",
+    effort: "max",
+  },
+  textFallback: {
+    provider: "cli:codex",
+    model: "gpt-5.5",
+    effort: "medium",
+  },
+  image: {
+    provider: "cli:antigravity",
+    model: "gemini-3.8-flash-medium",
+    effort: "none",
+  },
+  imageFallback: {
+    provider: "api:openai",
+    model: "gpt-5.6-sol",
+    effort: "medium",
+  },
+} as const;
+
+const ANTIGRAVITY_MODEL_UNAVAILABLE_MESSAGE =
+  "選択したAntigravityモデルは現在利用できません。モデル候補を再取得してください。";
+
+type ModelSelectionPreference = {
+  provider?: string;
+  model?: string;
+  effort?: string;
+};
+
+type ModelControlPreferences = {
+  text?: ModelSelectionPreference;
+  textFallback?: ModelSelectionPreference;
+  image?: ModelSelectionPreference;
+  imageFallback?: ModelSelectionPreference;
+};
 
 const DEFAULT_REASONING_EFFORT = "medium";
 const CODEX_REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh"];
@@ -1281,7 +1355,7 @@ function captureActiveEventDocumentOwner(): ActiveEventDocumentOwner {
 function isActiveEventDocumentOwner(owner: ActiveEventDocumentOwner): boolean {
   return (
     activeEventSlug === owner.slug &&
-    normalizeEventPath(editorJsonPathValue()) === owner.path
+    eventPathsEqual(editorJsonPathValue(), owner.path)
   );
 }
 
@@ -1409,6 +1483,27 @@ function logToFile(msg: string) {
   }).catch(() => {});
 }
 
+function logReprocessTelemetry(
+  job: ReprocessCircleJob,
+  stage: ReprocessTelemetryStage,
+  outcome: ReprocessTelemetryOutcome,
+): void {
+  try {
+    if (job.source !== "post") return;
+    logToFile(
+      formatReprocessTelemetry(
+        job.runId,
+        stage,
+        outcome,
+        job.telemetryStartMs,
+        performance.now(),
+      ),
+    );
+  } catch {
+    // telemetry failure must not affect the reprocess itself
+  }
+}
+
 function modelProvider(providerId: string): ModelProviderOption | undefined {
   return modelCatalog.providers.find((p) => p.id === providerId);
 }
@@ -1475,8 +1570,14 @@ function defaultEffortFor(efforts: string[]): string {
   return efforts[0] || "none";
 }
 
-function normalizeReasoningEffortFor(value: string | undefined, efforts: string[]): string {
-  return value && efforts.includes(value) ? value : defaultEffortFor(efforts);
+function normalizeReasoningEffortFor(
+  value: string | undefined,
+  efforts: string[],
+  fallbackValue?: string,
+): string {
+  if (value && efforts.includes(value)) return value;
+  if (fallbackValue && efforts.includes(fallbackValue)) return fallbackValue;
+  return defaultEffortFor(efforts);
 }
 
 function geminiApiEffortsForModel(modelId: string): string[] {
@@ -1497,12 +1598,21 @@ function reasoningEffortsForSelection(selection: TextProviderSelection, modelId:
   return NO_REASONING_EFFORTS;
 }
 
-function setEffortOptions(selectId: string, preferredValue?: string, efforts = OPENAI_REASONING_EFFORTS) {
+function setEffortOptions(
+  selectId: string,
+  preferredValue?: string,
+  efforts = OPENAI_REASONING_EFFORTS,
+  fallbackValue?: string,
+) {
   const select = document.getElementById(selectId) as HTMLSelectElement;
   setSelectOptions(
     select,
     reasoningEffortOptions(efforts),
-    normalizeReasoningEffortFor(preferredValue || select.value, efforts),
+    normalizeReasoningEffortFor(
+      preferredValue || select.value,
+      efforts,
+      fallbackValue,
+    ),
   );
 }
 
@@ -1512,7 +1622,7 @@ function inferApiProviderFromModel(modelId: string): string {
   );
   if (found?.provider) return found.provider;
   if (modelId.startsWith("gemini-")) return "gemini";
-  return apiProviderOptions()[0]?.value || "openai";
+  return "openai";
 }
 
 function textProviderOptions() {
@@ -1531,18 +1641,28 @@ function textProviderOptions() {
 }
 
 function parseTextProviderValue(value: string): TextProviderSelection {
-  if (value.startsWith("cli:")) {
-    return { kind: "cli", provider: value.slice(4) };
+  const normalized = value.trim();
+  if (normalized.startsWith("cli:")) {
+    return { kind: "cli", provider: normalized.slice(4) };
   }
-  if (value.startsWith("api:")) {
-    return { kind: "api", provider: value.slice(4) };
+  if (normalized.startsWith("api:")) {
+    return { kind: "api", provider: normalized.slice(4) || "openai" };
   }
-  return { kind: "api", provider: value || inferApiProviderFromModel("") };
+  return { kind: "api", provider: normalized || "openai" };
 }
 
 function textProviderValueFromConfig(provider: string, modelId: string): string {
-  if (provider && provider !== "api") return `cli:${provider}`;
-  return `api:${inferApiProviderFromModel(modelId)}`;
+  const normalized = provider.trim();
+  if (!normalized || normalized === "api") {
+    return `api:${inferApiProviderFromModel(modelId)}`;
+  }
+  if (normalized.startsWith("api:") || normalized.startsWith("cli:")) {
+    return normalized;
+  }
+  if (normalized === "openai" || normalized === "gemini") {
+    return `api:${normalized}`;
+  }
+  return `cli:${normalized}`;
 }
 
 function updateTextModelSelect(preferredValue?: string) {
@@ -1661,41 +1781,240 @@ function updateCliModelSelect(providerSelectId: string, modelSelectId: string) {
   setSelectOptions(modelSelect, modelOptions(providerModels(provider)));
 }
 
-function hydrateModelControls() {
+function controlValue(id: string): string {
+  const element = document.getElementById(id) as
+    | HTMLInputElement
+    | HTMLSelectElement
+    | HTMLTextAreaElement
+    | null;
+  return element?.value?.trim() || "";
+}
+
+function firstNonEmpty(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const normalized = value.trim();
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function hydrateModelControls(preferences: ModelControlPreferences = {}) {
+  const textProviderSelect = document.getElementById(
+    "modelProvider",
+  ) as HTMLSelectElement;
   const textModelSelect = document.getElementById("model") as HTMLSelectElement;
-  const currentTextModel = textModelSelect.value || "gpt-5.6-sol";
-  const textFallbackModelSelect = document.getElementById("textFallbackModel") as HTMLSelectElement;
-  const currentTextFallbackModel = textFallbackModelSelect.value || "gpt-5.5";
-  const visionFallbackModelSelect = document.getElementById("visionFallbackModel") as HTMLSelectElement;
-  const currentVisionFallbackModel = visionFallbackModelSelect.value || "gpt-5-mini";
+  const currentTextProvider = controlValue("modelProvider");
+  const currentTextModel = controlValue("model");
+  const currentTextEffort = controlValue("textReasoningEffort");
+  const textProviderValue =
+    firstNonEmpty(
+      preferences.text?.provider,
+      currentTextProvider,
+      DEFAULT_MODEL_SELECTIONS.text.provider,
+    );
   setSelectOptions(
-    document.getElementById("modelProvider") as HTMLSelectElement,
+    textProviderSelect,
     textProviderOptions(),
-    (document.getElementById("modelProvider") as HTMLSelectElement).value ||
-      textProviderValueFromConfig("api", currentTextModel),
+    textProviderValue,
   );
-  updateTextModelSelect(currentTextModel);
+  const hydratedTextProvider = textProviderSelect.value || textProviderValue;
+  const textModelValue =
+    firstNonEmpty(
+      preferences.text?.model,
+      currentTextModel,
+      hydratedTextProvider === DEFAULT_MODEL_SELECTIONS.text.provider
+        ? DEFAULT_MODEL_SELECTIONS.text.model
+        : "",
+    );
+  updateTextModelSelect(textModelValue || undefined);
+  const hydratedTextSelection = parseTextProviderValue(hydratedTextProvider);
+  const hydratedTextEfforts = reasoningEffortsForSelection(
+    hydratedTextSelection,
+    textModelSelect.value,
+  );
+  const textEffortDefault =
+    hydratedTextProvider === DEFAULT_MODEL_SELECTIONS.text.provider &&
+    textModelSelect.value === DEFAULT_MODEL_SELECTIONS.text.model
+      ? DEFAULT_MODEL_SELECTIONS.text.effort
+      : undefined;
+  setEffortOptions(
+    "textReasoningEffort",
+    firstNonEmpty(
+      preferences.text?.effort,
+      currentTextEffort,
+      textEffortDefault,
+    ),
+    hydratedTextEfforts,
+    textEffortDefault,
+  );
+
+  const textFallbackProviderSelect = document.getElementById(
+    "textFallbackModelProvider",
+  ) as HTMLSelectElement;
+  const textFallbackModelSelect = document.getElementById(
+    "textFallbackModel",
+  ) as HTMLSelectElement;
+  const currentTextFallbackProvider = controlValue(
+    "textFallbackModelProvider",
+  );
+  const currentTextFallbackModel = controlValue("textFallbackModel");
+  const currentTextFallbackEffort = controlValue(
+    "textFallbackReasoningEffort",
+  );
+  const textFallbackProviderValue =
+    firstNonEmpty(
+      preferences.textFallback?.provider,
+      currentTextFallbackProvider,
+      DEFAULT_MODEL_SELECTIONS.textFallback.provider,
+    );
   setSelectOptions(
-    document.getElementById("textFallbackModelProvider") as HTMLSelectElement,
+    textFallbackProviderSelect,
     textProviderOptions(),
-    (document.getElementById("textFallbackModelProvider") as HTMLSelectElement).value ||
-      "cli:codex",
+    textFallbackProviderValue,
   );
-  updateTextFallbackModelSelect(currentTextFallbackModel);
+  const hydratedTextFallbackProvider =
+    textFallbackProviderSelect.value || textFallbackProviderValue;
+  const textFallbackModelValue =
+    firstNonEmpty(
+      preferences.textFallback?.model,
+      currentTextFallbackModel,
+      hydratedTextFallbackProvider === DEFAULT_MODEL_SELECTIONS.textFallback.provider
+        ? DEFAULT_MODEL_SELECTIONS.textFallback.model
+        : "",
+    );
+  updateTextFallbackModelSelect(textFallbackModelValue || undefined);
+  const hydratedTextFallbackSelection = parseTextProviderValue(
+    hydratedTextFallbackProvider,
+  );
+  const hydratedTextFallbackEfforts = reasoningEffortsForSelection(
+    hydratedTextFallbackSelection,
+    textFallbackModelSelect.value,
+  );
+  const textFallbackEffortDefault =
+    hydratedTextFallbackProvider === DEFAULT_MODEL_SELECTIONS.textFallback.provider &&
+    textFallbackModelSelect.value === DEFAULT_MODEL_SELECTIONS.textFallback.model
+      ? DEFAULT_MODEL_SELECTIONS.textFallback.effort
+      : undefined;
+  setEffortOptions(
+    "textFallbackReasoningEffort",
+    firstNonEmpty(
+      preferences.textFallback?.effort,
+      currentTextFallbackEffort,
+      textFallbackEffortDefault,
+    ),
+    hydratedTextFallbackEfforts,
+    textFallbackEffortDefault,
+  );
+
+  const imageProviderSelect = document.getElementById(
+    "visionModel",
+  ) as HTMLSelectElement;
+  const imageModelSelect = document.getElementById(
+    "visionModelId",
+  ) as HTMLSelectElement;
+  const currentImageProvider = controlValue("visionModel");
+  const currentImageModel = controlValue("visionModelId");
+  const currentImageEffort = controlValue("visionReasoningEffort");
+  const imageProviderValue =
+    firstNonEmpty(
+      preferences.image?.provider,
+      currentImageProvider,
+      DEFAULT_MODEL_SELECTIONS.image.provider,
+    );
   setSelectOptions(
-    document.getElementById("visionModel") as HTMLSelectElement,
+    imageProviderSelect,
     textProviderOptions(),
-    (document.getElementById("visionModel") as HTMLSelectElement).value ||
-      "api:gemini",
+    imageProviderValue,
   );
-  updateVisionModelSelect();
+  const hydratedImageProvider = imageProviderSelect.value || imageProviderValue;
+  const imageModelValue =
+    firstNonEmpty(
+      preferences.image?.model,
+      currentImageModel,
+      hydratedImageProvider === DEFAULT_MODEL_SELECTIONS.image.provider
+        ? DEFAULT_MODEL_SELECTIONS.image.model
+        : "",
+    );
+  updateVisionModelSelect(imageModelValue || undefined);
+  const hydratedImageSelection = parseTextProviderValue(hydratedImageProvider);
+  const hydratedImageEfforts = reasoningEffortsForSelection(
+    hydratedImageSelection,
+    imageModelSelect.value,
+  );
+  const imageEffortDefault =
+    hydratedImageProvider === DEFAULT_MODEL_SELECTIONS.image.provider &&
+    imageModelSelect.value === DEFAULT_MODEL_SELECTIONS.image.model
+      ? DEFAULT_MODEL_SELECTIONS.image.effort
+      : undefined;
+  setEffortOptions(
+    "visionReasoningEffort",
+    firstNonEmpty(
+      preferences.image?.effort,
+      currentImageEffort,
+      imageEffortDefault,
+    ),
+    hydratedImageEfforts,
+    imageEffortDefault,
+  );
+
+  const imageFallbackProviderSelect = document.getElementById(
+    "visionFallbackModelProvider",
+  ) as HTMLSelectElement;
+  const imageFallbackModelSelect = document.getElementById(
+    "visionFallbackModel",
+  ) as HTMLSelectElement;
+  const currentImageFallbackProvider = controlValue(
+    "visionFallbackModelProvider",
+  );
+  const currentImageFallbackModel = controlValue("visionFallbackModel");
+  const currentImageFallbackEffort = controlValue(
+    "visionFallbackReasoningEffort",
+  );
+  const imageFallbackProviderValue =
+    firstNonEmpty(
+      preferences.imageFallback?.provider,
+      currentImageFallbackProvider,
+      DEFAULT_MODEL_SELECTIONS.imageFallback.provider,
+    );
   setSelectOptions(
-    document.getElementById("visionFallbackModelProvider") as HTMLSelectElement,
+    imageFallbackProviderSelect,
     textProviderOptions(),
-    (document.getElementById("visionFallbackModelProvider") as HTMLSelectElement).value ||
-      "api:openai",
+    imageFallbackProviderValue,
   );
-  updateVisionFallbackModelSelect(currentVisionFallbackModel);
+  const hydratedImageFallbackProvider =
+    imageFallbackProviderSelect.value || imageFallbackProviderValue;
+  const imageFallbackModelValue =
+    firstNonEmpty(
+      preferences.imageFallback?.model,
+      currentImageFallbackModel,
+      hydratedImageFallbackProvider === DEFAULT_MODEL_SELECTIONS.imageFallback.provider
+        ? DEFAULT_MODEL_SELECTIONS.imageFallback.model
+        : "",
+    );
+  updateVisionFallbackModelSelect(imageFallbackModelValue || undefined);
+  const hydratedImageFallbackSelection = parseTextProviderValue(
+    hydratedImageFallbackProvider,
+  );
+  const hydratedImageFallbackEfforts = reasoningEffortsForSelection(
+    hydratedImageFallbackSelection,
+    imageFallbackModelSelect.value,
+  );
+  const imageFallbackEffortDefault =
+    hydratedImageFallbackProvider === DEFAULT_MODEL_SELECTIONS.imageFallback.provider &&
+    imageFallbackModelSelect.value === DEFAULT_MODEL_SELECTIONS.imageFallback.model
+      ? DEFAULT_MODEL_SELECTIONS.imageFallback.effort
+      : undefined;
+  setEffortOptions(
+    "visionFallbackReasoningEffort",
+    firstNonEmpty(
+      preferences.imageFallback?.effort,
+      currentImageFallbackEffort,
+      imageFallbackEffortDefault,
+    ),
+    hydratedImageFallbackEfforts,
+    imageFallbackEffortDefault,
+  );
 }
 
 async function loadModelCatalog() {
@@ -1705,6 +2024,7 @@ async function loadModelCatalog() {
     modelCatalog = await invoke<ModelCatalog>("list_model_catalog", {
       projectRoot: projectRootEl.value || ".",
     });
+    modelCatalogLoaded = true;
     const apiCount = modelCatalog.apiModels.length;
     const cliCount = modelCatalog.providers.reduce(
       (sum, provider) => sum + provider.models.length,
@@ -1718,6 +2038,7 @@ async function loadModelCatalog() {
     }
   } catch (e) {
     modelCatalog = FALLBACK_MODEL_CATALOG;
+    modelCatalogLoaded = true;
     console.warn("モデルカタログ読み込みスキップ:", e);
     if (modelCatalogStatusEl) modelCatalogStatusEl.textContent = "候補表示";
   } finally {
@@ -1726,15 +2047,50 @@ async function loadModelCatalog() {
   hydrateModelControls();
 }
 
+async function preflightSelectedAntigravityModel(): Promise<boolean> {
+  const selection = selectedImageProvider();
+  if (selection.kind !== "cli" || selection.provider !== "antigravity") {
+    return true;
+  }
+
+  if (!modelCatalogLoaded) {
+    await loadModelCatalog();
+  }
+
+  const provider = modelProvider("antigravity");
+  if (provider?.source !== "cli-live") return true;
+
+  const selectedModel = selectedImageModel();
+  const availableInLiveCatalog = provider.models.some(
+    (model) =>
+      model.id === selectedModel && model.source === "cli-live",
+  );
+  if (!availableInLiveCatalog) {
+    resultEl.textContent = ANTIGRAVITY_MODEL_UNAVAILABLE_MESSAGE;
+    return false;
+  }
+  return true;
+}
+
 function selectedTextProvider(): TextProviderSelection {
   return parseTextProviderValue(
-    (document.getElementById("modelProvider") as HTMLSelectElement).value,
+    controlValue("modelProvider") || DEFAULT_MODEL_SELECTIONS.text.provider,
+  );
+}
+
+function selectedTextModel(): string {
+  const provider = selectedTextProvider();
+  return (
+    controlValue("model") ||
+    (providerConfigValue(provider) === DEFAULT_MODEL_SELECTIONS.text.provider
+      ? DEFAULT_MODEL_SELECTIONS.text.model
+      : "")
   );
 }
 
 function selectedTextCliModelMap(): Record<string, string> {
   const selection = selectedTextProvider();
-  const model = (document.getElementById("model") as HTMLSelectElement).value;
+  const model = selectedTextModel();
   if (selection.kind !== "cli" || !model || model === "default") return {};
   return { [selection.provider]: model };
 }
@@ -1742,11 +2098,11 @@ function selectedTextCliModelMap(): Record<string, string> {
 function selectedTextCliEffortMap(): Record<string, string> {
   const selection = selectedTextProvider();
   if (selection.kind !== "cli") return {};
-  const model = (document.getElementById("model") as HTMLSelectElement).value;
+  const model = selectedTextModel();
   const efforts = reasoningEffortsForSelection(selection, model);
   return {
     [selection.provider]: normalizeReasoningEffortFor(
-      (document.getElementById("textReasoningEffort") as HTMLSelectElement).value,
+      controlValue("textReasoningEffort"),
       efforts,
     ),
   };
@@ -1754,48 +2110,79 @@ function selectedTextCliEffortMap(): Record<string, string> {
 
 function selectedTextEffort(): string {
   const selection = selectedTextProvider();
-  const model = (document.getElementById("model") as HTMLSelectElement).value;
+  const model = selectedTextModel();
+  const defaultEffort =
+    providerConfigValue(selection) === DEFAULT_MODEL_SELECTIONS.text.provider &&
+    model === DEFAULT_MODEL_SELECTIONS.text.model
+      ? DEFAULT_MODEL_SELECTIONS.text.effort
+      : undefined;
   return normalizeReasoningEffortFor(
-    (document.getElementById("textReasoningEffort") as HTMLSelectElement).value,
+    controlValue("textReasoningEffort"),
     reasoningEffortsForSelection(selection, model),
+    defaultEffort,
   );
 }
 
 function selectedTextFallbackProvider(): TextProviderSelection {
   return parseTextProviderValue(
-    (document.getElementById("textFallbackModelProvider") as HTMLSelectElement).value,
+    controlValue("textFallbackModelProvider") ||
+      DEFAULT_MODEL_SELECTIONS.textFallback.provider,
   );
 }
 
 function selectedTextFallbackModel(): string {
-  return (document.getElementById("textFallbackModel") as HTMLSelectElement).value;
+  const provider = selectedTextFallbackProvider();
+  return (
+    controlValue("textFallbackModel") ||
+    (providerConfigValue(provider) === DEFAULT_MODEL_SELECTIONS.textFallback.provider
+      ? DEFAULT_MODEL_SELECTIONS.textFallback.model
+      : "")
+  );
 }
 
 function selectedTextFallbackEffort(): string {
   const selection = selectedTextFallbackProvider();
   const model = selectedTextFallbackModel();
+  const defaultEffort =
+    providerConfigValue(selection) === DEFAULT_MODEL_SELECTIONS.textFallback.provider &&
+    model === DEFAULT_MODEL_SELECTIONS.textFallback.model
+      ? DEFAULT_MODEL_SELECTIONS.textFallback.effort
+      : undefined;
   return normalizeReasoningEffortFor(
-    (document.getElementById("textFallbackReasoningEffort") as HTMLSelectElement).value,
+    controlValue("textFallbackReasoningEffort"),
     reasoningEffortsForSelection(selection, model),
+    defaultEffort,
   );
 }
 
 function selectedImageProvider(): TextProviderSelection {
   return parseTextProviderValue(
-    (document.getElementById("visionModel") as HTMLSelectElement).value,
+    controlValue("visionModel") || DEFAULT_MODEL_SELECTIONS.image.provider,
   );
 }
 
 function selectedImageModel(): string {
-  return (document.getElementById("visionModelId") as HTMLSelectElement).value;
+  const provider = selectedImageProvider();
+  return (
+    controlValue("visionModelId") ||
+    (providerConfigValue(provider) === DEFAULT_MODEL_SELECTIONS.image.provider
+      ? DEFAULT_MODEL_SELECTIONS.image.model
+      : "")
+  );
 }
 
 function selectedImageConfig() {
   const selection = selectedImageProvider();
   const model = selectedImageModel();
+  const defaultEffort =
+    providerConfigValue(selection) === DEFAULT_MODEL_SELECTIONS.image.provider &&
+    model === DEFAULT_MODEL_SELECTIONS.image.model
+      ? DEFAULT_MODEL_SELECTIONS.image.effort
+      : undefined;
   const effort = normalizeReasoningEffortFor(
-    (document.getElementById("visionReasoningEffort") as HTMLSelectElement).value,
+    controlValue("visionReasoningEffort"),
     reasoningEffortsForSelection(selection, model),
+    defaultEffort,
   );
   return {
     provider: `${selection.kind}:${selection.provider}`,
@@ -1806,20 +2193,33 @@ function selectedImageConfig() {
 
 function selectedImageFallbackProvider(): TextProviderSelection {
   return parseTextProviderValue(
-    (document.getElementById("visionFallbackModelProvider") as HTMLSelectElement).value,
+    controlValue("visionFallbackModelProvider") ||
+      DEFAULT_MODEL_SELECTIONS.imageFallback.provider,
   );
 }
 
 function selectedImageFallbackModel(): string {
-  return (document.getElementById("visionFallbackModel") as HTMLSelectElement).value;
+  const provider = selectedImageFallbackProvider();
+  return (
+    controlValue("visionFallbackModel") ||
+    (providerConfigValue(provider) === DEFAULT_MODEL_SELECTIONS.imageFallback.provider
+      ? DEFAULT_MODEL_SELECTIONS.imageFallback.model
+      : "")
+  );
 }
 
 function selectedImageFallbackEffort(): string {
   const selection = selectedImageFallbackProvider();
   const model = selectedImageFallbackModel();
+  const defaultEffort =
+    providerConfigValue(selection) === DEFAULT_MODEL_SELECTIONS.imageFallback.provider &&
+    model === DEFAULT_MODEL_SELECTIONS.imageFallback.model
+      ? DEFAULT_MODEL_SELECTIONS.imageFallback.effort
+      : undefined;
   return normalizeReasoningEffortFor(
-    (document.getElementById("visionFallbackReasoningEffort") as HTMLSelectElement).value,
+    controlValue("visionFallbackReasoningEffort"),
     reasoningEffortsForSelection(selection, model),
+    defaultEffort,
   );
 }
 
@@ -1830,7 +2230,7 @@ function uniqueModels(models: string[]): string[] {
 function selectedTextApiModels(): string[] {
   const textProvider = selectedTextProvider();
   const textFallbackProvider = selectedTextFallbackProvider();
-  const primaryModel = (document.getElementById("model") as HTMLSelectElement).value;
+  const primaryModel = selectedTextModel();
   const fallbackModel = selectedTextFallbackModel();
   return uniqueModels([
     textProvider.kind === "api" ? primaryModel : "",
@@ -1841,7 +2241,7 @@ function selectedTextApiModels(): string[] {
 function selectedTextApiEffortMap(): Record<string, string> {
   const textProvider = selectedTextProvider();
   const textFallbackProvider = selectedTextFallbackProvider();
-  const primaryModel = (document.getElementById("model") as HTMLSelectElement).value;
+  const primaryModel = selectedTextModel();
   const fallbackModel = selectedTextFallbackModel();
   const map: Record<string, string> = {};
   if (textProvider.kind === "api" && primaryModel) {
@@ -1875,6 +2275,10 @@ function selectedImageApiEffortMap(): Record<string, string> {
     map[fallbackModel] = selectedImageFallbackEffort();
   }
   return map;
+}
+
+function selectedTextModelsPayload(): string {
+  return uniqueModels([selectedTextModel(), ...selectedTextApiModels()]).join(",");
 }
 
 function selectedTweetProviders(): string[] {
@@ -2131,6 +2535,10 @@ function findHeaderByCandidates(
     if (idx >= 0) return headers[idx];
   }
   return null;
+}
+
+function convertFileSrc(filePath: string): string {
+  return tauriConvertFileSrc(normalizeFilePathForWebview(filePath));
 }
 
 function resolveImageSrc(pathOrUrl: string): string {
@@ -2709,6 +3117,14 @@ function currentBridgeJobOptions(timeoutMs = 10_800_000) {
   };
 }
 
+type RunJobOptions = {
+  /** この呼出しだけRust bridgeへ渡すtimeout。未指定時は既存設定を使う。 */
+  timeoutMsOverride?: number;
+  /** bridge invokeのrejectを呼出元でtyped rejectedとして扱う。 */
+  rethrowOnInvokeError?: boolean;
+  reprocess?: { runId: string; circleName: string };
+};
+
 /**
  * ユーザー向けジョブのUIアダプタ。
  * 実際のTauri呼び出しはinvokeBridgeJobへ委譲し、この関数は結果表示だけを担当する。
@@ -2717,9 +3133,11 @@ async function runJob(
   job: string,
   payload: Record<string, unknown>,
   withProgress = false,
+  options: RunJobOptions = {},
 ): Promise<BridgeJobResult<Record<string, unknown>> | null> {
   resultEl.textContent = "";
   let unlisten: (() => void) | null = null;
+  let reprocessTimer: number | undefined;
 
   if (withProgress) {
     startElapsedTimer();
@@ -2742,16 +3160,31 @@ async function runJob(
   }
 
   try {
+    if (options.reprocess) {
+      const { runId, circleName } = options.reprocess;
+      const started = performance.now();
+      let stage = "実行環境を準備中";
+      const renderProgress = () => {
+        resultEl.textContent = `「${circleName}」を再処理中：${stage}\n` +
+          `経過 ${Math.floor((performance.now() - started) / 1000)}秒 / 残りキュー: ${reprocessCircleQueue.length}件\n` +
+          "再処理中も優先度の変更・スクロール・画像表示・検索を利用できます。";
+      };
+      renderProgress();
+      reprocessTimer = window.setInterval(renderProgress, 1000);
+      unlisten = await listen<string>("pipeline-log", (event) => {
+        const label = reprocessProgressLabel(event.payload, runId);
+        if (label) { stage = label; renderProgress(); }
+      });
+    }
     const response = await invokeBridgeJob<Record<string, unknown>>(
       job,
       payload,
       {
         ...currentBridgeJobOptions(
-          Number(timeoutMsEl.value || "10800000"),
+          options.timeoutMsOverride ?? Number(timeoutMsEl.value || "10800000"),
         ),
       },
     );
-    if (unlisten) unlisten();
     if (withProgress) finishElapsedTimer(Boolean(response.ok));
     if (withProgress) {
       // リアルタイムログを保持し、エラー情報があれば末尾に追記
@@ -2780,14 +3213,17 @@ async function runJob(
     }
     return response;
   } catch (error) {
-    if (unlisten) unlisten();
     if (withProgress) finishElapsedTimer(false);
     if (withProgress) {
       resultEl.textContent += `\n❌ エラー: ${String(error)}\n`;
     } else {
       resultEl.textContent = `エラー: ${String(error)}`;
     }
+    if (options.rethrowOnInvokeError) throw error;
     return null;
+  } finally {
+    if (reprocessTimer !== undefined) window.clearInterval(reprocessTimer);
+    if (unlisten) unlisten();
   }
 }
 
@@ -2799,14 +3235,6 @@ type EventSaveRequest = {
   lifecycleLease: EventLifecycleLease;
 };
 
-function normalizeEventPath(path: string): string {
-  return path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
-}
-
-function eventJsonPathForDir(eventDir: string): string {
-  return `${normalizeEventPath(eventDir)}/event.json`;
-}
-
 function assertCurrentSaveOwnership(
   snapshot: Pick<EventSaveRequest, "ownerSlug" | "ownerDir" | "eventJsonPath">,
 ): void {
@@ -2816,9 +3244,9 @@ function assertCurrentSaveOwnership(
   if (
     !activeEvent ||
     activeEvent.slug !== snapshot.ownerSlug ||
-    normalizeEventPath(activeEvent.dir) !== normalizeEventPath(snapshot.ownerDir) ||
-    expectedPath !== normalizeEventPath(snapshot.eventJsonPath) ||
-    editorPath !== expectedPath
+    !eventPathsEqual(activeEvent.dir, snapshot.ownerDir) ||
+    !eventPathsEqual(expectedPath, snapshot.eventJsonPath) ||
+    !eventPathsEqual(editorPath, expectedPath)
   ) {
     throw new Error(
       `保存対象のイベント所有権が一致しません (slug=${snapshot.ownerSlug}, path=${snapshot.eventJsonPath})`,
@@ -2832,8 +3260,7 @@ function isActiveEventDocumentOwned(ownerSlug: string): boolean {
     ownerEvent &&
       activeEventSlug === ownerSlug &&
       eventJsonData &&
-      normalizeEventPath(editorJsonPathValue()) ===
-        eventJsonPathForDir(ownerEvent.dir),
+      eventPathsEqual(editorJsonPathValue(), eventJsonPathForDir(ownerEvent.dir)),
   );
 }
 
@@ -2988,7 +3415,7 @@ const eventSaveQueue = new KeyedRevisionedSaveQueue<EventSaveRequest>(
 /** 保存失敗したイベントだけを再試行する。別イベントの表示/loadは止めない。 */
 async function retryEventSave(slug: string, dir: string): Promise<boolean> {
   const owner = eventList.find(
-    (event) => event.slug === slug && normalizeEventPath(event.dir) === normalizeEventPath(dir),
+    (event) => event.slug === slug && eventPathsEqual(event.dir, dir),
   );
   if (!owner) return false;
   const receipt = eventSaveQueue.retryKey(eventMetaOwnerKey(slug, dir));
@@ -3095,7 +3522,7 @@ async function preflightFullSyncEventUids(): Promise<void> {
 
         if (
           activeEventSlug === owner.slug &&
-          normalizeEventPath(editorJsonPathValue()) === eventJsonPath
+          eventPathsEqual(editorJsonPathValue(), eventJsonPath)
         ) {
           // UIDだけを追加したnative saveとopen sessionの双方を同じsnapshotへ揃える。
           // これにより同期後の編集/saveがUIDなしの古いglobalから上書きしない。
@@ -3178,7 +3605,14 @@ async function saveNow(
   }
   const ownerDir = normalizeEventPath(ownerEvent.dir);
   const eventJsonPath = eventJsonPathForDir(ownerDir);
-  if (normalizeEventPath(editorJsonPathValue()) !== eventJsonPath) {
+  if (!eventPathsEqual(editorJsonPathValue(), eventJsonPath)) {
+    logExternalReloadFailure("save-owner-mismatch", {
+      slug: ownerSlug,
+      dir: ownerDir,
+      eventJsonPath,
+      revision: eventDocumentStateRevision,
+      session: committedSessionOwnerSnapshot(),
+    });
     return {
       ok: false,
       revision: null,
@@ -3254,10 +3688,274 @@ async function saveNow(
     persistedEventJsonData = persistedSnapshot;
     return { ok: true, revision: receipt.revision };
   } catch (error) {
+    logExternalReloadFailure("save-failed", {
+      slug: ownerSlug,
+      dir: ownerDir,
+      eventJsonPath,
+      revision: eventDocumentStateRevision,
+      session: committedSessionOwnerSnapshot(),
+    });
     const msg = `event.json保存エラー: ${String(error)}`;
-    logToFile(msg);
+    // error本文はCookie/event.json内容を含み得るため、診断ログには出さない。
     return { ok: false, revision: receipt.revision, error };
   }
+}
+
+type EventSelectionOptions = {
+  savePermit?: InternalOperationSavePermit;
+  reloadMode?: EventReloadMode;
+  externalOwner?: ExternalEventReloadOwner;
+};
+
+type EventSelectionArgument =
+  | InternalOperationSavePermit
+  | EventSelectionOptions;
+
+function eventSelectionOptions(
+  argument?: EventSelectionArgument,
+): EventSelectionOptions {
+  if (argument === INTERNAL_OPERATION_SAVE) {
+    return { savePermit: INTERNAL_OPERATION_SAVE };
+  }
+  return argument ?? {};
+}
+
+function committedSessionOwnerSnapshot(): ExternalEventReloadOwner["session"] {
+  if (!committedEventSession) return null;
+  return {
+    slug: committedEventSession.slug,
+    eventDir: normalizeEventPath(committedEventSession.eventDir),
+    eventJsonPath: normalizeEventPath(committedEventSession.eventJsonPath),
+  };
+}
+
+function externalReloadOwnerIdentityMatches(
+  left: ExternalEventReloadOwner,
+  right: ExternalEventReloadOwner,
+): boolean {
+  return (
+    left.slug === right.slug &&
+    eventPathsEqual(left.dir, right.dir) &&
+    eventPathsEqual(left.eventJsonPath, right.eventJsonPath) &&
+    left.revision === right.revision &&
+    eventSessionOwnerMatches(left, right.session) &&
+    eventSessionOwnerMatches(right, left.session)
+  );
+}
+
+function eventJsonHiddenPathValue(): string {
+  return (
+    document.getElementById("eventJsonHidden") as HTMLInputElement | null
+  )?.value.trim() || "";
+}
+
+/** Python実行前に、保存済みのactive ownerをimmutableなreload tokenへ固定する。 */
+function captureExternalEventReloadOwner(): ExternalEventReloadOwner | null {
+  if (!activeEventSlug || !eventJsonData) return null;
+  const event = eventList.find((entry) => entry.slug === activeEventSlug);
+  if (!event) return null;
+  const dir = normalizeEventPath(event.dir);
+  const eventJsonPath = eventJsonPathForDir(dir);
+  if (
+    !eventPathsEqual(editorJsonPathValue(), eventJsonPath) ||
+    !eventPathsEqual(eventJsonHiddenPathValue(), eventJsonPath)
+  ) {
+    return null;
+  }
+  const session = committedSessionOwnerSnapshot();
+  const owner = { slug: activeEventSlug, dir, eventJsonPath };
+  if (!eventSessionOwnerMatches(owner, session)) return null;
+  return {
+    ...owner,
+    revision: eventDocumentStateRevision,
+    session,
+  };
+}
+
+function isCurrentExternalEventReloadOwner(
+  owner: ExternalEventReloadOwner,
+): boolean {
+  const event = eventList.find((entry) => entry.slug === owner.slug);
+  return Boolean(
+    activeEventSlug === owner.slug &&
+      eventDocumentStateRevision === owner.revision &&
+      event &&
+      externalEventOwnerMatches(owner, event) &&
+      eventPathsEqual(editorJsonPathValue(), owner.eventJsonPath) &&
+      eventPathsEqual(eventJsonHiddenPathValue(), owner.eventJsonPath) &&
+      eventSessionOwnerMatches(owner, committedSessionOwnerSnapshot()),
+  );
+}
+
+type ExternalReloadFailureReason =
+  | "save-owner-mismatch"
+  | "save-failed"
+  | "preflight-save-failed"
+  | "preflight-owner-missing"
+  | "preflight-output-dir-mismatch"
+  | "preflight-queue-failed"
+  | "preflight-owner-changed"
+  | "owner-changed-before-list"
+  | "event-list-load-stale"
+  | "event-list-owner-mismatch"
+  | "owner-changed-before-reload"
+  | "disk-reload-failed"
+  | "renamed-owner-missing";
+
+/** Cookieやevent.json内容を含めず、owner識別情報だけを診断ログへ残す。 */
+function logExternalReloadFailure(
+  reason: ExternalReloadFailureReason,
+  owner: ExternalEventReloadOwner | null,
+  expectedPath = "",
+  listedSlug: string | null = null,
+  listedDir: string | null = null,
+): void {
+  const activeEvent = activeEventSlug
+    ? eventList.find((event) => event.slug === activeEventSlug)
+    : null;
+  const activeExpectedPath = activeEvent
+    ? eventJsonPathForDir(activeEvent.dir)
+    : "";
+  logToFile(
+    `[external-reload] ${JSON.stringify({
+      reason,
+      activeEventSlug,
+      ownerSlug: owner?.slug ?? null,
+      ownerDir: owner?.dir ?? null,
+      expectedPath: normalizeEventPath(
+        expectedPath || owner?.eventJsonPath || activeExpectedPath,
+      ),
+      editorPath: normalizeEventPath(editorJsonPathValue()),
+      committedSession: committedSessionOwnerSnapshot(),
+      requestedSlug: requestedEventSlug,
+      revision: eventDocumentStateRevision,
+      ownerRevision: owner?.revision ?? null,
+      listedSlug,
+      listedDir: listedDir === null ? null : normalizeEventPath(listedDir),
+    })}`,
+  );
+}
+
+async function prepareExternalEventReloadOwner(
+  expectedOutputDir?: string,
+  saveBeforeCapture = true,
+): Promise<ExternalEventReloadOwner | null> {
+  if (saveBeforeCapture) {
+    const initialSave = await saveNow(INTERNAL_OPERATION_SAVE);
+    if (!initialSave.ok) {
+      logExternalReloadFailure("preflight-save-failed", null);
+      return null;
+    }
+  }
+
+  const beforeFlush = captureExternalEventReloadOwner();
+  if (!beforeFlush) {
+    logExternalReloadFailure("preflight-owner-missing", null);
+    return null;
+  }
+  if (
+    expectedOutputDir !== undefined &&
+    !eventPathsEqual(expectedOutputDir, beforeFlush.dir)
+  ) {
+    logExternalReloadFailure(
+      "preflight-output-dir-mismatch",
+      beforeFlush,
+      eventJsonPathForDir(expectedOutputDir),
+    );
+    return null;
+  }
+
+  const key = eventMetaOwnerKey(beforeFlush.slug, beforeFlush.dir);
+  try {
+    await eventSaveQueue.flushKey(key);
+  } catch {
+    logExternalReloadFailure("preflight-queue-failed", beforeFlush);
+    return null;
+  }
+  if (eventSaveQueue.getStatus(key).error) {
+    logExternalReloadFailure("preflight-queue-failed", beforeFlush);
+    return null;
+  }
+
+  const owner = captureExternalEventReloadOwner();
+  if (
+    !owner ||
+    !externalReloadOwnerIdentityMatches(beforeFlush, owner) ||
+    (expectedOutputDir !== undefined &&
+      !eventPathsEqual(expectedOutputDir, owner.dir))
+  ) {
+    logExternalReloadFailure("preflight-owner-changed", owner ?? beforeFlush);
+    return null;
+  }
+  return owner;
+}
+
+/**
+ * Python完了後は一覧のslugだけで再選択せず、captured ownerとphysical
+ * directory/event.json mappingを先に照合する。失敗時はselect/saveを行わない。
+ */
+async function reloadExternalEvent(
+  owner: ExternalEventReloadOwner,
+): Promise<boolean> {
+  if (!isCurrentExternalEventReloadOwner(owner)) {
+    logExternalReloadFailure("owner-changed-before-list", owner);
+    resultEl.textContent =
+      "外部pipeline結果の再読み込みを中止しました（イベント所有権が変わりました）。";
+    return false;
+  }
+
+  const listed = await loadEventList();
+  if (!listed) {
+    logExternalReloadFailure("event-list-load-stale", owner);
+    resultEl.textContent =
+      "外部pipeline結果の再読み込みを中止しました（イベント一覧が古くなりました）。";
+    return false;
+  }
+  const listedEvent = eventList.find((event) => event.slug === owner.slug);
+  const expectedPath = listedEvent
+    ? eventJsonPathForDir(listedEvent.dir)
+    : "";
+  if (!listedEvent || !externalEventOwnerMatches(owner, listedEvent)) {
+    logExternalReloadFailure(
+      "event-list-owner-mismatch",
+      owner,
+      expectedPath,
+      listedEvent?.slug ?? null,
+      listedEvent?.dir ?? null,
+    );
+    resultEl.textContent =
+      "外部pipeline結果の再読み込みを中止しました（slugと保存先pathが一致しません）。";
+    return false;
+  }
+  if (!isCurrentExternalEventReloadOwner(owner)) {
+    logExternalReloadFailure(
+      "owner-changed-before-reload",
+      owner,
+      expectedPath,
+      listedEvent.slug,
+      listedEvent.dir,
+    );
+    resultEl.textContent =
+      "外部pipeline結果の再読み込みを中止しました（再読み込み前に所有権が変わりました）。";
+    return false;
+  }
+
+  const reloaded = await selectEvent(owner.slug, {
+    reloadMode: "external-authoritative",
+    externalOwner: owner,
+  });
+  if (!reloaded) {
+    logExternalReloadFailure(
+      "disk-reload-failed",
+      owner,
+      expectedPath,
+      listedEvent.slug,
+      listedEvent.dir,
+    );
+    resultEl.textContent =
+      "外部pipeline結果の再読み込みに失敗しました。所有権を確認してから再試行してください。";
+  }
+  return reloaded;
 }
 
 function isImageCol(h: string): boolean {
@@ -4556,6 +5254,7 @@ function renderCircleEditor() {
         document.querySelectorAll(".color-dropdown").forEach((d) => d.remove());
         const row = Number(swatch.dataset.row);
         const col = String(swatch.dataset.col);
+        const priorityIdentity = circleIdentityFromCircle(eventJsonData.circles[row]);
         const currentVal = String(
           parseFloat(tableState.rows[row][col] || "5") || 5,
         );
@@ -4572,8 +5271,20 @@ function renderCircleEditor() {
           btn.title = opt.label;
           btn.addEventListener("click", (ev) => {
             ev.stopPropagation();
-            tableState.rows[row][col] = opt.value + ".0";
-            saveNow();
+            const priorityRow = findCircleIndexByIdentity(row, priorityIdentity);
+            if (priorityRow < 0) { dropdown.remove(); return; }
+            tableState.rows[priorityRow][col] = opt.value + ".0";
+            if (isReprocessOperation(operationState)) {
+              reprocessPriorityEdits.record(
+                priorityRow,
+                priorityIdentity,
+                Number(opt.value),
+              );
+              // 商品patch反映時にも優先度を保持し、終了時にまとめて保存する。
+              scheduleAutoSave();
+            } else {
+              void saveNow();
+            }
             swatch.style.background = opt.bgColor;
             swatch.style.borderColor = opt.color;
             swatch.title = opt.label;
@@ -4591,6 +5302,7 @@ function renderCircleEditor() {
               applyPriorityRowStyle(tr as HTMLElement, opt);
             }
             dropdown.remove();
+            if (!swatch.isConnected) renderCircleEditorAndMap();
           });
           dropdown.appendChild(btn);
         }
@@ -4911,7 +5623,7 @@ function showCircleRowContextMenu(x: number, y: number, rowIdx: number) {
     menu.remove();
     void markCircleCatalogNeedsRecheck(rowIdx);
   });
-  menu.appendChild(needsRecheckItem);
+  if (!isReprocessOperation(operationState)) menu.appendChild(needsRecheckItem);
 
   const addItem = document.createElement("div");
   addItem.textContent = "このサークルの下に追加";
@@ -4919,7 +5631,7 @@ function showCircleRowContextMenu(x: number, y: number, rowIdx: number) {
     menu.remove();
     addCircleRow(rowIdx + 1);
   });
-  menu.appendChild(addItem);
+  if (!isReprocessOperation(operationState)) menu.appendChild(addItem);
 
   const deleteItem = document.createElement("div");
   deleteItem.textContent = "このサークルを削除";
@@ -4928,7 +5640,7 @@ function showCircleRowContextMenu(x: number, y: number, rowIdx: number) {
     menu.remove();
     void deleteCircleRow(rowIdx);
   });
-  menu.appendChild(deleteItem);
+  if (!isReprocessOperation(operationState)) menu.appendChild(deleteItem);
 
   document.body.appendChild(menu);
   const close = () => {
@@ -4940,6 +5652,7 @@ function showCircleRowContextMenu(x: number, y: number, rowIdx: number) {
 
 /** テーブル空白エリアの右クリックメニュー（末尾に追加のみ） */
 function showCircleTableContextMenu(x: number, y: number) {
+  if (isReprocessOperation(operationState)) return;
   document.querySelectorAll(".ctx-menu").forEach((m) => m.remove());
   const menu = document.createElement("div");
   menu.className = "ctx-menu";
@@ -5068,6 +5781,8 @@ type ReprocessCircleJob = {
   | {
       source: "post";
       postUrl: string;
+      runId: string;
+      telemetryStartMs: number;
     }
   | {
       source: "image";
@@ -5077,6 +5792,81 @@ type ReprocessCircleJob = {
 );
 
 const reprocessCircleQueue: ReprocessCircleJob[] = [];
+const reprocessPriorityEdits = new ReprocessPriorityEdits();
+
+let activePostReprocessRunId: string | null = null;
+let activePostReprocessJob: ReprocessCircleJob | null = null;
+let cancelReprocessRequestInFlight = false;
+let latestReprocessJobCleanup:
+  | { job: ReprocessCircleJob; outcome: Exclude<ReprocessTelemetryOutcome, "begin"> }
+  | null = null;
+
+function latestReprocessCleanupSnapshot():
+  | { job: ReprocessCircleJob; outcome: Exclude<ReprocessTelemetryOutcome, "begin"> }
+  | null {
+  return latestReprocessJobCleanup;
+}
+
+function setActivePostReprocessJob(job: ReprocessCircleJob | null): void {
+  if (!job || job.source !== "post") {
+    activePostReprocessRunId = null;
+    activePostReprocessJob = null;
+    cancelReprocessRequestInFlight = false;
+    cancelReprocessBtn.classList.add("hidden");
+    cancelReprocessBtn.disabled = true;
+    cancelReprocessBtn.textContent = "現在の再処理を中止";
+    return;
+  }
+  activePostReprocessRunId = job.runId;
+  activePostReprocessJob = job;
+  cancelReprocessRequestInFlight = false;
+  cancelReprocessBtn.classList.remove("hidden");
+  cancelReprocessBtn.disabled = false;
+  cancelReprocessBtn.textContent = "現在の再処理を中止";
+}
+
+async function cancelActivePostReprocess(): Promise<void> {
+  const runId = activePostReprocessRunId;
+  if (!runId || cancelReprocessRequestInFlight) return;
+  cancelReprocessRequestInFlight = true;
+  cancelReprocessBtn.disabled = true;
+  cancelReprocessBtn.textContent = "中止要求を送信中…";
+  resultEl.textContent = `「${activePostReprocessJob?.circleName || "対象サークル"}」の中止を要求しました。処理終了を待っています…`;
+  try {
+    const response = await invoke<Record<string, unknown>>(
+      "cancel_reprocess_bridge",
+      { runId },
+    );
+    if (activePostReprocessRunId !== runId) return;
+    if (response?.acknowledged !== true) {
+      cancelReprocessRequestInFlight = false;
+      cancelReprocessBtn.disabled = false;
+      cancelReprocessBtn.textContent = "現在の再処理を中止";
+      resultEl.textContent = `再処理の中止要求を受理できませんでした: ${String(response?.status || "unknown_run")}`;
+      return;
+    }
+    cancelReprocessBtn.textContent = "中止処理中…";
+  } catch (error) {
+    if (activePostReprocessRunId !== runId) return;
+    cancelReprocessRequestInFlight = false;
+    cancelReprocessBtn.disabled = false;
+    cancelReprocessBtn.textContent = "現在の再処理を中止";
+    resultEl.textContent = `再処理の中止要求に失敗しました: ${String(error)}`;
+  }
+}
+
+cancelReprocessBtn.addEventListener("click", (event) => {
+  event.stopPropagation();
+  void cancelActivePostReprocess();
+});
+
+function logPendingReprocessCleanup(
+  outcome: Exclude<ReprocessTelemetryOutcome, "begin">,
+): void {
+  for (const job of reprocessCircleQueue) {
+    logReprocessTelemetry(job, "frontend.cleanup", outcome);
+  }
+}
 
 function circleIdentityFromCircle(c: any): ReprocessCircleJob["circleIdentity"] {
   return {
@@ -5089,6 +5879,42 @@ function circleIdentityFromCircle(c: any): ReprocessCircleJob["circleIdentity"] 
 
 function reprocessJobLabel(job: ReprocessCircleJob): string {
   return job.source === "post" ? job.postUrl : job.imageFileName;
+}
+
+function reprocessOutcomeLabel(outcome: ReprocessBridgeTerminalOutcome): string {
+  switch (outcome) {
+    case "cancel":
+      return "中止";
+    case "timeout":
+      return "タイムアウト終了";
+    case "rejected":
+      return "呼び出し失敗";
+    case "success":
+      return "完了";
+    case "error":
+      return "失敗";
+  }
+}
+
+function showReprocessTerminalResult(
+  job: ReprocessCircleJob,
+  stage: string,
+  outcome: ReprocessBridgeTerminalOutcome,
+  response?: ReprocessBridgeResultLike,
+  cause?: string,
+  explicitError?: string,
+): void {
+  const causeText = cause || outcome;
+  const errorText =
+    explicitError?.trim() || extractReprocessErrorMessage(response, causeText);
+  const bridgeStage = (response?.bridge as Record<string, unknown> | undefined)?.stage;
+  if (stage === "frontend.bridge_response" && typeof bridgeStage === "string") stage = bridgeStage;
+  resultEl.textContent =
+    `「${job.circleName}」の再処理を${reprocessOutcomeLabel(outcome)}しました。\n` +
+    `stage=${stage}\n` +
+    `cause=${causeText}\n` +
+    `error=${errorText}\n` +
+    `残りキュー: ${reprocessCircleQueue.length}件`;
 }
 
 function findCircleIndexByIdentity(
@@ -5178,9 +6004,12 @@ function mergeReprocessedCircleIntoState(
 }
 
 function enqueueReprocessCircle(job: ReprocessCircleJob) {
+  logReprocessTelemetry(job, "frontend.enqueue", "begin");
   if (!canEnqueueReprocess(operationState)) {
     resultEl.textContent =
       "イベント処理中のため、1サークル再処理は完了後に実行してください。";
+    logReprocessTelemetry(job, "frontend.enqueue", "error");
+    logReprocessTelemetry(job, "frontend.cleanup", "error");
     return;
   }
   job.eventSlug = activeEventSlug || "";
@@ -5190,6 +6019,8 @@ function enqueueReprocessCircle(job: ReprocessCircleJob) {
   job.outputDir = getActiveEventDir() || "";
   if (!job.eventSlug || !job.eventJsonPath || !job.outputDir) {
     resultEl.textContent = "アクティブなイベントが選択されていません。";
+    logReprocessTelemetry(job, "frontend.enqueue", "error");
+    logReprocessTelemetry(job, "frontend.cleanup", "error");
     return;
   }
   const shouldStart =
@@ -5199,6 +6030,7 @@ function enqueueReprocessCircle(job: ReprocessCircleJob) {
   const queued = operationState.queuedReprocess +
     (isReprocessOperation(operationState) ? 1 : 0);
   resultEl.textContent = `「${job.circleName}」の再処理をキューに追加しました（待機中: ${queued}件）`;
+  logReprocessTelemetry(job, "frontend.enqueue", "end");
   if (shouldStart) {
     void drainReprocessCircleQueue().catch((error) => {
       const msg = `1サークル再処理キューで予期しないエラーが発生しました: ${String(error)}`;
@@ -5210,8 +6042,14 @@ function enqueueReprocessCircle(job: ReprocessCircleJob) {
 
 async function drainReprocessCircleQueue() {
   if (!canStartReprocess(operationState)) return;
+  reprocessPriorityEdits.clear();
+  latestReprocessJobCleanup = null;
   applyOperationEvent({ type: "start-reprocess" });
   setEventPipelineButtonsDisabled(true);
+  for (const id of ["tab-edit", "tab-history", "tab-settings"]) {
+    document.getElementById(id)!.inert = false;
+  }
+  const releaseReadOnlyView = makeReprocessViewReadOnly(document.getElementById("tab-edit")!);
   try {
     const pendingCrawlMeta = captureCrawlMetaSnapshot();
     cancelCrawlMetaSave();
@@ -5219,6 +6057,7 @@ async function drainReprocessCircleQueue() {
     const initialSave = await saveNow(INTERNAL_OPERATION_SAVE);
     if (!initialSave.ok) {
       resultEl.textContent = `1サークル再処理前の保存に失敗しました: ${String(initialSave.error)}`;
+      logPendingReprocessCleanup("error");
       reprocessCircleQueue.length = 0;
       applyOperationEvent({ type: "abort-reprocess" });
       return;
@@ -5227,68 +6066,119 @@ async function drainReprocessCircleQueue() {
       while (reprocessCircleQueue.length > 0) {
         const job = reprocessCircleQueue.shift()!;
         applyOperationEvent({ type: "dequeue-reprocess" });
+        logReprocessTelemetry(job, "frontend.start", "begin");
         await runReprocessCircleJob(job);
       }
+      const priorityRevision = reprocessPriorityEdits.revision;
       const finalSave = await saveNow(INTERNAL_OPERATION_SAVE);
       if (!finalSave.ok) {
         resultEl.textContent = `1サークル再処理後の保存に失敗しました: ${String(finalSave.error)}`;
       }
       // 最終保存中に追加されたキューも同じ排他区間で処理する。
-      if (reprocessCircleQueue.length === 0) break;
+      if (reprocessCircleQueue.length === 0 && priorityRevision === reprocessPriorityEdits.revision) break;
     }
   } finally {
     if (isReprocessOperation(operationState)) {
       if (reprocessCircleQueue.length === 0) {
         applyOperationEvent({ type: "finish-reprocess" });
       } else {
+        logPendingReprocessCleanup("error");
         reprocessCircleQueue.length = 0;
         applyOperationEvent({ type: "abort-reprocess" });
       }
     }
+    releaseReadOnlyView();
+    reprocessPriorityEdits.clear();
     setEventPipelineButtonsDisabled(false);
+    const finalCleanup = latestReprocessCleanupSnapshot();
+    setActivePostReprocessJob(null);
+    if (finalCleanup) {
+      logReprocessTelemetry(finalCleanup.job, "frontend.cleanup", finalCleanup.outcome);
+    }
   }
 }
 
 async function runReprocessCircleJob(job: ReprocessCircleJob) {
+  let terminalOutcome: ReprocessBridgeTerminalOutcome = "error";
+  let bridgeInvocationStarted = false;
+  let bridgeResponseReceived = false;
+  let patchStarted = false;
+  let patchTelemetryErrorLogged = false;
+  try {
   const stillTargetsQueuedEvent = () =>
     activeEventSlug === job.eventSlug &&
     (document.getElementById("editorJsonPath") as HTMLInputElement).value.trim() ===
       job.eventJsonPath &&
     getActiveEventDir() === job.outputDir;
   if (!stillTargetsQueuedEvent()) {
-    resultEl.textContent =
-      `「${job.circleName}」はイベントが切り替わったため再処理をスキップしました。`;
+    terminalOutcome = "cancel";
+    showReprocessTerminalResult(
+      job,
+      "identity",
+      terminalOutcome,
+      undefined,
+      "event switched before bridge",
+      "再処理対象のイベントが切り替わりました",
+    );
     return;
   }
   const currentIdx = findCircleIndexByIdentity(job.rowIdx, job.circleIdentity);
   if (currentIdx < 0) {
-    resultEl.textContent = `「${job.circleName}」が見つからないため再処理をスキップしました。`;
+    showReprocessTerminalResult(
+      job,
+      "preflight",
+      terminalOutcome,
+      undefined,
+      "circle identity not found",
+      `「${job.circleName}」が現在のイベントに見つかりません`,
+    );
     return;
   }
+  if (!(await preflightSelectedAntigravityModel())) return;
 
   resultEl.textContent = `「${job.circleName}」の変更を保存中...`;
   const saveResult = await saveNow(INTERNAL_OPERATION_SAVE);
   if (!saveResult.ok) {
-    resultEl.textContent = `「${job.circleName}」の変更保存に失敗しました: ${String(saveResult.error)}`;
+    showReprocessTerminalResult(
+      job,
+      "preflight-save",
+      terminalOutcome,
+      undefined,
+      "preflight save failed",
+      String(saveResult.error),
+    );
     return;
   }
   if (!stillTargetsQueuedEvent()) {
-    resultEl.textContent =
-      `「${job.circleName}」は保存中にイベントが切り替わったため再処理を中止しました。`;
+    terminalOutcome = "cancel";
+    showReprocessTerminalResult(
+      job,
+      "identity",
+      terminalOutcome,
+      undefined,
+      "event switched during preflight save",
+      "保存中にイベントが切り替わりました",
+    );
     return;
   }
 
   const eventJsonPath = job.eventJsonPath || "";
   const outputDir = job.outputDir || "";
   if (!eventJsonPath || !outputDir) {
-    alert("アクティブなイベントが選択されていません。");
+    showReprocessTerminalResult(
+      job,
+      "preflight",
+      terminalOutcome,
+      undefined,
+      "event target is missing",
+      "アクティブなイベントが選択されていません",
+    );
     return;
   }
 
   resultEl.textContent = `「${job.circleName}」を再処理中... (${reprocessJobLabel(job)})\n残りキュー: ${reprocessCircleQueue.length}件`;
-  const modelVal = (document.getElementById("model") as HTMLInputElement)?.value || "";
+  const modelVal = selectedTextModel();
   const imageConfig = selectedImageConfig();
-  const textApiModels = selectedTextApiModels();
   const additionalPrompt = displayAdditionalPromptText(
     (document.getElementById("additionalPrompt") as HTMLTextAreaElement)?.value || "",
   );
@@ -5302,8 +6192,11 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
     circle_index: currentIdx,
     circle_identity: job.circleIdentity,
     output_dir: outputDir,
-    model: textApiModels.join(",") || modelVal.split(",")[0]?.trim() || "gemini-pro",
-    text_llm_provider: selectedText.kind === "cli" ? selectedText.provider : "api",
+    model:
+      selectedTextModelsPayload() ||
+      modelVal ||
+      DEFAULT_MODEL_SELECTIONS.text.model,
+    text_llm_provider: providerConfigValue(selectedText),
     text_llm_cli_models: selectedTextCliModelMap(),
     text_llm_cli_efforts: selectedTextCliEffortMap(),
     text_llm_cli_timeout: 900,
@@ -5326,53 +6219,211 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
     catalog_additional_prompt: additionalPrompt,
     event_date: eventDate,
   };
-  const res =
-    job.source === "post"
-      ? await runJob("reprocess_circle_from_post", {
+  bridgeInvocationStarted = true;
+  let res: BridgeJobResult<Record<string, unknown>> | null;
+  if (job.source === "post") {
+    setActivePostReprocessJob(job);
+    res = await runJob(
+      "reprocess_circle_from_post",
+      attachReprocessRuntimePayload(
+        "post",
+        {
           ...commonPayload,
           post_url: job.postUrl,
-        })
-      : await runJob("reprocess_circle_from_image", {
-          ...commonPayload,
-          image_filename: job.imageFileName,
-          image_path: job.imagePath,
-        });
+        },
+        job.runId,
+      ),
+      false,
+      {
+        timeoutMsOverride: timeoutMsForReprocessSource(
+          "post",
+          Number(timeoutMsEl.value || "10800000"),
+        ),
+        rethrowOnInvokeError: true,
+        reprocess: { runId: job.runId, circleName: job.circleName },
+      },
+    );
+  } else {
+    setActivePostReprocessJob(null);
+    res = await runJob(
+      "reprocess_circle_from_image",
+      attachReprocessRuntimePayload("image", {
+        ...commonPayload,
+        image_filename: job.imageFileName,
+        image_path: job.imagePath,
+      }),
+    );
+  }
+  bridgeResponseReceived = true;
+  if (job.source === "post") {
+    // Rust has already settled and removed the registry entry; the cancel
+    // control must not remain visible while the local identity-safe patch is
+    // being saved.
+    setActivePostReprocessJob(null);
+  }
+
+  terminalOutcome = classifyBridgeTerminalOutcome(res, res === null);
+  logReprocessTelemetry(
+    job,
+    "frontend.bridge_response",
+    telemetryOutcomeForBridgeTerminal(terminalOutcome),
+  );
+
+  if (terminalOutcome !== "success") {
+    const cause =
+      terminalOutcome === "timeout"
+        ? "bridge timeout"
+        : terminalOutcome === "cancel"
+          ? "bridge cancelled"
+          : terminalOutcome === "rejected"
+            ? "bridge invocation rejected"
+            : "bridge returned ok=false";
+    showReprocessTerminalResult(
+      job,
+      "frontend.bridge_response",
+      terminalOutcome,
+      res,
+      cause,
+    );
+    return;
+  }
 
   if (!stillTargetsQueuedEvent()) {
-    resultEl.textContent =
-      `「${job.circleName}」の処理中にイベントが切り替わったため、画面への反映を中止しました。`;
+    terminalOutcome = "cancel";
+    showReprocessTerminalResult(
+      job,
+      "identity",
+      terminalOutcome,
+      res,
+      "event switched after bridge response",
+      "処理中にイベントが切り替わったため、画面への反映を中止しました",
+    );
     return;
   }
 
   const bridge = res?.bridge as Record<string, any> | undefined;
-  if (res?.ok && bridge?.circle_patch) {
-    const applied = await applyBridgeEventPatch(
-      job.eventSlug || "",
-      outputDir,
-      {
-        baseFingerprint: normalizeNativeEventFingerprint(
-          bridge.base_fingerprint as NativeEventFingerprint | undefined,
-        ),
-        circlePatches: [circlePatchFromBridge(bridge)],
-      },
+  if (!bridge?.circle_patch) {
+    terminalOutcome = "error";
+    showReprocessTerminalResult(
+      job,
+      "frontend.bridge_response",
+      terminalOutcome,
+      res,
+      "successful response did not include circle_patch",
+      "成功応答に反映対象のcircle_patchがありません",
     );
-    if (!stillTargetsQueuedEvent()) {
-      resultEl.textContent =
-        `「${job.circleName}」の保存中にイベントが切り替わったため画面反映を中止しました。`;
+    return;
+  }
+
+  {
+    patchStarted = true;
+    logReprocessTelemetry(job, "frontend.patch", "begin");
+    try {
+      const applied = await applyBridgeEventPatch(
+        job.eventSlug || "",
+        outputDir,
+        {
+          baseFingerprint: normalizeNativeEventFingerprint(
+            bridge.base_fingerprint as NativeEventFingerprint | undefined,
+          ),
+          circlePatches: [circlePatchFromBridge(bridge)],
+        },
+      );
+      if (!stillTargetsQueuedEvent()) {
+        terminalOutcome = "cancel";
+        showReprocessTerminalResult(
+          job,
+          "identity",
+          terminalOutcome,
+          res,
+          "event switched during patch save",
+          "保存中にイベントが切り替わったため、画面への反映を中止しました",
+        );
+        return;
+      }
+      const previousEventJsonData = eventJsonData;
+      const previousPersistedEventJsonData = persistedEventJsonData;
+      const previousTableState = tableState;
+      const previousEventTableBaseline = eventTableBaseline;
+      const previousRevision = eventDocumentStateRevision;
+      try {
+        eventJsonData = cloneJsonSnapshot(reprocessPriorityEdits.apply(applied.data));
+        persistedEventJsonData = cloneJsonSnapshot(applied.data);
+        tableState = circlesToTableState(eventJsonData);
+        // ディスクに保存済みの値をbaselineとし、未保存の優先度変更を残す。
+        eventTableBaseline = circlesToTableState(applied.data);
+        markEventDocumentMutated();
+        const resolvedIndex = applied.resolvedCircleIndices[0] ?? currentIdx;
+        mergeReprocessedCircleIntoState(
+          resolvedIndex,
+          job.circleIdentity,
+          eventJsonData.circles?.[resolvedIndex],
+        );
+      } catch (error) {
+        eventJsonData = previousEventJsonData;
+        persistedEventJsonData = previousPersistedEventJsonData;
+        tableState = previousTableState;
+        eventTableBaseline = previousEventTableBaseline;
+        eventDocumentStateRevision = previousRevision;
+        throw error;
+      }
+      resultEl.textContent = `「${job.circleName}」の再処理が完了しました\nアイテム数: ${bridge.items_count ?? "?"}\n残りキュー: ${reprocessCircleQueue.length}件`;
+      terminalOutcome = "success";
+      logReprocessTelemetry(job, "frontend.patch", "end");
+    } catch (error) {
+      terminalOutcome = "error";
+      patchTelemetryErrorLogged = true;
+      logReprocessTelemetry(job, "frontend.patch", "error");
+      showReprocessTerminalResult(
+        job,
+        "frontend.patch",
+        terminalOutcome,
+        res,
+        "circle_patch apply failed",
+        String(error),
+      );
       return;
     }
-    eventJsonData = cloneJsonSnapshot(applied.data);
-    persistedEventJsonData = cloneJsonSnapshot(applied.data);
-    tableState = circlesToTableState(eventJsonData);
-    eventTableBaseline = cloneJsonSnapshot(tableState);
-    markEventDocumentMutated();
-    const resolvedIndex = applied.resolvedCircleIndices[0] ?? currentIdx;
-    mergeReprocessedCircleIntoState(
-      resolvedIndex,
-      job.circleIdentity,
-      eventJsonData.circles?.[resolvedIndex],
+  }
+  } catch (error) {
+    if (bridgeInvocationStarted && !bridgeResponseReceived) {
+      terminalOutcome = "rejected";
+      logReprocessTelemetry(job, "frontend.bridge_response", "error");
+      showReprocessTerminalResult(
+        job,
+        "frontend.bridge_response",
+        terminalOutcome,
+        undefined,
+        "bridge invocation rejected",
+        String(error),
+      );
+    } else {
+      terminalOutcome = "error";
+      if (patchStarted && !patchTelemetryErrorLogged) {
+        patchTelemetryErrorLogged = true;
+        logReprocessTelemetry(job, "frontend.patch", "error");
+      }
+      showReprocessTerminalResult(
+        job,
+        patchStarted ? "frontend.patch" : "preflight",
+        terminalOutcome,
+        undefined,
+        patchStarted ? "circle_patch apply failed" : "unexpected reprocess error",
+        String(error),
+      );
+    }
+  } finally {
+    if (job.source === "post") {
+      latestReprocessJobCleanup = {
+        job,
+        outcome: telemetryOutcomeForBridgeTerminal(terminalOutcome),
+      };
+    }
+    logReprocessTelemetry(
+      job,
+      "frontend.job_cleanup",
+      telemetryOutcomeForBridgeTerminal(terminalOutcome),
     );
-    resultEl.textContent = `「${job.circleName}」の再処理が完了しました\nアイテム数: ${bridge.items_count ?? "?"}\n残りキュー: ${reprocessCircleQueue.length}件`;
   }
 }
 
@@ -5415,6 +6466,8 @@ async function reprocessCircleFromPostInteractive(rowIdx: number) {
     circleName: name,
     source: "post",
     postUrl,
+    runId: createReprocessRunId(),
+    telemetryStartMs: performance.now(),
   });
 }
 
@@ -6019,6 +7072,7 @@ function setEventPipelineButtonsDisabled(disabled: boolean): void {
   applyOperationEvent({ type: "request-pipeline" });
   setEventPipelineButtonsDisabled(true);
   try {
+  if (!(await preflightSelectedAntigravityModel())) return;
   const pendingCrawlMeta = captureCrawlMetaSnapshot();
   cancelCrawlMetaSave();
   await flushCrawlMetaSnapshot(pendingCrawlMeta, INTERNAL_OPERATION_SAVE);
@@ -6032,11 +7086,8 @@ function setEventPipelineButtonsDisabled(disabled: boolean): void {
       "既存イベントが選択されていません。イベントを選択してから実行してください。";
     return;
   }
-  const normalizedEventFile = eventFile.replace(/\\/g, "/").toLowerCase();
-  const expectedEventFile = `${outputDir.replace(/[\\/]+$/, "")}/event.json`
-    .replace(/\\/g, "/")
-    .toLowerCase();
-  if (normalizedEventFile !== expectedEventFile) {
+  const expectedEventFile = eventJsonPathForDir(outputDir);
+  if (!eventPathsEqual(eventFile, expectedEventFile)) {
     resultEl.textContent =
       "選択イベントとevent.jsonのパスが一致しないため、Twitterお品書き抽出を中止しました。イベントを選び直してください。";
     return;
@@ -6059,6 +7110,15 @@ function setEventPipelineButtonsDisabled(disabled: boolean): void {
       "イベント日が未設定または不正です。YYYY-MM-DD形式で設定してから実行してください。";
     return;
   }
+  const externalReloadOwner = await prepareExternalEventReloadOwner(
+    outputDir,
+    false,
+  );
+  if (!externalReloadOwner) {
+    resultEl.textContent =
+      "実行前のイベント所有権captureに失敗したため、Twitterお品書き抽出を中止しました。";
+    return;
+  }
   payload.output_dir = outputDir;
   payload.enable_twitter_catalog = true;
   payload.reprocess = true;
@@ -6068,10 +7128,11 @@ function setEventPipelineButtonsDisabled(disabled: boolean): void {
   applyOperationEvent({ type: "pipeline-started" });
   await runJob("run_main_pipeline", payload, true);
   const processingLog = resultEl.textContent;
-  const shouldReloadSelectedEvent = activeEventSlug === eventSlug;
-  await loadEventList();
-  if (shouldReloadSelectedEvent) {
-    await selectEvent(eventSlug, INTERNAL_OPERATION_SAVE);
+  const reloadSucceeded = await reloadExternalEvent(externalReloadOwner);
+  if (!reloadSucceeded) {
+    resultEl.textContent =
+      `${processingLog}\n\n❌ 外部pipeline結果を画面へ反映できませんでした。`;
+    return;
   }
   resultEl.textContent = processingLog;
   } finally {
@@ -6230,6 +7291,7 @@ function buildPipelinePayload() {
   const textProvider = selectedTextProvider();
   const imageConfig = selectedImageConfig();
   const textEffort = selectedTextEffort();
+  const textModel = selectedTextModelsPayload();
   const event = eventJsonData?.event || {};
   const eventUrlRaw =
     (document.getElementById("eventUrl") as HTMLInputElement).value.trim() ||
@@ -6260,11 +7322,11 @@ function buildPipelinePayload() {
     url: eventUrl,
     urls: sourceUrls,
     event_sources: sourceConfig.eventSources,
-    model: selectedTextApiModels().join(","),
+    model: textModel,
     output_dir: (
       document.getElementById("pipelineOutputDir") as HTMLInputElement
     ).value,
-    text_llm_provider: textProvider.kind === "cli" ? textProvider.provider : "api",
+    text_llm_provider: providerConfigValue(textProvider),
     text_llm_cli_models: selectedTextCliModelMap(),
     text_llm_cli_efforts: selectedTextCliEffortMap(),
     text_llm_cli_timeout: 900,
@@ -6332,6 +7394,7 @@ function isValidEventDate(value: unknown): value is string {
   applyOperationEvent({ type: "request-pipeline" });
   setEventPipelineButtonsDisabled(true);
   try {
+  if (!(await preflightSelectedAntigravityModel())) return;
   const pendingCrawlMeta = captureCrawlMetaSnapshot();
   cancelCrawlMetaSave();
   await flushCrawlMetaSnapshot(pendingCrawlMeta, INTERNAL_OPERATION_SAVE);
@@ -6450,23 +7513,25 @@ function isValidEventDate(value: unknown): value is string {
     }
   }
 
+  // ここまででURL/metadataの準備を終えたownerを、既に完了したUI saveと
+  // queue flushの後に固定する。tableStateは実行中表示用にクリア済みなので、
+  // このcaptureではsaveNowを再度呼ばない。
+  const externalReloadOwner = await prepareExternalEventReloadOwner(
+    String(payload.output_dir || ""),
+    false,
+  );
+  if (!externalReloadOwner) {
+    resultEl.textContent =
+      "実行前のイベント所有権captureに失敗したため、パイプラインを中止しました。";
+    return;
+  }
+
   // 再処理モードの場合はプレビューなしで直接実行
   if (boolFromSelect("reprocess")) {
     await runJob("run_main_pipeline", payload, true);
-    await loadEventList();
-    if (activeEventSlug) {
-      const completedEventSlug = activeEventSlug;
-      const reloadSucceeded = await selectEvent(
-        completedEventSlug,
-        INTERNAL_OPERATION_SAVE,
-      );
-      if (
-        !reloadSucceeded ||
-        !isActiveEventDocumentOwned(completedEventSlug)
-      ) {
-        resultEl.textContent =
-          "パイプライン完了後のイベント再読み込みに失敗しました。";
-      }
+    if (!(await reloadExternalEvent(externalReloadOwner))) {
+      resultEl.textContent =
+        "パイプライン完了後のイベント再読み込みに失敗しました。";
     }
     return;
   }
@@ -6528,21 +7593,10 @@ function isValidEventDate(value: unknown): value is string {
   resultEl.textContent = "フルパイプライン実行中...";
   }
   await runJob("run_main_pipeline", payload, true);
-  await loadEventList();
-  if (activeEventSlug) {
-    const completedEventSlug = activeEventSlug;
-    const reloadSucceeded = await selectEvent(
-      completedEventSlug,
-      INTERNAL_OPERATION_SAVE,
-    );
-    if (
-      !reloadSucceeded ||
-      !isActiveEventDocumentOwned(completedEventSlug)
-    ) {
-      resultEl.textContent =
-        "パイプライン完了後のイベント再読み込みに失敗したため、後続処理を中止しました。";
-      return;
-    }
+  if (!(await reloadExternalEvent(externalReloadOwner))) {
+    resultEl.textContent =
+      "パイプライン完了後のイベント再読み込みに失敗したため、後続処理を中止しました。";
+    return;
   }
 
   // パイプライン完了後: フォルダ名リネーム（スクレイピングで名前が取得された場合）
@@ -6555,8 +7609,21 @@ function isValidEventDate(value: unknown): value is string {
         ev.meta.date ?? undefined,
       );
       if (newSlug) {
-        await loadEventList();
-        await selectEvent(newSlug, INTERNAL_OPERATION_SAVE);
+        const renamedOwner = captureExternalEventReloadOwner();
+        if (!renamedOwner || renamedOwner.slug !== newSlug) {
+          logExternalReloadFailure(
+            "renamed-owner-missing",
+            renamedOwner ?? externalReloadOwner,
+          );
+          resultEl.textContent =
+            "パイプライン後のイベントrename結果を安全に再読み込みできませんでした。";
+          return;
+        }
+        if (!(await reloadExternalEvent(renamedOwner))) {
+          resultEl.textContent =
+            "パイプライン後のイベントrename結果を再読み込みできなかったため、後続処理を中止しました。";
+          return;
+        }
       }
     }
   }
@@ -6798,7 +7865,7 @@ function getActiveEventMeta(): EventMeta {
 
 function getActiveEventJsonPath(): string {
   const dir = getActiveEventDir();
-  return dir ? `${dir}/event.json`.replace(/\\/g, "/") : "";
+  return dir ? eventJsonPathForDir(dir) : "";
 }
 
 function startMobileZipServer(zipPath: string): Promise<Record<string, unknown>> {
@@ -7193,52 +8260,144 @@ async function loadProjectConfig(): Promise<boolean> {
         outputDir;
 
     const models = parseYamlList(raw, "models");
-    const textProvider = parseYamlValue(raw, "text_llm_provider") || "api";
+    const modelPreferences: ModelControlPreferences = {};
+
+    const rawTextProvider = parseYamlValue(raw, "text_llm_provider");
+    const configuredTextProvider = rawTextProvider
+      ? textProviderValueFromConfig(rawTextProvider, models[0] || "")
+      : "";
+    const configuredTextSelection = configuredTextProvider
+      ? parseTextProviderValue(configuredTextProvider)
+      : null;
     const textPrimaryModel =
-      textProvider !== "api"
-        ? parseYamlNestedValue(raw, "text_llm_cli_models", textProvider) || models[0]
-        : models[0];
-    if (textPrimaryModel) {
-      (document.getElementById("modelProvider") as HTMLSelectElement).value =
-        textProviderValueFromConfig(textProvider, textPrimaryModel);
-      updateTextModelSelect(textPrimaryModel);
-    }
+      configuredTextSelection?.kind === "cli"
+        ? parseYamlNestedValue(
+            raw,
+            "text_llm_cli_models",
+            configuredTextSelection.provider,
+          ) || models[0] || ""
+        : models[0] || "";
+    const savedTextProvider = firstNonEmpty(
+      configuredTextProvider,
+      textPrimaryModel
+        ? textProviderValueFromConfig("api", textPrimaryModel)
+        : "",
+    );
     const apiReasoningEffort = parseYamlValue(raw, "api_reasoning_effort");
     const textPrimaryEffort =
-      textProvider !== "api"
-        ? parseYamlNestedValue(raw, "text_llm_cli_efforts", textProvider) ||
-          apiReasoningEffort
-        : parseYamlNestedValue(raw, "api_reasoning_effort_map", textPrimaryModel) ||
-          apiReasoningEffort;
-    if (textPrimaryEffort) {
-      setEffortOptions(
-        "textReasoningEffort",
-        textPrimaryEffort,
-        reasoningEffortsForSelection(selectedTextProvider(), textPrimaryModel || ""),
-      );
+      configuredTextSelection?.kind === "cli"
+        ? parseYamlNestedValue(
+            raw,
+            "text_llm_cli_efforts",
+            configuredTextSelection.provider,
+          ) || apiReasoningEffort
+        : parseYamlNestedValue(
+            raw,
+            "api_reasoning_effort_map",
+            textPrimaryModel,
+          ) || apiReasoningEffort;
+    if (savedTextProvider || textPrimaryModel || textPrimaryEffort) {
+      modelPreferences.text = {
+        provider: savedTextProvider || undefined,
+        model: textPrimaryModel || undefined,
+        effort: textPrimaryEffort || undefined,
+      };
     }
-    const textFallbackModel =
-      parseYamlValue(raw, "text_fallback_llm_model") ||
-      (parseYamlValue(raw, "text_llm_provider") === "api" ? models[1] : models[0]) ||
-      "gpt-5.5";
-    const textFallbackProvider = parseYamlValue(raw, "text_fallback_llm_provider");
-    (document.getElementById("textFallbackModelProvider") as HTMLSelectElement).value =
-      textFallbackProvider
-        ? textFallbackProvider.startsWith("api:") || textFallbackProvider.startsWith("cli:")
-          ? textFallbackProvider
-          : `api:${textFallbackProvider}`
-        : `api:${inferApiProviderFromModel(textFallbackModel)}`;
-    updateTextFallbackModelSelect(textFallbackModel);
-    const textFallbackEffort =
-      parseYamlValue(raw, "text_fallback_llm_effort") ||
-      parseYamlNestedValue(raw, "api_reasoning_effort_map", textFallbackModel);
-    if (textFallbackEffort) {
-      setEffortOptions(
-        "textFallbackReasoningEffort",
-        textFallbackEffort,
-        reasoningEffortsForSelection(selectedTextFallbackProvider(), textFallbackModel),
-      );
+
+    const rawTextFallbackProvider = parseYamlValue(
+      raw,
+      "text_fallback_llm_provider",
+    );
+    const textFallbackModel = firstNonEmpty(
+      parseYamlValue(raw, "text_fallback_llm_model"),
+      configuredTextSelection?.kind === "api" ? models[1] : models[0],
+    );
+    const savedTextFallbackProvider = firstNonEmpty(
+      rawTextFallbackProvider
+        ? textProviderValueFromConfig(rawTextFallbackProvider, textFallbackModel)
+        : "",
+      textFallbackModel
+        ? textProviderValueFromConfig("api", textFallbackModel)
+        : "",
+    );
+    const textFallbackEffort = firstNonEmpty(
+      parseYamlValue(raw, "text_fallback_llm_effort"),
+      parseYamlNestedValue(raw, "api_reasoning_effort_map", textFallbackModel),
+    );
+    if (
+      savedTextFallbackProvider ||
+      textFallbackModel ||
+      textFallbackEffort
+    ) {
+      modelPreferences.textFallback = {
+        provider: savedTextFallbackProvider || undefined,
+        model: textFallbackModel || undefined,
+        effort: textFallbackEffort || undefined,
+      };
     }
+
+    const rawImageProvider = parseYamlValue(raw, "image_llm_provider");
+    const imageModel = parseYamlValue(raw, "image_llm_model");
+    const savedImageModel = firstNonEmpty(
+      imageModel,
+      rawImageProvider ? models[0] : "",
+    );
+    const savedImageProvider = firstNonEmpty(
+      rawImageProvider
+        ? textProviderValueFromConfig(rawImageProvider, savedImageModel)
+        : "",
+      savedImageModel
+        ? textProviderValueFromConfig("api", savedImageModel)
+        : "",
+    );
+    const visionEffort = parseYamlValue(raw, "image_llm_effort");
+    if (savedImageProvider || savedImageModel || visionEffort) {
+      modelPreferences.image = {
+        provider: savedImageProvider || undefined,
+        model: savedImageModel || undefined,
+        effort: visionEffort || undefined,
+      };
+    }
+
+    const rawImageFallbackProvider = parseYamlValue(
+      raw,
+      "image_fallback_llm_provider",
+    );
+    const imageFallbackModel = parseYamlValue(raw, "image_fallback_llm_model");
+    const savedImageFallbackProvider = firstNonEmpty(
+      rawImageFallbackProvider
+        ? textProviderValueFromConfig(
+            rawImageFallbackProvider,
+            imageFallbackModel,
+          )
+        : "",
+      imageFallbackModel
+        ? textProviderValueFromConfig("api", imageFallbackModel)
+        : "",
+    );
+    const imageFallbackEffort = firstNonEmpty(
+      parseYamlValue(raw, "image_fallback_llm_effort"),
+      parseYamlNestedValue(
+        raw,
+        "image_api_reasoning_effort_map",
+        imageFallbackModel,
+      ),
+    );
+    if (
+      savedImageFallbackProvider ||
+      imageFallbackModel ||
+      imageFallbackEffort
+    ) {
+      modelPreferences.imageFallback = {
+        provider: savedImageFallbackProvider || undefined,
+        model: imageFallbackModel || undefined,
+        effort: imageFallbackEffort || undefined,
+      };
+    }
+
+    // 保存済み設定を最優先にし、未指定の項目は現在のUI state、最後に
+    // DEFAULT_MODEL_SELECTIONSへ落とす。未知の候補もhydrate側で保持する。
+    hydrateModelControls(modelPreferences);
 
     const enableTwitter = parseYamlValue(raw, "enable_twitter_catalog");
     if (enableTwitter)
@@ -7249,46 +8408,6 @@ async function loadProjectConfig(): Promise<boolean> {
     if (useGrokSearch)
       (document.getElementById("useGrokSearch") as HTMLSelectElement).value =
         useGrokSearch;
-
-    const imageProvider = parseYamlValue(raw, "image_llm_provider");
-    const imageModel = parseYamlValue(raw, "image_llm_model");
-    let selectedImageProviderValue = `api:${inferApiProviderFromModel(imageModel || models[0] || "")}`;
-    if (imageProvider?.startsWith("api:") || imageProvider?.startsWith("cli:")) {
-      selectedImageProviderValue = imageProvider;
-    } else if (imageProvider) {
-      selectedImageProviderValue = `api:${imageProvider}`;
-    }
-    (document.getElementById("visionModel") as HTMLSelectElement).value =
-      selectedImageProviderValue;
-    updateVisionModelSelect(imageModel);
-    const visionEffort = parseYamlValue(raw, "image_llm_effort");
-    if (visionEffort) {
-      setEffortOptions(
-        "visionReasoningEffort",
-        visionEffort,
-        reasoningEffortsForSelection(selectedImageProvider(), imageModel || ""),
-      );
-    }
-    const imageFallbackModel =
-      parseYamlValue(raw, "image_fallback_llm_model") || "gpt-5-mini";
-    const imageFallbackProvider = parseYamlValue(raw, "image_fallback_llm_provider");
-    (document.getElementById("visionFallbackModelProvider") as HTMLSelectElement).value =
-      imageFallbackProvider
-        ? imageFallbackProvider.startsWith("api:") || imageFallbackProvider.startsWith("cli:")
-          ? imageFallbackProvider
-          : `api:${imageFallbackProvider}`
-        : `api:${inferApiProviderFromModel(imageFallbackModel)}`;
-    updateVisionFallbackModelSelect(imageFallbackModel);
-    const imageFallbackEffort =
-      parseYamlValue(raw, "image_fallback_llm_effort") ||
-      parseYamlNestedValue(raw, "image_api_reasoning_effort_map", imageFallbackModel);
-    if (imageFallbackEffort) {
-      setEffortOptions(
-        "visionFallbackReasoningEffort",
-        imageFallbackEffort,
-        reasoningEffortsForSelection(selectedImageFallbackProvider(), imageFallbackModel),
-      );
-    }
 
     const skipCircleImages = parseYamlValue(raw, "skip_circle_images");
     if (skipCircleImages)
@@ -7424,7 +8543,7 @@ function buildConfigYaml(): string {
     `output_dir: "${val("pipelineOutputDir")}"`,
     "",
     ...modelsYamlLines,
-    `text_llm_provider: "${textProvider.kind === "cli" ? textProvider.provider : "api"}"`,
+    `text_llm_provider: "${providerConfigValue(textProvider)}"`,
     ...textModelMapYamlLines,
     ...textEffortMapYamlLines,
     `api_reasoning_effort: "${textEffort}"`,
@@ -7963,18 +9082,25 @@ function getMapPinSpaceSpan(space: string): number {
   return Math.max(1, Math.min(4, numbers.length));
 }
 
-function mapNumberFromName(name: string): number | null {
-  const match = name.match(/^map_(\d+)/i);
-  if (!match) return null;
-  const num = Number.parseInt(match[1], 10);
-  return Number.isFinite(num) && num > 0 ? num : null;
-}
-
 function preferredEventMapReferences(
   data: EventJsonData | null = eventJsonData,
   explicitReference = "",
-): string[] {
-  const byNumber = new Map<number, string>();
+): EventMapReference[] {
+  const byNumber = new Map<number, EventMapReference>();
+  const withoutNumber: EventMapReference[] = [];
+  const addReference = (reference: string, explicitNumber?: unknown) => {
+    if (!reference) return;
+    const parsed = Number(explicitNumber);
+    const number =
+      Number.isInteger(parsed) && parsed > 0
+        ? parsed
+        : mapNumberFromMapName(reference);
+    const entry: EventMapReference = number
+      ? { reference, map_number: number }
+      : { reference };
+    if (number) byNumber.set(number, entry);
+    else withoutNumber.push(entry);
+  };
   const maps = Array.isArray(data?.event?.maps) ? data.event.maps : [];
   for (const entry of maps) {
     const reference =
@@ -7983,24 +9109,18 @@ function preferredEventMapReferences(
         : typeof entry?.filename === "string"
           ? entry.filename
           : "";
-    const number = mapNumberFromName(
-      reference.replace(/\\/g, "/").split("/").pop() || "",
-    );
-    if (number && reference) byNumber.set(number, reference);
+    addReference(reference, typeof entry === "object" ? entry?.map_number : undefined);
   }
   if (explicitReference) {
-    const number = mapNumberFromName(
-      explicitReference.replace(/\\/g, "/").split("/").pop() || "",
-    );
-    if (number) byNumber.set(number, explicitReference);
+    addReference(explicitReference);
   }
-  return Array.from(byNumber.values());
+  return [...byNumber.values(), ...withoutNumber];
 }
 
 function getMapNumbers(): number[] {
   const nums = new Set<number>();
   for (const map of mapImagePaths) {
-    const num = mapNumberFromName(map.name);
+    const num = eventMapImageNumber(map);
     if (num) nums.add(num);
   }
   for (const row of tableState.rows) {
@@ -8026,10 +9146,8 @@ function switchMapByOffset(offset: number): boolean {
   return true;
 }
 
-function getMapImageForNumber(num: number): { name: string; path: string } | null {
-  return (
-    mapImagePaths.find((m) => mapNumberFromName(m.name) === num) || null
-  );
+function getMapImageForNumber(num: number): EventMapImage | null {
+  return mapImagePaths.find((m) => eventMapImageNumber(m) === num) || null;
 }
 
 function mapFileNameFor(num: number, ext: string): string {
@@ -8042,7 +9160,7 @@ function mapFileNameFor(num: number, ext: string): string {
 function nextMapNumber(): number {
   const nums = [
     ...mapImagePaths
-      .map((m) => mapNumberFromName(m.name))
+      .map((m) => eventMapImageNumber(m))
       .filter((n): n is number => Boolean(n)),
     ...tableState.rows
       .map((row) => parseFloat(String(row["マップ番号"] ?? "0")))
@@ -8069,10 +9187,18 @@ function syncEventMapMetadata() {
     preferredEventMapReferences(eventJsonData),
   );
   eventJsonData.event.maps = mapImagePaths
-    .map((m) => ({
-      filename: eventRelativeAssetPath("maps", m.name),
-      map_number: mapNumberFromName(m.name) || 1,
-    }))
+    .map((m) => {
+      const mapNumber = eventMapImageNumber(m);
+      if (!mapNumber) return null;
+      return {
+        filename: m.reference || eventRelativeAssetPath("maps", m.name),
+        map_number: mapNumber,
+      };
+    })
+    .filter(
+      (entry): entry is { filename: string; map_number: number } =>
+        Boolean(entry),
+    )
     .sort((a, b) => a.map_number - b.map_number);
 }
 
@@ -8813,7 +9939,7 @@ function loadMapImage() {
     generation === mapImageLoadGeneration &&
     isActiveEventDocumentOwner(owner) &&
     currentMapNumber() === selectedMapNumber &&
-    normalizeEventPath(getMapImagePath()) === normalizeEventPath(imgPath);
+    eventPathsEqual(getMapImagePath(), imgPath);
   if (isDesktopDevBuild) {
     logToFile(
       `マップ画像読み込み: path=${imgPath}, src=${src}, mapImages=${JSON.stringify(mapImagePaths)}`,
@@ -9079,10 +10205,10 @@ async function runMapAutoPlacement(useCalibration: boolean) {
     logToFile("[map-auto] blocked: button elements missing");
     return;
   }
+  safeApplyOperationEvent({ type: "request-map-auto" }, "map-auto");
   resultEl.textContent = useCalibration
     ? `マップ ${mapNumber} を校正点で再処理中...`
     : `マップ ${mapNumber} のピンを自動配置中...`;
-  safeApplyOperationEvent({ type: "request-map-auto" }, "map-auto");
   markEventDocumentMutated();
   const mutationTabs = ["sidebar", "tab-crawl", "tab-edit", "tab-map"]
     .map((id) => document.getElementById(id) as HTMLElement | null)
@@ -9095,6 +10221,10 @@ async function runMapAutoPlacement(useCalibration: boolean) {
   let backendSucceeded = false;
   let reloadCommitted = false;
   try {
+    if (!(await preflightSelectedAntigravityModel())) {
+      logToFile("[map-auto] blocked: selected Antigravity model is not in live catalog");
+      return;
+    }
     logToFile("[map-auto] guard passed");
     const crawlSnapshot = captureCrawlMetaSnapshot();
     cancelCrawlMetaSave();
@@ -9393,6 +10523,7 @@ function renderCircleEditorAndMap() {
 
 // === 画像セルへのクリップボードペースト対応 ===
 document.addEventListener("paste", async (e) => {
+  if (isReprocessOperation(operationState)) return;
   const items = e.clipboardData?.items;
   if (!items) return;
   // フォーカスがinput/textareaの場合は通常のペーストを優先
@@ -9497,6 +10628,7 @@ document.addEventListener("dragleave", (e) => {
 });
 
 document.addEventListener("drop", async (e) => {
+  if (isReprocessOperation(operationState)) { e.preventDefault(); return; }
   e.preventDefault();
   if (dragHighlighted) dragHighlighted.classList.remove("drag-over");
   const cell = dragHighlighted as HTMLTableCellElement | null;
@@ -9621,7 +10753,7 @@ async function writeEventMetaSnapshot(
   const ownerDir = normalizeEventPath(owner.dir);
   const activeRawEvent =
     activeEventSlug === owner.slug &&
-    normalizeEventPath(editorJsonPathValue()) === eventJsonPathForDir(ownerDir)
+    eventPathsEqual(editorJsonPathValue(), eventJsonPathForDir(ownerDir))
       ? eventJsonData?.event
       : null;
   // event metaフォームが認識しないraw event fieldsも維持する。明示clearは
@@ -9639,7 +10771,7 @@ async function writeEventMetaSnapshot(
       if (!requireListedOwner) return true;
       const current = eventList.find((entry) => entry.slug === owner.slug);
       return Boolean(
-        current && normalizeEventPath(current.dir) === ownerDir,
+        current && eventPathsEqual(current.dir, ownerDir),
       );
     },
     write: (snapshot) =>
@@ -9647,7 +10779,7 @@ async function writeEventMetaSnapshot(
     commit: (snapshot) => {
       if (options.commitToEventList !== false) {
         const current = eventList.find((entry) => entry.slug === owner.slug);
-        if (current && normalizeEventPath(current.dir) === ownerDir) {
+        if (current && eventPathsEqual(current.dir, ownerDir)) {
           // 非同期画像操作が捕捉したmeta object identityを維持しつつ、
           // 成功したsnapshotのoptional field absenceも正確に反映する。
           for (const key of Object.keys(current.meta)) {
@@ -9660,7 +10792,7 @@ async function writeEventMetaSnapshot(
       }
       if (
         activeEventSlug === owner.slug &&
-        normalizeEventPath(editorJsonPathValue()) === eventJsonPathForDir(ownerDir)
+        eventPathsEqual(editorJsonPathValue(), eventJsonPathForDir(ownerDir))
       ) {
         const reconcileEventSection = (documentData: EventJsonData | null) => {
           if (!documentData) return;
@@ -9812,7 +10944,7 @@ function flushCrawlMetaSnapshot(
     const owner = eventList.find(
       (event) =>
         event.slug === snapshot.ownerSlug &&
-        normalizeEventPath(event.dir) === normalizeEventPath(snapshot.ownerDir),
+        eventPathsEqual(event.dir, snapshot.ownerDir),
     );
     return Boolean(owner) &&
       (crawlMetaEditRevisions.get(ownerKey) ?? 0) === snapshot.editRevision;
@@ -11104,7 +12236,7 @@ function enqueueCurrentEventSnapshotForSwitch(): SaveReceipt | null {
   const ownerSlug = activeEventSlug;
   const ownerDir = normalizeEventPath(ownerEvent.dir);
   const eventJsonPath = eventJsonPathForDir(ownerDir);
-  if (normalizeEventPath(editorJsonPathValue()) !== eventJsonPath) return null;
+  if (!eventPathsEqual(editorJsonPathValue(), eventJsonPath)) return null;
   const key = eventMetaOwnerKey(ownerSlug, ownerDir);
   const lifecycleLease = eventLifecycleGate.acquire(key);
   if (!lifecycleLease) return null;
@@ -11142,8 +12274,18 @@ function enqueueCurrentEventSnapshotForSwitch(): SaveReceipt | null {
 
 function selectEvent(
   slug: string,
-  savePermit?: InternalOperationSavePermit,
+  argument?: EventSelectionArgument,
 ): Promise<boolean> {
+  const options = eventSelectionOptions(argument);
+  const reloadMode = options.reloadMode ?? "manual";
+  if (
+    reloadMode === "external-authoritative" &&
+    (!options.externalOwner ||
+      renameInProgress ||
+      !isCurrentExternalEventReloadOwner(options.externalOwner))
+  ) {
+    return Promise.resolve(false);
+  }
   requestEventSelection(slug);
   // 物理rename中はgenerationを無効化せず、rename完了後の新slug/dir状態から
   // crawl snapshotを取得して選択処理を開始する。
@@ -11155,44 +12297,56 @@ function selectEvent(
       cancelCrawlMetaSave();
       const generation = ++selectEventGeneration;
       selectionEpoch = generation;
-      return selectEventLocked(slug, generation, crawlSnapshot, savePermit);
+      return selectEventLocked(slug, generation, crawlSnapshot, options);
     });
     eventDocumentSerial = deferredRequest.then(() => undefined, () => undefined);
     return deferredRequest;
   }
   // 呼び出し時点で旧リクエストを無効化する。旧イベント保存のawaitより必ず先。
-  const crawlSnapshot = captureCrawlMetaSnapshot();
+  const crawlSnapshot =
+    reloadMode === "external-authoritative"
+      ? null
+      : captureCrawlMetaSnapshot();
   cancelAutoSave();
   cancelEventMemoSave();
   cancelCrawlMetaSave();
   const generation = ++selectEventGeneration;
   selectionEpoch = generation;
-  if (slug === activeEventSlug && activeEventSlug) {
+  if (
+    slug === activeEventSlug &&
+    activeEventSlug &&
+    shouldSaveBeforeEventReload(reloadMode)
+  ) {
     // 同一slugのF2/明示再読込だけは、編集中snapshotを保存してからreloadする。
     // 異なるイベントへの通常切替は下記のlatest-wins経路で待たない。
     const current = eventList.find((event) => event.slug === activeEventSlug);
     const key = current ? eventMetaOwnerKey(current.slug, current.dir) : "";
     return (async () => {
-      const saveResult = await saveNow(savePermit);
+      const saveResult = await saveNow(options.savePermit);
       if (!saveResult.ok) {
         resultEl.textContent = `イベント再読み込み前の保存に失敗しました: ${String(saveResult.error)}`;
         return false;
       }
       if (key) await eventSaveQueue.flushKey(key);
-      return selectEventLocked(slug, generation, crawlSnapshot, savePermit);
+      return selectEventLocked(slug, generation, crawlSnapshot, options);
     })();
+  }
+  if (reloadMode === "external-authoritative") {
+    // captured ownerを事前に検証済みのため、active ownerからのsnapshot enqueueも
+    // 行わず、selectEventLockedはdiskのevent.jsonだけをcommitする。
+    return selectEventLocked(slug, generation, crawlSnapshot, options);
   }
   // 通常の選択はeventDocumentSerialから外し、latest-request-winsにする。
   // 旧イベントの未保存差分はイベントkeyへenqueueするだけで、保存完了を待たない。
   enqueueCurrentEventSnapshotForSwitch();
-  return selectEventLocked(slug, generation, crawlSnapshot, savePermit);
+  return selectEventLocked(slug, generation, crawlSnapshot, options);
 }
 
 async function selectEventLocked(
   slug: string,
   generation: number,
   crawlSnapshot: CrawlMetaSnapshot | null,
-  savePermit?: InternalOperationSavePermit,
+  options: EventSelectionOptions = {},
 ): Promise<boolean> {
   const isStale = () =>
     generation !== selectEventGeneration || generation !== selectionEpoch;
@@ -11208,6 +12362,15 @@ async function selectEventLocked(
     if (message) resultEl.textContent = message;
     return false;
   };
+  if (
+    options.reloadMode === "external-authoritative" &&
+    (!options.externalOwner ||
+      !isCurrentExternalEventReloadOwner(options.externalOwner))
+  ) {
+    return rejectCurrentSelection(
+      "外部pipeline結果の再読み込みを所有権確認前に開始できませんでした",
+    );
+  }
   // メタデータはowner固定のwriteを開始するが、通常切替のpending表示/loadを
   // 待たせない。rename/delete等のlifecycle mutationだけがflushKeyする。
   void flushCrawlMetaSnapshot(crawlSnapshot).catch((error) => {
@@ -11241,6 +12404,16 @@ async function selectEventLocked(
   const loadOwnerSlug = activeEventSlug;
   const loadOwnerPath = normalizeEventPath(editorJsonPathValue());
   const loadStateRevision = eventDocumentStateRevision;
+  if (
+    options.reloadMode === "external-authoritative" &&
+    (!options.externalOwner ||
+      loadOwnerSlug !== options.externalOwner.slug ||
+      !eventPathsEqual(loadOwnerPath, options.externalOwner.eventJsonPath))
+  ) {
+    return rejectCurrentSelection(
+      "外部pipeline結果の再読み込み対象が現在のイベント所有者と一致しません",
+    );
+  }
   const metaOwnerKey = eventMetaOwnerKey(ev.slug, ev.dir);
   if (deletingEventKeys.has(metaOwnerKey)) {
     return rejectCurrentSelection("イベント削除中のため切替を取り消しました");
@@ -11362,7 +12535,7 @@ async function selectEventLocked(
         isCurrent: () =>
           !isStale() &&
           activeEventSlug === loadOwnerSlug &&
-          normalizeEventPath(editorJsonPathValue()) === loadOwnerPath &&
+          eventPathsEqual(editorJsonPathValue(), loadOwnerPath) &&
           eventDocumentStateRevision === loadStateRevision,
       });
       if (!committed) return rejectCurrentSelection("イベントメタデータ補完が競合したため、再読込を取り消しました");
@@ -11388,14 +12561,23 @@ async function selectEventLocked(
     !eventList.some(
       (event) =>
         event.slug === ev.slug &&
-        normalizeEventPath(event.dir) === normalizeEventPath(ev.dir),
+        eventPathsEqual(event.dir, ev.dir),
     ) ||
     activeEventSlug !== loadOwnerSlug ||
-    normalizeEventPath(editorJsonPathValue()) !== loadOwnerPath ||
+    !eventPathsEqual(editorJsonPathValue(), loadOwnerPath) ||
     eventDocumentStateRevision !== loadStateRevision ||
     !eventMetaWriteCoordinator.isRevision(metaOwnerKey, commitMetaRevision)
   ) {
     return rejectCurrentSelection("イベント切替中に編集が発生したため、再読込を取り消しました");
+  }
+  if (
+    options.reloadMode === "external-authoritative" &&
+    (!options.externalOwner ||
+      !isCurrentExternalEventReloadOwner(options.externalOwner))
+  ) {
+    return rejectCurrentSelection(
+      "外部pipeline結果の再読み込み中にイベント所有権が変わりました",
+    );
   }
 
   // 全global ownerとフォームを、最後のawait後に同一generationで一括commitする。
