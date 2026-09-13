@@ -1,8 +1,8 @@
 {
   "desktop": {
-    "version": "0.1.22",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.22/EventAutoPin.exe",
-    "notes": "サークル一覧の配色とグラデーションの視認性を改善",
+    "version": "0.1.23",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.23/EventAutoPin.exe",
+    "notes": "欠席切替を右クリックへ統合し、欠席中の優先度を低に固定。欠席行と展開パネルをグレー表示。",
     "date": "2026-09-14"
   },
   "mobile": {
