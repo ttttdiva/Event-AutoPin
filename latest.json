@@ -1,9 +1,9 @@
 {
   "desktop": {
-    "version": "0.1.21",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.21/EventAutoPin.exe",
-    "notes": "サークルの欠席状態の表示・編集と投稿本文・全画像の同時解析に対応",
-    "date": "2026-09-13"
+    "version": "0.1.22",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.22/EventAutoPin.exe",
+    "notes": "サークル一覧の配色とグラデーションの視認性を改善",
+    "date": "2026-09-14"
   },
   "mobile": {
     "version": "1.4.60",
