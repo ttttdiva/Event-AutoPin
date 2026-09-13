@@ -3,6 +3,7 @@ const {
   createRunOncePlugin,
   withAndroidManifest,
   withAndroidStyles,
+  withAppBuildGradle,
 } = require("expo/config-plugins");
 
 const ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android";
@@ -61,6 +62,10 @@ function addSplashBehaviorTargetApi(styles) {
 }
 
 function withAndroidPlatformCompatibility(config) {
+  config = withAppBuildGradle(config, (gradleConfig) => {
+    gradleConfig.modResults.contents = addWindowsNativeBuildDirectory(gradleConfig.modResults.contents);
+    return gradleConfig;
+  });
   config = withAndroidManifest(config, (manifestConfig) => {
     manifestConfig.modResults = upsertOptionalCameraFeature(
       manifestConfig.modResults,
@@ -76,6 +81,22 @@ function withAndroidPlatformCompatibility(config) {
   });
 }
 
+function addWindowsNativeBuildDirectory(contents) {
+  const marker = '// EventAutoPin: Windows native build path';
+  contents = contents.replace(/\n?\/\/ EventAutoPin: Windows native build path\nif \(System[\s\S]*?\n}\n?/, '');
+  return contents.trimEnd() + `
+${marker}
+if (System.getProperty('os.name').toLowerCase().contains('windows')) {
+    // CMake/Ninjaの260文字制限を避け、checkoutごとに中間生成物を分離する。
+    def buildKey = java.security.MessageDigest.getInstance('SHA-256')
+        .digest(rootDir.canonicalPath.getBytes('UTF-8')).encodeHex().toString().substring(0, 8)
+    def driveRoot = rootDir.toPath().root.toFile()
+    android.externalNativeBuild.cmake.buildStagingDirectory = new File(driveRoot, '.ec/' + buildKey)
+    android.defaultConfig.externalNativeBuild.cmake.arguments '-DCMAKE_OBJECT_PATH_MAX=250'
+}
+`;
+}
+
 module.exports = createRunOncePlugin(
   withAndroidPlatformCompatibility,
   "with-android-platform-compatibility",
@@ -83,3 +104,4 @@ module.exports = createRunOncePlugin(
 );
 module.exports.addSplashBehaviorTargetApi = addSplashBehaviorTargetApi;
 module.exports.upsertOptionalCameraFeature = upsertOptionalCameraFeature;
+module.exports.addWindowsNativeBuildDirectory = addWindowsNativeBuildDirectory;

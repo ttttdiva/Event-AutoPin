@@ -1,3 +1,4 @@
+import { InputModal, InputScrollView } from "@/components/KeyboardLayout";
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import {
   StyleSheet,
@@ -1108,7 +1109,7 @@ export default function EventListScreen() {
       </Modal>
 
       {/* イベントメモ編集モーダル */}
-      <Modal
+      <InputModal
         visible={memoTarget !== null}
         transparent
         animationType="fade"
@@ -1118,6 +1119,7 @@ export default function EventListScreen() {
           style={styles.modalOverlay}
           onPress={() => setMemoTarget(null)}
         >
+          <InputScrollView style={{ width: '100%', flexGrow: 0, maxHeight: '100%' }} contentContainerStyle={{ alignItems: 'center' }}>
           <View
             style={[styles.modalCard, { backgroundColor: colors.card }]}
             onStartShouldSetResponder={() => true}
@@ -1156,11 +1158,12 @@ export default function EventListScreen() {
               </Pressable>
             </View>
           </View>
+          </InputScrollView>
         </Pressable>
-      </Modal>
+      </InputModal>
 
       {/* イベント作成モーダル */}
-      <Modal
+      <InputModal
         visible={showCreateModal}
         transparent
         animationType="fade"
@@ -1170,6 +1173,7 @@ export default function EventListScreen() {
           style={styles.modalOverlay}
           onPress={() => setShowCreateModal(false)}
         >
+          <InputScrollView style={{ width: '100%', flexGrow: 0, maxHeight: '100%' }} contentContainerStyle={{ alignItems: 'center' }}>
           <View
             style={[styles.modalCard, { backgroundColor: colors.card }]}
             onStartShouldSetResponder={() => true}
@@ -1256,8 +1260,9 @@ export default function EventListScreen() {
               </Pressable>
             </View>
           </View>
+          </InputScrollView>
         </Pressable>
-      </Modal>
+      </InputModal>
 
       {/* QRスキャナーモーダル */}
       <Modal

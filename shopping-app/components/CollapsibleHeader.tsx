@@ -59,8 +59,8 @@ interface CollapsibleHeaderProps {
   globalSearchEnabled: boolean;
   searchQuery: string;
   onSearchChange: (q: string) => void;
-  statusFilter: PurchaseStatusValue | null;
-  onStatusFilterChange: (v: PurchaseStatusValue | null) => void;
+  statusFilter: Set<PurchaseStatusValue>;
+  onStatusFilterChange: (v: Set<PurchaseStatusValue>) => void;
   sortBy: SortField;
   onSortChange: (v: SortField) => void;
   priorityFilter: Set<number>;
@@ -123,6 +123,25 @@ export default function CollapsibleHeader({
   const couldntBuyColor = PURCHASE_STATUS_LABELS[PURCHASE_STATUS.COULDNT_BUY].color;
   const skippedColor = PURCHASE_STATUS_LABELS[PURCHASE_STATUS.SKIPPED].color;
 
+  const activeConditions = [
+    ...(searchQuery.trim() ? [`検索: ${searchQuery.trim()}`] : []),
+    ...(hallFilter ? [`場所: ${hallFilter}`] : []),
+    ...Array.from(statusFilter).map((s) => `購入状態: ${PURCHASE_STATUS_LABELS[s].label}`),
+    ...Array.from(priorityFilter).map((p) => `優先度: ${getColor(p).label}`),
+    ...(genreFilter ? [`ジャンル: ${genreFilter}`] : []),
+    ...(catalogPostOnly ? ['おしながきあり'] : []),
+    ...(hideSkipped ? ['見送り非表示'] : []),
+  ];
+  function clearFilters() {
+    onSearchChange('');
+    onHallFilterChange(null);
+    onStatusFilterChange(new Set());
+    onGenreFilterChange(null);
+    onCatalogPostOnlyChange(false);
+    onHideSkippedChange(false);
+    onClearPriorityFilter();
+  }
+
   function toggleExpand() {
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
     setExpanded(!expanded);
@@ -158,6 +177,22 @@ export default function CollapsibleHeader({
           <FontAwesome name={expanded ? 'chevron-up' : 'filter'} size={14} color={colors.textSecondary} />
         </Pressable>
       </View>
+
+      {activeConditions.length > 0 && (
+        <View style={{ paddingHorizontal: 12, paddingBottom: 8, gap: 6 }}>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
+            {activeConditions.map((condition) => (
+              <Text key={condition} style={[styles.chip, { color: colors.text, borderColor: colors.border, fontSize: 12 }]}>{condition}</Text>
+            ))}
+          </View>
+          <View style={styles.countRow}>
+            <Text style={[styles.countText, { color: colors.textSecondary }]}>{filteredCount}件表示 / 全{totalCount}件</Text>
+            <Pressable onPress={clearFilters} accessibilityRole="button">
+              <Text style={[styles.clearFilterText, { color: colors.tint }]}>フィルター解除</Text>
+            </Pressable>
+          </View>
+        </View>
+      )}
 
       {globalSearchEnabled && (
         <View style={styles.globalSearchRow}>
@@ -271,16 +306,21 @@ export default function CollapsibleHeader({
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll} contentContainerStyle={styles.chipContent}>
             {/* ステータス */}
             <Pressable
-              style={[styles.chip, { borderColor: colors.border }, statusFilter === null && { backgroundColor: colors.tint, borderColor: colors.tint }]}
-              onPress={() => onStatusFilterChange(null)}
+              style={[styles.chip, { borderColor: colors.border }, statusFilter.size === 0 && !hideSkipped && { backgroundColor: colors.tint, borderColor: colors.tint }]}
+              onPress={() => { onStatusFilterChange(new Set()); onHideSkippedChange(false); }}
             >
-              <Text style={[styles.chipText, { color: colors.textSecondary }, statusFilter === null && { color: '#fff' }]}>全て</Text>
+              <Text style={[styles.chipText, { color: colors.textSecondary }, statusFilter.size === 0 && !hideSkipped && { color: '#fff' }]}>全て</Text>
             </Pressable>
             {([PURCHASE_STATUS.NOT_YET, PURCHASE_STATUS.BOUGHT, PURCHASE_STATUS.COULDNT_BUY, PURCHASE_STATUS.SKIPPED] as PurchaseStatusValue[]).map((s) => {
               const info = PURCHASE_STATUS_LABELS[s];
-              const isActive = statusFilter === s;
+              const isActive = statusFilter.has(s);
               return (
-                <Pressable key={s} style={[styles.chip, { borderColor: info.color }, isActive && { backgroundColor: info.color }]} onPress={() => onStatusFilterChange(isActive ? null : s)}>
+                <Pressable key={s} accessibilityRole="checkbox" accessibilityState={{ checked: isActive }} style={[styles.chip, { borderColor: info.color }, isActive && { backgroundColor: info.color }]} onPress={() => {
+                  const next = new Set(statusFilter);
+                  if (isActive) next.delete(s); else next.add(s);
+                  if (s === PURCHASE_STATUS.SKIPPED && !isActive) onHideSkippedChange(false);
+                  onStatusFilterChange(next);
+                }}>
                   <Text style={[styles.chipText, { color: isActive ? '#fff' : info.color }]}>{info.label}</Text>
                 </Pressable>
               );
@@ -343,7 +383,14 @@ export default function CollapsibleHeader({
                   borderColor: PURCHASE_STATUS_LABELS[PURCHASE_STATUS.SKIPPED].color,
                 },
               ]}
-              onPress={() => onHideSkippedChange(!hideSkipped)}
+              onPress={() => {
+                if (!hideSkipped && statusFilter.has(PURCHASE_STATUS.SKIPPED)) {
+                  const next = new Set(statusFilter);
+                  next.delete(PURCHASE_STATUS.SKIPPED);
+                  onStatusFilterChange(next);
+                }
+                onHideSkippedChange(!hideSkipped);
+              }}
             >
               <Text
                 style={[
@@ -405,8 +452,8 @@ export default function CollapsibleHeader({
               {filteredCount}件表示
               {filteredCount !== totalCount && ` / 全${totalCount}件`}
             </Text>
-            {(priorityFilter.size > 0 || statusFilter !== null || genreFilter !== null || catalogPostOnly || hideSkipped) && (
-              <Pressable onPress={() => { onStatusFilterChange(null); onGenreFilterChange(null); onCatalogPostOnlyChange(false); onHideSkippedChange(false); onClearPriorityFilter(); }}>
+            {activeConditions.length > 0 && (
+              <Pressable onPress={clearFilters}>
                 <Text style={[styles.clearFilterText, { color: colors.tint }]}>フィルター解除</Text>
               </Pressable>
             )}

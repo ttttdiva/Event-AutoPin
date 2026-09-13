@@ -7,6 +7,7 @@ import { useFonts } from "expo-font";
 import { Stack } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { useEffect, useRef } from "react";
+import { KeyboardProvider } from "react-native-keyboard-controller";
 import { EventProvider } from "@/lib/event-context";
 import { ThemeProvider, useTheme } from "@/lib/theme-context";
 import { PriorityColorProvider } from "@/lib/priority-color-context";
@@ -54,9 +55,11 @@ export default function RootLayout() {
   }
 
   return (
-    <ThemeProvider>
-      <RootLayoutNav />
-    </ThemeProvider>
+    <KeyboardProvider preload={false}>
+      <ThemeProvider>
+        <RootLayoutNav />
+      </ThemeProvider>
+    </KeyboardProvider>
   );
 }
 

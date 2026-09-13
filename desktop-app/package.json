@@ -1,7 +1,7 @@
 {
   "name": "event-autopin-desktop-app",
   "private": true,
-  "version": "0.1.20",
+  "version": "0.1.21",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -15,7 +15,7 @@
     "test:diagnostics": "tsc --target ES2020 --module CommonJS --moduleResolution Node --strict --skipLibCheck --rootDir src --outDir node_modules/.diagnostics-test src/coordinate-diagnostics.ts src/coordinate-diagnostics.test.ts && node node_modules/.diagnostics-test/coordinate-diagnostics.test.js",
     "test:model-capabilities": "node -e \"require('node:fs').rmSync('node_modules/.model-capabilities-test', { recursive: true, force: true })\" && tsc --target ES2020 --module CommonJS --moduleResolution Node --strict --skipLibCheck --rootDir src --outDir node_modules/.model-capabilities-test src/openai-model-capabilities.ts src/openai-model-capabilities.test.ts && node node_modules/.model-capabilities-test/openai-model-capabilities.test.js",
     "test:asset-path": "node -e \"require('node:fs').rmSync('node_modules/.asset-path-test', { recursive: true, force: true })\" && tsc --target ES2020 --module CommonJS --moduleResolution Node --strict --skipLibCheck --rootDir src --outDir node_modules/.asset-path-test src/file-asset-path.ts src/file-asset-path.test.ts && node node_modules/.asset-path-test/file-asset-path.test.js",
-    "test:runtime": "node -e \"require('node:fs').rmSync('node_modules/.runtime-test', { recursive: true, force: true })\" && tsc --target ES2020 --module CommonJS --moduleResolution Node --strict --skipLibCheck --rootDir src --outDir node_modules/.runtime-test src/bridge-job.ts src/reprocess-runtime.ts src/reprocess-runtime.test.ts && node node_modules/.runtime-test/reprocess-runtime.test.js",
+    "test:runtime": "node -e \"require('node:fs').rmSync('node_modules/.runtime-test', { recursive: true, force: true })\" && tsc --target ES2020 --module CommonJS --moduleResolution Node --strict --skipLibCheck --rootDir src --outDir node_modules/.runtime-test src/bridge-job.ts src/reprocess-runtime.ts src/reprocess-runtime.test.ts src/catalog-joint-runtime.test.ts && node node_modules/.runtime-test/reprocess-runtime.test.js && node node_modules/.runtime-test/catalog-joint-runtime.test.js",
     "tauri:build:root": "node ../scripts/run_desktop_build.cjs"
   },
   "devDependencies": {

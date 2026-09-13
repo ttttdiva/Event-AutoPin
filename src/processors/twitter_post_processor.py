@@ -18,6 +18,8 @@ from ..utils.twitter_extractor import TwitterExtractor
 from ..utils.logger import setup_logger
 from ..utils.progress_logger import ProgressLogger
 from ..utils.catalog_image_analyzer import CatalogImageAnalyzer
+from ..utils.catalog_post_analyzer import CatalogPostAnalyzer
+from . import catalog_post
 from ..utils.reprocess_deadline import ReprocessDeadline, ReprocessDeadlineExceeded
 from ..utils.reprocess_trace import (
     call_with_optional_trace,
@@ -275,6 +277,10 @@ class TwitterPostProcessor:
             api_reasoning_effort=config.image_llm_effort,
             api_reasoning_effort_map=config.image_api_reasoning_effort_map,
             attempts=image_attempts,
+        )
+        self.catalog_post_analyzer = (
+            CatalogPostAnalyzer(self.catalog_analyzer)
+            if CatalogPostAnalyzer.supports(image_attempts) else None
         )
         self.output_path = Path(config.output_dir)
         self.output_path.mkdir(exist_ok=True)
@@ -980,6 +986,16 @@ class TwitterPostProcessor:
         else:
             best_tweet = catalog_only_tweets[0]
 
+        # API設定では本文と全画像を一緒に見てから分類・抽出する。
+        if catalog_post.enabled(self):
+            try:
+                return await catalog_post.process_candidates(
+                    self, circle, catalog_only_tweets, best_tweet, event_name, event_date,
+                )
+            except Exception:
+                circle._checked_tweet_ids = existing_ids
+                raise
+
         # 統合LLM判定: 分類（確定/予告）+ 既刊のみ + 頒布物種別を1回で判定
         loop = asyncio.get_event_loop()
         detail = await loop.run_in_executor(
@@ -1057,6 +1073,12 @@ class TwitterPostProcessor:
         if not tweet_id:
             logger.warning(f"Invalid post URL for direct reprocess: {post_url}")
             return False
+
+        if catalog_post.enabled(self):
+            return await catalog_post.process_direct_post(
+                self, circle, tweet_id, post_url, event_name,
+                deadline=deadline, run_id=run_id, trace=trace,
+            )
 
         cached = self._post_reprocess_cache.get(tweet_id)
         if cached:

@@ -1,3 +1,4 @@
+import { renderInputScrollView } from "@/components/KeyboardLayout";
 import { useRef, useCallback } from 'react';
 import {
   StyleSheet,
@@ -150,6 +151,10 @@ export default function MapBottomSheet({
       </GestureDetector>
 
       <View style={styles.content}>
+        <FlatList
+          renderScrollComponent={renderInputScrollView}
+          keyboardShouldPersistTaps="handled"
+          ListHeaderComponent={
         <TextInput
           style={[styles.searchInput, {
             borderColor: colors.border,
@@ -162,7 +167,7 @@ export default function MapBottomSheet({
           onChangeText={onSearchChange}
           clearButtonMode="while-editing"
         />
-        <FlatList
+          }
           data={circles}
           keyExtractor={(item) => String(item.id)}
           renderItem={renderItem}

@@ -166,6 +166,7 @@ export function reprocessProgressLabel(line: string, runId: string): string | nu
     "image.analysis": "画像から商品を読み取り中",
     "catalog.initial": "画像から商品を読み取り中",
     "catalog.verify": "商品名・価格を読み取り中",
+    "catalog.joint": "投稿本文と全画像から商品・価格を確認中",
     "text.detail": "投稿本文を確認中",
     "text.items": "投稿本文から商品を読み取り中",
     "python.return": "結果を反映中",

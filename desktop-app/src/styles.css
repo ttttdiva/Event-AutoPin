@@ -653,6 +653,21 @@ html.dark {
   .item-panel {
     @apply px-4 py-2;
   }
+  .circle-attendance-label {
+    @apply flex items-center gap-2 mb-2 text-sm;
+    color: var(--text-primary);
+  }
+  .circle-absence-select {
+    @apply rounded px-2 py-1 text-sm;
+    background-color: var(--bg-input);
+    color: var(--text-primary);
+    border: 1px solid var(--border-default);
+  }
+  .circle-absence-badge {
+    @apply rounded px-1 ml-1 text-xs;
+    color: var(--text-primary);
+    border: 1px solid var(--border-default);
+  }
   .item-table {
     width: 100% !important;
     table-layout: auto !important;

@@ -2688,6 +2688,12 @@ function renderItemPanel(circleIdx: number): string {
 
   return `<tr class="item-panel-row" data-circle="${circleIdx}"><td colspan="100">
     <div class="item-panel">
+      <label class="circle-attendance-label">参加状況
+        <select class="circle-absence-select" data-circle="${circleIdx}" aria-label="サークルの参加状況">
+          <option value=""${!c.absence_status ? " selected" : ""}>欠席なし</option>
+          <option value="absent"${c.absence_status ? " selected" : ""}>欠席</option>
+        </select>
+      </label>
       <table class="item-table">
         <thead><tr><th class="w-8"></th><th class="w-11">画像</th><th>アイテム名</th><th class="w-[90px]">単価</th><th>メモ</th><th class="w-[110px]">分類</th><th class="w-[100px]">チェック</th><th class="w-8">感想</th><th class="w-15"></th></tr></thead>
         <tbody>${itemRows}${emptyMsg}</tbody>
@@ -5061,6 +5067,7 @@ function renderCircleEditor() {
           // サークル名列: アイテム数バッジ + Ctrl+F検索用の非表示アイテム名を追加
           if (h === "サークル名") {
             const itemCount = parseInt(row["_itemCount"] || "0");
+            const absenceBadge = ` <span class="circle-absence-badge"${eventJsonData.circles[realIdx]?.absence_status ? "" : " hidden"}>欠席</span>`;
             const badge =
               itemCount > 0
                 ? ` <span class="item-count-badge">${itemCount}</span>`
@@ -5073,7 +5080,7 @@ function renderCircleEditor() {
             const srOnly = hiddenItemNames
               ? `<span class="sr-only">${escapeHtml(hiddenItemNames)}</span>`
               : "";
-            return `<td class="relative"><input data-row="${realIdx}" data-col="${escapeHtml(h)}" value="${escapeHtml(val)}" />${badge}${srOnly}</td>`;
+            return `<td class="relative"><input data-row="${realIdx}" data-col="${escapeHtml(h)}" value="${escapeHtml(val)}" />${badge}${absenceBadge}${srOnly}</td>`;
           }
           // URL値: リンク＋編集欄（複数URL改行区切りの場合は最初のURLを「開く」対象に）
           const firstUrl = val
@@ -5424,6 +5431,19 @@ function renderCircleEditor() {
     circleEditorEl.addEventListener("change", (e) => {
     const target = e.target as HTMLInputElement | HTMLSelectElement | null;
     if (!target) return;
+    if (target.matches("select.circle-absence-select")) {
+      const row = Number(target.dataset.circle);
+      const circle = eventJsonData?.circles?.[row];
+      if (!circle) return;
+      circle.absence_status = target.value || null;
+      const badge = circleEditorEl.querySelector<HTMLElement>(`tr[data-circle-row="${row}"] .circle-absence-badge`);
+      if (badge) badge.hidden = !circle.absence_status;
+      markEventDocumentMutated();
+      void saveNow().then((result) => {
+        if (!result.ok) resultEl.textContent = `欠席状態を保存できませんでした: ${String(result.error)}`;
+      });
+      return;
+    }
     if (target.matches("select.genre-select")) {
       const row = Number(target.dataset.row);
       const col = String(target.dataset.col);

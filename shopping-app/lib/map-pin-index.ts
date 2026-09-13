@@ -23,8 +23,8 @@ export interface MapPinRecord {
 export interface MapPinFilters {
   /** Current map number. `null` means that all indexed maps are candidates. */
   mapNumber: number | null;
-  /** Empty/null status keeps only not-yet circles (the default map behavior). */
-  status: number | null | undefined;
+  /** 未指定・空集合は全状態。複数状態はOR条件。 */
+  status?: ReadonlySet<number> | number | null;
   colors?: ReadonlySet<number>;
   priorities?: ReadonlySet<number>;
   hall?: string | null;
@@ -74,13 +74,10 @@ export function selectMapPins<T extends MapPinRecord>(
   const result: T[] = [];
 
   for (const circle of candidates) {
-    // M4: without an explicit status filter only unpurchased circles are
-    // shown by default.
-    if (
-      filters.status == null
-        ? circle.purchaseStatus !== 0
-        : circle.purchaseStatus !== filters.status
-    ) {
+    const status = filters.status;
+    if (status != null && (typeof status === 'number'
+      ? circle.purchaseStatus !== status
+      : status.size > 0 && !status.has(circle.purchaseStatus))) {
       continue;
     }
     if (colors && colors.size > 0 && !colors.has(circle.priorityColor)) {

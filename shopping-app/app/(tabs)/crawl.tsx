@@ -1,8 +1,8 @@
+import { InputScrollView } from "@/components/KeyboardLayout";
 import { useState } from "react";
 import {
   ActivityIndicator,
   Alert,
-  ScrollView,
   StyleSheet,
   Switch,
   Text,
@@ -112,7 +112,7 @@ export default function CrawlScreen() {
   };
 
   return (
-    <ScrollView
+    <InputScrollView
       style={[styles.container, { backgroundColor: colors.background }]}
       contentContainerStyle={styles.content}
     >
@@ -323,7 +323,7 @@ export default function CrawlScreen() {
         </View>
       )}
       <View style={{ height: 40 }} />
-    </ScrollView>
+    </InputScrollView>
   );
 }
 

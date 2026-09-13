@@ -1,3 +1,4 @@
+import MapCirclePopup from "./MapCirclePopup";
 import {
   useState,
   useCallback,
@@ -93,7 +94,8 @@ interface MapViewProps {
   highlightCircleId?: number | null;
   showFilters?: boolean;
   // 親のフィルター状態（M2: リストと同じフィルターをマップにも適用）
-  parentStatusFilter?: number | null;
+  parentStatusFilter?: ReadonlySet<number> | number | null;
+  onPriorityFilterChange?: (value: Set<number>) => void;
   parentPriorityFilter?: Set<number>;
   parentHallFilter?: string | null;
   parentSearchQuery?: string;
@@ -303,6 +305,7 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
       showFilters = true,
       parentStatusFilter,
       parentPriorityFilter,
+      onPriorityFilterChange,
       parentHallFilter,
       parentSearchQuery,
       parentGlobalSearchEnabled,
@@ -326,7 +329,8 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
     const [containerSize, setContainerSize] = useState({ width: 1, height: 1 });
     const { width: screenWidth } = useWindowDimensions();
 
-    const [colorFilter, setColorFilter] = useState<Set<number>>(new Set());
+    const [localColorFilter, setLocalColorFilter] = useState<Set<number>>(new Set());
+    const colorFilter = parentPriorityFilter ?? localColorFilter;
     const [highlightedCircleId, setHighlightedCircleId] = useState<
       number | null
     >(null);
@@ -773,12 +777,10 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
     }));
 
     function toggleColorFilter(value: number) {
-      setColorFilter((prev) => {
-        const next = new Set(prev);
-        if (next.has(value)) next.delete(value);
-        else next.add(value);
-        return next;
-      });
+      const next = new Set(colorFilter);
+      if (next.has(value)) next.delete(value); else next.add(value);
+      if (onPriorityFilterChange) onPriorityFilterChange(next);
+      else setLocalColorFilter(next);
     }
 
     function adjustPinDimension(
@@ -1086,7 +1088,7 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
         <View style={styles.mapArea} onLayout={handleContainerLayout}>
           <GestureDetector gesture={composedGesture}>
             <View
-              style={{ width: displaySize.w, height: displaySize.h }}
+              style={{ flex: 1 }}
             >
             <Animated.View
               style={[
@@ -1160,14 +1162,14 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                 if (!geometry) return null;
                 const isHighlighted = circle.id === activeHighlight;
                 const bw = Math.max(
-                  isHighlighted ? 1.5 / currentScale : 0.7 / currentScale,
+                  isHighlighted ? 2.5 / currentScale : 0.7 / currentScale,
                   StyleSheet.hairlineWidth,
                 );
                 const fillColor = withAlpha(
                   priority.color,
                   isHighlighted ? 0.5 : PIN_FILL_ALPHA,
                 );
-                const outlineColor = withAlpha(priority.color, PIN_OUTLINE_ALPHA);
+                const outlineColor = isHighlighted ? '#ffffff' : withAlpha(priority.color, PIN_OUTLINE_ALPHA);
                 const handlePinLongPress = () => {
                   if (!onPinRemove) return;
                   Alert.alert("ピン削除", `「${circle.name}」のピンを削除しますか？`, [
@@ -1204,124 +1206,14 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                   <StaticPin {...commonPinProps} />
                 );
                 })}
-              {/* ツールチップ: タップしたピンのサークル情報 + サークルカット画像 */}
-              {naturalSize &&
-                activeHighlight != null &&
-                (() => {
-                  const c = pinsForMap.find((p) => p.id === activeHighlight);
-                  if (!c || c.pinX == null || c.pinY == null) return null;
-                  const geometry = getPinDisplayGeometry(c);
-                  if (!geometry) return null;
-                  const priority = getColor(c.priorityColor);
-                  const tipTop = geometry.centerY;
-                  const hasImage =
-                    c.circleCutFilename &&
-                    (c.circleCutFilename.startsWith("file://") ||
-                      c.circleCutFilename.startsWith("/"));
-                  const spaceLabel = `${c.hall ?? ""}${c.space ?? ""}`.trim();
-                  const penname = c.penname?.trim() ?? "";
-                  const popupW = 220;
-                  const popupTextRows =
-                    1 +
-                    (spaceLabel.length > 0 ? 1 : 0) +
-                    (penname.length > 0 ? 1 : 0);
-                  const popupH = hasImage
-                    ? 84 + popupTextRows * 14 + 16
-                    : penname.length > 0
-                      ? 72
-                      : 56;
-                  const gapScreen = Math.max(
-                    10,
-                    Math.max(geometry.width, geometry.height) *
-                      currentScale *
-                      0.75,
-                  );
-                  const pinX = geometry.centerX;
-                  const pinY = geometry.centerY;
-                  const showBelow =
-                    pinY - (popupH + gapScreen) / currentScale < 0;
-                  const minLeft = (popupW / 2 + 8) / currentScale;
-                  const maxLeft = displaySize.w - minLeft;
-                  const clampedLeft = Math.max(minLeft, Math.min(maxLeft, pinX));
-                  return (
-                    <View
-                      pointerEvents="none"
-                      style={{
-                        position: "absolute",
-                        left: clampedLeft,
-                        top: showBelow
-                          ? tipTop + gapScreen / currentScale
-                          : tipTop - (popupH + gapScreen) / currentScale,
-                        transform: [
-                          { translateX: -popupW / 2 },
-                          { scale: 1 / currentScale },
-                        ],
-                        transformOrigin: showBelow ? "top center" : "bottom center",
-                        backgroundColor: "rgba(15, 23, 42, 0.72)",
-                        paddingHorizontal: 8,
-                        paddingVertical: 6,
-                        borderRadius: 6,
-                        borderWidth: StyleSheet.hairlineWidth,
-                        borderColor: "rgba(255, 255, 255, 0.22)",
-                        borderLeftWidth: 4,
-                        borderLeftColor: withAlpha(priority.color, 0.86),
-                        width: popupW,
-                        alignItems: "center",
-                        zIndex: 200,
-                      }}
-                    >
-                      {hasImage && (
-                        <Image
-                          source={{ uri: c.circleCutFilename! }}
-                          style={{
-                            width: 80,
-                            height: 80,
-                            borderRadius: 4,
-                            marginBottom: 4,
-                          }}
-                          contentFit="cover"
-                          cachePolicy="memory-disk"
-                        />
-                      )}
-                      {spaceLabel.length > 0 && (
-                        <Text
-                          style={{
-                            color: "#fff",
-                            fontSize: 10,
-                            textAlign: "center",
-                          }}
-                          numberOfLines={1}
-                        >
-                          {spaceLabel}
-                        </Text>
-                      )}
-                      <Text
-                        style={{
-                          color: "#fff",
-                          fontSize: 11,
-                          fontWeight: "600",
-                          textAlign: "center",
-                        }}
-                        numberOfLines={1}
-                      >
-                        {c.name}
-                      </Text>
-                      {penname.length > 0 && (
-                        <Text
-                          style={{
-                            color: "#fff",
-                            fontSize: 10,
-                            textAlign: "center",
-                          }}
-                          numberOfLines={1}
-                        >
-                          {penname}
-                        </Text>
-                      )}
-                    </View>
-                  );
-                })()}
             </Animated.View>
+            {naturalSize && activeHighlight != null && (() => {
+              const circle = pinsForMap.find((p) => p.id === activeHighlight);
+              const pin = circle ? getPinDisplayGeometry(circle) : null;
+              return circle && pin ? <MapCirclePopup key={circle.id} circle={circle} pin={pin}
+                viewport={containerSize} scale={scale} translateX={translateX} translateY={translateY}
+                color={getColor(circle.priorityColor).color} /> : null;
+            })()}
             </View>
           </GestureDetector>
         </View>

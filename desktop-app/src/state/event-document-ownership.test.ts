@@ -602,3 +602,19 @@ void main().catch((error) => {
   console.error(error);
   throw error;
 });
+
+// モバイルのabsent/旧データの欠席を、表編集を経ても失わず保存する。
+for (const absence of ['absent', '欠席', null]) {
+  const table: TableState = { headers: ['サークル名'], rows: [{ サークル名: '確認用' }] };
+  const imported: EventJsonData = { circles: [{ name: '確認用', absence_status: absence, checked: 2, items: [] }] };
+  const unchanged = buildEventJsonSnapshot(imported, table, table);
+  assert(unchanged.circles?.[0].absence_status === absence, '取り込んだ欠席状態を保持すること');
+  for (const edited of ['absent', null]) {
+    imported.circles![0].absence_status = edited;
+    const snapshot = buildEventJsonSnapshot(imported, table, table);
+    const reopened = JSON.parse(JSON.stringify(snapshot));
+    assert(reopened.circles[0].absence_status === edited, '欠席設定・解除がJSON保存後にも残ること');
+    assert(reopened.circles[0].checked === 2, '欠席と購入状態を混同しないこと');
+  }
+}
+console.log('欠席状態のモバイル互換値・保存・解除を検証しました');

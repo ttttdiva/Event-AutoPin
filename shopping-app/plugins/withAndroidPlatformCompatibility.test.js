@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const {
   addSplashBehaviorTargetApi,
   upsertOptionalCameraFeature,
+  addWindowsNativeBuildDirectory,
 } = require("./withAndroidPlatformCompatibility");
 const appConfig = require("../app.json");
 
@@ -71,3 +72,10 @@ assert.equal(splashBehavior.$["tools:targetApi"], "33");
 assert.equal(styles.resources.$["xmlns:tools"], "http://schemas.android.com/tools");
 
 console.log("Android platform compatibility plugin tests passed");
+
+const gradle = addWindowsNativeBuildDirectory('android { defaultConfig { versionCode 198 } }\n');
+assert.equal(addWindowsNativeBuildDirectory(gradle), gradle);
+assert.ok(gradle.includes("contains('windows')"));
+assert.ok(gradle.includes('buildStagingDirectory'));
+assert.ok(gradle.includes('-DCMAKE_OBJECT_PATH_MAX=250'));
+assert.ok(addWindowsNativeBuildDirectory(gradle + '\n// 後続設定を保持\n').includes('// 後続設定を保持'));

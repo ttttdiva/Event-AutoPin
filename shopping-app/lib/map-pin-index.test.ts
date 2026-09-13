@@ -46,8 +46,8 @@ export function runMapPinIndexTests(): void {
     "numbered map should include only its bucket and unassigned pins",
   );
   assert(
-    mapOne.every((pin) => pin.purchaseStatus === 0),
-    "default status should hide completed pins",
+    mapOne.length === fixture.filter((pin) => pin.mapNumber === 1 || pin.mapNumber === 0).length,
+    "未指定では購入済みも含め、対象マップの全ピンを表示すること",
   );
 
   const searched = selectMapPins(index, {
@@ -57,6 +57,21 @@ export function runMapPinIndexTests(): void {
   });
   assert(searched.length > 0, "memo search should match fixture pins");
   assert(searched.every((pin) => pin.memo.includes("注目")), "search result mismatch");
+
+  const completed = fixture.slice(0, 12).map((pin, id) => ({ ...pin, purchaseStatus: id % 3 + 1 }));
+  const completedIndex = buildMapPinIndex(completed);
+  assert(selectMapPins(completedIndex, { mapNumber: null }).length === 12, "未購入0件でもピンを表示すること");
+  assert(selectMapPins(completedIndex, { mapNumber: null, status: new Set() }).length === 12, "空集合は全てを表示すること");
+  const allStatuses = fixture.slice(0, 20).map((pin, id) => ({ ...pin, purchaseStatus: id % 4 }));
+  const allIndex = buildMapPinIndex(allStatuses);
+  for (let mask = 1; mask < 16; mask++) {
+    const statuses = new Set([0, 1, 2, 3].filter((status) => mask & (1 << status)));
+    const actual = selectMapPins(allIndex, { mapNumber: null, status: statuses });
+    const expected = allStatuses.filter((pin) => statuses.has(pin.purchaseStatus));
+    assert(actual.map((p) => p.id).sort().join() === expected.map((p) => p.id).sort().join(), "状態の全組み合わせをORで絞り込むこと");
+    const combined = selectMapPins(allIndex, { mapNumber: null, status: statuses, hall: '東', catalogPostOnly: true });
+    assert(combined.length === expected.filter((p) => p.hall === '東' && p.hasCatalogPost).length, "場所・おしながき条件をANDで適用すること");
+  }
 
   // This is intentionally a generous guard for CI hosts; it catches an
   // accidental O(N²) regression without making the test timing-sensitive.

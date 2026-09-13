@@ -1,7 +1,7 @@
+import { InputScrollView } from "@/components/KeyboardLayout";
 import { useEffect, useState } from "react";
 import {
   Alert,
-  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -362,7 +362,7 @@ export default function SettingsScreen() {
   );
 
   return (
-    <ScrollView
+    <InputScrollView
       style={[styles.container, { backgroundColor: colors.background }]}
       contentContainerStyle={styles.content}
     >
@@ -778,7 +778,7 @@ export default function SettingsScreen() {
           </View>
         </View>
       )}
-    </ScrollView>
+    </InputScrollView>
   );
 }
 

@@ -19,6 +19,7 @@ desktop-app/src/openai-model-capabilities.test.ts
 desktop-app/src/openai-model-capabilities.ts
 desktop-app/src/purchase-status.ts
 desktop-app/src/reprocess-runtime.test.ts
+desktop-app/src/catalog-joint-runtime.test.ts
 desktop-app/src/reprocess-runtime.ts
 desktop-app/src/reprocess-edits.ts
 desktop-app/src/state/async-mutation-guard.test.ts
@@ -66,6 +67,7 @@ docs/mobile-auto-update-standard.md
 docs/mobile-item-purchase-ui.md
 docs/mockups/map-cell-highlight-ui-mock.html
 docs/public-repository-sync.md
+docs/catalog-joint-analysis.md
 docs/release-checklist.md
 docs/TWITTER_RATE_LIMIT.md
 docs/unlimited-ocr-migration-plan.md
@@ -203,6 +205,7 @@ src/models/config.py
 src/models/event.py
 src/processors/__init__.py
 src/processors/twitter_post_processor.py
+src/processors/catalog_post.py
 src/space_locator/__init__.py
 src/space_locator/auto_coordinate_generator.py
 src/space_locator/catalog_geometry_assignment.py
@@ -219,6 +222,7 @@ src/utils/api_cost_tracker.py
 src/utils/archiver.py
 src/utils/atomic_json.py
 src/utils/catalog_image_analyzer.py
+src/utils/catalog_post_analyzer.py
 src/utils/catalog_updater.py
 src/utils/circle_master.py
 src/utils/cli_llm.py
@@ -253,6 +257,7 @@ tests/unit/test_adapter_factory.py
 tests/unit/test_auto_coordinate_generator_event_json.py
 tests/unit/test_base_adapter.py
 tests/unit/test_catalog_geometry_resolver.py
+tests/unit/test_catalog_post_joint.py
 tests/unit/test_coordinate_generation_diagnostics.py
 tests/unit/test_circle_master.py
 tests/unit/test_date_utils.py
@@ -288,3 +293,9 @@ tests/unit/test_unlimited_ocr_config.py
 tests/unit/test_unlimited_ocr_evaluation.py
 tests/unit/test_ocr_runner_strategy.py
 tests/unit/test_setup_unlimited_ocr_bat.py
+shopping-app/components/KeyboardLayout.tsx
+shopping-app/components/MapCirclePopup.tsx
+shopping-app/lib/map-popup-layout.ts
+shopping-app/lib/map-popup-layout.test.ts
+shopping-app/lib/filter-header.test.ts
+docs/mobile-filter-keyboard-map.md

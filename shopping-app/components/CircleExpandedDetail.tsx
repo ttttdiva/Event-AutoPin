@@ -1,3 +1,4 @@
+import { InputModal, InputScrollView } from "@/components/KeyboardLayout";
 import { useEffect, useState, useMemo, useRef } from "react";
 import {
   StyleSheet,
@@ -973,7 +974,7 @@ export default function CircleExpandedDetail({
       />
 
       {/* Xポスト再処理モーダル */}
-      <Modal
+      <InputModal
         visible={showReprocessModal}
         transparent
         animationType="fade"
@@ -983,6 +984,7 @@ export default function CircleExpandedDetail({
           style={styles.reprocessOverlay}
           onPress={() => !reprocessing && setShowReprocessModal(false)}
         >
+          <InputScrollView style={{ width: '100%', flexGrow: 0, maxHeight: '100%' }} contentContainerStyle={{ alignItems: 'center' }}>
           <View
             style={[styles.reprocessCard, { backgroundColor: colors.card }]}
             onStartShouldSetResponder={() => true}
@@ -1051,8 +1053,9 @@ export default function CircleExpandedDetail({
               </Pressable>
             </View>
           </View>
+          </InputScrollView>
         </Pressable>
-      </Modal>
+      </InputModal>
     </View>
   );
 }

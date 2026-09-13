@@ -14,9 +14,9 @@ DEFAULT_TEXT_FALLBACK_PROVIDER = "cli:codex"
 DEFAULT_TEXT_FALLBACK_MODEL = "gpt-5.5"
 DEFAULT_TEXT_FALLBACK_EFFORT = "medium"
 
-DEFAULT_IMAGE_PRIMARY_PROVIDER = "cli:antigravity"
-DEFAULT_IMAGE_PRIMARY_MODEL = "gemini-3.8-flash-medium"
-DEFAULT_IMAGE_PRIMARY_EFFORT = "none"
+DEFAULT_IMAGE_PRIMARY_PROVIDER = "api:openai"
+DEFAULT_IMAGE_PRIMARY_MODEL = "gpt-5.6-luna"
+DEFAULT_IMAGE_PRIMARY_EFFORT = "max"
 DEFAULT_IMAGE_FALLBACK_PROVIDER = "api:openai"
 DEFAULT_IMAGE_FALLBACK_MODEL = "gpt-5.6-sol"
 DEFAULT_IMAGE_FALLBACK_EFFORT = "medium"
@@ -181,7 +181,7 @@ def build_image_llm_attempts(
 
     # For backwards compatibility, an explicit primary with no fallback
     # remains CLI/API single-attempt.  Fully omitted configuration gets the
-    # new CLI-primary + OpenAI-Sol fallback contract.
+    # Luna-primary + OpenAI-Sol fallback contract.
     effective_fallback_provider = fallback_provider or (
         DEFAULT_IMAGE_FALLBACK_PROVIDER if primary_was_omitted else None
     )

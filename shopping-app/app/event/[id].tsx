@@ -1,3 +1,4 @@
+import { InputModal, InputScrollView, renderInputScrollView } from "@/components/KeyboardLayout";
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import {
   StyleSheet,
@@ -14,7 +15,6 @@ import {
   SafeAreaView,
   StatusBar,
   Platform,
-  ScrollView,
 } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useFocusEffect } from "@react-navigation/native";
@@ -137,8 +137,8 @@ export default function CircleListScreen() {
   // フィルター
   const [searchQuery, setSearchQuery] = useState("");
   const [globalSearchEnabled, setGlobalSearchEnabled] = useState(false);
-  const [statusFilter, setStatusFilter] = useState<PurchaseStatusValue | null>(
-    null,
+  const [statusFilter, setStatusFilter] = useState<Set<PurchaseStatusValue>>(
+    new Set(),
   );
   const [sortBy, setSortBy] = useState<SortField>("space");
   const [hallFilter, setHallFilter] = useState<string | null>(null);
@@ -1215,8 +1215,8 @@ export default function CircleListScreen() {
   const filteredCircles = useMemo(() => {
     let result = circles;
     const activeSearchQuery = searchQuery.trim();
-    if (statusFilter !== null)
-      result = result.filter((c) => c.purchaseStatus === statusFilter);
+    if (statusFilter.size > 0)
+      result = result.filter((c) => statusFilter.has(c.purchaseStatus));
     if (hideSkipped)
       result = result.filter((c) => c.purchaseStatus !== PURCHASE_STATUS.SKIPPED);
     if (hallFilter) result = result.filter((c) => c.hall === hallFilter);
@@ -1463,16 +1463,6 @@ export default function CircleListScreen() {
   // M5: 統一レンダリング - MapViewを1インスタンスにしてズーム状態を維持
   const showMap = viewMode === "map" || viewMode === "split";
   const showList = viewMode === "list" || viewMode === "split";
-  const mapFilterProps = {
-    parentStatusFilter: statusFilter,
-    parentPriorityFilter: priorityFilter,
-    parentHallFilter: hallFilter,
-    parentSearchQuery: searchQuery,
-    parentGlobalSearchEnabled: globalSearchEnabled,
-    parentSearchTextMap: itemNamesMap,
-    parentCatalogPostOnly: catalogPostOnly,
-    parentHideSkipped: hideSkipped,
-  };
 
   return (
     <SafeAreaView
@@ -1482,6 +1472,7 @@ export default function CircleListScreen() {
         barStyle={effectiveScheme === "dark" ? "light-content" : "dark-content"}
       />
       <View style={{ flex: 1 }}>
+        {viewMode === "map" && renderFilters()}
         {showMap && renderPinBanner()}
         {showMap && (
           <View style={{ flex: 1 }}>
@@ -1490,14 +1481,15 @@ export default function CircleListScreen() {
               eventId={eventId}
               mapFmpRequestKey={mapFmpRequest?.key ?? null}
               mapFmpStartedAt={mapFmpRequest?.startedAt ?? null}
-              circles={circles}
+              circles={filteredCircles}
               maps={maps}
               showFilters={viewMode === "map"}
               onMapLongPress={handleMapLongPress}
               onCirclePress={handleMapCirclePress}
               onPinRemove={handlePinRemove}
               onPinMove={handlePinMove}
-              {...mapFilterProps}
+              parentPriorityFilter={priorityFilter}
+              onPriorityFilterChange={setPriorityFilter}
             />
           </View>
         )}
@@ -1520,7 +1512,7 @@ export default function CircleListScreen() {
       </View>
 
       {/* サークル追加モーダル */}
-      <Modal
+      <InputModal
         visible={showAddCircle}
         transparent
         animationType="fade"
@@ -1530,7 +1522,7 @@ export default function CircleListScreen() {
           style={styles.modalOverlay}
           onPress={() => setShowAddCircle(false)}
         >
-          <ScrollView
+          <InputScrollView
             style={styles.modalScroll}
             contentContainerStyle={styles.modalScrollContent}
             keyboardShouldPersistTaps="handled"
@@ -1759,12 +1751,12 @@ export default function CircleListScreen() {
                 </Pressable>
               </View>
             </View>
-          </ScrollView>
+          </InputScrollView>
         </Pressable>
-      </Modal>
+      </InputModal>
 
       {/* イベント編集モーダル */}
-      <Modal
+      <InputModal
         visible={showEditEvent}
         transparent
         animationType="fade"
@@ -1774,6 +1766,7 @@ export default function CircleListScreen() {
           style={styles.modalOverlay}
           onPress={() => setShowEditEvent(false)}
         >
+          <InputScrollView style={{ width: '100%', flexGrow: 0, maxHeight: '100%' }} contentContainerStyle={{ alignItems: 'center' }}>
           <View
             style={[styles.modalCard, { backgroundColor: colors.card }]}
             onStartShouldSetResponder={() => true}
@@ -1900,18 +1893,19 @@ export default function CircleListScreen() {
               </Pressable>
             </View>
           </View>
+          </InputScrollView>
         </Pressable>
-      </Modal>
+      </InputModal>
 
       {/* サークル編集モーダル */}
-      <Modal
+      <InputModal
         visible={showEditCircle}
         transparent
         animationType="fade"
         onRequestClose={() => setShowEditCircle(false)}
       >
         <View style={styles.modalOverlay}>
-          <ScrollView
+          <InputScrollView
             style={styles.modalScroll}
             contentContainerStyle={styles.modalScrollContent}
             keyboardShouldPersistTaps="handled"
@@ -2265,9 +2259,9 @@ export default function CircleListScreen() {
                 </Pressable>
               </View>
             </View>
-          </ScrollView>
+          </InputScrollView>
         </View>
-      </Modal>
+      </InputModal>
       <Modal
         visible={actionMenuCircle !== null}
         transparent
@@ -2377,33 +2371,9 @@ export default function CircleListScreen() {
     </SafeAreaView>
   );
 
-  function renderCircleList() {
+  function renderFilters() {
     return (
-      <View style={{ flex: 1 }}>
-        {/* 戻るボタン + イベント名 + アクションボタン */}
-        <View
-          style={[
-            styles.headerBar,
-            { backgroundColor: colors.card, borderBottomColor: colors.border },
-          ]}
-        >
-          <Pressable style={styles.backBtn} onPress={() => router.back()}>
-            <FontAwesome name="arrow-left" size={16} color={colors.tint} />
-          </Pressable>
-          <Pressable style={{ flex: 1 }} onPress={openEditEvent}>
-            <Text
-              style={[styles.headerTitle, { color: colors.text }]}
-              numberOfLines={1}
-            >
-              {event?.name ?? ""}
-            </Text>
-          </Pressable>
-          <Pressable style={styles.headerActionBtn} onPress={openAddCircle}>
-            <FontAwesome name="plus" size={16} color={colors.tint} />
-          </Pressable>
-        </View>
-
-        {/* フィルター・統計ヘッダー */}
+        <InputScrollView style={{ flexGrow: 0, flexShrink: 1, maxHeight: "45%" }}>
         <CollapsibleHeader
           globalSearchEnabled={globalSearchEnabled}
           searchQuery={searchQuery}
@@ -2432,8 +2402,42 @@ export default function CircleListScreen() {
           isShoppingMode={localShoppingActive}
           shoppingStartedAt={localShoppingStartedAt}
         />
+        </InputScrollView>
+    );
+  }
+
+  function renderCircleList() {
+    return (
+      <View style={{ flex: 1 }}>
+        {/* 戻るボタン + イベント名 + アクションボタン */}
+        <View
+          style={[
+            styles.headerBar,
+            { backgroundColor: colors.card, borderBottomColor: colors.border },
+          ]}
+        >
+          <Pressable style={styles.backBtn} onPress={() => router.back()}>
+            <FontAwesome name="arrow-left" size={16} color={colors.tint} />
+          </Pressable>
+          <Pressable style={{ flex: 1 }} onPress={openEditEvent}>
+            <Text
+              style={[styles.headerTitle, { color: colors.text }]}
+              numberOfLines={1}
+            >
+              {event?.name ?? ""}
+            </Text>
+          </Pressable>
+          <Pressable style={styles.headerActionBtn} onPress={openAddCircle}>
+            <FontAwesome name="plus" size={16} color={colors.tint} />
+          </Pressable>
+        </View>
+
+        {/* フィルター・統計ヘッダー */}
+        {renderFilters()}
 
         <FlatList
+          renderScrollComponent={renderInputScrollView}
+          keyboardShouldPersistTaps="handled"
           ref={flatListRef}
           data={filteredCircles}
           keyExtractor={(item) => String(item.id)}
@@ -2488,7 +2492,7 @@ export default function CircleListScreen() {
           initialNumToRender={20}
           maxToRenderPerBatch={20}
           windowSize={5}
-          removeClippedSubviews
+          removeClippedSubviews={false}
           updateCellsBatchingPeriod={50}
         />
       </View>
