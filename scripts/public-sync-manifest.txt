@@ -11,6 +11,7 @@ desktop-app/src/coordinate-diagnostics.ts
 desktop-app/src/coordinate-diagnostics.test.ts
 desktop-app/src/features/cookie-file.ts
 desktop-app/src/file-asset-path.ts
+desktop-app/src/file-asset-path.test.ts
 desktop-app/src/history-search-ui.test.ts
 desktop-app/src/history-search-ui.ts
 desktop-app/src/main.ts
@@ -19,8 +20,7 @@ desktop-app/src/openai-model-capabilities.ts
 desktop-app/src/purchase-status.ts
 desktop-app/src/reprocess-runtime.test.ts
 desktop-app/src/reprocess-runtime.ts
-desktop-app/src/reprocess-view.ts
-desktop-app/src/reprocess-priority.ts
+desktop-app/src/reprocess-edits.ts
 desktop-app/src/state/async-mutation-guard.test.ts
 desktop-app/src/state/async-mutation-guard.ts
 desktop-app/src/state/cookie-drop.test.ts
@@ -63,6 +63,7 @@ desktop-app/vite.config.ts
 docs/desktop/tauri-python-windows-plan.md
 docs/mobile_crawl_plan.md
 docs/mobile-auto-update-standard.md
+docs/mobile-item-purchase-ui.md
 docs/mockups/map-cell-highlight-ui-mock.html
 docs/public-repository-sync.md
 docs/release-checklist.md
@@ -106,6 +107,8 @@ sha256:0d7c1c9812be9b2419351dfc9e0a13b1d72a96fda3ff788113f95bd4e6eec6c1 shopping
 sha256:974eb696f42b1fe3f242af6fd73f70daf4155b9262979003ed44e6171eab721f shopping-app/assets/images/splash-icon.png
 shopping-app/components/BottomBar.tsx
 shopping-app/components/CircleExpandedDetail.tsx
+shopping-app/components/ItemPurchaseRow.tsx
+shopping-app/components/ItemPurchaseStatusMenu.tsx
 shopping-app/components/CircleRow.tsx
 shopping-app/components/CollapsibleHeader.tsx
 shopping-app/components/EventCard.tsx
@@ -148,6 +151,8 @@ shopping-app/lib/map-viewport-transform.ts
 shopping-app/lib/mutation-epoch.test.ts
 shopping-app/lib/mutation-epoch.ts
 shopping-app/lib/import-helpers.ts
+shopping-app/lib/item-purchase-menu.ts
+shopping-app/lib/item-purchase-ui.test.ts
 shopping-app/lib/import-helpers.test.ts
 shopping-app/lib/performance-core.test.ts
 shopping-app/lib/performance-core.ts

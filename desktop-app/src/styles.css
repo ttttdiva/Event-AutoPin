@@ -1304,6 +1304,16 @@ html.dark {
     border-bottom: 1px solid var(--border-default);
     @apply flex items-center gap-3 px-2 py-1.5 flex-wrap;
   }
+  .map-filter-chip {
+    border: 1px solid;
+    @apply inline-flex items-center justify-center rounded px-2 py-1 text-xs font-semibold cursor-pointer select-none transition;
+  }
+  .map-filter-chip:hover {
+    filter: brightness(1.08);
+  }
+  .map-filter-chip.off {
+    opacity: 0.35;
+  }
 
   /* 画像サイズ切替 */
   .img-size-selector {

@@ -24,8 +24,7 @@ import {
   type ReprocessTelemetryOutcome,
   type ReprocessTelemetryStage,
 } from "./reprocess-runtime";
-import { makeReprocessViewReadOnly } from "./reprocess-view";
-import { ReprocessPriorityEdits } from "./reprocess-priority";
+import { mergeReprocessEdits } from "./reprocess-edits";
 import {
   formatCoordinateGenerationFailure,
 } from "./coordinate-diagnostics";
@@ -3167,7 +3166,7 @@ async function runJob(
       const renderProgress = () => {
         resultEl.textContent = `「${circleName}」を再処理中：${stage}\n` +
           `経過 ${Math.floor((performance.now() - started) / 1000)}秒 / 残りキュー: ${reprocessCircleQueue.length}件\n` +
-          "再処理中も優先度の変更・スクロール・画像表示・検索を利用できます。";
+          "再処理中も他のサークルを編集できます。";
       };
       renderProgress();
       reprocessTimer = window.setInterval(renderProgress, 1000);
@@ -3577,6 +3576,12 @@ function editorJsonPathValue(): string {
 async function saveNow(
   permit?: InternalOperationSavePermit,
 ): Promise<SaveNowResult> {
+  if (isReprocessOperation(operationState) && permit !== INTERNAL_OPERATION_SAVE) {
+    // 入力は通常どおり受け付け、古い全体snapshotの書き戻しはジョブ終了まで待つ。
+    reprocessEditRevision += 1;
+    scheduleAutoSave();
+    return { ok: true, revision: null };
+  }
   if (isOperationBusy(operationState) && permit !== INTERNAL_OPERATION_SAVE) {
     return {
       ok: false,
@@ -5274,17 +5279,7 @@ function renderCircleEditor() {
             const priorityRow = findCircleIndexByIdentity(row, priorityIdentity);
             if (priorityRow < 0) { dropdown.remove(); return; }
             tableState.rows[priorityRow][col] = opt.value + ".0";
-            if (isReprocessOperation(operationState)) {
-              reprocessPriorityEdits.record(
-                priorityRow,
-                priorityIdentity,
-                Number(opt.value),
-              );
-              // 商品patch反映時にも優先度を保持し、終了時にまとめて保存する。
-              scheduleAutoSave();
-            } else {
-              void saveNow();
-            }
+            void saveNow();
             swatch.style.background = opt.bgColor;
             swatch.style.borderColor = opt.color;
             swatch.title = opt.label;
@@ -5623,7 +5618,7 @@ function showCircleRowContextMenu(x: number, y: number, rowIdx: number) {
     menu.remove();
     void markCircleCatalogNeedsRecheck(rowIdx);
   });
-  if (!isReprocessOperation(operationState)) menu.appendChild(needsRecheckItem);
+  menu.appendChild(needsRecheckItem);
 
   const addItem = document.createElement("div");
   addItem.textContent = "このサークルの下に追加";
@@ -5792,7 +5787,14 @@ type ReprocessCircleJob = {
 );
 
 const reprocessCircleQueue: ReprocessCircleJob[] = [];
-const reprocessPriorityEdits = new ReprocessPriorityEdits();
+let reprocessEditRevision = 0;
+
+// change前の入力も検知し、最終保存の待ち時間に入力された値を取りこぼさない。
+document.getElementById("tab-edit")!.addEventListener("input", () => {
+  if (!isReprocessOperation(operationState)) return;
+  reprocessEditRevision += 1;
+  scheduleAutoSave();
+});
 
 let activePostReprocessRunId: string | null = null;
 let activePostReprocessJob: ReprocessCircleJob | null = null;
@@ -5920,8 +5922,9 @@ function showReprocessTerminalResult(
 function findCircleIndexByIdentity(
   preferredIdx: number,
   identity: ReprocessCircleJob["circleIdentity"],
+  sourceCircles?: any[],
 ): number {
-  const circles: any[] = eventJsonData?.circles || [];
+  const circles: any[] = sourceCircles ?? eventJsonData?.circles ?? [];
   const hasIdentity = Boolean(
     identity.name || identity.penname || identity.space || identity.hall,
   );
@@ -6042,14 +6045,13 @@ function enqueueReprocessCircle(job: ReprocessCircleJob) {
 
 async function drainReprocessCircleQueue() {
   if (!canStartReprocess(operationState)) return;
-  reprocessPriorityEdits.clear();
+  reprocessEditRevision = 0;
   latestReprocessJobCleanup = null;
   applyOperationEvent({ type: "start-reprocess" });
   setEventPipelineButtonsDisabled(true);
   for (const id of ["tab-edit", "tab-history", "tab-settings"]) {
     document.getElementById(id)!.inert = false;
   }
-  const releaseReadOnlyView = makeReprocessViewReadOnly(document.getElementById("tab-edit")!);
   try {
     const pendingCrawlMeta = captureCrawlMetaSnapshot();
     cancelCrawlMetaSave();
@@ -6065,17 +6067,22 @@ async function drainReprocessCircleQueue() {
     while (true) {
       while (reprocessCircleQueue.length > 0) {
         const job = reprocessCircleQueue.shift()!;
+        const draft = buildEventJsonSnapshot(eventJsonData, tableState, eventTableBaseline);
+        if (draft.circles?.[job.rowIdx]) {
+          job.circleIdentity = circleIdentityFromCircle(draft.circles[job.rowIdx]);
+          job.circleName = String(draft.circles[job.rowIdx].name || job.circleName);
+        }
         applyOperationEvent({ type: "dequeue-reprocess" });
         logReprocessTelemetry(job, "frontend.start", "begin");
         await runReprocessCircleJob(job);
       }
-      const priorityRevision = reprocessPriorityEdits.revision;
+      const editRevision = reprocessEditRevision;
       const finalSave = await saveNow(INTERNAL_OPERATION_SAVE);
       if (!finalSave.ok) {
         resultEl.textContent = `1サークル再処理後の保存に失敗しました: ${String(finalSave.error)}`;
       }
       // 最終保存中に追加されたキューも同じ排他区間で処理する。
-      if (reprocessCircleQueue.length === 0 && priorityRevision === reprocessPriorityEdits.revision) break;
+      if (reprocessCircleQueue.length === 0 && editRevision === reprocessEditRevision) break;
     }
   } finally {
     if (isReprocessOperation(operationState)) {
@@ -6087,8 +6094,6 @@ async function drainReprocessCircleQueue() {
         applyOperationEvent({ type: "abort-reprocess" });
       }
     }
-    releaseReadOnlyView();
-    reprocessPriorityEdits.clear();
     setEventPipelineButtonsDisabled(false);
     const finalCleanup = latestReprocessCleanupSnapshot();
     setActivePostReprocessJob(null);
@@ -6122,7 +6127,10 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
     );
     return;
   }
-  const currentIdx = findCircleIndexByIdentity(job.rowIdx, job.circleIdentity);
+  const currentIdx = findCircleIndexByIdentity(
+    job.rowIdx, job.circleIdentity,
+    buildEventJsonSnapshot(eventJsonData, tableState, eventTableBaseline).circles,
+  );
   if (currentIdx < 0) {
     showReprocessTerminalResult(
       job,
@@ -6137,7 +6145,12 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
   if (!(await preflightSelectedAntigravityModel())) return;
 
   resultEl.textContent = `「${job.circleName}」の変更を保存中...`;
-  const saveResult = await saveNow(INTERNAL_OPERATION_SAVE);
+  const pendingSave = saveNow(INTERNAL_OPERATION_SAVE);
+  // saveNowの同期部分で確定したsnapshotを、ユーザーの追加入力より先に固定する。
+  const reprocessBase = cloneJsonSnapshot(eventJsonData);
+  job.circleIdentity = circleIdentityFromCircle(reprocessBase.circles?.[currentIdx]);
+  job.circleName = String(reprocessBase.circles?.[currentIdx]?.name || job.circleName);
+  const saveResult = await pendingSave;
   if (!saveResult.ok) {
     showReprocessTerminalResult(
       job,
@@ -6347,18 +6360,30 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
       const previousEventTableBaseline = eventTableBaseline;
       const previousRevision = eventDocumentStateRevision;
       try {
-        eventJsonData = cloneJsonSnapshot(reprocessPriorityEdits.apply(applied.data));
+        const currentDraft = buildEventJsonSnapshot(eventJsonData, tableState, eventTableBaseline);
+        const merged = mergeReprocessEdits(
+          reprocessBase, currentDraft, applied.data, currentIdx,
+          new Set(Object.keys(bridge.circle_patch)),
+        );
+        eventJsonData = merged.data;
         persistedEventJsonData = cloneJsonSnapshot(applied.data);
         tableState = circlesToTableState(eventJsonData);
-        // ディスクに保存済みの値をbaselineとし、未保存の優先度変更を残す。
+        // ディスクに保存済みの値をbaselineとし、待ち時間中の編集を残す。
         eventTableBaseline = circlesToTableState(applied.data);
         markEventDocumentMutated();
         const resolvedIndex = applied.resolvedCircleIndices[0] ?? currentIdx;
+        job.circleIdentity = circleIdentityFromCircle(eventJsonData.circles?.[resolvedIndex]);
         mergeReprocessedCircleIntoState(
           resolvedIndex,
           job.circleIdentity,
           eventJsonData.circles?.[resolvedIndex],
         );
+        for (const queued of reprocessCircleQueue) {
+          queued.rowIdx = merged.circleIndices[queued.rowIdx] ?? -1;
+          if (eventJsonData.circles?.[queued.rowIdx]) {
+            queued.circleIdentity = circleIdentityFromCircle(eventJsonData.circles[queued.rowIdx]);
+          }
+        }
       } catch (error) {
         eventJsonData = previousEventJsonData;
         persistedEventJsonData = previousPersistedEventJsonData;
@@ -10523,7 +10548,6 @@ function renderCircleEditorAndMap() {
 
 // === 画像セルへのクリップボードペースト対応 ===
 document.addEventListener("paste", async (e) => {
-  if (isReprocessOperation(operationState)) return;
   const items = e.clipboardData?.items;
   if (!items) return;
   // フォーカスがinput/textareaの場合は通常のペーストを優先
@@ -10628,7 +10652,6 @@ document.addEventListener("dragleave", (e) => {
 });
 
 document.addEventListener("drop", async (e) => {
-  if (isReprocessOperation(operationState)) { e.preventDefault(); return; }
   e.preventDefault();
   if (dragHighlighted) dragHighlighted.classList.remove("drag-over");
   const cell = dragHighlighted as HTMLTableCellElement | null;

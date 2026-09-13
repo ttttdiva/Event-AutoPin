@@ -35,12 +35,9 @@ import { useTheme } from "@/lib/theme-context";
 import { getColors } from "@/constants/Colors";
 import { useEvent } from "@/lib/event-context";
 import { beginSqlMetricsScope, recordUiMetric } from "@/lib/performance";
-import {
-  PURCHASE_STATUS,
-  PURCHASE_STATUS_LABELS,
-  ITEM_CATEGORIES,
-} from "@/lib/types";
+import { ITEM_CATEGORIES } from "@/lib/types";
 import ImageViewer from "@/components/ImageViewer";
+import ItemPurchaseRow from "@/components/ItemPurchaseRow";
 import type { Circle, Item, ItemImage, PurchaseStatusValue } from "@/lib/types";
 import { createLoadEpochGuard } from "@/lib/event-load-epoch";
 
@@ -257,26 +254,6 @@ export default function CircleExpandedDetail({
     );
     await refreshBoughtItemKeys();
     refreshStats(circle.eventId);
-  }
-
-  function openItemPurchaseStatusMenu(item: Item) {
-    const statuses = [
-      PURCHASE_STATUS.NOT_YET,
-      PURCHASE_STATUS.BOUGHT,
-      PURCHASE_STATUS.COULDNT_BUY,
-      PURCHASE_STATUS.SKIPPED,
-    ] as PurchaseStatusValue[];
-    Alert.alert(
-      "購入ステータス",
-      item.name,
-      [
-        ...statuses.map((status) => ({
-          text: `${PURCHASE_STATUS_LABELS[status].icon} ${PURCHASE_STATUS_LABELS[status].label}`,
-          onPress: () => handleItemPurchaseStatus(item.id, status),
-        })),
-        { text: "キャンセル", style: "cancel" as const },
-      ],
-    );
   }
 
   async function handleSaveMemo() {
@@ -731,170 +708,25 @@ export default function CircleExpandedDetail({
             );
           }
 
-          const boughtStatusInfo = PURCHASE_STATUS_LABELS[PURCHASE_STATUS.BOUGHT];
           const isBoughtSomewhere = boughtItemNameKeys.has(
             normalizePurchaseLookupKey(item.name),
           );
           return (
-            <Pressable
+            <ItemPurchaseRow
               key={item.id}
-              style={[
-                styles.itemCard,
-                { borderBottomColor: colors.border },
-                isBoughtSomewhere && {
-                  backgroundColor:
-                    effectiveScheme === "dark"
-                      ? "rgba(46,125,50,0.16)"
-                      : "rgba(46,125,50,0.08)",
-                },
-              ]}
-              onPress={() => startEditItem(item)}
-              onLongPress={() => handleDeleteItem(item.id)}
-            >
-              <View style={styles.itemRow}>
-                {/* 並び替えボタン */}
-                {items.length > 1 && (
-                  <View style={styles.reorderBtns}>
-                    <Pressable
-                      style={[
-                        styles.reorderBtn,
-                        itemIndex === 0 && { opacity: 0.2 },
-                      ]}
-                      onPress={(e) => {
-                        e.stopPropagation();
-                        handleReorderItem(itemIndex, itemIndex - 1);
-                      }}
-                      disabled={itemIndex === 0}
-                      hitSlop={4}
-                    >
-                      <Text
-                        style={[
-                          styles.reorderBtnText,
-                          { color: colors.textSecondary },
-                        ]}
-                      >
-                        ▲
-                      </Text>
-                    </Pressable>
-                    <Pressable
-                      style={[
-                        styles.reorderBtn,
-                        itemIndex === items.length - 1 && { opacity: 0.2 },
-                      ]}
-                      onPress={(e) => {
-                        e.stopPropagation();
-                        handleReorderItem(itemIndex, itemIndex + 1);
-                      }}
-                      disabled={itemIndex === items.length - 1}
-                      hitSlop={4}
-                    >
-                      <Text
-                        style={[
-                          styles.reorderBtnText,
-                          { color: colors.textSecondary },
-                        ]}
-                      >
-                        ▼
-                      </Text>
-                    </Pressable>
-                  </View>
-                )}
-                <View style={styles.itemContent}>
-                  <View
-                    style={{
-                      flexDirection: "row",
-                      alignItems: "center",
-                      gap: 4,
-                    }}
-                  >
-                    <Text
-                      style={[
-                        styles.itemName,
-                        { color: colors.text },
-                        item.purchaseStatus === PURCHASE_STATUS.BOUGHT && {
-                          textDecorationLine: "line-through",
-                          opacity: 0.5,
-                        },
-                      ]}
-                    >
-                      {item.name}
-                    </Text>
-                    {item.price != null && (
-                      <Text style={styles.itemPrice}>{item.price}円</Text>
-                    )}
-                    {item.type && (
-                      <Text
-                        style={[
-                          styles.itemType,
-                          {
-                            color: colors.textSecondary,
-                            backgroundColor: colors.background,
-                          },
-                        ]}
-                      >
-                        {item.type}
-                      </Text>
-                    )}
-                    {isBoughtSomewhere && (
-                      <Text
-                        style={[
-                          styles.purchasedBadge,
-                          {
-                            color: boughtStatusInfo.color,
-                            borderColor: boughtStatusInfo.color,
-                            backgroundColor:
-                              effectiveScheme === "dark"
-                                ? "rgba(46,125,50,0.18)"
-                                : "rgba(46,125,50,0.08)",
-                          },
-                        ]}
-                      >
-                        購入済み
-                      </Text>
-                    )}
-                  </View>
-                </View>
-                {/* M10: アイテム購入ステータスボタン */}
-                <View style={styles.itemStatusRow}>
-                  {(
-                    [
-                      PURCHASE_STATUS.BOUGHT,
-                      PURCHASE_STATUS.COULDNT_BUY,
-                      PURCHASE_STATUS.SKIPPED,
-                    ] as PurchaseStatusValue[]
-                  ).map((s) => {
-                    const info = PURCHASE_STATUS_LABELS[s];
-                    const isActive = item.purchaseStatus === s;
-                    return (
-                      <Pressable
-                        key={s}
-                        style={[
-                          styles.itemStatusBtn,
-                          { borderColor: info.color },
-                          isActive && { backgroundColor: info.color },
-                        ]}
-                        onPress={() =>
-                          handleItemPurchaseStatus(
-                            item.id,
-                            isActive ? PURCHASE_STATUS.NOT_YET : s,
-                          )
-                        }
-                        onLongPress={() => openItemPurchaseStatusMenu(item)}
-                      >
-                        <Text
-                          style={[
-                            styles.itemStatusText,
-                            { color: isActive ? "#fff" : info.color },
-                          ]}
-                        >
-                          {info.icon}
-                        </Text>
-                      </Pressable>
-                    );
-                  })}
-                </View>
-              </View>
-            </Pressable>
+              item={item}
+              colors={colors}
+              isDark={effectiveScheme === "dark"}
+              isBoughtSomewhere={isBoughtSomewhere}
+              showReorder={items.length > 1}
+              canMoveUp={itemIndex > 0}
+              canMoveDown={itemIndex < items.length - 1}
+              onEdit={() => startEditItem(item)}
+              onDelete={() => { void handleDeleteItem(item.id); }}
+              onMoveUp={() => { void handleReorderItem(itemIndex, itemIndex - 1); }}
+              onMoveDown={() => { void handleReorderItem(itemIndex, itemIndex + 1); }}
+              onStatusChange={(status) => handleItemPurchaseStatus(item.id, status)}
+            />
           );
         })}
         {items.length === 0 && !addingItem && (
@@ -1267,30 +1099,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   linkBtnText: { fontSize: 12, fontWeight: "600" },
-  itemCard: {
-    paddingVertical: 5,
-    paddingHorizontal: 4,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderRadius: 4,
-  },
-  itemName: { fontSize: 13, fontWeight: "600" },
-  itemMeta: { flexDirection: "row", gap: 6, marginTop: 2 },
-  itemPrice: { fontSize: 12, fontWeight: "600", color: "#e65100" },
-  itemType: {
-    fontSize: 10,
-    paddingHorizontal: 4,
-    paddingVertical: 1,
-    borderRadius: 3,
-  },
-  purchasedBadge: {
-    fontSize: 10,
-    fontWeight: "700",
-    paddingHorizontal: 5,
-    paddingVertical: 1,
-    borderRadius: 3,
-    borderWidth: 1,
-  },
-  itemDesc: { fontSize: 11, marginTop: 2 },
   itemImage: { width: "100%", height: 180, borderRadius: 6, marginBottom: 4 },
   catalogImageAddBtn: {
     minHeight: 84,
@@ -1306,18 +1114,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "600",
   },
-  itemRow: { flexDirection: "row", alignItems: "center" },
-  itemContent: { flex: 1 },
-  itemStatusRow: { flexDirection: "row", gap: 4, marginLeft: 4 },
-  itemStatusBtn: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 1.5,
-  },
-  itemStatusText: { fontSize: 12, fontWeight: "bold" },
   chipContainer: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -1373,20 +1169,6 @@ const styles = StyleSheet.create({
   addItemSaveBtnText: { color: "#fff", fontWeight: "600", fontSize: 12 },
   addItemCancelBtn: { paddingHorizontal: 14, paddingVertical: 5 },
   addItemCancelBtnText: { fontSize: 12 },
-  reorderBtns: {
-    flexDirection: "column",
-    justifyContent: "center",
-    marginRight: 4,
-    gap: 0,
-  },
-  reorderBtn: {
-    paddingHorizontal: 4,
-    paddingVertical: 1,
-  },
-  reorderBtnText: {
-    fontSize: 10,
-    fontWeight: "600",
-  },
   circleActionRow: {
     flexDirection: "row",
     justifyContent: "center",

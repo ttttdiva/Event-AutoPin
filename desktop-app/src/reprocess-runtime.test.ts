@@ -1,5 +1,5 @@
 import type { BridgeJobResult } from "./bridge-job";
-import { ReprocessPriorityEdits } from "./reprocess-priority";
+import { mergeReprocessEdits } from "./reprocess-edits";
 import { buildEventJsonSnapshot } from "./state/event-document";
 import {
   attachReprocessRunId,
@@ -199,35 +199,53 @@ assertEqual(
   "telemetry format",
 );
 
-// 対象行と別サークルの優先度を、商品更新・行順変更をまたいで保持する。
-const priorities = new ReprocessPriorityEdits();
-priorities.record(0, { name: "対象", space: "A-01" }, 1);
-priorities.record(1, { name: "別サークル", space: "A-02" }, 4);
-const savedBridgeData = {
+// 再処理していないサークルの入力・ジャンル・商品編集は結果反映で失わない。
+const beforeReprocess = {
+  event: { memo: "元のイベントメモ", venue: "元の会場" },
   circles: [
-    { name: "別サークル", space: "A-02", priority_color: 5, items: [] },
-    { name: "対象", space: "A-01", priority_color: 5, items: [{ name: "新しい商品" }] },
+    { name: "対象", space: "A-01", priority_color: 5, genres: [], items: [{ name: "元の商品" }] },
+    { name: "別サークル", space: "A-02", priority_color: 5, genres: ["漫画"], items: [{ name: "既存商品", price: 500 }] },
     { name: "未編集", space: "A-03", priority_color: 3, items: [] },
   ],
 };
-let priorityMerged = priorities.apply(savedBridgeData);
-assertEqual(priorityMerged.circles[0].priority_color, 4, "別サークルの優先度を保持する");
-assertEqual(priorityMerged.circles[1].priority_color, 1, "再処理対象の優先度を保持する");
-assertEqual(priorityMerged.circles[1].items[0].name, "新しい商品", "新しい商品データを保持する");
-assertEqual(priorityMerged.circles[2].priority_color, 3, "未編集の優先度を変更しない");
-assertEqual(savedBridgeData.circles[1].priority_color, 5, "保存済みsnapshotを変更しない");
-// 元の色へ戻した場合も、処理中に記録した古い選択を復活させない。
-priorities.record(0, { name: "対象", space: "A-01" }, 5);
-priorityMerged = priorities.apply(savedBridgeData);
-assertEqual(priorityMerged.circles[1].priority_color, 5, "最後に選んだ優先度を採用する");
+const untouchedTable = { headers: [], rows: [{}, {}, {}] };
+const localDraft = buildEventJsonSnapshot(beforeReprocess, {
+  headers: [], rows: [
+    { "サークル名": "対象の変更名", "色": "1.0" },
+    { "サークル名": "別サークルの変更名", "ペンネーム": "新しい名義", "ジャンル": "音楽", "アイテムメモ": "編集中のメモ", "色": "4.0" },
+    {},
+  ],
+}, untouchedTable);
+localDraft.circles![0].items = [{ name: "対象の手動入力" }];
+localDraft.circles![1].items = [{ name: "価格を編集した商品", price: 800 }, { name: "手動追加", price: 300 }];
+localDraft.event.memo = "待ち時間中のイベントメモ";
+const savedBridgeData = {
+  event: { memo: "元のイベントメモ", venue: "更新された会場" },
+  circles: [
+    beforeReprocess.circles[1],
+    { ...beforeReprocess.circles[0], items: [{ name: "再処理の商品", price: 700 }], catalog_status: "confirmed" },
+    { ...beforeReprocess.circles[2], priority_color: 2 },
+  ],
+};
+const mergedEdits = mergeReprocessEdits(beforeReprocess, localDraft, savedBridgeData, 0, new Set(["items", "catalog_status"]));
+assertEqual(mergedEdits.data.circles![0].name, "別サークルの変更名", "他のサークル名を保持する");
+assertEqual(mergedEdits.data.circles![0].penname, "新しい名義", "他の入力欄を保持する");
+assertEqual(mergedEdits.data.circles![0].genres[0], "音楽", "ジャンル選択を保持する");
+assertEqual(mergedEdits.data.circles![0].memo, "編集中のメモ", "メモ入力を保持する");
+assertEqual(mergedEdits.data.circles![0].priority_color, 4, "優先度も保持する");
+assertEqual(mergedEdits.data.circles![0].items.length, 2, "他サークルの商品追加を保持する");
+assertEqual(mergedEdits.data.circles![0].items[0].price, 800, "他サークルの価格編集を保持する");
+assertEqual(mergedEdits.data.circles![1].items[0].name, "再処理の商品", "対象商品の上書きは許可する");
+assertEqual(mergedEdits.data.circles![1].name, "対象の変更名", "再処理が変更しない入力欄は保持する");
+assertEqual(mergedEdits.data.circles![2].priority_color, 2, "未編集の欄は最新ディスク値を保持する");
+assertEqual(mergedEdits.data.event.memo, "待ち時間中のイベントメモ", "イベントメモを保持する");
+assertEqual(mergedEdits.data.event.venue, "更新された会場", "未編集のイベント情報を保持する");
+assertEqual(mergedEdits.circleIndices.join(","), "1,0,2", "次のキューを並び替え後の正しい行へ対応させる");
+assertEqual(savedBridgeData.circles[0].name, "別サークル", "保存済みsnapshotを変更しない");
 const finalSnapshot = buildEventJsonSnapshot(
-  priorityMerged as any,
-  { headers: ["色"], rows: [{ "色": "4.0" }, { "色": "5.0" }, { "色": "3.0" }] },
-  { headers: ["色"], rows: [{ "色": "5.0" }, { "色": "5.0" }, { "色": "3.0" }] },
+  mergedEdits.data, { headers: [], rows: [] }, { headers: [], rows: [] },
 );
-assertEqual(finalSnapshot.circles?.[0].priority_color, 4, "終了時の保存に優先度変更を含める");
-assertEqual(finalSnapshot.circles?.[1].items?.[0].name, "新しい商品", "終了時の保存で商品を巻き戻さない");
-priorities.clear();
-assert(priorities.apply(savedBridgeData) === savedBridgeData, "次の再処理へ以前の編集を持ち越さない");
+assertEqual(finalSnapshot.circles?.[0].genres[0], "音楽", "終了時の保存にジャンル変更を含める");
+assertEqual(finalSnapshot.circles?.[1].items?.[0].name, "再処理の商品", "終了時の保存で商品を巻き戻さない");
 
 console.log("reprocess runtime tests passed");

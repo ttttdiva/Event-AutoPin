@@ -12,6 +12,7 @@ const testCases = [
   ["lib/database-shared-settings.test.ts"],
   ["lib/event-load-epoch.test.ts", "runEventLoadEpochTests"],
   ["lib/import-helpers.test.ts", "runImportHelperContractTests"],
+  ["lib/item-purchase-ui.test.ts", "runItemPurchaseUiTests"],
   ["lib/map-pin-index.test.ts", "runMapPinIndexTests"],
   ["lib/map-pin-layout.test.ts", "runMapPinLayoutTests"],
   ["lib/map-viewport-transform.test.ts", "runMapViewportTransformTests"],
