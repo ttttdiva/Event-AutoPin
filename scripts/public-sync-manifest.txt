@@ -302,3 +302,6 @@ docs/mobile-filter-keyboard-map.md
 shopping-app/lib/input-scroll-layout.ts
 shopping-app/lib/input-scroll-layout.test.ts
 shopping-app/lib/keyboard-viewport.test.ts
+shopping-app/lib/priority-row-theme.ts
+shopping-app/lib/priority-row-theme.test.ts
+docs/circle-row-appearance.md

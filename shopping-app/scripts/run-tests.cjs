@@ -22,6 +22,7 @@ const testCases = [
   ["lib/map-viewport-transform.test.ts", "runMapViewportTransformTests"],
   ["lib/mutation-epoch.test.ts", "runMutationEpochTests"],
   ["lib/performance-core.test.ts"],
+  ["lib/priority-row-theme.test.ts", "runPriorityRowThemeTests"],
   ["lib/text-collation.test.ts", "runTextCollationTests"],
   ["lib/update-service.test.js"],
 ];

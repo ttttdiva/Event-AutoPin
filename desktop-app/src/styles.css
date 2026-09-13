@@ -25,14 +25,23 @@
   --th-text: #475569;
   --td-border: rgba(0, 0, 0, 0.06);
   --row-hover: rgba(0, 0, 0, 0.04);
-  --priority-row-base: #f2f6fd;
-  --priority-row-base-hover: #eaf2fc;
-  --priority-row-base-mix: 12%;
-  --priority-row-base-mix-hover: 16%;
-  --priority-row-tint: 24%;
-  --priority-row-tint-hover: 30%;
-  --priority-row-meter-strong: 34%;
-  --priority-row-meter-mid: 12%;
+  /* shopping-app/lib/priority-row-theme.ts と同じ不透明sRGB配色。 */
+  --priority-row-base: #ffffff;
+  --priority-row-start-rest: 34%;
+  --priority-row-end-rest: 18%;
+  --priority-row-start-hover: 38%;
+  --priority-row-end-hover: 22%;
+  --priority-row-text: #172033;
+  --priority-row-secondary: #273449;
+  --priority-row-ink-base: #000000;
+  --circle-status-0-bg: #f1f5f9;
+  --circle-status-0-ink: #334155;
+  --circle-status-1-bg: #dcfce7;
+  --circle-status-1-ink: #166534;
+  --circle-status-2-bg: #fee2e2;
+  --circle-status-2-ink: #991b1b;
+  --circle-status-3-bg: #f3e8ff;
+  --circle-status-3-ink: #6b21a8;
   --item-panel-bg: rgba(0, 0, 0, 0.03);
   --progress-bar: #3b82f6;
   --progress-track: #e2e8f0;
@@ -68,14 +77,23 @@ html.dark {
   --th-text: #d1d5db;
   --td-border: rgba(255, 255, 255, 0.05);
   --row-hover: rgba(255, 255, 255, 0.04);
-  --priority-row-base: #202638;
-  --priority-row-base-hover: #263047;
-  --priority-row-base-mix: 7%;
-  --priority-row-base-mix-hover: 10%;
-  --priority-row-tint: 14%;
-  --priority-row-tint-hover: 18%;
-  --priority-row-meter-strong: 46%;
-  --priority-row-meter-mid: 18%;
+  /* shopping-app/lib/priority-row-theme.ts と同じ不透明sRGB配色。 */
+  --priority-row-base: #111827;
+  --priority-row-start-rest: 36%;
+  --priority-row-end-rest: 22%;
+  --priority-row-start-hover: 38%;
+  --priority-row-end-hover: 24%;
+  --priority-row-text: #f8fafc;
+  --priority-row-secondary: #f1f5f9;
+  --priority-row-ink-base: #ffffff;
+  --circle-status-0-bg: #334155;
+  --circle-status-0-ink: #e2e8f0;
+  --circle-status-1-bg: #14532d;
+  --circle-status-1-ink: #dcfce7;
+  --circle-status-2-bg: #7f1d1d;
+  --circle-status-2-ink: #fee2e2;
+  --circle-status-3-bg: #581c87;
+  --circle-status-3-ink: #f3e8ff;
   --item-panel-bg: rgba(0, 0, 0, 0.15);
   --progress-bar: #3b82f6;
   --progress-track: #374151;
@@ -559,64 +577,70 @@ html.dark {
     }
   }
 
-  /* サークル行 */
+  /* サークル行: 全幅を連続補間し、右端にも優先度の色味を残す。 */
   .circle-row {
-    background:
-      linear-gradient(
-          90deg,
-          color-mix(in srgb, var(--priority-row-color, transparent) var(--priority-row-meter-strong), transparent),
-          color-mix(in srgb, var(--priority-row-color, transparent) var(--priority-row-meter-mid), transparent) 54%,
-          transparent
-        )
-        left bottom / 100% 1px no-repeat,
-      linear-gradient(
-        90deg,
-        color-mix(in srgb, var(--priority-row-color, transparent) var(--priority-row-tint), transparent),
-        transparent 52%
-      ),
-      color-mix(
-        in srgb,
-        var(--priority-row-color, transparent) var(--priority-row-base-mix),
-        var(--priority-row-base)
-      );
+    --priority-row-start: var(--priority-row-start-rest);
+    --priority-row-end: var(--priority-row-end-rest);
+    --priority-row-ink: color-mix(in srgb, var(--priority-row-color, #0277bd) 35%, var(--priority-row-ink-base));
+    --text-primary: var(--priority-row-text);
+    --text-secondary: var(--priority-row-secondary);
+    --text-muted: var(--priority-row-secondary);
+    color: var(--text-primary);
+    background-color: var(--priority-row-base);
+    background-image: linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--priority-row-color, #0277bd) var(--priority-row-start), var(--priority-row-base)) 0%,
+      color-mix(in srgb, var(--priority-row-color, #0277bd) var(--priority-row-end), var(--priority-row-base)) 100%
+    );
     @apply cursor-pointer transition-colors;
   }
-  .circle-row td {
-    background-color: transparent;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  .circle-row > td {
+    /* 購入ボタン操作が付けるインライン背景でグラデーションを分断しない。 */
+    background: transparent !important;
+    border-bottom-color: color-mix(in srgb, var(--priority-row-ink) 28%, var(--priority-row-base));
   }
-  .circle-row:hover {
-    background:
-      linear-gradient(
-          90deg,
-          color-mix(in srgb, var(--priority-row-color, transparent) var(--priority-row-meter-strong), transparent),
-          color-mix(in srgb, var(--priority-row-color, transparent) var(--priority-row-meter-mid), transparent) 54%,
-          transparent
-        )
-        left bottom / 100% 1px no-repeat,
-      linear-gradient(
-        90deg,
-        color-mix(in srgb, var(--priority-row-color, transparent) var(--priority-row-tint-hover), transparent),
-        transparent 52%
-      ),
-      color-mix(
-        in srgb,
-        var(--priority-row-color, transparent) var(--priority-row-base-mix-hover),
-        var(--priority-row-base-hover)
-      );
+  .circle-row > td:first-child {
+    box-shadow: inset 4px 0 0 var(--priority-row-ink);
   }
-  .circle-row:hover td {
-    background-color: transparent;
+  .circle-row:hover,
+  .circle-row:focus-within {
+    --priority-row-start: var(--priority-row-start-hover);
+    --priority-row-end: var(--priority-row-end-hover);
   }
   .circle-row.expanded {
-    background-color: var(--bg-elevated);
+    --priority-row-end: var(--priority-row-end-hover);
   }
   .circle-row td input {
     color: var(--text-primary);
     @apply w-full bg-transparent border-none text-sm px-0 py-0 focus:outline-none focus:ring-1 focus:ring-blue-500 rounded;
   }
-
-  /* 優先度色は行の下端メーターで反映する */
+  .circle-row .color-label {
+    color: var(--priority-row-ink) !important;
+    white-space: nowrap;
+  }
+  .circle-row .color-swatch {
+    border-color: var(--priority-row-ink) !important;
+    flex-shrink: 0;
+  }
+  .circle-row .check-cycle-btn {
+    --status-bg: var(--circle-status-0-bg);
+    --status-ink: var(--circle-status-0-ink);
+    background-color: var(--status-bg) !important;
+    border-color: var(--status-ink) !important;
+    color: var(--status-ink) !important;
+  }
+  .circle-row .check-cycle-btn[data-val="1"] {
+    --status-bg: var(--circle-status-1-bg);
+    --status-ink: var(--circle-status-1-ink);
+  }
+  .circle-row .check-cycle-btn[data-val="2"] {
+    --status-bg: var(--circle-status-2-bg);
+    --status-ink: var(--circle-status-2-ink);
+  }
+  .circle-row .check-cycle-btn[data-val="3"] {
+    --status-bg: var(--circle-status-3-bg);
+    --status-ink: var(--circle-status-3-ink);
+  }
 
   /* 画像セル */
   .img-cell {

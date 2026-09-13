@@ -7,26 +7,7 @@ import { getColors } from '@/constants/Colors';
 import { useTheme } from '@/lib/theme-context';
 import { usePriorityColors } from '@/lib/priority-color-context';
 import type { Circle } from '@/lib/types';
-
-const DARK_PRIORITY_ROW_BASE = '#202638';
-const LIGHT_PRIORITY_ROW_BASE = '#f2f5fb';
-
-function normalizeHexColor(color: string): string | null {
-  if (!/^#[0-9a-fA-F]{6}$/.test(color)) return null;
-  return color;
-}
-
-function mixHexColor(color: string, weight: number, base: string): string {
-  const normalizedColor = normalizeHexColor(color);
-  const normalizedBase = normalizeHexColor(base);
-  if (!normalizedColor || !normalizedBase) return base;
-  const clampedWeight = Math.min(1, Math.max(0, weight));
-  const read = (hex: string, start: number) => parseInt(hex.slice(start, start + 2), 16);
-  const r = Math.round(read(normalizedColor, 1) * clampedWeight + read(normalizedBase, 1) * (1 - clampedWeight));
-  const g = Math.round(read(normalizedColor, 3) * clampedWeight + read(normalizedBase, 3) * (1 - clampedWeight));
-  const b = Math.round(read(normalizedColor, 5) * clampedWeight + read(normalizedBase, 5) * (1 - clampedWeight));
-  return `rgb(${r},${g},${b})`;
-}
+import { getPriorityRowTheme, getRowStatusColors } from '@/lib/priority-row-theme';
 
 interface CircleRowProps {
   circle: Circle;
@@ -56,10 +37,7 @@ function CircleRowInner({
   const { getColor } = usePriorityColors();
   const priority = getColor(circle.priorityColor);
   const statusInfo = PURCHASE_STATUS_LABELS[circle.purchaseStatus];
-  const isDone = circle.purchaseStatus !== PURCHASE_STATUS.NOT_YET;
   const isBought = circle.purchaseStatus === PURCHASE_STATUS.BOUGHT;
-  const isCouldntBuy = circle.purchaseStatus === PURCHASE_STATUS.COULDNT_BUY;
-  const isSkipped = circle.purchaseStatus === PURCHASE_STATUS.SKIPPED;
 
   // ホール + スペース番号
   const spaceLabel = [circle.hall, circle.space].filter(Boolean).join(' ');
@@ -70,21 +48,15 @@ function CircleRowInner({
       : null
     : null;
 
-  // 購入済み行は薄く表示
-  const rowOpacity = isBought ? 0.5 : isCouldntBuy || isSkipped ? 0.6 : 1;
-  const priorityRowBg = mixHexColor(
-    priority.color,
-    effectiveScheme === 'dark' ? 0.14 : 0.12,
-    effectiveScheme === 'dark' ? DARK_PRIORITY_ROW_BASE : LIGHT_PRIORITY_ROW_BASE
+  // 購入状態はボタンと取り消し線で示し、文字・画像・操作部を透過しない。
+  const surface = React.useMemo(
+    () => getPriorityRowTheme(priority.color, effectiveScheme),
+    [priority.color, effectiveScheme],
   );
+  const statusColors = getRowStatusColors(circle.purchaseStatus, effectiveScheme);
   const priorityRowBorder = effectiveScheme === 'dark'
-    ? 'rgba(255,255,255,0.05)'
-    : 'rgba(15,23,42,0.08)';
-  const priorityTintStrong = `${priority.color}${effectiveScheme === 'dark' ? '42' : '3d'}`;
-  const priorityTintMid = `${priority.color}${effectiveScheme === 'dark' ? '28' : '24'}`;
-  const priorityTintSoft = `${priority.color}${effectiveScheme === 'dark' ? '14' : '14'}`;
-  const priorityMeterStrong = `${priority.color}${effectiveScheme === 'dark' ? '90' : '57'}`;
-  const priorityMeterMid = `${priority.color}${effectiveScheme === 'dark' ? '38' : '1f'}`;
+    ? 'rgba(255,255,255,0.16)'
+    : 'rgba(15,23,42,0.18)';
 
   return (
     <View style={[
@@ -96,17 +68,26 @@ function CircleRowInner({
         style={[
           styles.prioritySurface,
           {
-            backgroundColor: priorityRowBg,
+            backgroundColor: surface.end,
             borderTopColor: priorityRowBorder,
             borderBottomColor: priorityRowBorder,
           },
         ]}
       >
-        <View pointerEvents="none" style={[styles.priorityTintStrong, { backgroundColor: priorityTintStrong }]} />
-        <View pointerEvents="none" style={[styles.priorityTintMid, { backgroundColor: priorityTintMid }]} />
-        <View pointerEvents="none" style={[styles.priorityTintSoft, { backgroundColor: priorityTintSoft }]} />
+        <Image
+          pointerEvents="none"
+          accessible={false}
+          style={StyleSheet.absoluteFillObject}
+          source={{ uri: surface.gradientUri }}
+          contentFit="fill"
+          cachePolicy="memory"
+          recyclingKey={surface.gradientUri}
+          transition={0}
+          decodeFormat="argb"
+        />
+        <View pointerEvents="none" style={[styles.priorityAccent, { backgroundColor: surface.ink }]} />
         <Pressable
-          style={[styles.row, { opacity: rowOpacity }]}
+          style={styles.row}
           onPress={() => onToggleExpand(circle.id)}
           onLongPress={() => onOpenActions?.(circle)}
         >
@@ -126,7 +107,7 @@ function CircleRowInner({
             <Image source={{ uri: imagePath }} style={styles.circleCut} contentFit="cover" cachePolicy="memory-disk" recyclingKey={`cut-${circle.id}-${imagePath}`} transition={100} />
           ) : (
             <View style={[styles.circleCut, styles.noImage, { backgroundColor: effectiveScheme === 'dark' ? '#333' : '#e8e8e8' }]}>
-              <Text style={[styles.noImageText, { color: colors.textSecondary }]}>
+              <Text style={[styles.noImageText, { color: surface.secondary }]}>
                 {circle.name.charAt(0)}
               </Text>
             </View>
@@ -137,7 +118,7 @@ function CircleRowInner({
         <View style={styles.info}>
           {/* スペース番号 (小さめ・上) */}
           {spaceLabel !== '' && (
-            <Text style={[styles.space, { color: priority.color }]}>
+            <Text style={[styles.space, { color: surface.ink }]}>
               {spaceLabel}
             </Text>
           )}
@@ -145,7 +126,7 @@ function CircleRowInner({
           <Text
             style={[
               styles.name,
-              { color: colors.text },
+              { color: surface.text },
               isBought && { textDecorationLine: 'line-through' },
             ]}
             numberOfLines={1}
@@ -154,13 +135,13 @@ function CircleRowInner({
           </Text>
           {/* ペンネーム */}
           {circle.penname && (
-            <Text style={[styles.penname, { color: colors.textSecondary }]} numberOfLines={1}>
+            <Text style={[styles.penname, { color: surface.secondary }]} numberOfLines={1}>
               {circle.penname}
             </Text>
           )}
           {/* メモ (あれば) */}
           {circle.memo !== '' && (
-            <Text style={[styles.memo, { color: colors.textSecondary }]} numberOfLines={1}>
+            <Text style={[styles.memo, { color: surface.secondary }]} numberOfLines={1}>
               {circle.memo}
             </Text>
           )}
@@ -183,8 +164,8 @@ function CircleRowInner({
                 size={18}
                 color={
                   circle.pinX != null && circle.pinY != null
-                    ? colors.tint
-                    : colors.textSecondary
+                    ? surface.ink
+                    : surface.secondary
                 }
               />
             </Pressable>
@@ -192,10 +173,11 @@ function CircleRowInner({
 
           {/* 購入状態トグル */}
           <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={statusInfo.label}
             style={[
               styles.statusBtn,
-              { borderColor: statusInfo.color },
-              isDone && { backgroundColor: statusInfo.color },
+              { borderColor: statusColors.foreground, backgroundColor: statusColors.background },
             ]}
             onPress={(e) => {
               e.stopPropagation();
@@ -207,14 +189,10 @@ function CircleRowInner({
             }}
             hitSlop={6}
           >
-            <Text style={[styles.statusIcon, { color: isDone ? '#fff' : statusInfo.color }]}>{statusInfo.icon}</Text>
+            <Text style={[styles.statusIcon, { color: statusColors.foreground }]}>{statusInfo.icon}</Text>
           </Pressable>
         </View>
         </Pressable>
-        <View pointerEvents="none" style={styles.priorityMeter}>
-          <View style={[styles.priorityMeterStrong, { backgroundColor: priorityMeterStrong }]} />
-          <View style={[styles.priorityMeterMid, { backgroundColor: priorityMeterMid }]} />
-        </View>
       </View>
     </View>
   );
@@ -273,57 +251,19 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     overflow: 'hidden',
   },
-  priorityTintStrong: {
+  priorityAccent: {
     position: 'absolute',
     left: 0,
     top: 0,
     bottom: 0,
-    width: '24%',
-  },
-  priorityTintMid: {
-    position: 'absolute',
-    left: '24%',
-    top: 0,
-    bottom: 0,
-    width: '20%',
-  },
-  priorityTintSoft: {
-    position: 'absolute',
-    left: '44%',
-    top: 0,
-    bottom: 0,
-    width: '12%',
-  },
-  priorityMeter: {
-    position: 'absolute',
-    left: 12,
-    right: 12,
-    bottom: 0,
-    height: 2,
-    borderTopLeftRadius: 999,
-    borderTopRightRadius: 999,
-    overflow: 'hidden',
-  },
-  priorityMeterStrong: {
-    position: 'absolute',
-    left: 0,
-    top: 0,
-    bottom: 0,
-    width: '54%',
-  },
-  priorityMeterMid: {
-    position: 'absolute',
-    left: '54%',
-    top: 0,
-    bottom: 0,
-    width: '16%',
+    width: 4,
   },
   row: {
     flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 10,
-    paddingLeft: 8,
+    paddingLeft: 12,
     paddingRight: 10,
     minHeight: 76,
   },
@@ -343,6 +283,7 @@ const styles = StyleSheet.create({
   },
   info: {
     flex: 1,
+    minWidth: 0,
     justifyContent: 'center',
   },
   space: {
