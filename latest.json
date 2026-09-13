@@ -1,14 +1,14 @@
 {
   "desktop": {
-    "date": "2026-08-25",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.15/EventAutoPin.exe",
-    "version": "0.1.15",
-    "notes": "GPT-5.6 Sol / Terra / Luna と reasoning effort 対応"
+    "version": "0.1.20",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.20/EventAutoPin.exe",
+    "notes": "マップ編集の優先度ボタン表示と再処理中の編集を改善",
+    "date": "2026-09-13"
   },
   "mobile": {
-    "version": "1.4.56",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.56/EventAutoPin.apk",
-    "notes": "v1.4.56 リリース",
-    "date": "2026-08-28"
+    "version": "1.4.57",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.57/EventAutoPin.apk",
+    "notes": "頒布物の価格固定表示と購入状態メニューを改善",
+    "date": "2026-09-13"
   }
 }

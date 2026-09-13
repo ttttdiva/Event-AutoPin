@@ -89,7 +89,7 @@ call gradlew.bat assembleRelease --no-daemon
 if %ERRORLEVEL% NEQ 0 (
     echo.
     echo ===================================
-    echo  ビルド失敗 (exit code: %ERRORLEVEL%)
+    echo  ビルド失敗: exit code %ERRORLEVEL%
     echo ===================================
     exit /b 1
 )
