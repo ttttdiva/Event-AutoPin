@@ -1,5 +1,6 @@
 # Exact committed code/text manifest for the public repository root. One repository-relative path per line.
 .env.example
+.gitattributes
 .gitignore
 batch_set_catalog_images.py
 desktop-app/index.html

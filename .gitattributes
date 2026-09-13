@@ -1,0 +1,2 @@
+# 公開manifestはOSによらず1行1パスのLF形式に統一する。
+scripts/public-sync-manifest.txt text eol=lf
