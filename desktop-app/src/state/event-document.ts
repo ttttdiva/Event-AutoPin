@@ -1,4 +1,5 @@
 import { cloneJsonSnapshot } from "./revisioned-save-queue";
+import { enforceAbsentCirclePriorities } from "./circle-absence";
 
 // event-document経由のcloneもrevisioned-save-queueの共通observerで計測する。
 export { setCloneObserver } from "./revisioned-save-queue";
@@ -410,5 +411,7 @@ export function buildEventJsonSnapshot(
     }
   });
 
+  // 表の古い優先度や、非表示の旧データも保存時には低へ揃える。
+  enforceAbsentCirclePriorities(circles);
   return next;
 }

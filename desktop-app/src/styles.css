@@ -610,6 +610,26 @@ html.dark {
   .circle-row.expanded {
     --priority-row-end: var(--priority-row-end-hover);
   }
+  /* 欠席は購入状態と独立した表示。優先度以外の編集操作は維持する。 */
+  .circle-row.circle-absent {
+    --priority-row-color: var(--text-muted) !important;
+    opacity: 0.6;
+    filter: grayscale(1);
+  }
+  .circle-row.circle-absent > td,
+  .circle-row.circle-absent:hover > td {
+    background: var(--bg-surface2) !important;
+  }
+  .circle-row.circle-absent img {
+    opacity: 0.55;
+  }
+  .circle-row.circle-absent .color-swatch {
+    cursor: not-allowed;
+  }
+  .circle-row.circle-absent + .item-panel-row {
+    opacity: 0.65;
+    filter: grayscale(1);
+  }
   .circle-row td input {
     color: var(--text-primary);
     @apply w-full bg-transparent border-none text-sm px-0 py-0 focus:outline-none focus:ring-1 focus:ring-blue-500 rounded;
@@ -677,16 +697,6 @@ html.dark {
   .item-panel {
     @apply px-4 py-2;
   }
-  .circle-attendance-label {
-    @apply flex items-center gap-2 mb-2 text-sm;
-    color: var(--text-primary);
-  }
-  .circle-absence-select {
-    @apply rounded px-2 py-1 text-sm;
-    background-color: var(--bg-input);
-    color: var(--text-primary);
-    border: 1px solid var(--border-default);
-  }
   .circle-absence-badge {
     @apply rounded px-1 ml-1 text-xs;
     color: var(--text-primary);
@@ -744,6 +754,26 @@ html.dark {
   }
   .ctx-menu > div:hover {
     background-color: var(--ctx-hover);
+  }
+  .ctx-menu > button.circle-absence-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    border: 0;
+    background: transparent;
+    color: var(--text-primary);
+    text-align: left;
+    @apply px-3 py-1.5 text-sm cursor-pointer transition-colors;
+  }
+  .ctx-menu > button.circle-absence-menu-item:hover,
+  .ctx-menu > button.circle-absence-menu-item:focus-visible {
+    background-color: var(--ctx-hover);
+  }
+  .circle-absence-menu-check {
+    width: 1em;
+    flex: 0 0 1em;
+    text-align: center;
   }
   .ctx-menu > div.danger {
     color: #ef4444;

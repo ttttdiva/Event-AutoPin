@@ -1,5 +1,10 @@
 import "./styles.css";
 import {
+  effectiveCirclePriority,
+  isCircleAbsent,
+  setCircleAbsent,
+} from "./state/circle-absence";
+import {
   invoke as tauriInvoke,
   convertFileSrc as tauriConvertFileSrc,
 } from "@tauri-apps/api/tauri";
@@ -595,7 +600,7 @@ function circlesToTableState(data: any): TableState {
       アイテムメモ: (c.memo ? c.memo.replace(/^【[^】]*】\n?/, "") : "") || "",
       ペンネーム: penname,
       アイテムタグ: uniqueItemTags.join(", "),
-      色: String(c.priority_color ?? 5) + ".0",
+      色: String(effectiveCirclePriority(c)) + ".0",
       マップ番号: String(c.map_number ?? 0),
       ピンX: String(c.pin_x ?? 0),
       ピンY: String(c.pin_y ?? 0),
@@ -2688,12 +2693,6 @@ function renderItemPanel(circleIdx: number): string {
 
   return `<tr class="item-panel-row" data-circle="${circleIdx}"><td colspan="100">
     <div class="item-panel">
-      <label class="circle-attendance-label">参加状況
-        <select class="circle-absence-select" data-circle="${circleIdx}" aria-label="サークルの参加状況">
-          <option value=""${!c.absence_status ? " selected" : ""}>欠席なし</option>
-          <option value="absent"${c.absence_status ? " selected" : ""}>欠席</option>
-        </select>
-      </label>
       <table class="item-table">
         <thead><tr><th class="w-8"></th><th class="w-11">画像</th><th>アイテム名</th><th class="w-[90px]">単価</th><th>メモ</th><th class="w-[110px]">分類</th><th class="w-[100px]">チェック</th><th class="w-8">感想</th><th class="w-15"></th></tr></thead>
         <tbody>${itemRows}${emptyMsg}</tbody>
@@ -5050,7 +5049,8 @@ function renderCircleEditor() {
             const bg = opt ? opt.bgColor : "#f0f0f0";
             const fg = opt ? opt.color : "#666";
             const label = opt ? opt.label : "";
-            return `<td><div class="color-picker-cell"><div class="color-swatch" data-row="${realIdx}" data-col="${escapeHtml(h)}" style="background:${bg};border-color:${fg};" title="${label}"></div><span class="color-label" style="color:${fg};">${escapeHtml(label)}</span></div></td>`;
+            const absent = isCircleAbsent(eventJsonData.circles[realIdx]);
+            return `<td><div class="color-picker-cell"><div class="color-swatch" data-row="${realIdx}" data-col="${escapeHtml(h)}" style="background:${bg};border-color:${fg};" title="${absent ? "欠席中は優先度「低」に固定" : label}"${absent ? ' aria-disabled="true"' : ""}></div><span class="color-label" style="color:${fg};">${escapeHtml(label)}</span></div></td>`;
           }
           // チェック列: selectで表示
           if (h === "チェック") {
@@ -5067,7 +5067,7 @@ function renderCircleEditor() {
           // サークル名列: アイテム数バッジ + Ctrl+F検索用の非表示アイテム名を追加
           if (h === "サークル名") {
             const itemCount = parseInt(row["_itemCount"] || "0");
-            const absenceBadge = ` <span class="circle-absence-badge"${eventJsonData.circles[realIdx]?.absence_status ? "" : " hidden"}>欠席</span>`;
+            const absenceBadge = ` <span class="circle-absence-badge"${isCircleAbsent(eventJsonData.circles[realIdx]) ? "" : " hidden"}>欠席</span>`;
             const badge =
               itemCount > 0
                 ? ` <span class="item-count-badge">${itemCount}</span>`
@@ -5106,6 +5106,7 @@ function renderCircleEditor() {
       const isExpanded = expandedCircleIdx === realIdx;
       const rowClasses = [
         `circle-row`,
+        ...(isCircleAbsent(eventJsonData.circles[realIdx]) ? ["circle-absent"] : []),
         ...(!isNaN(colorParsed) ? [`row-color-${colorParsed}`] : []),
         ...(isExpanded ? ["expanded"] : []),
         ...(isFav ? ["favorite-circle"] : []),
@@ -5266,6 +5267,7 @@ function renderCircleEditor() {
         document.querySelectorAll(".color-dropdown").forEach((d) => d.remove());
         const row = Number(swatch.dataset.row);
         const col = String(swatch.dataset.col);
+        if (isCircleAbsent(eventJsonData.circles[row])) return;
         const priorityIdentity = circleIdentityFromCircle(eventJsonData.circles[row]);
         const currentVal = String(
           parseFloat(tableState.rows[row][col] || "5") || 5,
@@ -5284,7 +5286,10 @@ function renderCircleEditor() {
           btn.addEventListener("click", (ev) => {
             ev.stopPropagation();
             const priorityRow = findCircleIndexByIdentity(row, priorityIdentity);
-            if (priorityRow < 0) { dropdown.remove(); return; }
+            if (priorityRow < 0 || isCircleAbsent(eventJsonData.circles[priorityRow])) {
+              dropdown.remove();
+              return;
+            }
             tableState.rows[priorityRow][col] = opt.value + ".0";
             void saveNow();
             swatch.style.background = opt.bgColor;
@@ -5431,19 +5436,6 @@ function renderCircleEditor() {
     circleEditorEl.addEventListener("change", (e) => {
     const target = e.target as HTMLInputElement | HTMLSelectElement | null;
     if (!target) return;
-    if (target.matches("select.circle-absence-select")) {
-      const row = Number(target.dataset.circle);
-      const circle = eventJsonData?.circles?.[row];
-      if (!circle) return;
-      circle.absence_status = target.value || null;
-      const badge = circleEditorEl.querySelector<HTMLElement>(`tr[data-circle-row="${row}"] .circle-absence-badge`);
-      if (badge) badge.hidden = !circle.absence_status;
-      markEventDocumentMutated();
-      void saveNow().then((result) => {
-        if (!result.ok) resultEl.textContent = `欠席状態を保存できませんでした: ${String(result.error)}`;
-      });
-      return;
-    }
     if (target.matches("select.genre-select")) {
       const row = Number(target.dataset.row);
       const col = String(target.dataset.col);
@@ -5615,6 +5607,34 @@ function showCircleRowContextMenu(x: number, y: number, rowIdx: number) {
   menu.className = "ctx-menu";
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
+
+  const absenceOwner = captureActiveEventDocumentOwner();
+  const absenceIdentity = circleIdentityFromCircle(eventJsonData?.circles?.[rowIdx]);
+  const absenceItem = document.createElement("button");
+  absenceItem.type = "button";
+  absenceItem.className = "circle-absence-menu-item";
+  absenceItem.setAttribute("role", "menuitemcheckbox");
+  const absent = isCircleAbsent(eventJsonData?.circles?.[rowIdx]);
+  absenceItem.setAttribute("aria-checked", String(absent));
+  absenceItem.innerHTML = `<span class="circle-absence-menu-check" aria-hidden="true">${absent ? "✓" : ""}</span>欠席`;
+  absenceItem.addEventListener("click", () => {
+    menu.remove();
+    if (!isActiveEventDocumentOwner(absenceOwner)) return;
+    const index = findCircleIndexByIdentity(rowIdx, absenceIdentity);
+    const circle = eventJsonData?.circles?.[index];
+    const row = tableState.rows[index];
+    if (!circle || !row) return;
+    setCircleAbsent(circle, !isCircleAbsent(circle), row);
+    markEventDocumentMutated();
+    document.querySelectorAll(".color-dropdown").forEach((dropdown) => dropdown.remove());
+    void saveNow().then((result) => {
+      if (!result.ok && isActiveEventDocumentOwner(absenceOwner)) {
+        resultEl.textContent = `欠席状態を保存できませんでした: ${String(result.error)}`;
+      }
+    });
+    renderCircleEditorAndMap();
+  });
+  menu.appendChild(absenceItem);
 
   const reprocessItem = document.createElement("div");
   reprocessItem.textContent = "このサークルを再処理（XポストURL指定）";
@@ -13309,7 +13329,7 @@ function calculateBudgetSummary() {
   if (!eventJsonData?.circles) return summary;
 
   for (const circle of eventJsonData.circles) {
-    const prioColor = circle.priority_color ?? 5;
+    const prioColor = Number(effectiveCirclePriority(circle));
     if (!summary.byPriority.has(prioColor)) {
       summary.byPriority.set(prioColor, {
         total: 0,

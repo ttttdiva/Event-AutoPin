@@ -21,6 +21,29 @@ Event AutoPin の APK、EXE、installer、GitHub Release asset など公開用 a
 
 ## EXE / Desktop
 
+デスクトップ機能の変更は通常の実装・修正でも以下の一括リリースを実行する。APKのgateが `RELEASE_REQUIRED=False` でもEXEの判定は別である。
+
+### 一括実行（Windows開発checkout専用）
+
+実装・manifestの変更を先にcommit・pushし、作業ツリーをcleanにする。Git、認証済みGitHub CLI、Node.js、PowerShell 7（`pwsh.exe`）、既存Tauriビルド環境が必要。起動中のEventAutoPinは終了しておく。
+
+```powershell
+# 公開予定の版を確認（バージョン変更・build・uploadはしない）
+node scripts/release_desktop.cjs --plan
+# patch番号を自動で繰り上げ、EXE公開と更新情報の反映まで実行
+node scripts/release_desktop.cjs --notes "欠席切替を右クリックへ統合し、欠席中の優先度を低に固定"
+# 途中失敗した場合、同じバージョン・同じ成果物で続きを実行
+node scripts/release_desktop.cjs --resume
+```
+
+既定のPublic checkoutは `('D:' + '\Publish\Event-AutoPin')`。別の既存checkoutを使う場合は `--public-root` を指定し、再開時も同じ値を渡す。この開発側専用スクリプトは公開manifestには含めない。
+
+処理順は、公開済み版も確認したpatch繰り上げ → package.json/package-lock.json/Tauri/Cargo.toml/Cargo.lockの更新と対象限定commit・push → 既存buildスクリプトで型チェック・test・Tauri release build・ルートEXE配置 → manifest検査を伴うPublic同期 → draft ReleaseへのEXE upload・SHA256一致確認・公開 → mobile等を保持したlatest.json.desktop更新・commit・push → strict gate → Public source build CI成功確認。既存assetを上書きしない。新しい公開ソースはmanifestへ明示登録してから実行する。
+
+進行状況は開発checkoutの `.git/desktop-release-state.json` に保存する。build/upload/metadata/CI失敗は非ゼロ終了とし、公開完了扱いにしない。`--resume` は元の開発HEADとEXEのSHA256を照合し、別ソースや別成果物へのすり替わりを防ぐ。再開前にコード変更が必要になった場合は旧リリースの公開状況を確認し、新版としてやり直す。バージョンcommit前やPublic同期commit直後に失敗して未コミット・未pushが残った場合は、示された差分を確認して整理してから再開する。
+
+### 個別の完了条件
+
 - `scripts/check_desktop_release_gate.ps1` をPublic checkoutとともに実行する。`-FailOnMismatch` はPrivate/Publicのdesktop source、`desktop-app/package.json`・`src-tauri/tauri.conf.json`・`src-tauri/Cargo.toml` のversion、`desktop-v<version>`、`EventAutoPin.exe`、`latest.json.desktop` のversion/URLをstrictに検証する。
 - desktop sourceに差分がある場合、既存Releaseのversionを使い回さず3箇所のversionを同じ新versionへ更新する。
 - desktop build script、Tauri / Electron / PyInstaller / installer 設定を確認する。

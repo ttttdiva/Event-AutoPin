@@ -146,9 +146,13 @@ Assert-DesktopExeNotRunning
 
 Push-Location $desktopDir
 try {
-    Write-Host "=== npm install ==="
-    npm install
-    if ($LASTEXITCODE -ne 0) { throw "npm install に失敗しました (exit=$LASTEXITCODE)" }
+    Write-Host "=== npm ci ==="
+    npm ci
+    if ($LASTEXITCODE -ne 0) { throw "npm ci に失敗しました (exit=$LASTEXITCODE)" }
+
+    Write-Host "=== TypeScript型チェック ==="
+    npx tsc --noEmit
+    if ($LASTEXITCODE -ne 0) { throw "型チェックに失敗しました (exit=$LASTEXITCODE)" }
 
     Write-Host "=== npm test ==="
     npm test

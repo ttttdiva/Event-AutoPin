@@ -24,6 +24,8 @@ desktop-app/src/reprocess-runtime.ts
 desktop-app/src/reprocess-edits.ts
 desktop-app/src/state/async-mutation-guard.test.ts
 desktop-app/src/state/async-mutation-guard.ts
+desktop-app/src/state/circle-absence.ts
+desktop-app/src/state/circle-absence.test.ts
 desktop-app/src/state/cookie-drop.test.ts
 desktop-app/src/state/cookie-drop.ts
 desktop-app/src/state/event-document.ts

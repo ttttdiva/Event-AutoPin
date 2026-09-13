@@ -38,7 +38,7 @@ sha256:<64桁のSHA-256> relative/path/to/asset.png
 
 公開先に未commitの変更、未pushのcommit、分岐した履歴がある場合は停止します。pushだけ失敗した場合は公開先に同期commitが残るため、その差分を確認して公開先から `git push origin HEAD` を実行してください。force pushや自動stashは行いません。
 
-実装は開発側専用の `scripts/publish_public_repo.ps1` です。既定の同期先は下記の `$DestinationRoot` と同じです。変更する場合はこのスクリプトの既定値か `-DestinationRoot` 引数を使います。この入口はソース同期専用で、アプリの動作テスト、APK/EXEのビルド、Release upload、`latest.json` 更新は行いません。成果物をリリースする際は別途release checklistに従います。`.github/` と `latest.json` は既存同期処理と同じく公開先の内容を保持します。
+実装は開発側専用の `scripts/publish_public_repo.ps1` です。既定の同期先は下記の `$DestinationRoot` と同じです。変更する場合はこのスクリプトの既定値か `-DestinationRoot` 引数を使います。この入口はソース同期専用で、アプリの動作テスト、APK/EXEのビルド、Release upload、`latest.json` 更新は行いません。**デスクトップ機能を変更した作業では、開発側の `node scripts/release_desktop.cjs --notes "変更内容"` を実行します。** この一括入口がソース同期を含むバージョン更新・EXEビルド・Release公開・更新情報反映までを行います。詳細はrelease checklistを参照してください。`.github/` と `latest.json` はソース同期処理では公開先の内容を保持します。
 
 ### 同期内容を個別に確認・適用
 
