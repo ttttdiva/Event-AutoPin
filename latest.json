@@ -1,14 +1,14 @@
 {
   "desktop": {
-    "version": "0.1.20",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.20/EventAutoPin.exe",
-    "notes": "マップ編集の優先度ボタン表示と再処理中の編集を改善",
+    "version": "0.1.21",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.21/EventAutoPin.exe",
+    "notes": "サークルの欠席状態の表示・編集と投稿本文・全画像の同時解析に対応",
     "date": "2026-09-13"
   },
   "mobile": {
-    "version": "1.4.57",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.57/EventAutoPin.apk",
-    "notes": "頒布物の価格固定表示と購入状態メニューを改善",
+    "version": "1.4.58",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.58/EventAutoPin.apk",
+    "notes": "フィルター条件表示・購入状態の複数選択・入力欄のキーボード回避・マップ追従を改善",
     "date": "2026-09-13"
   }
 }
