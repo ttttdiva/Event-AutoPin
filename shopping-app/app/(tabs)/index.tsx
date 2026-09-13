@@ -1,10 +1,10 @@
+import { InputTextInput as TextInput } from "@/components/KeyboardLayout";
 import { InputModal, InputScrollView } from "@/components/KeyboardLayout";
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import {
   StyleSheet,
   View,
   Text,
-  TextInput,
   FlatList,
   ActivityIndicator,
   RefreshControl,

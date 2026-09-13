@@ -1,10 +1,10 @@
+import { InputTextInput as TextInput } from "@/components/KeyboardLayout";
 import { renderInputScrollView } from "@/components/KeyboardLayout";
 import { useRef, useCallback } from 'react';
 import {
   StyleSheet,
   View,
   Text,
-  TextInput,
   Pressable,
   FlatList,
   type LayoutChangeEvent,

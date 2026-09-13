@@ -1,3 +1,4 @@
+import { InputTextInput as TextInput } from "@/components/KeyboardLayout";
 import { InputModal, InputScrollView } from "@/components/KeyboardLayout";
 import { useEffect, useState, useMemo, useRef } from "react";
 import {
@@ -5,7 +6,6 @@ import {
   View,
   Text,
   Pressable,
-  TextInput,
   ScrollView,
   Linking,
   ActivityIndicator,
@@ -129,6 +129,7 @@ export default function CircleExpandedDetail({
   const [newItemDesc, setNewItemDesc] = useState("");
   // M9: アイテム編集
   const [editingItemId, setEditingItemId] = useState<number | null>(null);
+  const [editItemFocus, setEditItemFocus] = useState<'name' | 'price'>('name');
   const [editItemName, setEditItemName] = useState("");
   const [editItemPrice, setEditItemPrice] = useState("");
   const [editItemType, setEditItemType] = useState("");
@@ -281,7 +282,8 @@ export default function CircleExpandedDetail({
   }
 
   // M9: アイテム編集開始
-  function startEditItem(item: Item) {
+  function startEditItem(item: Item, field: 'name' | 'price' = 'name') {
+    setEditItemFocus(field);
     setEditingItemId(item.id);
     setEditItemName(item.name);
     setEditItemPrice(item.price != null ? String(item.price) : "");
@@ -608,7 +610,7 @@ export default function CircleExpandedDetail({
                   onChangeText={setEditItemName}
                   placeholder="アイテム名 *"
                   placeholderTextColor={colors.textSecondary}
-                  autoFocus
+                  autoFocus={editItemFocus === 'name'}
                 />
                 <TextInput
                   style={[
@@ -621,6 +623,7 @@ export default function CircleExpandedDetail({
                     },
                   ]}
                   value={editItemPrice}
+                  autoFocus={editItemFocus === 'price'}
                   onChangeText={setEditItemPrice}
                   placeholder="価格"
                   placeholderTextColor={colors.textSecondary}
@@ -722,7 +725,7 @@ export default function CircleExpandedDetail({
               showReorder={items.length > 1}
               canMoveUp={itemIndex > 0}
               canMoveDown={itemIndex < items.length - 1}
-              onEdit={() => startEditItem(item)}
+              onEdit={(field) => startEditItem(item, field)}
               onDelete={() => { void handleDeleteItem(item.id); }}
               onMoveUp={() => { void handleReorderItem(itemIndex, itemIndex - 1); }}
               onMoveDown={() => { void handleReorderItem(itemIndex, itemIndex + 1); }}

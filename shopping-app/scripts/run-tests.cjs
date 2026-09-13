@@ -13,6 +13,8 @@ const testCases = [
   ["lib/event-load-epoch.test.ts", "runEventLoadEpochTests"],
   ["lib/filter-header.test.ts", "runFilterHeaderTests"],
   ["lib/import-helpers.test.ts", "runImportHelperContractTests"],
+  ["lib/input-scroll-layout.test.ts", "runInputScrollLayoutTests"],
+  ["lib/keyboard-viewport.test.ts", "runKeyboardViewportTests"],
   ["lib/item-purchase-ui.test.ts", "runItemPurchaseUiTests"],
   ["lib/map-pin-index.test.ts", "runMapPinIndexTests"],
   ["lib/map-pin-layout.test.ts", "runMapPinLayoutTests"],

@@ -18,6 +18,7 @@ export function runFilterHeaderTests() {
       StyleSheet: { create: (s: unknown) => s, hairlineWidth: 1 },
       LayoutAnimation: { configureNext() {}, Presets: { easeInEaseOut: {} } },
     };
+    if (request === '@/components/KeyboardLayout') return { InputTextInput: 'TextInput' };
     if (request === '@expo/vector-icons/FontAwesome') return 'Icon';
     if (request === '@/constants/Colors') return { getColors };
     if (request === '@/lib/types') return types;

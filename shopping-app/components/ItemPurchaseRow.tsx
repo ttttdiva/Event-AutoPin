@@ -12,7 +12,7 @@ interface Props {
   showReorder: boolean;
   canMoveUp: boolean;
   canMoveDown: boolean;
-  onEdit: () => void;
+  onEdit: (field: 'name' | 'price') => void;
   onDelete: () => void;
   onMoveUp: () => void;
   onMoveDown: () => void;
@@ -71,7 +71,7 @@ export default function ItemPurchaseRow({
             contentContainerStyle={styles.nameScrollContent}
           >
             <Pressable
-              onPress={onEdit}
+              onPress={() => onEdit('name')}
               onLongPress={onDelete}
               accessibilityRole="button"
               accessibilityLabel={item.name}
@@ -93,7 +93,7 @@ export default function ItemPurchaseRow({
           <Pressable
             testID="item-price"
             style={styles.priceSlot}
-            onPress={onEdit}
+            onPress={() => onEdit('price')}
             onLongPress={onDelete}
             accessibilityRole="button"
             accessibilityLabel={`${item.name}、${formatItemPrice(item.price)}。編集`}
@@ -104,7 +104,7 @@ export default function ItemPurchaseRow({
           </Pressable>
         </View>
         {(item.type || isBoughtSomewhere) && (
-          <Pressable style={styles.metadata} onPress={onEdit} onLongPress={onDelete} accessibilityRole="button" accessibilityLabel={`${item.name}の詳細を編集`}>
+          <Pressable style={styles.metadata} onPress={() => onEdit('name')} onLongPress={onDelete} accessibilityRole="button" accessibilityLabel={`${item.name}の詳細を編集`}>
             {item.type && (
               <Text numberOfLines={1} style={[styles.type, { color: colors.textSecondary, backgroundColor: colors.background }]}>
                 {item.type}

@@ -1,10 +1,10 @@
+import { InputTextInput as TextInput } from "@/components/KeyboardLayout";
 import { InputScrollView } from "@/components/KeyboardLayout";
 import { useEffect, useState } from "react";
 import {
   Alert,
   StyleSheet,
   Text,
-  TextInput,
   TouchableOpacity,
   View,
   ActivityIndicator,

@@ -1,10 +1,10 @@
+import { InputTextInput as TextInput } from "@/components/KeyboardLayout";
 import React, { useEffect, useState } from 'react';
 import {
   StyleSheet,
   View,
   Text,
   Pressable,
-  TextInput,
   ScrollView,
   LayoutAnimation,
 } from 'react-native';
@@ -182,7 +182,9 @@ export default function CollapsibleHeader({
         <View style={{ paddingHorizontal: 12, paddingBottom: 8, gap: 6 }}>
           <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
             {activeConditions.map((condition) => (
-              <Text key={condition} style={[styles.chip, { color: colors.text, borderColor: colors.border, fontSize: 12 }]}>{condition}</Text>
+              <View key={condition} style={[styles.chip, { borderColor: colors.border }]}>
+                <Text style={{ color: colors.text, fontSize: 12 }}>{condition}</Text>
+              </View>
             ))}
           </View>
           <View style={styles.countRow}>

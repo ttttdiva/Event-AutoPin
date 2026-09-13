@@ -299,3 +299,6 @@ shopping-app/lib/map-popup-layout.ts
 shopping-app/lib/map-popup-layout.test.ts
 shopping-app/lib/filter-header.test.ts
 docs/mobile-filter-keyboard-map.md
+shopping-app/lib/input-scroll-layout.ts
+shopping-app/lib/input-scroll-layout.test.ts
+shopping-app/lib/keyboard-viewport.test.ts

@@ -403,6 +403,8 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
     const pinchStartTranslateY = useSharedValue(0);
     const pinchStartFocalX = useSharedValue(0);
     const pinchStartFocalY = useSharedValue(0);
+    const transformRevision = useSharedValue(0);
+    const tapStartRevision = useSharedValue(0);
 
     // 画像の表示サイズ（コンテナにフィット）
     const displaySize = useMemo(() => {
@@ -615,6 +617,7 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
         pinchStartFocalY.value = e.focalY;
       })
       .onUpdate((e) => {
+        transformRevision.value += 1;
         const next = calculateFocalPinchTransform({
           startScale: pinchStartScale.value,
           startTranslateX: pinchStartTranslateX.value,
@@ -649,6 +652,7 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
         }
       })
       .onUpdate((e) => {
+        transformRevision.value += 1;
         translateX.value = savedTranslateX.value + e.translationX;
         translateY.value = savedTranslateY.value + e.translationY;
       })
@@ -708,7 +712,10 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
         currentScale: number,
         currentTranslateX: number,
         currentTranslateY: number,
+        gestureRevision: number,
       ) => {
+        // パン・ピンチで変形した後に届く古いタップで選択を消さない。
+        if (transformRevision.value !== gestureRevision) return;
         if (!naturalSize) {
           clearHighlightJS();
           return;
@@ -742,19 +749,23 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
         }
         clearHighlightJS();
       },
-      [naturalSize, pinsForMap, getPinDisplayGeometry, clearHighlightJS],
+      [naturalSize, pinsForMap, getPinDisplayGeometry, clearHighlightJS, transformRevision],
     );
 
     const singleTapGesture = Gesture.Tap()
       .numberOfTaps(1)
+      .maxDistance(8)
+      .maxDuration(250)
+      .onBegin(() => { tapStartRevision.value = transformRevision.value; })
       .onEnd((e, success) => {
-        if (success) {
+        if (success && tapStartRevision.value === transformRevision.value) {
           runOnJS(clearHighlightIfBlankJS)(
             e.x,
             e.y,
             scale.value,
             translateX.value,
             translateY.value,
+            transformRevision.value,
           );
         }
       });

@@ -1,3 +1,4 @@
+import { InputTextInput as TextInput } from "@/components/KeyboardLayout";
 import { InputScrollView } from "@/components/KeyboardLayout";
 import { useState } from "react";
 import {
@@ -6,7 +7,6 @@ import {
   StyleSheet,
   Switch,
   Text,
-  TextInput,
   TouchableOpacity,
   View,
 } from "react-native";

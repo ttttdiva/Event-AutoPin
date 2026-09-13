@@ -152,8 +152,9 @@ export async function runItemPurchaseUiTests(): Promise<void> {
       purchaseStatus: PURCHASE_STATUS.NOT_YET, purchaseStatusSource: null, rawJson: null,
     };
     let edits = 0;
+    const editFields: string[] = [];
     const row = Row({ item, colors, isDark: true, isBoughtSomewhere: true, showReorder: true,
-      canMoveUp: false, canMoveDown: true, onEdit: () => edits++, onDelete() {},
+      canMoveUp: false, canMoveDown: true, onEdit: (field: string) => { edits++; editFields.push(field); }, onDelete() {},
       onMoveUp() {}, onMoveDown() {}, onStatusChange: async () => {},
     });
     assert(row.type === "View" && !row.props.onPress, "行全体に編集タップを持たせないこと");
@@ -167,6 +168,8 @@ export async function runItemPurchaseUiTests(): Promise<void> {
     assert(findElements(row, (element) => element.type === Menu).length === 1, "状態トリガーを1個に集約すること");
     findElements(nameScroll, (element) => element.type === "Pressable")[0].props.onPress();
     assert(edits === 1, "商品名の通常タップによる編集を維持すること");
+    price.props.onPress();
+    assert(editFields.join(',') === 'name,price', '名前・価格でタップした入力欄を開くこと');
 
     let writes: number[] = [];
     let props = { itemName: item.name, colors, status: 0, onChange: async (value: number) => { writes.push(value); } };
