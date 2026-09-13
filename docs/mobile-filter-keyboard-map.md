@@ -8,7 +8,7 @@
 
 ## キーボード
 
-Expo SDK 54対応の `react-native-keyboard-controller` を導入。ルートの `KeyboardProvider`、`KeyboardLayout.tsx` の `InputScrollView` / `InputModal` を共通で使う。FlatListは `renderScrollComponent` で自動スクロールを追加し、商品の編集中に行をクリップしない。
+Expo SDK 54対応の `react-native-keyboard-controller` を導入。ルートの `KeyboardProvider` / `KeyboardAvoidingView`、`KeyboardLayout.tsx` の `InputScrollView` / `InputModal` を共通で使う。画面全体もIMEの高さに合わせて縮め、分割表示で一覧自体がキーボードの後ろに残ることを防ぐ。FlatListは `renderScrollComponent` で自動スクロールを追加し、商品の編集中に行をクリップしない。
 
 対象は商品名・価格・メモ、商品追加、サークル追加・編集、イベント作成・編集・メモ、イベント検索、クロール入力、設定入力、Xポスト再処理。今後入力UIを追加する場合も、スクロールするフォームを `InputScrollView`、入力モーダルを `InputModal` と組み合わせる。native依存の追加なので、旧APKやExpo Goだけでは確認できず再ビルドが必要。
 
