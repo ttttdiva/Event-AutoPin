@@ -8,10 +8,27 @@ import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
-import androidx.core.content.FileProvider
+import android.util.Log
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import java.io.File
+
+/** DownloadManagerが公開するURIを使い、Expoのprivate files用Providerへ外部ファイルを渡さない。 */
+fun launchDownloadedApk(context: Context, manager: DownloadManager, id: Long): Boolean {
+  return try {
+    val uri = manager.getUriForDownloadedFile(id) ?: return false
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+      setDataAndType(uri, "application/vnd.android.package-archive")
+      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    context.startActivity(intent)
+    true
+  } catch (error: Exception) {
+    // 自動起動できない場合も、ダウンロード完了通知からの手動インストールを残す。
+    Log.w("ApkInstaller", "インストーラーを自動起動できませんでした。通知から更新してください。", error)
+    false
+  }
+}
 
 class ApkInstallerModule : Module() {
   private var downloadId: Long = -1
@@ -66,28 +83,7 @@ class ApkInstallerModule : Module() {
 
           if (status != DownloadManager.STATUS_SUCCESSFUL) return
 
-          // APKファイルのインストーラーを起動
-          val apkFile = File(
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-            "EventAutoPin-update.apk"
-          )
-          if (!apkFile.exists()) return
-
-          val installIntent = Intent(Intent.ACTION_VIEW).apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-              val contentUri = FileProvider.getUriForFile(
-                ctx,
-                "${ctx.packageName}.FileSystemFileProvider",
-                apkFile
-              )
-              setDataAndType(contentUri, "application/vnd.android.package-archive")
-              addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } else {
-              setDataAndType(Uri.fromFile(apkFile), "application/vnd.android.package-archive")
-            }
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-          }
-          ctx.startActivity(installIntent)
+          launchDownloadedApk(ctx, dm, id)
         }
       }
 
