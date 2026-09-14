@@ -1,5 +1,5 @@
-import { formatItemPrice, getItemPurchaseMenuLayout, ITEM_PURCHASE_OPTIONS } from "./item-purchase-menu";
-import { PURCHASE_STATUS, type Item } from "./types";
+import { formatItemPrice, getItemPurchaseMenuLayout, ITEM_PURCHASE_OPTIONS, nextItemPurchaseStatus } from "./item-purchase-menu";
+import { PURCHASE_STATUS, type Item, type PurchaseStatusValue } from "./types";
 import { getColors } from "../constants/Colors";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -174,13 +174,39 @@ export async function runItemPurchaseUiTests(): Promise<void> {
     let writes: number[] = [];
     let props = { itemName: item.name, colors, status: 0, onChange: async (value: number) => { writes.push(value); } };
     function render() { return harness.render(Menu, props); }
+    let propagationStops = 0;
+    const pressEvent = { stopPropagation: () => { propagationStops++; } };
     function open() {
       let tree = render();
       const trigger = byId(tree, "item-purchase-status-trigger");
       trigger.props.ref.current = { measureInWindow: (callback: Function) => callback(330, 720, 44, 44) };
-      trigger.props.onPress();
+      const before = writes.length;
+      const previousStops = propagationStops;
+      trigger.props.onLongPress(pressEvent);
+      assert(writes.length === before, "長押しで状態を変更しないこと");
+      assert(propagationStops === previousStops + 1, "長押しを親の行に伝播させないこと");
       return render();
     }
+    const cycle: PurchaseStatusValue[] = [PURCHASE_STATUS.SKIPPED, PURCHASE_STATUS.NOT_YET, PURCHASE_STATUS.BOUGHT, PURCHASE_STATUS.COULDNT_BUY];
+    for (let index = 0; index < cycle.length * 2; index++) {
+      const status = cycle[index % cycle.length];
+      const expected = cycle[(index + 1) % cycle.length];
+      assert(nextItemPurchaseStatus(status) === expected, "サークルと同じ順序で4状態を循環すること");
+      props = { ...props, status };
+      const current = render();
+      const button = byId(current, "item-purchase-status-trigger");
+      assert(!textOf(button).includes("▾"), "通常タップがプルダウンに見える矢印を表示しないこと");
+      assert(button.props.accessibilityHint.includes("長押し"), "長押しメニューの操作を読み上げに提供すること");
+      const before = writes.length;
+      const previousStops = propagationStops;
+      button.props.onPress(pressEvent);
+      await Promise.resolve();
+      assert(writes.length === before + 1 && writes[writes.length - 1] === expected, "ワンタップで次の状態だけを保存すること");
+      assert(propagationStops === previousStops + 1, "通常タップを親の行に伝播させないこと");
+      assert(!findElements(render(), (element) => element.type === "Modal").length, "通常タップでメニューを開かないこと");
+    }
+    writes = [];
+    props = { ...props, status: PURCHASE_STATUS.NOT_YET };
     let tree = open();
     let trigger = byId(tree, "item-purchase-status-trigger");
     assert(trigger.props.style.width === 44 && trigger.props.style.height === 44, "トリガーのタップ領域は44dpを確保すること");
@@ -233,11 +259,28 @@ export async function runItemPurchaseUiTests(): Promise<void> {
     await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
     assert(!byId(render(), "item-purchase-status-trigger").props.disabled, "保存完了後は再選択できること");
 
+    writes = [];
+    props = { ...props, status: PURCHASE_STATUS.SKIPPED };
+    trigger = byId(render(), "item-purchase-status-trigger");
+    trigger.props.onPress(pressEvent);
+    trigger.props.onPress(pressEvent);
+    trigger.props.onLongPress(pressEvent);
+    assert(writes.length === 1 && writes[0] === PURCHASE_STATUS.NOT_YET, "タップの連打でも次の状態を一度だけ保存すること");
+    assert(byId(render(), "item-purchase-status-trigger").props.disabled, "タップによる保存中も再操作を無効化すること");
+    assert(!findElements(render(), (element) => element.type === "Modal").length, "保存中の長押しではメニューを開かないこと");
+    finish?.();
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    assert(!byId(render(), "item-purchase-status-trigger").props.disabled, "タップによる保存完了後に再操作できること");
+
     props = { ...props, onChange: async () => { throw new Error("保存失敗"); } };
     tree = open();
     byId(tree, "item-purchase-status-option-2").props.onPress();
     await Promise.resolve();
     assert(alerts.length === 1 && !byId(render(), "item-purchase-status-trigger").props.disabled, "保存失敗を通知して再操作を許可すること");
+    byId(render(), "item-purchase-status-trigger").props.onPress(pressEvent);
+    await Promise.resolve();
+    assert(Number(alerts.length) === 2 && !byId(render(), "item-purchase-status-trigger").props.disabled, "通常タップの保存失敗も通知して再操作を許可すること");
+    assert(byId(render(), "item-purchase-status-trigger").props.accessibilityLabel.endsWith("見送り"), "保存失敗で表示中の状態を進めないこと");
 
     tree = open();
     viewport = { ...viewport, width: 852, height: 393 };
@@ -246,11 +289,11 @@ export async function runItemPurchaseUiTests(): Promise<void> {
     let lateMeasure: Function | undefined;
     trigger = byId(tree, "item-purchase-status-trigger");
     trigger.props.ref.current = { measureInWindow: (callback: Function) => { lateMeasure = callback; } };
-    trigger.props.onPress();
+    trigger.props.onLongPress(pressEvent);
     harness.unmount();
     lateMeasure?.(330, 720, 44, 44);
     assert(!findElements(render(), (element) => element.type === "Modal").length, "アンマウント後の遅い測定結果でメニューを開かないこと");
-    console.log(`購入UI: ${geometryChecks}件の配置検査、長い名前・価格固定・3状態・取消・連打・失敗・回転の契約検証に成功`);
+    console.log(`購入UI: ${geometryChecks}件の配置検査、長い名前・価格固定・4状態循環・長押しメニュー・取消・連打・失敗・回転の契約検証に成功`);
   } finally {
     Module._load = originalLoad;
     harness.unmount();

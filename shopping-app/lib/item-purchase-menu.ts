@@ -17,6 +17,16 @@ export function itemPurchaseStatusLabel(status: PurchaseStatusValue): string {
     : PURCHASE_STATUS_LABELS[status].label;
 }
 
+/** サークルと同じ順序で循環する。見送り → 未購入 → 購入済み → 買えなかった。 */
+export function nextItemPurchaseStatus(status: PurchaseStatusValue): PurchaseStatusValue {
+  switch (status) {
+    case PURCHASE_STATUS.NOT_YET: return PURCHASE_STATUS.BOUGHT;
+    case PURCHASE_STATUS.BOUGHT: return PURCHASE_STATUS.COULDNT_BUY;
+    case PURCHASE_STATUS.COULDNT_BUY: return PURCHASE_STATUS.SKIPPED;
+    case PURCHASE_STATUS.SKIPPED: return PURCHASE_STATUS.NOT_YET;
+  }
+}
+
 export function formatItemPrice(price: number | null): string {
   return price == null ? "価格不明" : `${price.toLocaleString("ja-JP")}円`;
 }

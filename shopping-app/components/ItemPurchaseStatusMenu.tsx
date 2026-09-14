@@ -20,6 +20,7 @@ import {
   getItemPurchaseMenuLayout,
   ITEM_PURCHASE_OPTIONS,
   itemPurchaseStatusLabel,
+  nextItemPurchaseStatus,
   type MenuAnchor,
 } from "../lib/item-purchase-menu";
 
@@ -113,10 +114,17 @@ export default function ItemPurchaseStatusMenu({ itemName, status, colors, onCha
         testID="item-purchase-status-trigger"
         style={styles.trigger}
         disabled={saving}
-        onPress={openMenu}
+        onPress={(event) => {
+          event.stopPropagation();
+          void selectStatus(nextItemPurchaseStatus(status));
+        }}
+        onLongPress={(event) => {
+          event.stopPropagation();
+          openMenu();
+        }}
         accessibilityRole="button"
         accessibilityLabel={`${itemName}の購入状態: ${itemPurchaseStatusLabel(status)}`}
-        accessibilityHint="タップして購入状態の選択メニューを開きます"
+        accessibilityHint={`タップで${itemPurchaseStatusLabel(nextItemPurchaseStatus(status))}に変更、長押しで購入状態の選択メニューを開きます`}
         accessibilityState={{ expanded: anchor != null, disabled: saving, busy: saving }}
       >
         <View
@@ -128,13 +136,8 @@ export default function ItemPurchaseStatusMenu({ itemName, status, colors, onCha
           ]}
         >
           <Text allowFontScaling={false} style={[styles.icon, { color: isNotYet ? statusColor : "#fff" }]}>
-            {isNotYet ? "▾" : statusInfo.icon}
+            {statusInfo.icon}
           </Text>
-          {!isNotYet && (
-            <Text allowFontScaling={false} style={[styles.caret, { color: colors.text, backgroundColor: colors.card }]}>
-              ▾
-            </Text>
-          )}
         </View>
       </Pressable>
       {anchor && layout && (
@@ -210,7 +213,6 @@ const styles = StyleSheet.create({
   trigger: { width: 44, height: 44, flexShrink: 0, alignItems: "center", justifyContent: "center" },
   circle: { width: 28, height: 28, borderRadius: 14, borderWidth: 1.5, alignItems: "center", justifyContent: "center" },
   icon: { fontSize: 14, fontWeight: "bold" },
-  caret: { position: "absolute", bottom: -3, right: -4, fontSize: 10, lineHeight: 12, borderRadius: 6, width: 12, textAlign: "center" },
   overlay: { flex: 1, backgroundColor: "rgba(0,0,0,0.25)" },
   menu: { position: "absolute", borderRadius: 12, borderWidth: 1, overflow: "hidden", elevation: 8, shadowColor: "#000", shadowOpacity: 0.2, shadowRadius: 8, shadowOffset: { width: 0, height: 4 } },
   menuScroll: { flexGrow: 0, flexShrink: 1 },
