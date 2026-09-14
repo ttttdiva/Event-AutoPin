@@ -6,9 +6,9 @@
     "date": "2026-09-14"
   },
   "mobile": {
-    "version": "1.4.60",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.60/EventAutoPin.apk",
-    "notes": "実機検証で入力欄の追従・画面復元・マップ選択・フィルター表示を修正",
-    "date": "2026-09-13"
+    "version": "1.4.61",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.61/EventAutoPin.apk",
+    "notes": "お品書きの商品状態を通常タップで4状態循環、長押しで直接選択に統一",
+    "date": "2026-09-14"
   }
 }
