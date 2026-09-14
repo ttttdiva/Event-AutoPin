@@ -6,9 +6,9 @@
     "date": "2026-09-14"
   },
   "mobile": {
-    "version": "1.4.61",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.61/EventAutoPin.apk",
-    "notes": "お品書きの商品状態を通常タップで4状態循環、長押しで直接選択に統一",
+    "version": "1.4.62",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.62/EventAutoPin.apk",
+    "notes": "お品書きの商品状態を通常タップで4状態循環、長押しで直接選択に統一。APK更新完了時のクラッシュも修正",
     "date": "2026-09-14"
   }
 }
