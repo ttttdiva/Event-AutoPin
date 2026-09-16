@@ -1,9 +1,9 @@
 {
   "desktop": {
-    "version": "0.1.23",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.23/EventAutoPin.exe",
-    "notes": "欠席切替を右クリックへ統合し、欠席中の優先度を低に固定。欠席行と展開パネルをグレー表示。",
-    "date": "2026-09-14"
+    "version": "0.1.24",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.24/EventAutoPin.exe",
+    "notes": "おしながきOCR検証失敗でフルパイプライン全体が止まらないようにした",
+    "date": "2026-09-17"
   },
   "mobile": {
     "version": "1.4.63",
