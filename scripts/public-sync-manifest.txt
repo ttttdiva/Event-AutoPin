@@ -125,6 +125,8 @@ shopping-app/components/useColorScheme.ts
 shopping-app/components/useColorScheme.web.ts
 shopping-app/constants/Colors.ts
 shopping-app/eas.json
+shopping-app/lib/circle-expanded-actions.test.js
+shopping-app/lib/circle-reprocess-lifecycle.test.js
 shopping-app/lib/crawl/adapter-factory.ts
 shopping-app/lib/crawl/adapters/generic.ts
 shopping-app/lib/crawl/adapters/picrea.ts

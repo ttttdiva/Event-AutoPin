@@ -129,6 +129,7 @@ export default function CircleListScreen() {
   } | null>(null);
   const [circleCutViewer, setCircleCutViewer] = useState<string | null>(null);
   const [actionMenuCircle, setActionMenuCircle] = useState<Circle | null>(null);
+  const reprocessRequestSequenceRef = useRef(0);
   const [reprocessRequest, setReprocessRequest] = useState<{
     circleId: number;
     token: number;
@@ -242,6 +243,7 @@ export default function CircleListScreen() {
     pinMutationGuardRef.current.reset();
     setCurrentEventId(eventId);
     setExpandedCircleId(null);
+    setReprocessRequest(null);
     viewModeRef.current = "list";
     setViewMode("list");
     setMapFmpRequest(null);
@@ -895,8 +897,15 @@ export default function CircleListScreen() {
   function requestCircleReprocess(circle: Circle) {
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
     setExpandedCircleId(circle.id);
-    setReprocessRequest({ circleId: circle.id, token: Date.now() });
+    setReprocessRequest({ circleId: circle.id, token: ++reprocessRequestSequenceRef.current });
   }
+
+  const handleReprocessRequestHandled = useCallback((circleId: number, token: number) => {
+    // 古い詳細の通知で、新しいサークル/要求を取り消さない。
+    setReprocessRequest((current) =>
+      current?.circleId === circleId && current.token === token ? null : current,
+    );
+  }, []);
 
   const openCircleActionMenu = useCallback((circle: Circle) => {
     setActionMenuCircle(circle);
@@ -1399,6 +1408,7 @@ export default function CircleListScreen() {
           onEditCircle={openEditCircle}
           onOpenCatalogImage={openCatalogViewer}
           statusCommittedRevision={statusCommitRevision}
+          onReprocessRequestHandled={handleReprocessRequestHandled}
           reprocessRequestToken={
             reprocessRequest && reprocessRequest.circleId === item.id
               ? reprocessRequest.token
@@ -1411,6 +1421,7 @@ export default function CircleListScreen() {
     expandedCircleId,
     handleOpenCircleCut,
     reprocessRequest,
+    handleReprocessRequestHandled,
     // Handlers below are intentionally listed so memoized rows cannot retain stale actions.
     handleToggleCircle,
     handleCyclePurchaseStatus,

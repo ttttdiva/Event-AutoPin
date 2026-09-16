@@ -474,6 +474,7 @@ class CircleListGenerator:
                         "days_before_event": self.config.get("days_before", 30),
                         "days_after_event": self.config.get("days_after", 7),
                         "max_workers": 1,
+                        "continue_on_error": True,
                         "rate_limit_seconds": 2,
                         "model": self._get_model_config(),  # 同じモデル設定を使用
                         "text_llm_provider": self.config.get(
@@ -607,21 +608,49 @@ class CircleListGenerator:
                     )
 
                     unresolved_targets = twitter_summary.get("unresolved_targets", [])
-                    if unresolved_targets or twitter_summary.get("status") in {
+                    has_failures = bool(unresolved_targets) or twitter_summary.get(
+                        "status"
+                    ) in {
                         "failed",
                         "partial",
-                    }:
-                        self.logger.error(
-                            "❌ Twitter未解決対象があるためevent.json保存を中止します: "
-                            f"{len(unresolved_targets)}件"
+                    }
+                    successful_circles = [
+                        circle
+                        for circle in updated_circles
+                        if getattr(circle, "_twitter_processing_succeeded", False)
+                    ]
+                    if has_failures:
+                        if not successful_circles:
+                            self.logger.error(
+                                "❌ Twitter未解決対象があり、成功したサークルがないためevent.json保存を中止します: "
+                                f"{len(unresolved_targets)}件"
+                            )
+                            return False
+                        self.logger.warning(
+                            "⚠️ 一部のサークルが未解決です。"
+                            f"成功した{len(successful_circles)}件を保存し、"
+                            "失敗したサークルの既存データを保持します"
                         )
-                        return False
+                        twitter_summary["saved_successful_count"] = len(
+                            successful_circles
+                        )
+                        print(
+                            "TWITTER_PROCESSING_RESULT="
+                            + json.dumps(twitter_summary, ensure_ascii=False),
+                            file=sys.stderr,
+                            flush=True,
+                        )
 
-                    # checked_tweets.json を保存（チェック済みツイートID記録）
-                    self._save_checked_tweets(updated_circles, output_dir)
+                    # checked_tweets.json を保存（成功サークルのみ）
+                    self._save_checked_tweets(
+                        successful_circles if has_failures else updated_circles,
+                        output_dir,
+                    )
 
                     # ジャンル判定結果をcircle_masterに書き込み（未設定の場合のみ）
-                    self._save_detected_genres(updated_circles)
+                    self._save_detected_genres(
+                        successful_circles if has_failures else updated_circles
+                    )
 
                     # 更新されたデータでevent.jsonを再生成
                     self.logger.info("Twitter情報を反映したevent.jsonを再生成中...")
@@ -632,6 +661,10 @@ class CircleListGenerator:
 
                     if twitter_summary.get("status") == "failed":
                         self.logger.warning("⚠️ Twitter処理は失敗を含んで終了しました")
+                    elif has_failures:
+                        self.logger.warning(
+                            "⚠️ Twitter処理は一部失敗しましたが、成功分を保存しました"
+                        )
                     else:
                         self.logger.info("✅ Twitter処理が完了しました！")
                 else:

@@ -195,28 +195,20 @@ class CatalogImageAnalyzer:
             deadline=deadline,
         )
 
-        ocr_a, _ = self._run_catalog_pass(
+        ocr_a = self._run_ocr_identity_observation_pass(
             image_path,
-            self._build_ocr_name_verification_prompt(extracted["items"]),
+            extracted["items"],
             stage="catalog.ocr_a",
             forced_attempt=first_attempt,
-            parser=lambda response: self._parse_ocr_name_verification_response(
-                response,
-                extracted["items"],
-            ),
             run_id=run_id,
             trace=trace,
             deadline=deadline,
         )
-        ocr_b, _ = self._run_catalog_pass(
+        ocr_b = self._run_ocr_identity_observation_pass(
             image_path,
-            self._build_ocr_name_verification_prompt(extracted["items"]),
+            extracted["items"],
             stage="catalog.ocr_b",
             forced_attempt=first_attempt,
-            parser=lambda response: self._parse_ocr_name_verification_response(
-                response,
-                extracted["items"],
-            ),
             run_id=run_id,
             trace=trace,
             deadline=deadline,
@@ -238,20 +230,16 @@ class CatalogImageAnalyzer:
                     "observation_b": observation_b,
                 })
         if disagreement_candidates:
-            adjudicated_names, _ = self._run_catalog_pass(
-                image_path,
-                self._build_ocr_adjudication_prompt(disagreement_candidates),
-                stage="catalog.adjudication",
-                forced_attempt=first_attempt,
-                parser=lambda response: self._parse_ocr_adjudication_response(
-                    response,
+            resolved_ocr_names.update(
+                self._run_ocr_adjudication_pass(
+                    image_path,
                     disagreement_candidates,
-                ),
-                run_id=run_id,
-                trace=trace,
-                deadline=deadline,
+                    forced_attempt=first_attempt,
+                    run_id=run_id,
+                    trace=trace,
+                    deadline=deadline,
+                )
             )
-            resolved_ocr_names.update(adjudicated_names)
         ocr_items = []
         for candidate_id, item in enumerate(extracted["items"]):
             ocr_item = dict(item)
@@ -390,6 +378,96 @@ class CatalogImageAnalyzer:
         if isinstance(raw.get("is_existing_only"), bool):
             result["is_existing_only"] = raw["is_existing_only"]
         return result
+
+    def _raw_ocr_identity_observations(
+        self,
+        items: List[Dict[str, Any]],
+    ) -> Dict[int, Dict[str, Any]]:
+        observations: Dict[int, Dict[str, Any]] = {}
+        for candidate_id, item in enumerate(items):
+            raw_name = self._preserve_name_surface(item.get("name", ""))
+            observations[candidate_id] = {
+                "raw_name": raw_name,
+                "observed_name": raw_name,
+                "evidence_text": raw_name,
+            }
+        return observations
+
+    def _run_ocr_identity_observation_pass(
+        self,
+        image_path: Path,
+        items: List[Dict[str, Any]],
+        *,
+        stage: str,
+        forced_attempt: Dict[str, Any],
+        run_id: Optional[str] = None,
+        trace: Any = None,
+        deadline: Optional[ReprocessDeadline] = None,
+    ) -> Dict[int, Dict[str, Any]]:
+        try:
+            observations, _ = self._run_catalog_pass(
+                image_path,
+                self._build_ocr_name_verification_prompt(items),
+                stage=stage,
+                forced_attempt=forced_attempt,
+                parser=lambda response: self._parse_ocr_name_verification_response(
+                    response,
+                    items,
+                ),
+                run_id=run_id,
+                trace=trace,
+                deadline=deadline,
+                validation_retries=1,
+            )
+            return observations
+        except ReprocessDeadlineExceeded:
+            raise
+        except ValueError as exc:
+            logger.warning(
+                "OCR identity observation failed; continuing with extracted raw names "
+                f"({stage}): {exc}"
+            )
+            return self._raw_ocr_identity_observations(items)
+
+    def _run_ocr_adjudication_pass(
+        self,
+        image_path: Path,
+        disagreement_candidates: List[Dict[str, Any]],
+        *,
+        forced_attempt: Dict[str, Any],
+        run_id: Optional[str] = None,
+        trace: Any = None,
+        deadline: Optional[ReprocessDeadline] = None,
+    ) -> Dict[int, str]:
+        try:
+            adjudicated_names, _ = self._run_catalog_pass(
+                image_path,
+                self._build_ocr_adjudication_prompt(disagreement_candidates),
+                stage="catalog.adjudication",
+                forced_attempt=forced_attempt,
+                parser=lambda response: self._parse_ocr_adjudication_response(
+                    response,
+                    disagreement_candidates,
+                ),
+                run_id=run_id,
+                trace=trace,
+                deadline=deadline,
+                validation_retries=1,
+            )
+            return adjudicated_names
+        except ReprocessDeadlineExceeded:
+            raise
+        except ValueError as exc:
+            logger.warning(
+                "OCR adjudication failed; continuing with raw names: "
+                f"{exc}"
+            )
+            return {
+                candidate["candidate_id"]: self._preserve_name_surface(
+                    candidate["raw_name"]
+                )
+                for candidate in disagreement_candidates
+            }
 
     def _run_catalog_pass(
         self,

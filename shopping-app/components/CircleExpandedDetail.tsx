@@ -10,7 +10,6 @@ import {
   Linking,
   ActivityIndicator,
   Alert,
-  Modal,
 } from "react-native";
 import {
   reprocessCircleFromPost,
@@ -91,10 +90,14 @@ function renderMemoWithLinks(
 interface CircleExpandedDetailProps {
   circle: Circle;
   onCircleUpdated: (updated: Circle) => void;
+  /** @deprecated サークル操作は親画面の長押しメニューに集約。呼び出し元との互換用。 */
   onDeleteCircle?: (circle: Circle) => void;
+  /** @deprecated サークル操作は親画面の長押しメニューに集約。呼び出し元との互換用。 */
   onEditCircle?: (circle: Circle) => void;
   onOpenCatalogImage?: (circle: Circle, uri: string) => void;
   reprocessRequestToken?: number | null;
+  /** 表示済みの要求を親から消し、再マウント時の意図しない再表示を防ぐ。 */
+  onReprocessRequestHandled?: (circleId: number, token: number) => void;
   /** Parent increments only after the circle status DB write commits. */
   statusCommittedRevision?: number;
 }
@@ -102,10 +105,9 @@ interface CircleExpandedDetailProps {
 export default function CircleExpandedDetail({
   circle,
   onCircleUpdated,
-  onDeleteCircle,
-  onEditCircle,
   onOpenCatalogImage,
   reprocessRequestToken,
+  onReprocessRequestHandled,
   statusCommittedRevision,
 }: CircleExpandedDetailProps) {
   const { effectiveScheme } = useTheme();
@@ -167,8 +169,9 @@ export default function CircleExpandedDetail({
   useEffect(() => {
     if (reprocessRequestToken != null) {
       openReprocessModal();
+      onReprocessRequestHandled?.(circle.id, reprocessRequestToken);
     }
-  }, [reprocessRequestToken]);
+  }, [circle.id, reprocessRequestToken, onReprocessRequestHandled]);
 
   async function loadData() {
     const epoch = loadEpochGuardRef.current.next();
@@ -911,38 +914,7 @@ export default function CircleExpandedDetail({
         </View>
       )}
 
-      <View style={styles.circleActionRow}>
-        {onEditCircle && (
-          <Pressable
-            style={[styles.editCircleBtn, { borderColor: colors.tint }]}
-            onPress={() => onEditCircle(circle)}
-          >
-            <FontAwesome name="pencil" size={12} color={colors.tint} />
-            <Text style={[styles.editCircleBtnText, { color: colors.tint }]}>
-              編集
-            </Text>
-          </Pressable>
-        )}
-        <Pressable
-          style={[styles.editCircleBtn, { borderColor: colors.tint }]}
-          onPress={openReprocessModal}
-        >
-          <FontAwesome name="refresh" size={12} color={colors.tint} />
-          <Text style={[styles.editCircleBtnText, { color: colors.tint }]}>
-            Xポスト再処理
-          </Text>
-        </Pressable>
-        {onDeleteCircle && (
-          <Pressable
-            style={styles.deleteCircleBtn}
-            onPress={() => onDeleteCircle(circle)}
-          >
-            <FontAwesome name="trash" size={12} color="#c62828" />
-            <Text style={styles.deleteCircleBtnText}>削除</Text>
-          </Pressable>
-        )}
-      </View>
-
+      {/* サークルの編集・再処理・削除は親画面の長押しメニューから行う。 */}
       {/* タグ・ジャンル（M6: URLは除去済み、おしながき文言も除去） */}
       {(tagOthers.length > 0 || genres.length > 0) && (
         <View style={styles.chipContainer}>
@@ -1175,38 +1147,6 @@ const styles = StyleSheet.create({
   addItemSaveBtnText: { color: "#fff", fontWeight: "600", fontSize: 12 },
   addItemCancelBtn: { paddingHorizontal: 14, paddingVertical: 5 },
   addItemCancelBtnText: { fontSize: 12 },
-  circleActionRow: {
-    flexDirection: "row",
-    justifyContent: "center",
-    gap: 16,
-    paddingVertical: 8,
-    marginTop: 4,
-  },
-  editCircleBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 6,
-    borderWidth: 1,
-  },
-  editCircleBtnText: {
-    fontSize: 12,
-    fontWeight: "600",
-  },
-  deleteCircleBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-  },
-  deleteCircleBtnText: {
-    fontSize: 12,
-    color: "#c62828",
-    fontWeight: "600",
-  },
   categoryScroll: {
     maxHeight: 30,
     marginVertical: 2,

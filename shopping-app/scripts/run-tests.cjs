@@ -6,6 +6,8 @@ const appRoot = path.resolve(__dirname, "..");
 const childMarker = "--run-test-file";
 const testCases = [
   ["plugins/withAndroidPlatformCompatibility.test.js"],
+  ["lib/circle-expanded-actions.test.js", "runCircleExpandedActionsTests"],
+  ["lib/circle-reprocess-lifecycle.test.js", "runCircleReprocessLifecycleTests"],
   ["lib/database-core.test.ts", "runDatabaseCoreTests"],
   ["lib/database-filesystem.test.ts"],
   ["lib/database-instrumentation.test.ts"],
