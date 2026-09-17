@@ -1,8 +1,8 @@
 {
   "desktop": {
-    "version": "0.1.24",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.24/EventAutoPin.exe",
-    "notes": "おしながきOCR検証失敗でフルパイプライン全体が止まらないようにした",
+    "version": "0.1.25",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.25/EventAutoPin.exe",
+    "notes": "ずんだぱ～てぃ再処理結果の逐次保存、フルパイプラインの実行タイムアウトを10時間へ延長、デスクトップウィンドウの最前面固定を無効化",
     "date": "2026-09-17"
   },
   "mobile": {
