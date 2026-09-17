@@ -153,6 +153,24 @@ def test_update_catalog_links_does_not_duplicate_memo_url(tmp_path: Path):
     assert circle["catalog_status"] == "confirmed"
     assert circle["existing_only_status"] == "既刊のみ"
 
+    # サークル単位チェックポイント後に最終保存で同じ更新を再適用しても、
+    # おしながき画像を二重登録しない。
+    reprocessor.update_catalog_links(
+        data,
+        [
+            {
+                "circle_index": 0,
+                "catalog_url": "https://example.com/catalog",
+                "catalog_image": "catalog_a.jpg",
+                "catalog_type": "おしながき",
+                "items": [{"name": "CD", "type": "音楽", "price": 0}],
+                "catalog_status": "confirmed",
+                "existing_only_status": "既刊のみ",
+            }
+        ],
+    )
+    assert circle["item_images"] == [{"path": "catalog_a.jpg", "source": "twitter"}]
+
 
 def test_load_existing_json_returns_data(tmp_path: Path):
     path = tmp_path / "event.json"

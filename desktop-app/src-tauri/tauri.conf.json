@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "Event AutoPin",
-    "version": "0.1.24"
+    "version": "0.1.25"
   },
   "tauri": {
     "allowlist": {
@@ -46,7 +46,8 @@
         "height": 1080,
         "center": true,
         "maximizable": true,
-        "fileDropEnabled": false
+        "fileDropEnabled": false,
+        "alwaysOnTop": false
       }
     ],
     "bundle": {

@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 import argparse
 import json
+import re
 from typing import Dict, Any, Union, List, Optional
 from dotenv import load_dotenv
 
@@ -888,11 +889,33 @@ class CircleListGenerator:
 
             import asyncio
 
+            checkpointed_count = 0
+
+            def checkpoint_reprocess_circle(circle):
+                """成功済みサークルを全件終了待ちにせず即時保存する。"""
+                nonlocal checkpointed_count
+                if not getattr(circle, "_twitter_processing_succeeded", False):
+                    return
+
+                update = self._build_reprocess_update(circle)
+                if update:
+                    reprocessor.update_catalog_links(event_data, [update])
+                    reprocessor.save_updated_json(event_data)
+                    checkpointed_count += 1
+                    self.logger.info(
+                        f"再処理チェックポイント保存: {circle.name} "
+                        f"({checkpointed_count}件目)"
+                    )
+
+                # event.json と同じく checked state もサークル単位で耐障害化する。
+                self._save_checked_tweets([circle], output_dir)
+
             updated_circles = asyncio.run(
                 self._run_reprocess_targets(
                     circles_to_process,
                     twitter_processor,
                     event,
+                    on_circle_complete=checkpoint_reprocess_circle,
                 )
             )
             twitter_summary = dict(twitter_processor.last_run_summary)
@@ -944,65 +967,11 @@ class CircleListGenerator:
             # ジャンル判定結果をcircle_masterに書き込み（未設定の場合のみ）
             self._save_detected_genres(updated_circles)
 
-            import re
-
             update_data = []
             for circle in updated_circles:
-                if hasattr(circle, "_circle_index"):
-                    catalog_url = None
-                    if circle.memo:
-                        status_urls = re.findall(
-                            r"https?://(?:twitter\.com|x\.com)/[^\s]+/status(?:es)?/\d+",
-                            circle.memo,
-                        )
-                        catalog_urls = re.findall(r"https?://[^\s]+", circle.memo)
-                        if status_urls:
-                            catalog_url = status_urls[0]
-                        elif catalog_urls:
-                            catalog_url = catalog_urls[0]
-
-                    catalog_image = None
-                    if circle.item_images and len(circle.item_images) > 0:
-                        catalog_image = circle.item_images[0].path
-
-                    catalog_type = None
-                    catalog_status = getattr(circle, "catalog_status", None)
-
-                    if catalog_status == "preview":
-                        catalog_type = "おしながき予告"
-                    elif circle.items:
-                        # 画像解析結果（高精度）を最優先
-                        item_types = list(
-                            dict.fromkeys(
-                                item.get("type", "")
-                                for item in circle.items
-                                if item.get("type")
-                            )
-                        )
-                        if item_types:
-                            catalog_type = "、".join(item_types)
-                    if not catalog_type and (catalog_url or catalog_image):
-                        catalog_type = "おしながき"
-
-                    has_update = bool(
-                        catalog_url
-                        or catalog_image
-                        or circle.items
-                        or catalog_status
-                        or circle.existing_only_status
-                    )
-                    if has_update:
-                        update_data.append(
-                            {
-                                "circle_index": circle._circle_index,
-                                "catalog_url": catalog_url,
-                                "catalog_image": catalog_image,
-                                "catalog_type": catalog_type,
-                                "items": list(circle.items),
-                                "catalog_status": catalog_status,
-                                "existing_only_status": circle.existing_only_status,
-                            }
-                        )
+                update = self._build_reprocess_update(circle)
+                if update:
+                    update_data.append(update)
 
             event_data = reprocessor.update_catalog_links(event_data, update_data)
             event_data = reprocessor.apply_default_cuts_for_missing(event_data)
@@ -1036,7 +1005,11 @@ class CircleListGenerator:
             return False
 
     async def _run_reprocess_targets(
-        self, circles_to_process: List[Any], twitter_processor: Any, event: Any
+        self,
+        circles_to_process: List[Any],
+        twitter_processor: Any,
+        event: Any,
+        on_circle_complete: Any = None,
     ) -> List[Any]:
         """再処理対象を保存URL優先・timeline fallback付きで処理する。"""
         search_targets = []
@@ -1080,6 +1053,10 @@ class CircleListGenerator:
 
                 if circle.items:
                     circle._twitter_processing_succeeded = processed is True
+                    if on_circle_complete is not None and circle._twitter_processing_succeeded:
+                        callback_result = on_circle_complete(circle)
+                        if asyncio.iscoroutine(callback_result):
+                            await callback_result
                     break
 
             # 保存URLがない場合だけでなく、保存URLで品目を得られなかった
@@ -1088,12 +1065,72 @@ class CircleListGenerator:
                 search_targets.append(circle)
 
         if search_targets:
+            kwargs = {"debug_limit": len(search_targets)}
+            if on_circle_complete is not None:
+                kwargs["on_circle_complete"] = on_circle_complete
             await twitter_processor.process_circles(
                 search_targets,
                 event,
-                debug_limit=len(search_targets),
+                **kwargs,
             )
         return circles_to_process
+
+    def _build_reprocess_update(self, circle: Any) -> Optional[Dict[str, Any]]:
+        """Circle の再処理結果を event.json 更新形式へ変換する。"""
+        if not hasattr(circle, "_circle_index"):
+            return None
+
+        catalog_url = None
+        if circle.memo:
+            status_urls = re.findall(
+                r"https?://(?:twitter\.com|x\.com)/[^\s]+/status(?:es)?/\d+",
+                circle.memo,
+            )
+            catalog_urls = re.findall(r"https?://[^\s]+", circle.memo)
+            if status_urls:
+                catalog_url = status_urls[0]
+            elif catalog_urls:
+                catalog_url = catalog_urls[0]
+
+        catalog_image = None
+        if circle.item_images:
+            catalog_image = circle.item_images[0].path
+
+        catalog_type = None
+        catalog_status = getattr(circle, "catalog_status", None)
+        if catalog_status == "preview":
+            catalog_type = "おしながき予告"
+        elif circle.items:
+            item_types = list(
+                dict.fromkeys(
+                    item.get("type", "")
+                    for item in circle.items
+                    if item.get("type")
+                )
+            )
+            if item_types:
+                catalog_type = "、".join(item_types)
+        if not catalog_type and (catalog_url or catalog_image):
+            catalog_type = "おしながき"
+
+        if not (
+            catalog_url
+            or catalog_image
+            or circle.items
+            or catalog_status
+            or circle.existing_only_status
+        ):
+            return None
+
+        return {
+            "circle_index": circle._circle_index,
+            "catalog_url": catalog_url,
+            "catalog_image": catalog_image,
+            "catalog_type": catalog_type,
+            "items": list(circle.items),
+            "catalog_status": catalog_status,
+            "existing_only_status": circle.existing_only_status,
+        }
 
     def _normalize_checked_tweet_ids(self, raw_ids, circle_name: str) -> List[int]:
         """保存済みIDの文字列・整数を揃え、不正値と重複を除く。"""

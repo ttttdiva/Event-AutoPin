@@ -650,6 +650,7 @@ const projectRootEl = document.getElementById(
   "projectRoot",
 ) as HTMLInputElement;
 const timeoutMsEl = document.getElementById("timeoutMs") as HTMLInputElement;
+const DEFAULT_DESKTOP_TIMEOUT_MS = 36_000_000; // 10 hours
 const foamDirEl = document.getElementById("foamDir") as HTMLInputElement;
 const unlimitedOcrModelEl = document.getElementById("unlimitedOcrModel") as HTMLInputElement;
 const unlimitedOcrModelPathEl = document.getElementById("unlimitedOcrModelPath") as HTMLInputElement;
@@ -2737,7 +2738,7 @@ async function saveConfig() {
   const payload: DesktopConfig = {
     pythonExe: pythonExeEl.value,
     projectRoot: projectRootEl.value,
-    timeoutMs: Number(timeoutMsEl.value || "10800000"),
+    timeoutMs: Number(timeoutMsEl.value || String(DEFAULT_DESKTOP_TIMEOUT_MS)),
     foamDir: foamDirEl.value,
     unlimitedOcrModel: unlimitedOcrModelEl.value.trim(),
     unlimitedOcrModelPath: unlimitedOcrModelPathEl.value.trim(),
@@ -3113,7 +3114,7 @@ function initHistorySearch() {
   });
 }
 
-function currentBridgeJobOptions(timeoutMs = 10_800_000) {
+function currentBridgeJobOptions(timeoutMs = DEFAULT_DESKTOP_TIMEOUT_MS) {
   return {
     pythonExe: pythonExeEl.value,
     projectRoot: projectRootEl.value,
@@ -3185,7 +3186,7 @@ async function runJob(
       payload,
       {
         ...currentBridgeJobOptions(
-          options.timeoutMsOverride ?? Number(timeoutMsEl.value || "10800000"),
+          options.timeoutMsOverride ?? Number(timeoutMsEl.value || String(DEFAULT_DESKTOP_TIMEOUT_MS)),
         ),
       },
     );
@@ -6290,7 +6291,7 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
       {
         timeoutMsOverride: timeoutMsForReprocessSource(
           "post",
-          Number(timeoutMsEl.value || "10800000"),
+          Number(timeoutMsEl.value || String(DEFAULT_DESKTOP_TIMEOUT_MS)),
         ),
         rethrowOnInvokeError: true,
         reprocess: { runId: job.runId, circleName: job.circleName },
@@ -8714,9 +8715,9 @@ function restoreFormValues() {
         | null;
       if (el && val) el.value = val;
     }
-    // 古いデフォルト(300000ms)が保存されていたら新デフォルトに引き上げ
-    if (data.timeoutMs && Number(data.timeoutMs) < 10800000) {
-      timeoutMsEl.value = "10800000";
+    // 旧版で保存された短いtimeoutは現行の10時間へ引き上げ
+    if (data.timeoutMs && Number(data.timeoutMs) < DEFAULT_DESKTOP_TIMEOUT_MS) {
+      timeoutMsEl.value = String(DEFAULT_DESKTOP_TIMEOUT_MS);
     }
     updateTextModelSelect(data.model);
     updateTextFallbackModelSelect(data.textFallbackModel);
@@ -9084,7 +9085,7 @@ initialConfigPromise
     resultEl.textContent = `設定読み込み警告: ${String(e)}`;
     pythonExeEl.value = "python";
     projectRootEl.value = ".";
-    timeoutMsEl.value = "10800000";
+    timeoutMsEl.value = String(DEFAULT_DESKTOP_TIMEOUT_MS);
     restoreFormValues();
   });
 
@@ -10343,7 +10344,7 @@ async function runMapAutoPlacement(useCalibration: boolean) {
     const response = await rawInvokeBridgeJob<Record<string, unknown>>(
       "auto_place_map_pins",
       payload,
-      currentBridgeJobOptions(Number(timeoutMsEl.value || "10800000")),
+      currentBridgeJobOptions(Number(timeoutMsEl.value || String(DEFAULT_DESKTOP_TIMEOUT_MS))),
     );
     logToFile(`[map-auto] bridge returned ok=${Boolean(response?.ok)}`);
     const bridge = response?.bridge as Record<string, any> | undefined;

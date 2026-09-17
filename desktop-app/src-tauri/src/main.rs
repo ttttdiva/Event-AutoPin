@@ -198,6 +198,8 @@ mod windows_process_job {
     }
 }
 
+const DEFAULT_DESKTOP_TIMEOUT_MS: u64 = 36_000_000;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopConfig {
@@ -257,7 +259,7 @@ impl Default for DesktopConfig {
         Self {
             python_exe: "python".to_string(),
             project_root: root,
-            timeout_ms: 3_600_000,
+            timeout_ms: DEFAULT_DESKTOP_TIMEOUT_MS,
             foam_dir: String::new(),
             unlimited_ocr_model: "baidu/Unlimited-OCR".to_string(),
             unlimited_ocr_model_path: String::new(),
@@ -284,7 +286,14 @@ fn load_desktop_config() -> Result<DesktopConfig, String> {
 
     let text =
         fs::read_to_string(path).map_err(|e| format!("Failed to read desktop config: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("Invalid desktop config JSON: {e}"))
+    let mut config: DesktopConfig =
+        serde_json::from_str(&text).map_err(|e| format!("Invalid desktop config JSON: {e}"))?;
+    // 旧版で保存された短いtimeoutでも、全サークル再処理が途中終了しないよう
+    // 現行の最低値（10時間）へ自動的に引き上げる。
+    if config.timeout_ms < DEFAULT_DESKTOP_TIMEOUT_MS {
+        config.timeout_ms = DEFAULT_DESKTOP_TIMEOUT_MS;
+    }
+    Ok(config)
 }
 
 #[tauri::command]

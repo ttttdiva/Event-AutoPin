@@ -592,7 +592,13 @@ class TwitterPostProcessor:
                     changed = True
         return changed
 
-    async def process_circles(self, circles: List[Circle], event: Event, debug_limit: int = None) -> List[Circle]:
+    async def process_circles(
+        self,
+        circles: List[Circle],
+        event: Event,
+        debug_limit: int = None,
+        on_circle_complete: Any = None,
+    ) -> List[Circle]:
         """
         サークルリストにTwitter情報を追加
 
@@ -782,6 +788,10 @@ class TwitterPostProcessor:
             circle._twitter_processing_succeeded = outcome in {
                 None, "catalog_found", "no_catalog_found"
             }
+            if on_circle_complete is not None and circle._twitter_processing_succeeded:
+                callback_result = on_circle_complete(circle)
+                if asyncio.iscoroutine(callback_result):
+                    await callback_result
 
         # 結果を統合
         circle_map = {c.name: c for c in circles}

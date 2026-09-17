@@ -135,7 +135,13 @@ class JSONReprocessor:
                     img_entry = {'path': update['catalog_image'], 'source': 'twitter'}
                     if 'item_images' not in circle:
                         circle['item_images'] = []
-                    circle['item_images'].append(img_entry)
+                    if not any(
+                        image.get('path') == img_entry['path']
+                        and image.get('source') == img_entry['source']
+                        for image in circle['item_images']
+                        if isinstance(image, dict)
+                    ):
+                        circle['item_images'].append(img_entry)
 
                 if update.get('items'):
                     circle['items'] = update['items']
