@@ -1,9 +1,9 @@
 {
   "desktop": {
-    "version": "0.1.25",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.25/EventAutoPin.exe",
-    "notes": "ずんだぱ～てぃ再処理結果の逐次保存、フルパイプラインの実行タイムアウトを10時間へ延長、デスクトップウィンドウの最前面固定を無効化",
-    "date": "2026-09-17"
+    "version": "0.1.26",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.26/EventAutoPin.exe",
+    "notes": "おしながき手動並び替えをWebViewで安定動作するPointer操作へ修正",
+    "date": "2026-09-18"
   },
   "mobile": {
     "version": "1.4.63",
