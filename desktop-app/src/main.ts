@@ -2669,7 +2669,7 @@ function renderItemPanel(circleIdx: number): string {
       const rowStyle = knownPurchased
         ? ` style="background:${boughtView.bg || "rgba(46,125,50,0.12)"};"`
         : "";
-      return `<tr class="item-draggable-row${knownPurchased ? " item-purchased-known" : ""}" data-circle="${circleIdx}" data-item="${itemIdx}" draggable="true"${rowStyle}>
+      return `<tr class="item-draggable-row${knownPurchased ? " item-purchased-known" : ""}" data-circle="${circleIdx}" data-item="${itemIdx}" draggable="false"${rowStyle}>
       <td class="item-drag-handle" title="ドラッグで並び替え">⠿</td>
       <td class="item-img-cell w-10 text-center cursor-pointer" data-circle="${circleIdx}" data-item="${itemIdx}">${itemImgHtml}</td>
       <td><input class="item-field" data-circle="${circleIdx}" data-item="${itemIdx}" data-field="name" value="${escapeHtml(item.name || "")}" placeholder="アイテム名" /></td>
@@ -6669,75 +6669,120 @@ function updateItemCountBadge(circleIdx: number) {
 
 /** アイテムパネル内のイベントリスナーを付与する */
 function attachItemPanelListeners() {
-  // アイテム行D&D並び替え
-  let dragSrcItemIdx = -1;
-  let dragSrcCircleIdx = -1;
+  // Tauri/WebView2ではHTML5 D&Dが画像・ファイルD&Dと競合しやすいため、
+  // おしながきの並び替えはハンドル起点のPointer Eventsだけで処理する。
+  let pointerReorder: {
+    pointerId: number;
+    circleIdx: number;
+    sourceIdx: number;
+    startY: number;
+    targetIdx: number;
+    row: HTMLTableRowElement;
+  } | null = null;
+
+  const clearPointerReorder = () => {
+    const active = pointerReorder;
+    if (active) {
+      try {
+        if (active.row.hasPointerCapture(active.pointerId)) {
+          active.row.releasePointerCapture(active.pointerId);
+        }
+      } catch {
+        // WebView側ですでにcaptureが失われていても後始末は継続する。
+      }
+      active.row.classList.remove("item-dragging");
+    }
+    circleEditorEl
+      .querySelectorAll(".item-drag-over")
+      .forEach((r) => r.classList.remove("item-drag-over"));
+    pointerReorder = null;
+    window.removeEventListener("blur", clearPointerReorder);
+    window.removeEventListener("keydown", cancelPointerReorderOnEscape);
+  };
+
+  const cancelPointerReorderOnEscape = (event: KeyboardEvent) => {
+    if (event.key !== "Escape" || !pointerReorder) return;
+    event.preventDefault();
+    clearPointerReorder();
+  };
+
+  const moveItem = (circleIdx: number, sourceIdx: number, targetIdx: number) => {
+    if (targetIdx === sourceIdx || !eventJsonData) return;
+    const c = eventJsonData.circles[circleIdx];
+    if (!c?.items || !c.items[sourceIdx] || !c.items[targetIdx]) return;
+    const [moved] = c.items.splice(sourceIdx, 1);
+    c.items.splice(targetIdx, 0, moved);
+    tableState.rows[circleIdx]["アイテムタグ"] = c.items
+      .map((it: any) => it.type || it.genre || "")
+      .join(", ");
+    saveNow();
+    toggleItemPanelInPlace();
+  };
+
   circleEditorEl
     .querySelectorAll<HTMLTableRowElement>("tr.item-draggable-row")
     .forEach((row) => {
       if ((row as any)._dragBound) return;
       (row as any)._dragBound = true;
+      row.draggable = false;
 
-      row.addEventListener("dragstart", (e) => {
-        // input/selectにフォーカスがある場合はD&Dを開始しない
-        const active = document.activeElement;
+      row.addEventListener("pointerdown", (event) => {
+        if (!event.isPrimary || event.button !== 0) return;
+        const target = event.target as HTMLElement | null;
+        const handle = target?.closest<HTMLElement>(".item-drag-handle");
+        if (!handle || !row.contains(handle)) return;
+
+        event.preventDefault();
+        clearPointerReorder();
+        pointerReorder = {
+          pointerId: event.pointerId,
+          circleIdx: Number(row.dataset.circle),
+          sourceIdx: Number(row.dataset.item),
+          startY: event.clientY,
+          targetIdx: Number(row.dataset.item),
+          row,
+        };
+        row.setPointerCapture(event.pointerId);
+        window.addEventListener("blur", clearPointerReorder);
+        window.addEventListener("keydown", cancelPointerReorderOnEscape);
+      });
+
+      row.addEventListener("pointermove", (event) => {
+        if (!pointerReorder || pointerReorder.pointerId !== event.pointerId) return;
+        if (Math.abs(event.clientY - pointerReorder.startY) < 6) return;
+
+        event.preventDefault();
+        pointerReorder.row.classList.add("item-dragging");
+        circleEditorEl
+          .querySelectorAll(".item-drag-over")
+          .forEach((r) => r.classList.remove("item-drag-over"));
+
+        const targetRow = document
+          .elementFromPoint(event.clientX, event.clientY)
+          ?.closest<HTMLTableRowElement>("tr.item-draggable-row");
         if (
-          active &&
-          row.contains(active) &&
-          (active.tagName === "INPUT" ||
-            active.tagName === "SELECT" ||
-            active.tagName === "TEXTAREA")
+          !targetRow ||
+          Number(targetRow.dataset.circle) !== pointerReorder.circleIdx
         ) {
-          e.preventDefault();
           return;
         }
-        dragSrcCircleIdx = Number(row.dataset.circle);
-        dragSrcItemIdx = Number(row.dataset.item);
-        row.classList.add("item-dragging");
-        e.dataTransfer!.effectAllowed = "move";
-        e.dataTransfer!.setData("text/plain", String(dragSrcItemIdx));
+
+        pointerReorder.targetIdx = Number(targetRow.dataset.item);
+        targetRow.classList.add("item-drag-over");
       });
 
-      row.addEventListener("dragend", () => {
-        row.classList.remove("item-dragging");
-        circleEditorEl
-          .querySelectorAll(".item-drag-over")
-          .forEach((r) => r.classList.remove("item-drag-over"));
+      row.addEventListener("pointerup", (event) => {
+        if (!pointerReorder || pointerReorder.pointerId !== event.pointerId) return;
+        const action = pointerReorder;
+        clearPointerReorder();
+        moveItem(action.circleIdx, action.sourceIdx, action.targetIdx);
       });
 
-      row.addEventListener("dragover", (e) => {
+      row.addEventListener("pointercancel", clearPointerReorder);
+
+      row.addEventListener("dragstart", (e) => {
+        // 将来markupが変わってもHTML5 D&Dへ戻らないための防御。
         e.preventDefault();
-        e.dataTransfer!.dropEffect = "move";
-        const ci = Number(row.dataset.circle);
-        if (ci !== dragSrcCircleIdx) return;
-        circleEditorEl
-          .querySelectorAll(".item-drag-over")
-          .forEach((r) => r.classList.remove("item-drag-over"));
-        row.classList.add("item-drag-over");
-      });
-
-      row.addEventListener("dragleave", () => {
-        row.classList.remove("item-drag-over");
-      });
-
-      row.addEventListener("drop", (e) => {
-        e.preventDefault();
-        row.classList.remove("item-drag-over");
-        const ci = Number(row.dataset.circle);
-        const targetIdx = Number(row.dataset.item);
-        if (ci !== dragSrcCircleIdx || targetIdx === dragSrcItemIdx) return;
-        if (!eventJsonData) return;
-        const c = eventJsonData.circles[ci];
-        if (!c || !c.items) return;
-        // 配列内で要素を移動
-        const [moved] = c.items.splice(dragSrcItemIdx, 1);
-        c.items.splice(targetIdx, 0, moved);
-        // tableStateも同期
-        tableState.rows[ci]["アイテムタグ"] = c.items
-          .map((it: any) => it.type || it.genre || "")
-          .join(", ");
-        saveNow();
-        toggleItemPanelInPlace();
       });
     });
 

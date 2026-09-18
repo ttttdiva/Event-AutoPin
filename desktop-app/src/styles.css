@@ -1559,6 +1559,7 @@ html.dark {
   cursor: grab;
   text-align: center;
   user-select: none;
+  touch-action: none;
   color: var(--text-muted);
   font-size: 14px;
   width: 28px;
