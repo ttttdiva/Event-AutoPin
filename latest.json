@@ -6,9 +6,9 @@
     "date": "2026-09-18"
   },
   "mobile": {
-    "version": "1.4.64",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.64/EventAutoPin.apk",
-    "notes": "イベント一覧・イベント詳細画面の上部に生じていた余分な空白を削除",
-    "date": "2026-09-22"
+    "version": "1.4.65",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.65/EventAutoPin.apk",
+    "notes": "v1.4.65 release",
+    "date": "2026-09-27"
   }
 }
