@@ -8,6 +8,8 @@ const testCases = [
   ["plugins/withAndroidPlatformCompatibility.test.js"],
   ["lib/circle-expanded-actions.test.js", "runCircleExpandedActionsTests"],
   ["lib/circle-reprocess-lifecycle.test.js", "runCircleReprocessLifecycleTests"],
+  ["lib/crawl/post-reprocess.test.js"],
+  ["lib/crawl/image-downloader.test.js"],
   ["lib/database-core.test.ts", "runDatabaseCoreTests"],
   ["lib/database-filesystem.test.ts"],
   ["lib/database-instrumentation.test.ts"],

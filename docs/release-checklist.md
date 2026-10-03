@@ -38,9 +38,9 @@ node scripts/release_desktop.cjs --resume
 
 既定のPublic checkoutは `('D:' + '\Publish\Event-AutoPin')`。別の既存checkoutを使う場合は `--public-root` を指定し、再開時も同じ値を渡す。この開発側専用スクリプトは公開manifestには含めない。
 
-処理順は、公開済み版も確認したpatch繰り上げ → package.json/package-lock.json/Tauri/Cargo.toml/Cargo.lockの更新と対象限定commit・push → 既存buildスクリプトで型チェック・test・Tauri release build・ルートEXE配置 → manifest検査を伴うPublic同期 → draft ReleaseへのEXE upload・SHA256一致確認・公開 → mobile等を保持したlatest.json.desktop更新・commit・push → strict gate → Public source build CI成功確認。既存assetを上書きしない。新しい公開ソースはmanifestへ明示登録してから実行する。
+処理順は、公開済み版も確認したpatch繰り上げ → package.json/package-lock.json/Tauri/Cargo.toml/Cargo.lockの更新と対象限定commit・push → 既存buildスクリプトで型チェック・test・Tauri release build・ルートEXE配置 → manifest検査を伴うPublic同期 → draft ReleaseへのEXE upload・SHA256一致確認・公開 → mobile等を保持したlatest.json.desktop更新・commit・push → strict gate → リモートのcommit・Release・metadataの確認。GitHub Actions / Public source build CIの完了は待たず、成否や利用可否を完了条件にしない。既存assetを上書きしない。新しい公開ソースはmanifestへ明示登録してから実行する。
 
-進行状況は開発checkoutの `.git/desktop-release-state.json` に保存する。build/upload/metadata/CI失敗は非ゼロ終了とし、公開完了扱いにしない。`--resume` は元の開発HEADとEXEのSHA256を照合し、別ソースや別成果物へのすり替わりを防ぐ。再開前にコード変更が必要になった場合は旧リリースの公開状況を確認し、新版としてやり直す。バージョンcommit前やPublic同期commit直後に失敗して未コミット・未pushが残った場合は、示された差分を確認して整理してから再開する。
+進行状況は開発checkoutの `.git/desktop-release-state.json` に保存する。build/upload/metadataやstrict gateの失敗は公開完了扱いにしない。既存スクリプトには末尾のCI待機処理が残っているため、CI待機に入った場合はそこで終了し、CI待機・失敗・タイムアウトだけを理由に `--resume` しない。スクリプト全体の終了コードだけで判定せず、下記の個別条件とリモート実体を確認する。CI以外の未完了・失敗は解消が必要。`--resume` は元の開発HEADとEXEのSHA256を照合し、別ソースや別成果物へのすり替わりを防ぐ。再開前にコード変更が必要になった場合は旧リリースの公開状況を確認し、新版としてやり直す。バージョンcommit前やPublic同期commit直後に失敗して未コミット・未pushが残った場合は、示された差分を確認して整理してから再開する。
 
 ### 個別の完了条件
 
@@ -50,7 +50,7 @@ node scripts/release_desktop.cjs --resume
 - EXE / installer をビルドし、成果物のパス、version、起動可否を確認する。
 - GitHub Release や配布先へ upload する運用の場合は、tag、asset 名、公開先を確認して upload する。
 - `ttttdiva/Event-AutoPin` の `desktop-v<version>` に `EventAutoPin.exe` が存在し、`latest.json.desktop.version` とURLが同じtag/assetを指すことを確認する。
-- Public sync後、strict gateとPublic source build CIがgreenになるまで完了扱いにしない。
+- Public sync後、strict gateの成功とリモートのcommit・Release asset・metadataの整合性を確認する。ローカルtest / typecheck / lint・必要なUI QAは維持し、Public source build CIの完了・成功は待たない。
 - 生成物を開発リポジトリに残す必要がない場合は、追跡対象に含めない。
 
 ## Report

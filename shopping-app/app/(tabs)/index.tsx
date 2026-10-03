@@ -11,7 +11,6 @@ import {
   Alert,
   Modal,
   Pressable,
-  SafeAreaView,
   StatusBar,
   Platform,
 } from "react-native";
@@ -52,6 +51,7 @@ import { getColors } from "@/constants/Colors";
 import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
 import FontAwesome from "@expo/vector-icons/FontAwesome";
+import { ScreenSafeArea } from "@/components/ScreenSafeArea";
 import EventCard from "@/components/EventCard";
 import {
   beginSqlMetricsScope,
@@ -176,7 +176,9 @@ export default function EventListScreen() {
 
   const [events, setEvents] = useState<EventWithStats[]>([]);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const [hasLoaded, setHasLoaded] = useState(false);
+  const activeListLoadRef = useRef<number | null>(null);
   const [eventSortKey, setEventSortKey] = useState<EventSortKey>("imported");
   const [eventSortDirection, setEventSortDirection] =
     useState<SortDirection>("desc");
@@ -277,17 +279,30 @@ export default function EventListScreen() {
   }, []);
 
   const loadData = useCallback(async () => {
-    const epoch = listLoadEpochGuardRef.current.next();
+    const guard = listLoadEpochGuardRef.current;
+    // Coalesce repeated taps while this request still owns the list. A mutation
+    // or focus change invalidates its epoch so a newer read can start immediately.
+    if (
+      activeListLoadRef.current !== null &&
+      guard.isCurrent(activeListLoadRef.current)
+    ) return;
+    const epoch = guard.next();
+    activeListLoadRef.current = epoch;
     const endSqlMetrics = beginSqlMetricsScope("event-list");
     setLoading(true);
+    setLoadError(false);
     try {
       // イベント件数に比例する N+1 を避け、集約 projection を1 SQLで取得する。
       const summaries = await getEventSummaries();
       if (!listLoadEpochGuardRef.current.isCurrent(epoch)) return;
       setEvents(summaries);
+      setHasLoaded(true);
     } catch (e) {
+      if (!guard.isCurrent(epoch)) return;
+      setLoadError(true);
       console.error("データ読み込みエラー:", e);
     } finally {
+      if (activeListLoadRef.current === epoch) activeListLoadRef.current = null;
       const snapshot = endSqlMetrics();
       recordUiMetric("event-list-sql-count", snapshot.count);
       recordUiMetric("event-list-sql-elapsed-ms", snapshot.elapsedMs);
@@ -310,6 +325,9 @@ export default function EventListScreen() {
   useFocusEffect(
     useCallback(() => {
       void loadData();
+      return () => {
+        listLoadEpochGuardRef.current.next();
+      };
     }, [loadData]),
   );
 
@@ -322,9 +340,7 @@ export default function EventListScreen() {
   }, [loading]);
 
   const onRefresh = useCallback(async () => {
-    setRefreshing(true);
     await loadData();
-    setRefreshing(false);
   }, [loadData]);
 
   async function handleAction(action: string) {
@@ -759,7 +775,7 @@ export default function EventListScreen() {
   ), [effectiveScheme, handleEventPress, handleEventLongPress]);
   if (loading && events.length === 0) {
     return (
-      <SafeAreaView
+      <ScreenSafeArea
         style={[styles.safeArea, { backgroundColor: colors.background }]}
       >
         <View style={styles.center}>
@@ -768,18 +784,37 @@ export default function EventListScreen() {
             読み込み中...
           </Text>
         </View>
-      </SafeAreaView>
+      </ScreenSafeArea>
     );
   }
 
   return (
-    <SafeAreaView
+    <ScreenSafeArea
       style={[styles.safeArea, { backgroundColor: colors.background }]}
     >
       <StatusBar
         barStyle={effectiveScheme === "dark" ? "light-content" : "dark-content"}
       />
       <View style={{ flex: 1 }}>
+        {loadError && (
+          <View style={styles.loadError} accessibilityRole="alert">
+            <Text style={{ color: colors.text }}>イベントを読み込めませんでした</Text>
+            <Text style={{ color: colors.textSecondary }}>
+              {events.length > 0
+                ? "前回読み込んだ一覧を表示しています。"
+                : "データがないとは限りません。再読み込みしてください。"}
+            </Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="イベント一覧を再読み込み"
+              disabled={loading}
+              onPress={() => { void loadData(); }}
+              style={[styles.emptyImportBtn, { backgroundColor: colors.tint }]}
+            >
+              <Text style={styles.emptyImportBtnText}>再読み込み</Text>
+            </Pressable>
+          </View>
+        )}
         <FlatList
           data={sortedEvents}
           keyExtractor={(item) => String(item.id)}
@@ -869,7 +904,7 @@ export default function EventListScreen() {
             </View>
             </>
           }
-          ListEmptyComponent={
+          ListEmptyComponent={hasLoaded && !loading && !loadError ? (
             <View style={styles.emptyContainer}>
               <Text style={[styles.emptyTitle, { color: colors.text }]}>
                 イベントデータがありません
@@ -889,10 +924,10 @@ export default function EventListScreen() {
                 </Text>
               </Pressable>
             </View>
-          }
+          ) : null}
           refreshControl={
             <RefreshControl
-              refreshing={refreshing}
+              refreshing={loading && events.length > 0}
               onRefresh={onRefresh}
               tintColor={colors.tint}
             />
@@ -1368,14 +1403,13 @@ export default function EventListScreen() {
           </View>
         </View>
       )}
-    </SafeAreaView>
+    </ScreenSafeArea>
   );
 }
 
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    paddingTop: Platform.OS === "android" ? StatusBar.currentHeight : 0,
   },
   center: {
     flex: 1,
@@ -1571,6 +1605,11 @@ const styles = StyleSheet.create({
   },
   footerBtnText: {
     fontSize: 11,
+  },
+  loadError: {
+    padding: 16,
+    gap: 10,
+    alignItems: "center",
   },
   emptyContainer: {
     flex: 1,

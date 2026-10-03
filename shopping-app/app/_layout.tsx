@@ -7,7 +7,6 @@ import { useFonts } from "expo-font";
 import { Stack } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { useEffect, useRef } from "react";
-import { Platform, StatusBar } from "react-native";
 import { KeyboardProvider } from "react-native-keyboard-controller";
 import { KeyboardViewport } from "@/components/KeyboardLayout";
 import { EventProvider } from "@/lib/event-context";
@@ -69,9 +68,6 @@ export default function RootLayout() {
 
 function RootLayoutNav() {
   const { effectiveScheme } = useTheme();
-  const eventScreenTopOffset =
-    Platform.OS === "android" ? -(StatusBar.currentHeight ?? 0) : 0;
-
   return (
     <NavThemeProvider
       value={effectiveScheme === "dark" ? DarkTheme : DefaultTheme}
@@ -80,10 +76,7 @@ function RootLayoutNav() {
         <EventProvider>
           <Stack screenOptions={{ headerShown: false }}>
             <Stack.Screen name="(tabs)" />
-            <Stack.Screen
-              name="event/[id]"
-              options={{ contentStyle: { marginTop: eventScreenTopOffset } }}
-            />
+            <Stack.Screen name="event/[id]" />
           </Stack>
         </EventProvider>
       </PriorityColorProvider>

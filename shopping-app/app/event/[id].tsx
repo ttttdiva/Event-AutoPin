@@ -12,14 +12,13 @@ import {
   LayoutAnimation,
   Alert,
   Modal,
-  SafeAreaView,
   StatusBar,
-  Platform,
 } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useFocusEffect } from "@react-navigation/native";
 import { Image } from "expo-image";
 import FontAwesome from "@expo/vector-icons/FontAwesome";
+import { ScreenSafeArea } from "@/components/ScreenSafeArea";
 import { useEvent } from "@/lib/event-context";
 import type { ViewMode } from "@/lib/event-context";
 import {
@@ -1438,7 +1437,7 @@ export default function CircleListScreen() {
 
   if (loading && circles.length === 0) {
     return (
-      <SafeAreaView
+      <ScreenSafeArea
         style={[styles.safeArea, { backgroundColor: colors.background }]}
       >
         <View style={styles.center}>
@@ -1447,7 +1446,7 @@ export default function CircleListScreen() {
             読み込み中...
           </Text>
         </View>
-      </SafeAreaView>
+      </ScreenSafeArea>
     );
   }
 
@@ -1476,7 +1475,7 @@ export default function CircleListScreen() {
   const showList = viewMode === "list" || viewMode === "split";
 
   return (
-    <SafeAreaView
+    <ScreenSafeArea
       style={[styles.safeArea, { backgroundColor: colors.background }]}
     >
       <StatusBar
@@ -2379,7 +2378,7 @@ export default function CircleListScreen() {
         uri={circleCutViewer ?? ""}
         onClose={() => setCircleCutViewer(null)}
       />
-    </SafeAreaView>
+    </ScreenSafeArea>
   );
 
   function renderFilters() {
@@ -2514,7 +2513,6 @@ export default function CircleListScreen() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    paddingTop: Platform.OS === "android" ? StatusBar.currentHeight : 0,
   },
   center: {
     flex: 1,

@@ -83,6 +83,10 @@ echo ===================================
 
 if exist build rmdir /S /Q build
 if exist app\build rmdir /S /Q app\build
+if exist app\build (
+    echo [ERROR] 前回の APK ビルド出力を削除できないため中止します。
+    exit /b 1
+)
 if exist app\.cxx rmdir /S /Q app\.cxx
 call gradlew.bat assembleRelease --no-daemon
 
@@ -95,44 +99,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo.
-cd /d "%~dp0.."
-move /Y "%MOBILE_DIR%\android\app\build\outputs\apk\release\app-release.apk" "%APP_NAME%.apk"
-echo ===================================
-echo  ビルド成功！ APK: %APP_NAME%.apk
-echo ===================================
-
-REM === リリース処理（RELEASE_REPO が設定されている場合のみ） ===
-if "%RELEASE_REPO%"=="" (
-    echo.
-    echo [INFO] RELEASE_REPO が未設定のためリリース処理をスキップ
-    exit /b 0
-)
-
-REM app.json からバージョンを取得し、厳密な X.Y.Z 形式を検証
-set "VERSION="
-for /f "delims=" %%V in ('node -e "process.stdout.write(String(require('./%MOBILE_DIR:\=/%/app.json').expo.version??''))"') do set VERSION=%%V
-
-if not defined VERSION (
-    echo [ERROR] app.json のバージョンが空です
-    exit /b 1
-)
-powershell -NoProfile -Command "if ('%VERSION%' -cnotmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') { exit 1 }"
-if errorlevel 1 (
-    echo [ERROR] app.json のバージョンが不正です: %VERSION%
-    exit /b 1
-)
-
-set "APK_PATH=%CD%\%APP_NAME%.apk"
-set "APK_SHA256="
-for /f "usebackq delims=" %%H in (`powershell -NoProfile -Command "(Get-FileHash -LiteralPath '%APK_PATH%' -Algorithm SHA256).Hash.ToLowerInvariant()"`) do set "APK_SHA256=%%H"
-if not defined APK_SHA256 (
-    echo [ERROR] APK の SHA-256 を計算できませんでした
-    exit /b 1
-)
-
-set "EXPECTED_TAG=mobile-v%VERSION%"
-set "EXPECTED_APK_URL=https://github.com/%RELEASE_REPO%/releases/download/%EXPECTED_TAG%/%APP_NAME%.apk"
-for /f "delims=" %%D in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd"') do set TODAY=%%D
+cd /d "%~dp0.." || exit /b 1
 
 set "VALIDATOR_JS=%TEMP%\event-autopin-release-validator-%RANDOM%-%RANDOM%.js"
 set "LATEST_RESPONSE=%TEMP%\event-autopin-latest-response-%RANDOM%-%RANDOM%.json"
@@ -145,12 +112,58 @@ set "RELEASE_LOOKUP_ERROR=%TEMP%\event-autopin-release-error-%RANDOM%-%RANDOM%.t
 set "PUT_RESPONSE=%TEMP%\event-autopin-put-%RANDOM%-%RANDOM%.json"
 set "POST_RESPONSE=%TEMP%\event-autopin-post-%RANDOM%-%RANDOM%.json"
 
-node -e "const fs=require('fs');const source=fs.readFileSync(process.argv[1],'utf8');const begin='REM __RELEASE_'+'VALIDATOR_JS_BEGIN__';const end='REM __RELEASE_'+'VALIDATOR_JS_END__';const start=source.indexOf(begin);const finish=source.indexOf(end,start);if(start<0||finish<0)process.exit(1);const firstLine=source.indexOf('\n',start);fs.writeFileSync(process.argv[2],source.slice(firstLine+1,finish).replace(/\r\n/g,'\n'),'utf8');" "%~f0" "%VALIDATOR_JS%"
-if errorlevel 1 (
+node -e "const fs=require('fs');const source=fs.readFileSync(process.argv[1],'utf8');const begin='REM __RELEASE_'+'VALIDATOR_JS_BEGIN__';const end='REM __RELEASE_'+'VALIDATOR_JS_END__';const start=source.indexOf(begin);const finish=source.indexOf(end,start);if(start<0||finish<0)process.exit(1);const firstLine=source.indexOf('\n',start);fs.writeFileSync(process.argv[2],source.slice(firstLine+1,finish).replace(/\r\n/g,'\n'),'utf8');" "%~f0" "%VALIDATOR_JS%" || (
     echo [ERROR] failed to extract release validator
     call :cleanup_release_temp
     exit /b 1
 )
+
+REM 生成 APK と版情報を確認し、一時ファイル経由で配置する。失敗時は公開しない。
+node "%VALIDATOR_JS%" stage-apk "%MOBILE_DIR%\android\app\build\outputs\apk\release\app-release.apk" "%APP_NAME%.apk" "%MOBILE_DIR%\app.json" || (
+    echo [ERROR] 生成 APK の検証または配置に失敗したためリリースを中止します。
+    call :cleanup_release_temp
+    exit /b 1
+)
+echo ===================================
+echo  ビルド成功！ APK: %APP_NAME%.apk
+echo ===================================
+
+REM === リリース処理（RELEASE_REPO が設定されている場合のみ） ===
+if "%RELEASE_REPO%"=="" (
+    echo.
+    echo [INFO] RELEASE_REPO が未設定のためリリース処理をスキップ
+    call :cleanup_release_temp
+    exit /b 0
+)
+
+REM app.json からバージョンを取得し、厳密な X.Y.Z 形式を検証
+set "VERSION="
+for /f "delims=" %%V in ('node -e "process.stdout.write(String(require('./%MOBILE_DIR:\=/%/app.json').expo.version??''))"') do set VERSION=%%V
+
+if not defined VERSION (
+    echo [ERROR] app.json のバージョンが空です
+    call :cleanup_release_temp
+    exit /b 1
+)
+powershell -NoProfile -Command "if ('%VERSION%' -cnotmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') { exit 1 }"
+if errorlevel 1 (
+    echo [ERROR] app.json のバージョンが不正です: %VERSION%
+    call :cleanup_release_temp
+    exit /b 1
+)
+
+set "APK_PATH=%CD%\%APP_NAME%.apk"
+set "APK_SHA256="
+for /f "usebackq delims=" %%H in (`powershell -NoProfile -Command "(Get-FileHash -LiteralPath '%APK_PATH%' -Algorithm SHA256).Hash.ToLowerInvariant()"`) do set "APK_SHA256=%%H"
+if not defined APK_SHA256 (
+    echo [ERROR] APK の SHA-256 を計算できませんでした
+    call :cleanup_release_temp
+    exit /b 1
+)
+
+set "EXPECTED_TAG=mobile-v%VERSION%"
+set "EXPECTED_APK_URL=https://github.com/%RELEASE_REPO%/releases/download/%EXPECTED_TAG%/%APP_NAME%.apk"
+for /f "delims=" %%D in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd"') do set TODAY=%%D
 
 echo.
 echo ===================================
@@ -322,6 +335,8 @@ exit /b 0
 
 REM __RELEASE_VALIDATOR_JS_BEGIN__
 const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 
 const REPOSITORY = "ttttdiva/Event-AutoPin";
 const ASSETS = { desktop: "EventAutoPin.exe", mobile: "EventAutoPin.apk" };
@@ -343,6 +358,45 @@ function readJson(path, label) {
     return JSON.parse(fs.readFileSync(path, "utf8"));
   } catch (error) {
     throw new Error(`${label} の JSON が不正です: ${error.message}`);
+  }
+}
+
+function apkDigest(filePath) {
+  const stat = fs.statSync(filePath);
+  assert(stat.isFile() && stat.size > 0, "APK が存在しないか空です");
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
+function stageApk(args) {
+  const [sourcePath, outputPath, configPath] = args;
+  const source = path.resolve(sourcePath);
+  const output = path.resolve(outputPath);
+  assert(source !== output, "生成 APK と配置先は別のパスである必要があります");
+  const config = readJson(configPath, "app.json");
+  const expo = config.expo;
+  assert(isRecord(expo) && typeof expo.version === "string" && VERSION_RE.test(expo.version), "app.json のバージョンが不正です");
+  assert(isRecord(expo.android) && typeof expo.android.package === "string" && expo.android.package.length > 0, "app.json の Android package が不正です");
+  assert(Number.isSafeInteger(expo.android.versionCode) && expo.android.versionCode > 0, "app.json の versionCode が不正です");
+
+  // 同じ clean build から生成された Gradle metadata と app.json を照合する。
+  const metadata = readJson(path.join(path.dirname(source), "output-metadata.json"), "APK output metadata");
+  assert(isRecord(metadata) && isRecord(metadata.artifactType) && metadata.artifactType.type === "APK", "APK output metadata の種別が不正です");
+  assert(metadata.variantName === "release" && metadata.applicationId === expo.android.package, "生成 APK の variant/package が一致しません");
+  assert(Array.isArray(metadata.elements) && metadata.elements.length === 1, "生成 APK を一意に特定できません");
+  const artifact = metadata.elements[0];
+  assert(isRecord(artifact) && artifact.outputFile === path.basename(source), "生成 APK のファイル名が一致しません");
+  assert(artifact.versionName === expo.version && artifact.versionCode === expo.android.versionCode, "生成 APK の version/versionCode が app.json と一致しません");
+
+  const expectedDigest = apkDigest(source);
+  const stagingDirectory = fs.mkdtempSync(path.join(path.dirname(output), `.${path.basename(output)}-stage-`));
+  try {
+    const staged = path.join(stagingDirectory, path.basename(output));
+    fs.copyFileSync(source, staged, fs.constants.COPYFILE_EXCL);
+    assert(apkDigest(staged) === expectedDigest, "配置前の APK ハッシュが生成 APK と一致しません");
+    fs.renameSync(staged, output);
+    assert(apkDigest(output) === expectedDigest, "配置後の APK ハッシュが生成 APK と一致しません");
+  } finally {
+    fs.rmSync(stagingDirectory, { recursive: true, force: true });
   }
 }
 
@@ -457,7 +511,8 @@ function verifyPost(args) {
 
 try {
   const [command, ...args] = process.argv.slice(2);
-  if (command === "prepare-latest") prepareLatest(args);
+  if (command === "stage-apk") stageApk(args);
+  else if (command === "prepare-latest") prepareLatest(args);
   else if (command === "validate-release") validateRelease(args);
   else if (command === "put-sha") readPutSha(args[0]);
   else if (command === "verify-post") verifyPost(args);

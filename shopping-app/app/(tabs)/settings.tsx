@@ -10,6 +10,7 @@ import {
   ActivityIndicator,
 } from "react-native";
 import FontAwesome from "@expo/vector-icons/FontAwesome";
+import { ScreenSafeArea } from "@/components/ScreenSafeArea";
 import { useTheme, type ThemeMode } from "@/lib/theme-context";
 import { getColors } from "@/constants/Colors";
 import { usePriorityColors } from "@/lib/priority-color-context";
@@ -362,423 +363,427 @@ export default function SettingsScreen() {
   );
 
   return (
-    <InputScrollView
+    <ScreenSafeArea
       style={[styles.container, { backgroundColor: colors.background }]}
-      contentContainerStyle={styles.content}
     >
-      <Text style={[styles.h1, { color: colors.text }]}>設定</Text>
-
-      {/* テーマ */}
-      <Text style={[styles.sectionTitle, { color: colors.text }]}>
-        テーマ
-      </Text>
-      <View style={styles.themeRow}>
-        {renderThemeButton("light", "ライト")}
-        {renderThemeButton("dark", "ダーク")}
-        {renderThemeButton("auto", "システム")}
-      </View>
-
-      <Text style={[styles.sectionTitle, { color: colors.text }]}>
-        優先度カラー
-      </Text>
-      <View
-        style={[
-          styles.card,
-          { backgroundColor: colors.card, borderColor: colors.border },
-        ]}
+      <InputScrollView
+        style={styles.container}
+        contentContainerStyle={styles.content}
       >
-        {priorityOptions.map((option) => (
-          <View key={option.value} style={styles.priorityColorRow}>
-            <View
-              style={[
-                styles.priorityColorSwatch,
-                { backgroundColor: option.color },
-              ]}
-            />
-            <Text style={[styles.priorityColorLabel, { color: colors.text }]}>
-              {option.label}
-            </Text>
-            <TextInput
-              style={[
-                styles.priorityColorInput,
-                {
-                  color: colors.text,
-                  borderColor: colors.border,
-                  backgroundColor: colors.inputBackground,
-                },
-              ]}
-              value={priorityColorInputs[option.value] ?? option.color}
-              onChangeText={(text) =>
-                setPriorityColorInputs((prev) => ({
-                  ...prev,
-                  [option.value]: text,
-                }))
-              }
-              autoCapitalize="none"
-              autoCorrect={false}
-              placeholder="#ff6600"
-              placeholderTextColor={colors.textSecondary}
-            />
-            <TouchableOpacity
-              style={[styles.priorityColorSave, { borderColor: colors.tint }]}
-              onPress={() => handleSavePriorityColor(option.value)}
-            >
-              <FontAwesome name="check" size={14} color={colors.tint} />
-            </TouchableOpacity>
-          </View>
-        ))}
-        <TouchableOpacity
-          style={[styles.resetBtn, { borderColor: colors.border }]}
-          onPress={handleResetPriorityColors}
+        <Text style={[styles.h1, { color: colors.text }]}>設定</Text>
+
+        {/* テーマ */}
+        <Text style={[styles.sectionTitle, { color: colors.text }]}>
+          テーマ
+        </Text>
+        <View style={styles.themeRow}>
+          {renderThemeButton("light", "ライト")}
+          {renderThemeButton("dark", "ダーク")}
+          {renderThemeButton("auto", "システム")}
+        </View>
+
+        <Text style={[styles.sectionTitle, { color: colors.text }]}>
+          優先度カラー
+        </Text>
+        <View
+          style={[
+            styles.card,
+            { backgroundColor: colors.card, borderColor: colors.border },
+          ]}
         >
-          <Text style={[styles.resetBtnText, { color: colors.textSecondary }]}>
-            初期値に戻す
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* APIキー */}
-      <Text style={[styles.sectionTitle, { color: colors.text }]}>
-        APIキー
-      </Text>
-      <Text style={[styles.description, { color: colors.textSecondary }]}>
-        クロール機能でAI解析を行うために必要です。端末内に暗号化保存されます。
-      </Text>
-
-      {PROVIDERS.map((p) => {
-        const value = apiKeys[p.id];
-        const masked = keyMasked[p.id];
-        return (
-          <View
-            key={p.id}
-            style={[
-              styles.card,
-              { backgroundColor: colors.card, borderColor: colors.border },
-            ]}
-          >
-            <Text style={[styles.label, { color: colors.text }]}>
-              {p.label}
-            </Text>
-            <View style={styles.inputRow}>
+          {priorityOptions.map((option) => (
+            <View key={option.value} style={styles.priorityColorRow}>
+              <View
+                style={[
+                  styles.priorityColorSwatch,
+                  { backgroundColor: option.color },
+                ]}
+              />
+              <Text style={[styles.priorityColorLabel, { color: colors.text }]}>
+                {option.label}
+              </Text>
               <TextInput
                 style={[
-                  styles.input,
+                  styles.priorityColorInput,
                   {
                     color: colors.text,
-                    backgroundColor: colors.inputBackground,
                     borderColor: colors.border,
+                    backgroundColor: colors.inputBackground,
                   },
                 ]}
-                placeholder={p.placeholder}
-                placeholderTextColor={colors.textSecondary}
-                value={value}
-                secureTextEntry={masked}
+                value={priorityColorInputs[option.value] ?? option.color}
+                onChangeText={(text) =>
+                  setPriorityColorInputs((prev) => ({
+                    ...prev,
+                    [option.value]: text,
+                  }))
+                }
                 autoCapitalize="none"
                 autoCorrect={false}
-                onChangeText={(t) =>
-                  setApiKeys((prev) => ({ ...prev, [p.id]: t }))
-                }
+                placeholder="#ff6600"
+                placeholderTextColor={colors.textSecondary}
               />
               <TouchableOpacity
-                onPress={() =>
-                  setKeyMasked((prev) => ({ ...prev, [p.id]: !prev[p.id] }))
-                }
-                style={styles.eyeBtn}
+                style={[styles.priorityColorSave, { borderColor: colors.tint }]}
+                onPress={() => handleSavePriorityColor(option.value)}
               >
-                <FontAwesome
-                  name={masked ? "eye" : "eye-slash"}
-                  size={18}
-                  color={colors.textSecondary}
-                />
+                <FontAwesome name="check" size={14} color={colors.tint} />
               </TouchableOpacity>
             </View>
-            <Text style={[styles.maskedText, { color: colors.textSecondary }]}>
-              保存済み: {maskApiKey(value || null)}
+          ))}
+          <TouchableOpacity
+            style={[styles.resetBtn, { borderColor: colors.border }]}
+            onPress={handleResetPriorityColors}
+          >
+            <Text style={[styles.resetBtnText, { color: colors.textSecondary }]}>
+              初期値に戻す
             </Text>
-            <View style={styles.btnRow}>
-              <TouchableOpacity
-                style={[styles.btn, { backgroundColor: colors.tint }]}
-                onPress={() => handleSaveKey(p.id)}
-              >
-                <Text style={styles.btnText}>保存</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[
-                  styles.btn,
-                  {
-                    backgroundColor: colors.card,
-                    borderWidth: 1,
-                    borderColor: colors.tint,
-                  },
-                ]}
-                onPress={() => handleTestKey(p)}
-                disabled={testing === p.id}
-              >
-                {testing === p.id ? (
-                  <ActivityIndicator size="small" color={colors.tint} />
-                ) : (
-                  <Text style={[styles.btnText, { color: colors.tint }]}>
-                    接続テスト
-                  </Text>
-                )}
-              </TouchableOpacity>
+          </TouchableOpacity>
+        </View>
+
+        {/* APIキー */}
+        <Text style={[styles.sectionTitle, { color: colors.text }]}>
+          APIキー
+        </Text>
+        <Text style={[styles.description, { color: colors.textSecondary }]}>
+          クロール機能でAI解析を行うために必要です。端末内に暗号化保存されます。
+        </Text>
+
+        {PROVIDERS.map((p) => {
+          const value = apiKeys[p.id];
+          const masked = keyMasked[p.id];
+          return (
+            <View
+              key={p.id}
+              style={[
+                styles.card,
+                { backgroundColor: colors.card, borderColor: colors.border },
+              ]}
+            >
+              <Text style={[styles.label, { color: colors.text }]}>
+                {p.label}
+              </Text>
+              <View style={styles.inputRow}>
+                <TextInput
+                  style={[
+                    styles.input,
+                    {
+                      color: colors.text,
+                      backgroundColor: colors.inputBackground,
+                      borderColor: colors.border,
+                    },
+                  ]}
+                  placeholder={p.placeholder}
+                  placeholderTextColor={colors.textSecondary}
+                  value={value}
+                  secureTextEntry={masked}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  onChangeText={(t) =>
+                    setApiKeys((prev) => ({ ...prev, [p.id]: t }))
+                  }
+                />
+                <TouchableOpacity
+                  onPress={() =>
+                    setKeyMasked((prev) => ({ ...prev, [p.id]: !prev[p.id] }))
+                  }
+                  style={styles.eyeBtn}
+                >
+                  <FontAwesome
+                    name={masked ? "eye" : "eye-slash"}
+                    size={18}
+                    color={colors.textSecondary}
+                  />
+                </TouchableOpacity>
+              </View>
+              <Text style={[styles.maskedText, { color: colors.textSecondary }]}>
+                保存済み: {maskApiKey(value || null)}
+              </Text>
+              <View style={styles.btnRow}>
+                <TouchableOpacity
+                  style={[styles.btn, { backgroundColor: colors.tint }]}
+                  onPress={() => handleSaveKey(p.id)}
+                >
+                  <Text style={styles.btnText}>保存</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[
+                    styles.btn,
+                    {
+                      backgroundColor: colors.card,
+                      borderWidth: 1,
+                      borderColor: colors.tint,
+                    },
+                  ]}
+                  onPress={() => handleTestKey(p)}
+                  disabled={testing === p.id}
+                >
+                  {testing === p.id ? (
+                    <ActivityIndicator size="small" color={colors.tint} />
+                  ) : (
+                    <Text style={[styles.btnText, { color: colors.tint }]}>
+                      接続テスト
+                    </Text>
+                  )}
+                </TouchableOpacity>
+              </View>
             </View>
-          </View>
-        );
-      })}
+          );
+        })}
 
-      {/* モデル選択 */}
-      <Text style={[styles.sectionTitle, { color: colors.text }]}>
-        LLMモデル
-      </Text>
-      {renderModelRow(
-        "メインモデル",
-        "クロール時の第一選択。デフォルトは Gemini 3 Flash",
-        primary,
-        "primary",
-      )}
-      {renderModelRow(
-        "フォールバックモデル",
-        "メインが失敗した時に自動で切り替え",
-        fallback,
-        "fallback",
-      )}
-      {renderModelRow(
-        "画像解析モデル",
-        "サークルカットの画像解析（ジャンル判定等）",
-        vision,
-        "vision",
-      )}
-      {renderModelRow(
-        "サイト解析モデル",
-        "未知サイトのパターン推測（高性能モデル推奨）",
-        siteParsing,
-        "siteParsing",
-      )}
-      {renderEffortRow(
-        "テキスト処理effort",
-        "OpenAI APIモデル利用時の推論量",
-        textEffort,
-        "text",
-      )}
-      {renderEffortRow(
-        "画像解析effort",
-        "OpenAI APIで画像解析する場合の推論量",
-        visionEffort,
-        "vision",
-      )}
-      {renderEffortRow(
-        "サイト解析effort",
-        "未知サイト抽出でOpenAI APIを使う場合の推論量",
-        siteParsingEffort,
-        "siteParsing",
-      )}
+        {/* モデル選択 */}
+        <Text style={[styles.sectionTitle, { color: colors.text }]}>
+          LLMモデル
+        </Text>
+        {renderModelRow(
+          "メインモデル",
+          "クロール時の第一選択。デフォルトは Gemini 3 Flash",
+          primary,
+          "primary",
+        )}
+        {renderModelRow(
+          "フォールバックモデル",
+          "メインが失敗した時に自動で切り替え",
+          fallback,
+          "fallback",
+        )}
+        {renderModelRow(
+          "画像解析モデル",
+          "サークルカットの画像解析（ジャンル判定等）",
+          vision,
+          "vision",
+        )}
+        {renderModelRow(
+          "サイト解析モデル",
+          "未知サイトのパターン推測（高性能モデル推奨）",
+          siteParsing,
+          "siteParsing",
+        )}
+        {renderEffortRow(
+          "テキスト処理effort",
+          "OpenAI APIモデル利用時の推論量",
+          textEffort,
+          "text",
+        )}
+        {renderEffortRow(
+          "画像解析effort",
+          "OpenAI APIで画像解析する場合の推論量",
+          visionEffort,
+          "vision",
+        )}
+        {renderEffortRow(
+          "サイト解析effort",
+          "未知サイト抽出でOpenAI APIを使う場合の推論量",
+          siteParsingEffort,
+          "siteParsing",
+        )}
 
-      {/* 機能フラグ */}
-      <Text style={[styles.sectionTitle, { color: colors.text }]}>
-        機能
-      </Text>
-      <TouchableOpacity
-        style={[
-          styles.toggleRow,
-          { backgroundColor: colors.card, borderColor: colors.border },
-        ]}
-        onPress={async () => {
-          const next = !globalSearchEnabled;
-          setGlobalSearchEnabledState(next);
-          await setGlobalSearchEnabled(next);
-        }}
-      >
-        <View style={{ flex: 1 }}>
-          <Text style={[styles.modelTitle, { color: colors.text }]}>
-            全体検索をON
-          </Text>
-          <Text style={[styles.modelDesc, { color: colors.textSecondary }]}>
-            サークル名・ペンネーム・アイテム名・メモを検索
-          </Text>
-        </View>
-        <FontAwesome
-          name={globalSearchEnabled ? "toggle-on" : "toggle-off"}
-          size={32}
-          color={globalSearchEnabled ? colors.tint : colors.textSecondary}
-        />
-      </TouchableOpacity>
-
-      <TouchableOpacity
-        style={[
-          styles.toggleRow,
-          { backgroundColor: colors.card, borderColor: colors.border },
-        ]}
-        onPress={async () => {
-          const next = !visionEnabled;
-          setVisionEnabledState(next);
-          await setVisionAnalysisEnabled(next);
-        }}
-      >
-        <View style={{ flex: 1 }}>
-          <Text style={[styles.modelTitle, { color: colors.text }]}>
-            画像解析を有効化
-          </Text>
-          <Text style={[styles.modelDesc, { color: colors.textSecondary }]}>
-            サークルカットからジャンル情報を推定
-          </Text>
-        </View>
-        <FontAwesome
-          name={visionEnabled ? "toggle-on" : "toggle-off"}
-          size={32}
-          color={visionEnabled ? colors.tint : colors.textSecondary}
-        />
-      </TouchableOpacity>
-
-      <TouchableOpacity
-        style={[
-          styles.toggleRow,
-          { backgroundColor: colors.card, borderColor: colors.border },
-        ]}
-        onPress={async () => {
-          const next = !grokEnabled;
-          setGrokEnabledState(next);
-          await setGrokEnabled(next);
-        }}
-      >
-        <View style={{ flex: 1 }}>
-          <Text style={[styles.modelTitle, { color: colors.text }]}>
-            Grok（X）おしながき取得を有効化
-          </Text>
-          <Text style={[styles.modelDesc, { color: colors.textSecondary }]}>
-            xAI APIでXのおしながき投稿を検索
-          </Text>
-        </View>
-        <FontAwesome
-          name={grokEnabled ? "toggle-on" : "toggle-off"}
-          size={32}
-          color={grokEnabled ? colors.tint : colors.textSecondary}
-        />
-      </TouchableOpacity>
-
-      {/* バージョン */}
-      <Text style={[styles.sectionTitle, { color: colors.text }]}>
-        アプリ情報
-      </Text>
-      <View
-        style={[
-          styles.card,
-          { backgroundColor: colors.card, borderColor: colors.border },
-        ]}
-      >
-        <Text style={[styles.label, { color: colors.text }]}>
-          バージョン: v{getCurrentVersion()}
+        {/* 機能フラグ */}
+        <Text style={[styles.sectionTitle, { color: colors.text }]}>
+          機能
         </Text>
         <TouchableOpacity
           style={[
-            styles.btn,
-            { backgroundColor: colors.tint, marginTop: 12 },
+            styles.toggleRow,
+            { backgroundColor: colors.card, borderColor: colors.border },
           ]}
-          onPress={handleCheckUpdate}
+          onPress={async () => {
+            const next = !globalSearchEnabled;
+            setGlobalSearchEnabledState(next);
+            await setGlobalSearchEnabled(next);
+          }}
         >
-          <Text style={styles.btnText}>更新を確認</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.modelTitle, { color: colors.text }]}>
+              全体検索をON
+            </Text>
+            <Text style={[styles.modelDesc, { color: colors.textSecondary }]}>
+              サークル名・ペンネーム・アイテム名・メモを検索
+            </Text>
+          </View>
+          <FontAwesome
+            name={globalSearchEnabled ? "toggle-on" : "toggle-off"}
+            size={32}
+            color={globalSearchEnabled ? colors.tint : colors.textSecondary}
+          />
         </TouchableOpacity>
-      </View>
 
-      <View style={{ height: 40 }} />
+        <TouchableOpacity
+          style={[
+            styles.toggleRow,
+            { backgroundColor: colors.card, borderColor: colors.border },
+          ]}
+          onPress={async () => {
+            const next = !visionEnabled;
+            setVisionEnabledState(next);
+            await setVisionAnalysisEnabled(next);
+          }}
+        >
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.modelTitle, { color: colors.text }]}>
+              画像解析を有効化
+            </Text>
+            <Text style={[styles.modelDesc, { color: colors.textSecondary }]}>
+              サークルカットからジャンル情報を推定
+            </Text>
+          </View>
+          <FontAwesome
+            name={visionEnabled ? "toggle-on" : "toggle-off"}
+            size={32}
+            color={visionEnabled ? colors.tint : colors.textSecondary}
+          />
+        </TouchableOpacity>
 
-      {/* モデルピッカー（インラインモーダル相当） */}
-      {modelPickerFor && (
+        <TouchableOpacity
+          style={[
+            styles.toggleRow,
+            { backgroundColor: colors.card, borderColor: colors.border },
+          ]}
+          onPress={async () => {
+            const next = !grokEnabled;
+            setGrokEnabledState(next);
+            await setGrokEnabled(next);
+          }}
+        >
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.modelTitle, { color: colors.text }]}>
+              Grok（X）おしながき取得を有効化
+            </Text>
+            <Text style={[styles.modelDesc, { color: colors.textSecondary }]}>
+              xAI APIでXのおしながき投稿を検索
+            </Text>
+          </View>
+          <FontAwesome
+            name={grokEnabled ? "toggle-on" : "toggle-off"}
+            size={32}
+            color={grokEnabled ? colors.tint : colors.textSecondary}
+          />
+        </TouchableOpacity>
+
+        {/* バージョン */}
+        <Text style={[styles.sectionTitle, { color: colors.text }]}>
+          アプリ情報
+        </Text>
         <View
           style={[
-            styles.pickerOverlay,
-            { backgroundColor: effectiveScheme === "dark" ? "#000a" : "#0006" },
+            styles.card,
+            { backgroundColor: colors.card, borderColor: colors.border },
           ]}
         >
-          <View
+          <Text style={[styles.label, { color: colors.text }]}>
+            バージョン: v{getCurrentVersion()}
+          </Text>
+          <TouchableOpacity
             style={[
-              styles.pickerBox,
-              { backgroundColor: colors.card, borderColor: colors.border },
+              styles.btn,
+              { backgroundColor: colors.tint, marginTop: 12 },
             ]}
+            onPress={handleCheckUpdate}
           >
-            <Text style={[styles.pickerTitle, { color: colors.text }]}>
-              モデルを選択
-            </Text>
-            {AVAILABLE_MODELS.filter((m) =>
-              modelPickerFor === "vision" ? m.vision : true,
-            ).map((m) => (
-              <TouchableOpacity
-                key={m.id}
-                style={[
-                  styles.pickerItem,
-                  { borderBottomColor: colors.border },
-                ]}
-                onPress={() => onPickModel(modelPickerFor, m.id)}
-              >
-                <Text style={{ color: colors.text, fontSize: 15 }}>
-                  {m.label}
-                </Text>
-                <Text
-                  style={{ color: colors.textSecondary, fontSize: 12 }}
-                >
-                  {m.id} ({m.provider})
-                </Text>
-              </TouchableOpacity>
-            ))}
-            <TouchableOpacity
-              style={[styles.btn, { backgroundColor: colors.border }]}
-              onPress={() => setModelPickerFor(null)}
-            >
-              <Text style={[styles.btnText, { color: colors.text }]}>
-                キャンセル
-              </Text>
-            </TouchableOpacity>
-          </View>
+            <Text style={styles.btnText}>更新を確認</Text>
+          </TouchableOpacity>
         </View>
-      )}
 
-      {effortPickerFor && (
-        <View
-          style={[
-            styles.pickerOverlay,
-            { backgroundColor: effectiveScheme === "dark" ? "#000a" : "#0006" },
-          ]}
-        >
+        <View style={{ height: 40 }} />
+
+        {/* モデルピッカー（インラインモーダル相当） */}
+        {modelPickerFor && (
           <View
             style={[
-              styles.pickerBox,
-              { backgroundColor: colors.card, borderColor: colors.border },
+              styles.pickerOverlay,
+              { backgroundColor: effectiveScheme === "dark" ? "#000a" : "#0006" },
             ]}
           >
-            <Text style={[styles.pickerTitle, { color: colors.text }]}>
-              effortを選択
-            </Text>
-            {REASONING_EFFORT_OPTIONS.map((effort) => (
-              <TouchableOpacity
-                key={effort.id}
-                style={[
-                  styles.pickerItem,
-                  { borderBottomColor: colors.border },
-                ]}
-                onPress={() => onPickEffort(effortPickerFor, effort.id)}
-              >
-                <Text style={{ color: colors.text, fontSize: 15 }}>
-                  {effort.label}
-                </Text>
-                <Text
-                  style={{ color: colors.textSecondary, fontSize: 12 }}
+            <View
+              style={[
+                styles.pickerBox,
+                { backgroundColor: colors.card, borderColor: colors.border },
+              ]}
+            >
+              <Text style={[styles.pickerTitle, { color: colors.text }]}>
+                モデルを選択
+              </Text>
+              {AVAILABLE_MODELS.filter((m) =>
+                modelPickerFor === "vision" ? m.vision : true,
+              ).map((m) => (
+                <TouchableOpacity
+                  key={m.id}
+                  style={[
+                    styles.pickerItem,
+                    { borderBottomColor: colors.border },
+                  ]}
+                  onPress={() => onPickModel(modelPickerFor, m.id)}
                 >
-                  {effort.description}
+                  <Text style={{ color: colors.text, fontSize: 15 }}>
+                    {m.label}
+                  </Text>
+                  <Text
+                    style={{ color: colors.textSecondary, fontSize: 12 }}
+                  >
+                    {m.id} ({m.provider})
+                  </Text>
+                </TouchableOpacity>
+              ))}
+              <TouchableOpacity
+                style={[styles.btn, { backgroundColor: colors.border }]}
+                onPress={() => setModelPickerFor(null)}
+              >
+                <Text style={[styles.btnText, { color: colors.text }]}>
+                  キャンセル
                 </Text>
               </TouchableOpacity>
-            ))}
-            <TouchableOpacity
-              style={[styles.btn, { backgroundColor: colors.border }]}
-              onPress={() => setEffortPickerFor(null)}
-            >
-              <Text style={[styles.btnText, { color: colors.text }]}>
-                キャンセル
-              </Text>
-            </TouchableOpacity>
+            </View>
           </View>
-        </View>
-      )}
-    </InputScrollView>
+        )}
+
+        {effortPickerFor && (
+          <View
+            style={[
+              styles.pickerOverlay,
+              { backgroundColor: effectiveScheme === "dark" ? "#000a" : "#0006" },
+            ]}
+          >
+            <View
+              style={[
+                styles.pickerBox,
+                { backgroundColor: colors.card, borderColor: colors.border },
+              ]}
+            >
+              <Text style={[styles.pickerTitle, { color: colors.text }]}>
+                effortを選択
+              </Text>
+              {REASONING_EFFORT_OPTIONS.map((effort) => (
+                <TouchableOpacity
+                  key={effort.id}
+                  style={[
+                    styles.pickerItem,
+                    { borderBottomColor: colors.border },
+                  ]}
+                  onPress={() => onPickEffort(effortPickerFor, effort.id)}
+                >
+                  <Text style={{ color: colors.text, fontSize: 15 }}>
+                    {effort.label}
+                  </Text>
+                  <Text
+                    style={{ color: colors.textSecondary, fontSize: 12 }}
+                  >
+                    {effort.description}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+              <TouchableOpacity
+                style={[styles.btn, { backgroundColor: colors.border }]}
+                onPress={() => setEffortPickerFor(null)}
+              >
+                <Text style={[styles.btnText, { color: colors.text }]}>
+                  キャンセル
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+      </InputScrollView>
+    </ScreenSafeArea>
   );
 }
 

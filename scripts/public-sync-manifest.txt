@@ -120,6 +120,7 @@ shopping-app/components/EventCard.tsx
 shopping-app/components/ImageViewer.tsx
 shopping-app/components/MapBottomSheet.tsx
 shopping-app/components/MapView.tsx
+shopping-app/components/ScreenSafeArea.tsx
 shopping-app/components/Themed.tsx
 shopping-app/components/useColorScheme.ts
 shopping-app/components/useColorScheme.web.ts
@@ -132,9 +133,11 @@ shopping-app/lib/crawl/adapters/generic.ts
 shopping-app/lib/crawl/adapters/picrea.ts
 shopping-app/lib/crawl/html-fetcher.ts
 shopping-app/lib/crawl/image-downloader.ts
+shopping-app/lib/crawl/image-downloader.test.js
 shopping-app/lib/crawl/llm-client.ts
 shopping-app/lib/crawl/pipeline.ts
 shopping-app/lib/crawl/post-reprocess.ts
+shopping-app/lib/crawl/post-reprocess.test.js
 shopping-app/lib/crawl/site-schema-store.ts
 shopping-app/lib/crawl/twitter-grok.ts
 shopping-app/lib/crawl/types.ts

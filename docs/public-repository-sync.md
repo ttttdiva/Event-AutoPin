@@ -72,9 +72,9 @@ Private側 `.github/workflows/private-public-sync.yml` は最小権限 `contents
 
 `.github/workflows/public-source-build.yml` はPrivate sourceをcheckoutせず、Public repositoryだけを匿名取得します。Private secretを環境変数へ渡さず、PublicのPythonについてrequirements install、dependency closure、compile、公開manifest内のpytest suiteを実行します。Private側だけに保持するcanonical OCR reference reportを直接読む1 assertionだけはnode IDで明示除外し、それ以外の公開Python testsを実行します。desktopについてTypeScript/test/Vite/Tauri debug buildを、shopping appについてTypeScript/test/Expo prebuild/Gradle debug APK buildを行います。どちらのworkflowもSHA固定action、最小permissions、concurrency cancelを使用し、commit・push・Release upload・metadata更新は行いません。
 
-`.github/` は公開同期scriptの保護対象なので、manifest同期ではPublic側workflowを新規作成・更新できません。初回導入時とworkflow変更時は、Private側の `.github/workflows/public-source-build.yml` だけを内容review後にPublic checkoutへ別作業・別commitでcopyし、Public側の差分とGitHub Actions実行結果を確認してください。`.github/` をmanifest管理可能に変更する、Public workflowからPrivate repositoryをcheckoutする、またはPrivate用credential/secretsをPublic workflowへ設定・受け渡す方法で自動化してはいけません。Public側でこのworkflowがinstall済みであることは、source同期完了とは別の運用ゲートとして確認します。
+`.github/` は公開同期scriptの保護対象なので、manifest同期ではPublic側workflowを新規作成・更新できません。初回導入時とworkflow変更時は、Private側の `.github/workflows/public-source-build.yml` だけを内容review後にPublic checkoutへ別作業・別commitでcopyし、Public側の差分とリモート反映を確認してください。GitHub Actionsの完了は待たず、成功を完了条件にしません。`.github/` をmanifest管理可能に変更する、Public workflowからPrivate repositoryをcheckoutする、またはPrivate用credential/secretsをPublic workflowへ設定・受け渡す方法で自動化してはいけません。Public側でこのworkflowがinstall済みであることは、source同期完了とは別の運用ゲートとして確認します。
 
-desktop sourceが変わったのにversion、Release asset、`latest.json`、またはPublic syncが古い場合、strict gateは意図的に失敗します。先にrelease checklistを完了させてからgreenに戻してください。
+desktop sourceが変わったのにversion、Release asset、`latest.json`、またはPublic syncが古い場合、strict gateは意図的に失敗します。先にrelease checklistのローカル検証・配布整合性確認を完了し、strict gateを成功させてください。CIのgreenは待ちません。
 
 ## テスト
 

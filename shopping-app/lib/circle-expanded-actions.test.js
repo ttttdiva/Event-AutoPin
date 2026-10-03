@@ -140,6 +140,14 @@ async function runCircleExpandedActionsTests() {
     await new Promise((resolve) => setImmediate(resolve));
     tree = render();
     const modalOf = (value) => find(value, (node) => node.type === "InputModal")[0];
+    const reprocessNotice = textOf(modalOf(tree));
+    for (const rule of [
+      "取得できた頒布物・お品書き画像だけを更新します",
+      "同名・同種別の頒布物の購入状態と説明は引き継ぎます",
+      "取得結果にない頒布物は更新後の一覧から除かれます",
+      "失敗時や何も取得できなかった場合は既存データを保持します",
+    ]) assert.ok(reprocessNotice.includes(rule), `再処理の説明に「${rule}」を含めること`);
+    assert.doesNotMatch(reprocessNotice, /既存の頒布物・画像は削除されます/, "無条件に削除されると案内しないこと");
     assert.equal(modalOf(tree).props.visible, false, "通常の展開では再処理モーダルを開かないこと");
     const inline = tree.props.children.filter((node) => node?.type !== "InputModal" && node?.type !== "ImageViewer");
     const labels = find(inline, (node) => node.type === "Pressable").map((node) => textOf(node).trim());

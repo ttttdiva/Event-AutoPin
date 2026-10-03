@@ -971,7 +971,7 @@ export default function CircleExpandedDetail({
               style={[styles.reprocessDesc, { color: colors.textSecondary }]}
             >
               「{circle.name}
-              」の頒布物・お品書き画像を、指定したXポストで置き換えます。既存の頒布物・画像は削除されます。
+              」について、指定したXポストから取得できた頒布物・お品書き画像だけを更新します。同名・同種別の頒布物の購入状態と説明は引き継ぎます。頒布物を取得できた場合、取得結果にない頒布物は更新後の一覧から除かれます。失敗時や何も取得できなかった場合は既存データを保持します。
             </Text>
             <TextInput
               style={[

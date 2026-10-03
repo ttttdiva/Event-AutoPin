@@ -76,7 +76,7 @@ async function runCircleReprocessLifecycleTests() {
       Platform: { OS: "android", select: (choices) => choices.android ?? choices.default },
       useWindowDimensions: () => ({ width: 412, height: 915, scale: 1, fontScale: 1 }),
     },
-    "react-native-safe-area-context": { useSafeAreaInsets: () => ({ top: 24, bottom: 24, left: 0, right: 0 }) },
+    "react-native-safe-area-context": { SafeAreaView: "SafeAreaView", useSafeAreaInsets: () => ({ top: 24, bottom: 24, left: 0, right: 0 }) },
     "expo-router": { useLocalSearchParams: () => ({ id: "21" }), useRouter: () => ({ back() {} }) },
     "@react-navigation/native": { useFocusEffect: (effect) => React.useEffect(effect, [effect]) },
     "expo-image": { Image: "Image" },

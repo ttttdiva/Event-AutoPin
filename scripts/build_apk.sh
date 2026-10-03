@@ -131,42 +131,11 @@ echo " APK ローカルビルド開始"
 echo "==================================="
 
 rm -rf build app/build app/.cxx
+if [ -d app/build ]; then
+    echo "[ERROR] 前回の APK ビルド出力を削除できないため中止します。"
+    exit 1
+fi
 ./gradlew assembleRelease --no-daemon
-
-cp app/build/outputs/apk/release/app-release.apk "$PROJECT_ROOT/$APP_NAME.apk"
-
-echo ""
-echo "==================================="
-echo " ビルド成功！ APK: $APP_NAME.apk"
-echo "==================================="
-
-cd "$PROJECT_ROOT"
-
-# === リリース処理（RELEASE_REPO が設定されている場合のみ） ===
-if [ -z "$RELEASE_REPO" ]; then
-    echo ""
-    echo "[INFO] RELEASE_REPO が未設定のためリリース処理をスキップ"
-    exit 0
-fi
-
-# app.json からバージョンを取得
-VERSION=$(node -e "console.log(require('./$MOBILE_DIR/app.json').expo.version)")
-
-if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-    echo "[ERROR] app.json のバージョンが不正です: ${VERSION}"
-    exit 1
-fi
-
-APK_PATH="$PROJECT_ROOT/$APP_NAME.apk"
-APK_SHA256=$(sha256sum "$APK_PATH" | awk '{print tolower($1)}')
-if ! [[ "$APK_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
-    echo "[ERROR] APK の SHA-256 を計算できませんでした"
-    exit 1
-fi
-
-EXPECTED_TAG="mobile-v${VERSION}"
-EXPECTED_APK_URL="https://github.com/${RELEASE_REPO}/releases/download/${EXPECTED_TAG}/${APP_NAME}.apk"
-DATE=$(date +%Y-%m-%d)
 
 VALIDATOR_JS=$(mktemp)
 LATEST_RESPONSE=$(mktemp)
@@ -186,6 +155,8 @@ trap cleanup_release_temp EXIT
 
 cat > "$VALIDATOR_JS" <<'NODE'
 const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 
 const REPOSITORY = "ttttdiva/Event-AutoPin";
 const ASSETS = { desktop: "EventAutoPin.exe", mobile: "EventAutoPin.apk" };
@@ -207,6 +178,45 @@ function readJson(path, label) {
     return JSON.parse(fs.readFileSync(path, "utf8"));
   } catch (error) {
     throw new Error(`${label} の JSON が不正です: ${error.message}`);
+  }
+}
+
+function apkDigest(filePath) {
+  const stat = fs.statSync(filePath);
+  assert(stat.isFile() && stat.size > 0, "APK が存在しないか空です");
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
+function stageApk(args) {
+  const [sourcePath, outputPath, configPath] = args;
+  const source = path.resolve(sourcePath);
+  const output = path.resolve(outputPath);
+  assert(source !== output, "生成 APK と配置先は別のパスである必要があります");
+  const config = readJson(configPath, "app.json");
+  const expo = config.expo;
+  assert(isRecord(expo) && typeof expo.version === "string" && VERSION_RE.test(expo.version), "app.json のバージョンが不正です");
+  assert(isRecord(expo.android) && typeof expo.android.package === "string" && expo.android.package.length > 0, "app.json の Android package が不正です");
+  assert(Number.isSafeInteger(expo.android.versionCode) && expo.android.versionCode > 0, "app.json の versionCode が不正です");
+
+  // 同じ clean build から生成された Gradle metadata と app.json を照合する。
+  const metadata = readJson(path.join(path.dirname(source), "output-metadata.json"), "APK output metadata");
+  assert(isRecord(metadata) && isRecord(metadata.artifactType) && metadata.artifactType.type === "APK", "APK output metadata の種別が不正です");
+  assert(metadata.variantName === "release" && metadata.applicationId === expo.android.package, "生成 APK の variant/package が一致しません");
+  assert(Array.isArray(metadata.elements) && metadata.elements.length === 1, "生成 APK を一意に特定できません");
+  const artifact = metadata.elements[0];
+  assert(isRecord(artifact) && artifact.outputFile === path.basename(source), "生成 APK のファイル名が一致しません");
+  assert(artifact.versionName === expo.version && artifact.versionCode === expo.android.versionCode, "生成 APK の version/versionCode が app.json と一致しません");
+
+  const expectedDigest = apkDigest(source);
+  const stagingDirectory = fs.mkdtempSync(path.join(path.dirname(output), `.${path.basename(output)}-stage-`));
+  try {
+    const staged = path.join(stagingDirectory, path.basename(output));
+    fs.copyFileSync(source, staged, fs.constants.COPYFILE_EXCL);
+    assert(apkDigest(staged) === expectedDigest, "配置前の APK ハッシュが生成 APK と一致しません");
+    fs.renameSync(staged, output);
+    assert(apkDigest(output) === expectedDigest, "配置後の APK ハッシュが生成 APK と一致しません");
+  } finally {
+    fs.rmSync(stagingDirectory, { recursive: true, force: true });
   }
 }
 
@@ -321,7 +331,8 @@ function verifyPost(args) {
 
 try {
   const [command, ...args] = process.argv.slice(2);
-  if (command === "prepare-latest") prepareLatest(args);
+  if (command === "stage-apk") stageApk(args);
+  else if (command === "prepare-latest") prepareLatest(args);
   else if (command === "validate-release") validateRelease(args);
   else if (command === "put-sha") readPutSha(args[0]);
   else if (command === "verify-post") verifyPost(args);
@@ -331,6 +342,47 @@ try {
   process.exit(1);
 }
 NODE
+
+# BAT と同じ検証を通過した今回の生成物だけを配置する。
+if ! node "$VALIDATOR_JS" stage-apk \
+    "app/build/outputs/apk/release/app-release.apk" \
+    "$PROJECT_ROOT/$APP_NAME.apk" "$PROJECT_ROOT/$MOBILE_DIR/app.json"; then
+    echo "[ERROR] 生成 APK の検証または配置に失敗したためリリースを中止します。"
+    exit 1
+fi
+
+echo ""
+echo "==================================="
+echo " ビルド成功！ APK: $APP_NAME.apk"
+echo "==================================="
+
+cd "$PROJECT_ROOT"
+
+# === リリース処理（RELEASE_REPO が設定されている場合のみ） ===
+if [ -z "$RELEASE_REPO" ]; then
+    echo ""
+    echo "[INFO] RELEASE_REPO が未設定のためリリース処理をスキップ"
+    exit 0
+fi
+
+# app.json からバージョンを取得
+VERSION=$(node -e "console.log(require('./$MOBILE_DIR/app.json').expo.version)")
+
+if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    echo "[ERROR] app.json のバージョンが不正です: ${VERSION}"
+    exit 1
+fi
+
+APK_PATH="$PROJECT_ROOT/$APP_NAME.apk"
+APK_SHA256=$(sha256sum "$APK_PATH" | awk '{print tolower($1)}')
+if ! [[ "$APK_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "[ERROR] APK の SHA-256 を計算できませんでした"
+    exit 1
+fi
+
+EXPECTED_TAG="mobile-v${VERSION}"
+EXPECTED_APK_URL="https://github.com/${RELEASE_REPO}/releases/download/${EXPECTED_TAG}/${APP_NAME}.apk"
+DATE=$(date +%Y-%m-%d)
 
 echo ""
 echo "==================================="
