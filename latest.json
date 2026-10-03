@@ -6,9 +6,9 @@
     "date": "2026-09-18"
   },
   "mobile": {
-    "version": "1.4.65",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.65/EventAutoPin.apk",
-    "notes": "v1.4.65 release",
-    "date": "2026-09-27"
+    "version": "1.4.68",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.68/EventAutoPin.apk",
+    "notes": "画像変換のNative互換性を修正し、一時画像の回収とイベント一覧の再読込を改善",
+    "date": "2026-10-03"
   }
 }
