@@ -6,9 +6,9 @@
     "date": "2026-09-18"
   },
   "mobile": {
-    "version": "1.4.68",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.68/EventAutoPin.apk",
-    "notes": "画像変換のNative互換性を修正し、一時画像の回収とイベント一覧の再読込を改善",
-    "date": "2026-10-03"
+    "version": "1.4.69",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.69/EventAutoPin.apk",
+    "notes": "全件取込・同期更新・復旧処理の DB 接続寿命と、アイテム全文検索の不具合を修正。",
+    "date": "2026-10-06"
   }
 }
