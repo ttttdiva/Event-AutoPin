@@ -48,9 +48,11 @@ const LATEST_SCHEMA_VERSION = 7;
 
 let db: SQLite.SQLiteDatabase | null = null;
 let dbInitPromise: Promise<SQLite.SQLiteDatabase> | null = null;
+let dbRecoveryError: Error | null = null;
 let itemFtsAvailable = false;
 let itemFtsBackfilled = false;
 let itemFtsBackfillPromise: Promise<void> | null = null;
+let itemFtsGeneration = 0;
 const purchaseLookupCache = new Map<string, Set<string>>();
 const PURCHASE_LOOKUP_CACHE_LIMIT = 128;
 const instrumentedDatabases = new WeakMap<object, SQLite.SQLiteDatabase>();
@@ -280,14 +282,26 @@ async function addColumnIfMissing(
 
 /** データベースを開いて初期化 */
 export async function getDatabase(): Promise<SQLite.SQLiteDatabase> {
+  if (dbRecoveryError) throw dbRecoveryError;
   if (db) return db;
   if (!dbInitPromise) {
     dbInitPromise = (async () => {
       const rawDatabase = await openEventTrailDatabaseAsync(DB_NAME);
-      const database = instrumentDatabase(rawDatabase);
-      await initDatabase(database);
-      db = database;
-      return database;
+      try {
+        const database = instrumentDatabase(rawDatabase);
+        await initDatabase(database);
+        db = database;
+        return database;
+      } catch (error) {
+        // 未公開の接続はこの初期化だけが所有する。共有promiseのreject前に
+        // 一度closeし、close失敗でも元の初期化エラーを失わない。
+        try {
+          await rawDatabase.closeAsync();
+        } catch (closeError) {
+          console.error("[SQLite] initialization_close_failed", String((closeError as any)?.message ?? closeError));
+        }
+        throw error;
+      }
     })().finally(() => {
       dbInitPromise = null;
     });
@@ -296,7 +310,7 @@ export async function getDatabase(): Promise<SQLite.SQLiteDatabase> {
 }
 
 /** テーブル作成 */
-async function initDatabase(database: SQLite.SQLiteDatabase, options?: { recover?: boolean }): Promise<void> {
+async function initDatabase(database: SQLite.SQLiteDatabase, options?: { recover?: boolean }): Promise<boolean> {
   await database.execAsync(`
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
@@ -551,19 +565,22 @@ async function initDatabase(database: SQLite.SQLiteDatabase, options?: { recover
 
   // FTS5 は端末 SQLite build により無い場合があるため、起動時に一度だけ能力を
   // 検出する。利用できない場合は searchItemsByEvent の indexed LIKE に fallback。
+  let ftsAvailable = false;
   try {
     await database.execAsync(
       "CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(name, description, item_id UNINDEXED)",
     );
-    itemFtsAvailable = true;
-    itemFtsBackfilled = false;
+    ftsAvailable = true;
   } catch {
-    itemFtsAvailable = false;
-    itemFtsBackfilled = false;
+    // FTS非対応のSQLite buildではLIKEへfallbackする。
   }
-  // 前回プロセスが staging 中に終了しても、次回起動時に新規行/画像だけを
-  // rollback し、旧 live event と画像を保持する。
-  if (options?.recover !== false) await recoverImportStages(database);
+  // stageの能力検出はliveの検索状態へ反映しない。
+  if (options?.recover !== false) {
+    invalidateItemFtsState(ftsAvailable);
+    // 前回プロセスの未完了importをrecoverするのはliveだけ。
+    await recoverImportStages(database);
+  }
+  return ftsAvailable;
 }
 
 // --- Event CRUD ---
@@ -1726,7 +1743,10 @@ export interface FavoriteCircle {
 }
 
 export async function getFavoriteCircles(): Promise<FavoriteCircle[]> {
-  const txDb = await getDatabase();
+  return getFavoriteCirclesFromDatabase(await getDatabase());
+}
+
+async function getFavoriteCirclesFromDatabase(txDb: SQLite.SQLiteDatabase): Promise<FavoriteCircle[]> {
   const rows = await txDb.getAllAsync<any>(
     "SELECT * FROM favorite_circles ORDER BY added_at DESC",
   );
@@ -1737,13 +1757,20 @@ export async function addFavoriteCircle(
   name: string,
   tag: string,
 ): Promise<void> {
-  const txDb = await getDatabase();
+  await addFavoriteCircleToDatabase(await getDatabase(), name, tag);
+}
+
+async function addFavoriteCircleToDatabase(
+  txDb: SQLite.SQLiteDatabase,
+  name: string,
+  tag: string,
+): Promise<void> {
   await txDb.runAsync(
     "INSERT INTO favorite_circles (name, tag) VALUES (?, ?)",
     name,
     tag,
   );
-  await updateStoredCircleMasterFavorite(name, tag, true);
+  await updateStoredCircleMasterFavorite(name, tag, true, txDb);
 }
 
 export async function removeFavoriteCircle(
@@ -1763,7 +1790,14 @@ export async function isFavoriteCircle(
   name: string,
   tag: string,
 ): Promise<boolean> {
-  const txDb = await getDatabase();
+  return isFavoriteCircleInDatabase(await getDatabase(), name, tag);
+}
+
+async function isFavoriteCircleInDatabase(
+  txDb: SQLite.SQLiteDatabase,
+  name: string,
+  tag: string,
+): Promise<boolean> {
   const row = await txDb.getFirstAsync<any>(
     "SELECT 1 FROM favorite_circles WHERE (name != '' AND name = ?) OR (tag != '' AND tag = ?) LIMIT 1",
     name,
@@ -1949,29 +1983,36 @@ async function ensureDirectory(path: string): Promise<void> {
   }
 }
 
+function invalidateItemFtsState(available: boolean): void {
+  itemFtsGeneration += 1;
+  itemFtsAvailable = available;
+  itemFtsBackfilled = false;
+}
+
 async function ensureItemFtsReady(): Promise<void> {
-  if (!itemFtsAvailable || itemFtsBackfilled) return;
-  if (!itemFtsBackfillPromise) {
-    itemFtsBackfillPromise = (async () => {
-      try {
-        const txDb = await getDatabase();
-        // COUNT(*) cannot tell whether an earlier process died after a partial
-        // backfill.  Rebuild from the authoritative items table once per DB
-        // lifetime, lazily on first non-empty search, so every row is covered.
-        await measuredRun(txDb, "DELETE FROM items_fts");
-        await measuredRun(
-          txDb,
-          "INSERT INTO items_fts(name, description, item_id) SELECT name, COALESCE(description, ''), id FROM items",
-        );
-        itemFtsBackfilled = true;
-      } catch {
-        itemFtsAvailable = false;
-      } finally {
-        itemFtsBackfillPromise = null;
-      }
-    })();
+  // publishを跨いだ旧backfillの完了を待った場合は、新世代で再構築する。
+  while (itemFtsAvailable && !itemFtsBackfilled) {
+    if (!itemFtsBackfillPromise) {
+      const generation = itemFtsGeneration;
+      itemFtsBackfillPromise = (async () => {
+        try {
+          const txDb = await getDatabase();
+          // COUNT(*)では過去の途中終了を判別できないため全行を再構築する。
+          await measuredRun(txDb, "DELETE FROM items_fts");
+          await measuredRun(
+            txDb,
+            "INSERT INTO items_fts(name, description, item_id) SELECT name, COALESCE(description, ''), id FROM items",
+          );
+          if (generation === itemFtsGeneration) itemFtsBackfilled = true;
+        } catch {
+          if (generation === itemFtsGeneration) itemFtsAvailable = false;
+        } finally {
+          itemFtsBackfillPromise = null;
+        }
+      })();
+    }
+    await itemFtsBackfillPromise;
   }
-  await itemFtsBackfillPromise;
 }
 
 /** items を削除する前に派生 FTS 行を除去する。旧 item_id の stale 検索を残さない。 */
@@ -3052,12 +3093,14 @@ async function finalizeLegacyFullImport(
 ): Promise<{ lastEventId: number; importedEventIds: number[] }> {
   // legacy manifest でも reset を先行させず、temp DB/image を検証・構築してから
   // publish する。既存 live は最後まで閉じず、失敗時にも保持する。
+  // 初期化中のlive接続を別openで迂回しない。startup recoveryが新しいstageを
+  // 未完了の前回importと誤認しないよう、stage作成より先に初期化を完了する。
+  const destination = await getDatabase();
   const stageRoot = createImageStageRoot();
   const stageDatabaseName = `eventtrail_legacy_stage_${Date.now()}.db`;
   const stageDb = await openLegacyStageDatabaseAsync(stageDatabaseName);
   const closeStageDb = createDatabaseCloseOnce(stageDb, "legacy_stage_db");
-  const previousDb = db;
-  const previousPromise = dbInitPromise;
+  const stageRowIdSeeds = new Map<string, number>();
   const oldImagesBackup = `${normalizeDir(FileSystem.cacheDirectory ?? stageRoot)}eventtrail_legacy_old_live_${Date.now()}/`;
   const legacyCutsStage = `${normalizeDir(stageRoot)}__legacy_cuts/`;
   const oldCutsBackup = `${normalizeDir(FileSystem.cacheDirectory ?? stageRoot)}eventtrail_legacy_old_cuts_${Date.now()}/`;
@@ -3086,11 +3129,12 @@ async function finalizeLegacyFullImport(
   let legacyCutsBackupReady = false;
   let legacyDestination: SQLite.SQLiteDatabase | null = null;
   let dbPublishAttempted = false;
+  let liveFtsAvailableBeforePublish = itemFtsAvailable;
   let dbRestoreVerified = false;
   let dbRestoreFailed = false;
   let dbRestoredToOld = false;
   let temporaryDatabaseCloseFailed = false;
-  let closeOwnedLegacyDestination: (() => Promise<void>) | null = null;
+  let rollbackGuard: Error | null = null;
   try {
     await ensureDirectory(stageRoot);
     legacyHadLiveImages = (await FileSystem.getInfoAsync(IMAGES_DIR)).exists;
@@ -3117,15 +3161,11 @@ async function finalizeLegacyFullImport(
       legacyCutsPublishAttempted: cutsPublishAttempted,
       legacyCutsPublished,
     });
-    // Stage DB の schema を init するため一時的に db 参照を差し替える。
-    db = stageDb;
-    dbInitPromise = Promise.resolve(stageDb);
-    // Row-id seeds are scoped to a SQLite file; never carry a temporary stage
-    // DB's max id into the live DB (or vice versa) across a full-sync swap.
-    importRowIdSeeds.clear();
+    // stageは内部のimport呼出しにだけ渡す。UIのgetDatabase()には最後まで
+    // liveを返し、finallyでcloseする一時接続を共有singletonへ公開しない。
     // Temporary legacy DB must not attempt to recover the stage root it is
     // currently constructing; only the live DB performs startup recovery.
-    await initDatabase(stageDb, { recover: false });
+    const stageFtsAvailable = await initDatabase(stageDb, { recover: false });
     await ensureDirectory(stageRoot);
     for (let i = 0; i < events.length; i++) {
       onProgress?.({ current: i + 1, total: events.length, phase: "events" });
@@ -3138,6 +3178,8 @@ async function finalizeLegacyFullImport(
         null,
         stageRoot,
         scopeAssetManifest(rootAssetManifest ?? null, events[i].path, manifestUid(events[i])),
+        stageDb,
+        stageRowIdSeeds,
       );
       importedEventIds.push(lastEventId);
       await writeImportStageJournal(stageRoot, {
@@ -3190,7 +3232,7 @@ async function finalizeLegacyFullImport(
     // Shared settings are validated and committed to the temporary DB before
     // any live image/DB publish.  A failure therefore leaves live state
     // untouched and is compensated by importSharedBundleSettings itself.
-    await importSharedBundleSettings(extractDir, legacyCutsStage);
+    await importSharedBundleSettings(extractDir, legacyCutsStage, undefined, stageDb);
     const legacyImagesFingerprint = await verifyDirectoryCandidateForMove(
       legacyImagesStage,
       "legacy image candidate",
@@ -3204,23 +3246,8 @@ async function finalizeLegacyFullImport(
           )
         : null;
     const liveInfo = await FileSystem.getInfoAsync(IMAGES_DIR);
-    // Always snapshot the current live SQLite file, even when the module had
-    // not initialized `db` yet.  Opening DB_NAME here creates an empty but
-    // integrity-checkable preimage on a fresh install and avoids a publish
-    // failure window with no same-process restore source.
-    const destination =
-      previousDb ??
-      instrumentDatabase(await openEventTrailDatabaseAsync(DB_NAME));
-    if (!previousDb) {
-      closeOwnedLegacyDestination = createDatabaseCloseOnce(
-        destination,
-        "legacy_destination",
-      );
-      // A database opened lazily before the first getDatabase() call may be a
-      // newly-created file.  Initialize it before taking the rollback
-      // snapshot so recovery can validate the expected schema.
-      await initDatabase(destination, { recover: false });
-    }
+    // liveはgetDatabase()から借用する。同じ接続をsnapshot/publish/rollbackに
+    // 使用し、成功・失敗いずれでもimport側ではcloseしない。
     legacyDestination = destination;
     {
       const oldDb = await openLegacyTemporaryDatabaseAsync(legacyDbBackupName);
@@ -3448,8 +3475,11 @@ async function finalizeLegacyFullImport(
     // If the process dies after DB copy but before journal update, recovery sees
     // all-finalized rows in the live DB and forwards cleanup safely.
     await stageDb.runAsync("UPDATE sync_import_staging SET phase = 'finalized' WHERE stage_root = ?", stageRoot);
+    liveFtsAvailableBeforePublish = itemFtsAvailable;
     dbPublishAttempted = true;
     await SQLite.backupDatabaseAsync({ sourceDatabase: rawDatabase(stageDb), destDatabase: rawDatabase(destination) });
+    invalidateItemFtsState(stageFtsAvailable);
+    invalidatePurchaseLookupCache();
     legacyPhase = "db_published";
     await writeImportStageJournal(stageRoot, {
       version: 1,
@@ -3470,9 +3500,6 @@ async function finalizeLegacyFullImport(
       legacyDbBackupReady,
       legacyImagesBackupReady,
     });
-    db = instrumentDatabase(destination);
-    dbInitPromise = Promise.resolve(db);
-    closeOwnedLegacyDestination = null;
     importRowIdSeeds.clear();
     await destination.runAsync("DELETE FROM sync_import_staging WHERE stage_root = ?", stageRoot);
     legacyPhase = "finalized";
@@ -3499,6 +3526,12 @@ async function finalizeLegacyFullImport(
     return { lastEventId, importedEventIds: [...importedEventIds] };
   } catch (error) {
     primaryError = error;
+    if (dbPublishAttempted || imagesPublishAttempted || cutsPublishAttempted) {
+      // 最初のrollback awaitより前に新しい利用者を止める。復旧失敗確定後の
+      // backup close/画像restore/stage close待機中にも未検証liveを返さない。
+      rollbackGuard = new Error("インポートの復旧中です。完了するまでデータベースを利用できません");
+      dbRecoveryError = rollbackGuard;
+    }
     let dbRestoreError: unknown = null;
     let rollbackIntentWritten = false;
     // Record rollback intent before touching the old DB.  If the process dies
@@ -3567,11 +3600,11 @@ async function finalizeLegacyFullImport(
         if (restoredCheck?.integrity_check !== "ok") throw new Error("legacy DB restore integrity check failed");
         dbRestoreVerified = true;
         dbRestoredToOld = true;
+        invalidateItemFtsState(liveFtsAvailableBeforePublish);
+        invalidatePurchaseLookupCache();
       } catch (restoreError) {
         dbRestoreError = restoreError;
         dbRestoreFailed = true;
-        db = null;
-        dbInitPromise = null;
       }
     }
     let imagesRollbackOk = !imagesPublished;
@@ -3593,8 +3626,6 @@ async function finalizeLegacyFullImport(
         imagesRollbackOk = true;
       } catch (restoreError) {
         // Preserve stage, backup and journal evidence for startup retry.
-        db = previousDb;
-        dbInitPromise = previousPromise;
         throw new Error(`${String((error as any)?.message ?? error)}; legacy image rollback failed: ${String((restoreError as any)?.message ?? restoreError)}`);
       }
     }
@@ -3616,45 +3647,26 @@ async function finalizeLegacyFullImport(
         cutsRollbackOk = true;
         legacyCutsRollbackCompleted = true;
       } catch (restoreError) {
-        db = previousDb;
-        dbInitPromise = previousPromise;
         throw new Error(`${String((error as any)?.message ?? error)}; legacy default cuts rollback failed: ${String((restoreError as any)?.message ?? restoreError)}`);
       }
     }
     legacyRollbackCompleted = imagesRollbackOk && cutsRollbackOk;
     if (dbRestoreError) {
-      if (closeOwnedLegacyDestination) {
-        try {
-          await closeOwnedLegacyDestination();
-          closeOwnedLegacyDestination = null;
-        } catch (closeError) {
-          temporaryDatabaseCloseFailed = true;
-          console.error(
-            "[LegacyFullImport] legacy_destination_close_failed_after_restore_error",
-            String((closeError as any)?.message ?? closeError),
-          );
-        }
-      }
       throw new Error(`${String((error as any)?.message ?? error)}; DB rollback failed: ${String((dbRestoreError as any)?.message ?? dbRestoreError)}`);
-    }
-    if (previousDb) {
-      db = previousDb;
-      dbInitPromise = previousPromise;
-    } else if (legacyDestination) {
-      // The destination is owned by this bootstrap attempt.  Do not expose it
-      // as the singleton on a failed attempt; finally closes it once and the
-      // next getDatabase() call reopens and initializes the live DB.
-      db = null;
-      dbInitPromise = null;
-    } else {
-      db = null;
-      dbInitPromise = null;
     }
     importRowIdSeeds.clear();
     throw error;
   } finally {
+    if (rollbackGuard && dbRecoveryError === rollbackGuard) {
+      // 自分のgateだけを更新する。他の処理の復旧エラーを解除しない。
+      // close待機に入る前に、DBと全ファイルの検証結果で利用可否を確定する。
+      const rollbackVerified = legacyRollbackCompleted && !dbRestoreFailed &&
+        (!dbPublishAttempted || dbRestoreVerified);
+      dbRecoveryError = rollbackVerified
+        ? null
+        : new Error(`インポートの復旧が完了していません。アプリを再起動して復旧してください: ${String((primaryError as any)?.message ?? primaryError)}`);
+    }
     let stageDbCloseError: unknown = null;
-    let destinationCloseError: unknown = null;
     try {
       await closeStageDb();
     } catch (closeError) {
@@ -3664,25 +3676,6 @@ async function finalizeLegacyFullImport(
         "[LegacyFullImport] legacy_stage_db_close_failed",
         String((closeError as any)?.message ?? closeError),
       );
-    }
-    if (closeOwnedLegacyDestination) {
-      try {
-        await closeOwnedLegacyDestination();
-        closeOwnedLegacyDestination = null;
-      } catch (closeError) {
-        temporaryDatabaseCloseFailed = true;
-        destinationCloseError = closeError;
-        console.error(
-          "[LegacyFullImport] legacy_destination_close_failed",
-          String((closeError as any)?.message ?? closeError),
-        );
-      }
-    }
-    if (!legacyFinalized) {
-      // Never leave the global singleton pointing at the temporary stage or at
-      // a destination that may have been closed during rollback.
-      db = previousDb;
-      dbInitPromise = previousPromise;
     }
     if (
       !temporaryDatabaseCloseFailed &&
@@ -3704,9 +3697,6 @@ async function finalizeLegacyFullImport(
     }
     if (stageDbCloseError && primaryError == null) {
       throw stageDbCloseError;
-    }
-    if (destinationCloseError && primaryError == null && !stageDbCloseError) {
-      throw destinationCloseError;
     }
   }
 }
@@ -4191,11 +4181,12 @@ function toSqlBind(value: unknown): SqlValue {
 async function nextImportRowId(
   txDb: SQLite.SQLiteDatabase,
   tableName: "events" | "circles",
+  rowIdSeeds = importRowIdSeeds,
 ): Promise<number> {
-  const cached = importRowIdSeeds.get(tableName);
+  const cached = rowIdSeeds.get(tableName);
   if (cached != null) {
     const next = cached + 1;
-    importRowIdSeeds.set(tableName, next);
+    rowIdSeeds.set(tableName, next);
     return next;
   }
 
@@ -4205,7 +4196,7 @@ async function nextImportRowId(
   const currentMax = Number(row?.max_id ?? 0);
   const seed = Number.isSafeInteger(currentMax) ? currentMax : 0;
   const next = seed + 1;
-  importRowIdSeeds.set(tableName, next);
+  rowIdSeeds.set(tableName, next);
   return next;
 }
 
@@ -4396,8 +4387,8 @@ async function copyDefaultCutsFromBundle(
   for (const snapshot of bundleBackups) await FileSystem.deleteAsync(snapshot.backup, { idempotent: true });
 }
 
-async function readStoredCircleMasterData(): Promise<CircleMasterData> {
-  const raw = await getSetting("circle_master_json");
+async function readStoredCircleMasterData(databaseOverride?: SQLite.SQLiteDatabase): Promise<CircleMasterData> {
+  const raw = await getSettingFromDatabase(databaseOverride ?? await getDatabase(), "circle_master_json");
   if (!raw) return { circles: {} };
   try {
     const parsed = JSON.parse(raw) as CircleMasterData;
@@ -4410,9 +4401,9 @@ async function readStoredCircleMasterData(): Promise<CircleMasterData> {
   }
 }
 
-async function writeStoredCircleMasterData(data: CircleMasterData): Promise<void> {
-  await setSetting("circle_master_json", JSON.stringify(data));
-  const database = await getDatabase();
+async function writeStoredCircleMasterData(data: CircleMasterData, databaseOverride?: SQLite.SQLiteDatabase): Promise<void> {
+  const database = databaseOverride ?? await getDatabase();
+  await setSettingInDatabase(database, "circle_master_json", JSON.stringify(data));
   await database.runAsync("DELETE FROM app_settings WHERE key = ?", SHARED_BUNDLE_FINGERPRINT_KEY);
 }
 
@@ -4420,10 +4411,11 @@ async function updateStoredCircleMasterFavorite(
   name: string,
   penname: string,
   favorite: boolean,
+  databaseOverride?: SQLite.SQLiteDatabase,
 ): Promise<void> {
   const key = name || penname;
   if (!key) return;
-  const data = await readStoredCircleMasterData();
+  const data = await readStoredCircleMasterData(databaseOverride);
   const existing = data.circles[key] ?? {
     penname: penname || "",
     favorite: false,
@@ -4435,7 +4427,7 @@ async function updateStoredCircleMasterFavorite(
     penname: existing.penname || penname || "",
     favorite,
   };
-  await writeStoredCircleMasterData(data);
+  await writeStoredCircleMasterData(data, databaseOverride);
 }
 
 function nextDefaultCutFilename(data: CircleMasterData, sourcePath: string): string {
@@ -4526,20 +4518,20 @@ export async function registerDefaultCutFromImage(
   return filename;
 }
 
-async function importCircleMasterFromBundle(extractDir: string): Promise<void> {
+async function importCircleMasterFromBundle(extractDir: string, database: SQLite.SQLiteDatabase): Promise<void> {
   const cmPath = `${extractDir}circle_master.json`;
   const cmInfo = await FileSystem.getInfoAsync(cmPath);
   if (!cmInfo.exists) return;
 
   const cmText = await FileSystem.readAsStringAsync(cmPath);
   const cmData = JSON.parse(cmText) as CircleMasterData;
-  await setSetting("circle_master_json", JSON.stringify(cmData));
+  await setSettingInDatabase(database, "circle_master_json", JSON.stringify(cmData));
 
   for (const [name, entry] of Object.entries(cmData.circles ?? {})) {
     if (!entry.favorite) continue;
-    const alreadyFav = await isFavoriteCircle(name, entry.penname ?? "");
+    const alreadyFav = await isFavoriteCircleInDatabase(database, name, entry.penname ?? "");
     if (!alreadyFav) {
-      await addFavoriteCircle(name, entry.penname ?? "");
+      await addFavoriteCircleToDatabase(database, name, entry.penname ?? "");
     }
   }
 }
@@ -4548,22 +4540,23 @@ async function importSharedBundleSettings(
   extractDir: string,
   defaultCutsDestination = DEFAULT_CUTS_DIR,
   inspection?: SharedBundleInspection,
+  databaseOverride?: SQLite.SQLiteDatabase,
 ): Promise<boolean> {
+  const database = databaseOverride ?? await getDatabase();
   const inspected = inspection ?? await inspectSharedBundleSettings(extractDir, defaultCutsDestination);
-  const previousFingerprint = await getSetting(SHARED_BUNDLE_FINGERPRINT_KEY);
+  const previousFingerprint = await getSettingFromDatabase(database, SHARED_BUNDLE_FINGERPRINT_KEY);
   if (previousFingerprint === inspected.fingerprint) return false;
   // Validate and publish image files first; commit the JSON setting only after
   // every cut has completed its verified stage->backup->rename path.  A
   // malformed/copy-failed bundle propagates and therefore cannot report a
   // successful sync with partially updated shared settings.
-  const previous = await getSetting("circle_master_json");
-  const previousFavorites = await getFavoriteCircles();
+  const previous = await getSettingFromDatabase(database, "circle_master_json");
+  const previousFavorites = await getFavoriteCirclesFromDatabase(database);
   try {
     await copyDefaultCutsFromBundle(extractDir, defaultCutsDestination, inspected);
-    await importCircleMasterFromBundle(extractDir);
-    await setSetting(SHARED_BUNDLE_FINGERPRINT_KEY, inspected.fingerprint);
+    await importCircleMasterFromBundle(extractDir, database);
+    await setSettingInDatabase(database, SHARED_BUNDLE_FINGERPRINT_KEY, inspected.fingerprint);
   } catch (error) {
-    const database = await getDatabase();
     await database.withExclusiveTransactionAsync(async (txn) => {
       if (previous == null) await txn.runAsync("DELETE FROM app_settings WHERE key = ?", "circle_master_json");
       else await txn.runAsync("INSERT OR REPLACE INTO app_settings(key, value) VALUES (?, ?)", "circle_master_json", previous);
@@ -4683,6 +4676,8 @@ async function importEventFromExtractDir(
   previousEventId?: number | null,
   stageRoot?: string,
   assetManifestOverride?: AssetManifest | null,
+  databaseOverride?: SQLite.SQLiteDatabase,
+  rowIdSeeds = importRowIdSeeds,
 ): Promise<number> {
   const extractDir = normalizeDir(sourceDir);
 
@@ -4710,8 +4705,8 @@ async function importEventFromExtractDir(
   }
 
   // イベント挿入
-  const database = await getDatabase();
-  const eventId = await nextImportRowId(database, "events");
+  const database = databaseOverride ?? await getDatabase();
+  const eventId = await nextImportRowId(database, "events", rowIdSeeds);
   // event 単位で DB を atomic にする。画像コピーが途中で失敗しても SQL は
   // rollback し、呼び出し側が生成した event ディレクトリを cleanup できる。
   try {
@@ -4807,7 +4802,7 @@ async function importEventFromExtractDir(
     }
 
     // サークルカット画像を移動
-    const circleId = await nextImportRowId(txDb, "circles");
+    const circleId = await nextImportRowId(txDb, "circles", rowIdSeeds);
     let cutFilePath: string | null = null;
     if (circle.circle_cut_filename) {
       const cutSrc = await resolveImportedAsset(extractDir, assetManifest, [
@@ -4883,12 +4878,14 @@ async function importEventFromExtractDir(
           toSqlValue(serializeRaw(item)),
           toSqlValue(normalizePurchaseLookupKey(item.name)),
         );
-        await updateItemFts(
-          txDb,
-          itemResult.lastInsertRowId,
-          String(item.name ?? "不明"),
-          item.description ?? null,
-        );
+        if (!databaseOverride) {
+          await updateItemFts(
+            txDb,
+            itemResult.lastInsertRowId,
+            String(item.name ?? "不明"),
+            item.description ?? null,
+          );
+        }
       }
     }
 
@@ -6036,7 +6033,7 @@ export async function searchItemsByEvent(
          FROM items_fts f
          JOIN items i ON i.id = f.item_id
          JOIN circles c ON c.id = i.circle_id
-         WHERE c.event_id = ? AND f MATCH ?
+         WHERE c.event_id = ? AND items_fts MATCH ?
          ORDER BY i.name_key LIMIT ?`,
         eventId,
         normalized.replace(/["*]/g, " ").trim() + "*",
@@ -6309,7 +6306,10 @@ function mapEventMap(row: any): EventMap {
 // --- アプリ設定 ---
 
 export async function getSetting(key: string): Promise<string | null> {
-  const database = await getDatabase();
+  return getSettingFromDatabase(await getDatabase(), key);
+}
+
+async function getSettingFromDatabase(database: SQLite.SQLiteDatabase, key: string): Promise<string | null> {
   const row = await database.getFirstAsync<{ value: string }>(
     "SELECT value FROM app_settings WHERE key = ?",
     key,
@@ -6318,7 +6318,10 @@ export async function getSetting(key: string): Promise<string | null> {
 }
 
 export async function setSetting(key: string, value: string): Promise<void> {
-  const database = await getDatabase();
+  await setSettingInDatabase(await getDatabase(), key, value);
+}
+
+async function setSettingInDatabase(database: SQLite.SQLiteDatabase, key: string, value: string): Promise<void> {
   await database.runAsync(
     "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
     key,

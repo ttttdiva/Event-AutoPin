@@ -146,6 +146,7 @@ shopping-app/lib/crawl/vision-analyzer.ts
 shopping-app/lib/database-core.test.ts
 shopping-app/lib/database-filesystem.test.ts
 shopping-app/lib/database-instrumentation.test.ts
+shopping-app/lib/database-lifetime.test.ts
 shopping-app/lib/database-shared-settings.test.ts
 shopping-app/lib/database-core.ts
 shopping-app/lib/database.ts

@@ -13,6 +13,7 @@ const testCases = [
   ["lib/database-core.test.ts", "runDatabaseCoreTests"],
   ["lib/database-filesystem.test.ts"],
   ["lib/database-instrumentation.test.ts"],
+  ["lib/database-lifetime.test.ts"],
   ["lib/database-shared-settings.test.ts"],
   ["lib/event-load-epoch.test.ts", "runEventLoadEpochTests"],
   ["lib/filter-header.test.ts", "runFilterHeaderTests"],
