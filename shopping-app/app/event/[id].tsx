@@ -63,6 +63,7 @@ import { isGlobalSearchEnabled } from "@/lib/settings-store";
 import CircleRow from "@/components/CircleRow";
 import CircleExpandedDetail from "@/components/CircleExpandedDetail";
 import CollapsibleHeader from "@/components/CollapsibleHeader";
+import { selectHighPriorityProgress } from "@/lib/high-priority-progress";
 import BottomBar from "@/components/BottomBar";
 import ImageViewer from "@/components/ImageViewer";
 import MapViewComponent, { type MapViewHandle } from "@/components/MapView";
@@ -1219,6 +1220,11 @@ export default function CircleListScreen() {
       genres,
     }] as const;
   })), [circles]);
+
+  const highPriorityProgress = useMemo(
+    () => selectHighPriorityProgress(circles, eventId),
+    [circles, eventId],
+  );
 
   const filteredCircles = useMemo(() => {
     let result = circles;
@@ -2383,7 +2389,7 @@ export default function CircleListScreen() {
 
   function renderFilters() {
     return (
-        <InputScrollView style={{ flexGrow: 0, flexShrink: 1, maxHeight: "45%" }}>
+        <InputScrollView style={{ flexGrow: 0, flexShrink: 0, maxHeight: "45%" }}>
         <CollapsibleHeader
           globalSearchEnabled={globalSearchEnabled}
           searchQuery={searchQuery}
@@ -2411,6 +2417,7 @@ export default function CircleListScreen() {
           onImport={null}
           isShoppingMode={localShoppingActive}
           shoppingStartedAt={localShoppingStartedAt}
+          highPriorityProgress={highPriorityProgress}
         />
         </InputScrollView>
     );

@@ -307,6 +307,8 @@ shopping-app/components/MapCirclePopup.tsx
 shopping-app/lib/map-popup-layout.ts
 shopping-app/lib/map-popup-layout.test.ts
 shopping-app/lib/filter-header.test.ts
+shopping-app/lib/high-priority-progress.ts
+shopping-app/lib/high-priority-progress.test.ts
 docs/mobile-filter-keyboard-map.md
 shopping-app/lib/input-scroll-layout.ts
 shopping-app/lib/input-scroll-layout.test.ts

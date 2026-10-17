@@ -1,6 +1,11 @@
 import { InputTextInput as TextInput } from "@/components/KeyboardLayout";
 import React, { useEffect, useState } from 'react';
 import {
+  formatHighPriorityProgressLabel,
+  fullHighPriorityProgressLabel,
+  highPriorityProgressRatio,
+} from '@/lib/high-priority-progress';
+import {
   StyleSheet,
   View,
   Text,
@@ -91,6 +96,7 @@ interface CollapsibleHeaderProps {
   // 買い物モード
   isShoppingMode: boolean;
   shoppingStartedAt?: string | null;
+  highPriorityProgress?: { done: number; total: number; remaining: number };
 }
 
 export default function CollapsibleHeader({
@@ -109,12 +115,20 @@ export default function CollapsibleHeader({
   filteredCount, totalCount,
   onImport,
   isShoppingMode, shoppingStartedAt,
+  highPriorityProgress = { done: 0, total: 0, remaining: 0 },
 }: CollapsibleHeaderProps) {
   const { effectiveScheme } = useTheme();
   const colors = getColors(effectiveScheme);
   const { options: priorityOptions, getColor } = usePriorityColors();
   const [expanded, setExpanded] = useState(false);
   const [showBudget, setShowBudget] = useState(false);
+  const [progressSlotWidth, setProgressSlotWidth] = useState<number | undefined>(undefined);
+  const highPriorityRatio = highPriorityProgressRatio(highPriorityProgress);
+  const highPriorityLabel = formatHighPriorityProgressLabel(
+    highPriorityProgress,
+    progressSlotWidth,
+  );
+  const highPriorityA11y = fullHighPriorityProgressLabel(highPriorityProgress);
   const totalForProgress = stats.totalCircles || 1;
   const boughtPct = (stats.boughtCircles / totalForProgress) * 100;
   const couldntPct = (stats.couldntBuyCircles / totalForProgress) * 100;
@@ -171,7 +185,34 @@ export default function CollapsibleHeader({
           </Text>
         )}
 
-        <View style={{ flex: 1 }} />
+        <View
+          style={styles.highPrioritySlot}
+          onLayout={(event) => setProgressSlotWidth(event.nativeEvent.layout.width)}
+        >
+          <Text
+            style={[styles.highPriorityLabel, { color: colors.textSecondary }]}
+            numberOfLines={1}
+            accessibilityLabel={highPriorityA11y}
+          >
+            {highPriorityLabel}
+          </Text>
+          <View
+            style={[styles.highPriorityTrack, { backgroundColor: colors.border }]}
+            accessibilityRole="progressbar"
+            accessibilityValue={{
+              min: 0,
+              max: highPriorityProgress.total,
+              now: highPriorityProgress.total === 0 ? 0 : highPriorityProgress.done,
+            }}
+          >
+            <View
+              style={[
+                styles.highPriorityFill,
+                { backgroundColor: colors.tint, width: `${highPriorityRatio * 100}%` },
+              ]}
+            />
+          </View>
+        </View>
 
         <Pressable style={styles.expandBtn} onPress={toggleExpand}>
           <FontAwesome name={expanded ? 'chevron-up' : 'filter'} size={14} color={colors.textSecondary} />
@@ -182,8 +223,8 @@ export default function CollapsibleHeader({
         <View style={{ paddingHorizontal: 12, paddingBottom: 8, gap: 6 }}>
           <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
             {activeConditions.map((condition) => (
-              <View key={condition} style={[styles.chip, { borderColor: colors.border }]}>
-                <Text style={{ color: colors.text, fontSize: 12 }}>{condition}</Text>
+              <View key={condition} style={[styles.chip, { maxWidth: '100%', flexShrink: 1, borderColor: colors.border }]}>
+                <Text style={{ color: colors.text, fontSize: 12, flexShrink: 1 }}>{condition}</Text>
               </View>
             ))}
           </View>
@@ -305,7 +346,7 @@ export default function CollapsibleHeader({
           )}
 
           {/* フィルター・ソートチップ */}
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll} contentContainerStyle={styles.chipContent}>
+          <ScrollView horizontal testID="circle-filter-chips" keyboardShouldPersistTaps="handled" showsHorizontalScrollIndicator={false} style={styles.chipScroll} contentContainerStyle={styles.chipContent}>
             {/* ステータス */}
             <Pressable
               style={[styles.chip, { borderColor: colors.border }, statusFilter.size === 0 && !hideSkipped && { backgroundColor: colors.tint, borderColor: colors.tint }]}
@@ -472,6 +513,7 @@ const styles = StyleSheet.create({
   },
   topRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     alignItems: 'center',
     paddingHorizontal: 12,
     paddingVertical: 8,
@@ -487,6 +529,8 @@ const styles = StyleSheet.create({
   shoppingBadge: {
     backgroundColor: '#e65100',
     flexDirection: 'row',
+    flexWrap: 'wrap',
+    flexShrink: 1,
     paddingHorizontal: 8,
     paddingVertical: 2,
     borderRadius: 8,
@@ -504,6 +548,23 @@ const styles = StyleSheet.create({
   miniProgress: {
     fontSize: 13,
     fontWeight: '600',
+  },
+  highPrioritySlot: {
+    flex: 1,
+    minWidth: 0,
+    flexShrink: 1,
+    overflow: 'hidden',
+  },
+  highPriorityLabel: {
+    fontSize: 11,
+    flexShrink: 1,
+  },
+  highPriorityTrack: {
+    height: 3,
+    overflow: 'hidden',
+  },
+  highPriorityFill: {
+    height: 3,
   },
   expandBtn: {
     width: 32,
@@ -533,6 +594,7 @@ const styles = StyleSheet.create({
   },
   statsRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     paddingBottom: 6,
     gap: 10,
     alignItems: 'center',
@@ -572,17 +634,20 @@ const styles = StyleSheet.create({
   budgetPriorityCount: { fontSize: 10, width: 28 },
   budgetPriorityValue: { fontSize: 11, fontWeight: '600', flex: 1, textAlign: 'right' },
   searchInput: {
-    height: 34,
+    minHeight: 34,
     borderWidth: 1,
     borderRadius: 8,
     paddingHorizontal: 12,
+    paddingVertical: 6,
     fontSize: 14,
   },
   filterSearchInput: {
     marginBottom: 6,
   },
   chipScroll: {
-    maxHeight: 36,
+    // 親の縦スクロール内で自然高を保つ。縮むと子ボタンが一覧に隠れる。
+    flexGrow: 0,
+    flexShrink: 0,
     marginBottom: 4,
   },
   chipContent: {
@@ -622,6 +687,8 @@ const styles = StyleSheet.create({
   },
   countRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
     justifyContent: 'space-between',
     alignItems: 'center',
   },

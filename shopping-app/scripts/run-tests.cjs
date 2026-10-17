@@ -17,6 +17,7 @@ const testCases = [
   ["lib/database-shared-settings.test.ts"],
   ["lib/event-load-epoch.test.ts", "runEventLoadEpochTests"],
   ["lib/filter-header.test.ts", "runFilterHeaderTests"],
+  ["lib/high-priority-progress.test.ts", "runHighPriorityProgressTests"],
   ["lib/import-helpers.test.ts", "runImportHelperContractTests"],
   ["lib/input-scroll-layout.test.ts", "runInputScrollLayoutTests"],
   ["lib/keyboard-viewport.test.ts", "runKeyboardViewportTests"],
