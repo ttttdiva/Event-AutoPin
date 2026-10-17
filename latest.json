@@ -1,8 +1,8 @@
 {
   "desktop": {
-    "version": "0.1.27",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.27/EventAutoPin.exe",
-    "notes": "補足説明をクリックヘルプへ整理し重要な操作条件を維持",
+    "version": "0.1.28",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.28/EventAutoPin.exe",
+    "notes": "ヘルプのEscapeでマップ配置モードを解除しないよう修正",
     "date": "2026-10-17"
   },
   "mobile": {
