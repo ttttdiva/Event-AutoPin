@@ -2609,8 +2609,9 @@ function initHelpPopovers(): void {
     );
     if (!button) return;
     event.preventDefault();
+    event.stopImmediatePropagation();
     setHelpPopoverExpanded(button, false, true);
-  });
+  }, true);
 }
 
 function initTabs() {
