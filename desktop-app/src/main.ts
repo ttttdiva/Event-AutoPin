@@ -2463,6 +2463,7 @@ function escapeHtml(v: string): string {
 }
 
 function onTabActivated(target: string) {
+  closeHelpPopovers();
   if (target === "tab-map") {
     requestAnimationFrame(() => fitMapToViewport());
   } else if (target === "tab-history") {
@@ -2470,6 +2471,146 @@ function onTabActivated(target: string) {
       document.getElementById("historySearchQuery")?.focus();
     });
   }
+}
+
+const HELP_VIEWPORT_PADDING_PX = 8;
+const HELP_MAX_WIDTH_PX = 320;
+let openHelpButton: HTMLButtonElement | null = null;
+
+function helpPanelForButton(button: HTMLButtonElement): HTMLElement | null {
+  const panelId = button.getAttribute("aria-controls");
+  return panelId ? document.getElementById(panelId) : null;
+}
+
+function positionHelpPopover(button: HTMLButtonElement): void {
+  const panel = helpPanelForButton(button);
+  if (!panel || panel.hidden) return;
+
+  const triggerRect = button.getBoundingClientRect();
+  const viewportPadding = HELP_VIEWPORT_PADDING_PX;
+  const viewportWidth = Math.max(
+    1,
+    document.documentElement.clientWidth || window.innerWidth,
+  );
+  const viewportHeight = Math.max(
+    1,
+    document.documentElement.clientHeight || window.innerHeight,
+  );
+  const panelWidthLimit = Math.min(
+    HELP_MAX_WIDTH_PX,
+    Math.max(1, viewportWidth - viewportPadding * 2),
+  );
+  panel.style.boxSizing = "border-box";
+  panel.style.width = `${panelWidthLimit}px`;
+  panel.style.maxWidth = `${panelWidthLimit}px`;
+
+  const panelRect = panel.getBoundingClientRect();
+  const panelWidth = Math.min(panelRect.width, panelWidthLimit);
+  const panelHeight = Math.min(
+    panelRect.height,
+    Math.max(1, viewportHeight - viewportPadding * 2),
+  );
+  const maxLeft = Math.max(
+    viewportPadding,
+    viewportWidth - viewportPadding - panelWidth,
+  );
+  const left = Math.min(
+    Math.max(viewportPadding, triggerRect.left),
+    maxLeft,
+  );
+  const belowTop = triggerRect.bottom + viewportPadding;
+  const aboveTop = triggerRect.top - viewportPadding - panelHeight;
+  const maxTop = Math.max(
+    viewportPadding,
+    viewportHeight - viewportPadding - panelHeight,
+  );
+  const top = belowTop + panelHeight <= viewportHeight - viewportPadding
+    ? belowTop
+    : Math.max(viewportPadding, Math.min(aboveTop, maxTop));
+
+  panel.style.left = `${left}px`;
+  panel.style.top = `${top}px`;
+}
+
+function setHelpPopoverExpanded(
+  button: HTMLButtonElement,
+  expanded: boolean,
+  restoreFocus = false,
+): void {
+  const panel = helpPanelForButton(button);
+  button.setAttribute("aria-expanded", String(expanded));
+  if (!panel) {
+    if (!expanded && restoreFocus) button.focus();
+    return;
+  }
+  if (!expanded) {
+    panel.hidden = true;
+    panel.style.removeProperty("left");
+    panel.style.removeProperty("top");
+    panel.style.removeProperty("width");
+    panel.style.removeProperty("max-width");
+    panel.style.removeProperty("box-sizing");
+    panel.style.removeProperty("visibility");
+    if (openHelpButton === button) openHelpButton = null;
+    if (restoreFocus) button.focus();
+    return;
+  }
+  panel.hidden = false;
+  panel.style.visibility = "hidden";
+  openHelpButton = button;
+  positionHelpPopover(button);
+  panel.style.visibility = "visible";
+  requestAnimationFrame(() => {
+    if (openHelpButton === button) positionHelpPopover(button);
+  });
+}
+
+function closeHelpPopovers(except?: HTMLButtonElement): void {
+  document
+    .querySelectorAll<HTMLButtonElement>('.help-trigger[aria-expanded="true"]')
+    .forEach((button) => {
+      if (button !== except) setHelpPopoverExpanded(button, false);
+    });
+}
+
+function initHelpPopovers(): void {
+  const repositionOpenHelp = () => {
+    if (!openHelpButton) return;
+    if (!openHelpButton.isConnected) {
+      openHelpButton = null;
+      return;
+    }
+    positionHelpPopover(openHelpButton);
+  };
+
+  window.addEventListener("resize", repositionOpenHelp);
+  document.addEventListener("scroll", repositionOpenHelp, true);
+  document.addEventListener("pointerdown", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest(".help-trigger, .help-popover")) return;
+    closeHelpPopovers();
+  });
+
+  document.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const button = target?.closest<HTMLButtonElement>(".help-trigger");
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const expanded = button.getAttribute("aria-expanded") === "true";
+    closeHelpPopovers(button);
+    setHelpPopoverExpanded(button, !expanded);
+  }, true);
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    const button = document.querySelector<HTMLButtonElement>(
+      '.help-trigger[aria-expanded="true"]',
+    );
+    if (!button) return;
+    event.preventDefault();
+    setHelpPopoverExpanded(button, false, true);
+  });
 }
 
 function initTabs() {
@@ -9111,6 +9252,7 @@ function initCircleTableKeyboardNav() {
 
 renderCircleEditorAndMap();
 initTabs();
+initHelpPopovers();
 initHistorySearch();
 initShortcuts();
 initCircleTableKeyboardNav();
@@ -9579,10 +9721,42 @@ function renderMapPins() {
   });
 }
 
+function mapInfoEmptyStateHtml(): string {
+  return `
+    <h4 class="map-info-card-heading">
+      <span>サークル情報</span>
+      <span class="help-popover-anchor">
+        <button
+          id="mapInfoHelpTrigger"
+          class="help-trigger"
+          type="button"
+          aria-label="サークル情報の説明"
+          aria-expanded="false"
+          aria-controls="mapInfoHelp"
+        >?</button>
+        <span
+          id="mapInfoHelp"
+          class="help-popover"
+          role="note"
+          aria-labelledby="mapInfoHelpTrigger"
+          hidden
+        >
+          マップ上のピンをクリックすると、サークル情報を表示します。
+        </span>
+      </span>
+    </h4>`;
+}
+
+function renderMapInfoEmptyState(): void {
+  closeHelpPopovers();
+  mapInfoCard.innerHTML = mapInfoEmptyStateHtml();
+}
+
 function showMapInfo(rowIdx: number) {
+  closeHelpPopovers();
   const row = tableState.rows[rowIdx];
   if (!row) {
-    mapInfoCard.innerHTML = `<h4>サークル情報</h4><p class="hint">ピンをクリックして選択</p>`;
+    renderMapInfoEmptyState();
     return;
   }
   const hall = String(row["ホール"] ?? "");
@@ -9687,7 +9861,7 @@ function showMapPinContextMenu(x: number, y: number, rowIdx: number) {
     renderMapCircleList();
     if (mapSelectedRow === rowIdx) {
       mapSelectedRow = -1;
-      mapInfoCard.innerHTML = `<h4>サークル情報</h4><p class="hint">ピンをクリックして選択</p>`;
+      renderMapInfoEmptyState();
     }
   });
   menu.appendChild(deleteItem);
@@ -10145,7 +10319,7 @@ mapViewport.addEventListener("click", (e) => {
     mapInner
       .querySelectorAll(".map-pin.selected")
       .forEach((p) => p.classList.remove("selected"));
-    mapInfoCard.innerHTML = `<h4>サークル情報</h4><p class="hint">ピンをクリックして選択</p>`;
+    renderMapInfoEmptyState();
   }
   if (mapPlacingRow < 0 || !mapImgWidth || !mapImgHeight) return;
   // パン操作直後のクリックは無視（5px以上動いていたら）

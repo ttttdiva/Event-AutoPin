@@ -380,6 +380,12 @@ html.dark {
   .history-search-heading {
     @apply flex items-start justify-between gap-4 mb-4;
   }
+  .history-search-heading-copy {
+    min-width: 0;
+  }
+  .help-heading-row {
+    @apply flex items-center gap-2;
+  }
   .history-search-heading h2 {
     @apply text-xl pb-1;
   }
@@ -1186,6 +1192,62 @@ html.dark {
     @apply text-xs mt-1;
   }
 
+  /* クリック式の補足説明。初期状態では本文の余白を占有しない。 */
+  .help-popover-anchor {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: flex-start;
+    vertical-align: middle;
+  }
+  .help-trigger {
+    width: 1.75rem;
+    height: 1.75rem;
+    min-width: 1.75rem;
+    min-height: 1.75rem;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-secondary);
+    background: var(--bg-surface2);
+    border: 1px solid var(--border-default);
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    line-height: 1;
+  }
+  .help-trigger:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+  .help-trigger:focus-visible {
+    outline: 2px solid var(--ring-focus);
+    outline-offset: 2px;
+  }
+  .help-popover {
+    position: fixed;
+    z-index: 10000;
+    display: block;
+    width: min(20rem, calc(100vw - 1rem));
+    max-width: min(34rem, calc(100vw - 1rem));
+    max-height: calc(100vh - 1rem);
+    box-sizing: border-box;
+    overflow: auto;
+    margin-top: 0;
+    padding: 0.5rem 0.65rem;
+    color: var(--text-secondary);
+    background: var(--bg-surface2);
+    border: 1px solid var(--border-default);
+    border-radius: 0.5rem;
+    font-size: 0.75rem;
+    font-weight: 400;
+    line-height: 1.5;
+    white-space: normal;
+  }
+  .help-popover[hidden] {
+    display: none;
+  }
+
   /* 配置済みバッジ */
   .circle-pin-badge {
     @apply w-2.5 h-2.5 rounded-full absolute right-2 top-1/2 -translate-y-1/2;
@@ -1235,6 +1297,9 @@ html.dark {
   .map-info-card {
     border-bottom: 1px solid var(--border-default);
     @apply p-3;
+  }
+  .map-info-card-heading {
+    @apply flex items-center justify-between gap-2;
   }
   .map-info-card h4 {
     @apply text-sm font-semibold m-0 mb-2;

@@ -479,8 +479,28 @@
             </div>
             <div class="map-sidebar" id="mapSidebar">
               <div class="map-info-card" id="mapInfoCard">
-                <h4 class="text-sm font-semibold m-0 mb-1">サークル情報</h4>
-                <p class="hint">ピンをクリックして選択</p>
+                <h4 class="text-sm font-semibold m-0 mb-1 map-info-card-heading">
+                  <span>サークル情報</span>
+                  <span class="help-popover-anchor">
+                    <button
+                      id="mapInfoHelpTrigger"
+                      class="help-trigger"
+                      type="button"
+                      aria-label="サークル情報の説明"
+                      aria-expanded="false"
+                      aria-controls="mapInfoHelp"
+                    >?</button>
+                    <span
+                      id="mapInfoHelp"
+                      class="help-popover"
+                      role="note"
+                      aria-labelledby="mapInfoHelpTrigger"
+                      hidden
+                    >
+                      マップ上のピンをクリックすると、サークル情報を表示します。
+                    </span>
+                  </span>
+                </h4>
               </div>
               <div class="flex-1 flex flex-col overflow-hidden p-3">
                 <h4 class="text-sm font-semibold m-0 mb-1">サークル一覧</h4>
@@ -505,12 +525,29 @@
         <section id="tab-history" class="tab-pane">
           <div class="history-search-shell">
             <div class="history-search-heading">
-              <div>
-                <h2>過去出展検索</h2>
-                <p>
-                  保存済みイベントから、うろ覚えの本タイトルやサークル名を探します。
-                  空白・記号・全角半角・ひらがな/カタカナの違いや、少しの入力違いも吸収します。
-                </p>
+              <div class="history-search-heading-copy">
+                <div class="help-heading-row">
+                  <h2>過去出展検索</h2>
+                  <span class="help-popover-anchor">
+                    <button
+                      id="historySearchHelpTrigger"
+                      class="help-trigger"
+                      type="button"
+                      aria-label="過去出展検索の説明"
+                      aria-expanded="false"
+                      aria-controls="historySearchHelp"
+                    >?</button>
+                    <span
+                      id="historySearchHelp"
+                      class="help-popover"
+                      role="note"
+                      aria-labelledby="historySearchHelpTrigger"
+                      hidden
+                    >
+                      保存済みイベントから、本タイトルやサークル名を探します。空白・記号・全角半角・ひらがな/カタカナの違いや、少しの入力違いを吸収します。
+                    </span>
+                  </span>
+                </div>
               </div>
               <span class="history-local-badge">ローカル検索</span>
             </div>
@@ -540,7 +577,28 @@
         </section>
 
         <section id="tab-mobile" class="tab-pane">
-          <h2>モバイル連携</h2>
+          <h2 class="help-heading-row">
+            <span>モバイル連携</span>
+            <span class="help-popover-anchor">
+              <button
+                id="mobileTransferHelpTrigger"
+                class="help-trigger"
+                type="button"
+                aria-label="モバイル連携の説明"
+                aria-expanded="false"
+                aria-controls="mobileTransferHelp"
+              >?</button>
+              <span
+                id="mobileTransferHelp"
+                class="help-popover"
+                role="note"
+                aria-labelledby="mobileTransferHelpTrigger"
+                hidden
+              >
+                サイドバーで選択中のイベントのデータと画像をZIPにまとめてモバイルへ転送します。
+              </span>
+            </span>
+          </h2>
           <div id="mobileActiveEvent" class="active-event-box">
             <span style="color: var(--text-muted)"
               >サイドバーでイベントを選択してください</span
@@ -579,10 +637,6 @@
               サーバー停止
             </button>
           </div>
-          <p class="text-xs mt-3" style="color: var(--text-muted)">
-            サイドバーで選択中のイベントのデータ +
-            画像をZIPにまとめてモバイルに転送します。
-          </p>
         </section>
 
         <section id="tab-settings" class="tab-pane">
