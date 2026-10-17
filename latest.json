@@ -1,9 +1,9 @@
 {
   "desktop": {
-    "version": "0.1.26",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.26/EventAutoPin.exe",
-    "notes": "おしながき手動並び替えをWebViewで安定動作するPointer操作へ修正",
-    "date": "2026-09-18"
+    "version": "0.1.27",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.27/EventAutoPin.exe",
+    "notes": "補足説明をクリックヘルプへ整理し重要な操作条件を維持",
+    "date": "2026-10-17"
   },
   "mobile": {
     "version": "1.4.71",
