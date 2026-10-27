@@ -12,6 +12,7 @@ from typing import Optional
 from ..models.config import SiteParsingConfig
 from .cli_llm import execute_cli_prompt
 from .llm_client import LLMClient
+from .llm_attempts import api_models_from_attempts, build_text_llm_attempts
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,45 @@ def parse_with_high_end_model(
         LLMレスポンス文字列（JSON形式を期待）
     """
     effective_timeout = timeout or site_parsing_config.cli_timeout
+
+    # 新形式は選択された構造解析roleだけを呼ぶ。旧 codex_model/api_model
+    # 設定には触れず、保存済みconfigの従来順序を維持する。
+    if site_parsing_config.provider and site_parsing_config.model:
+        attempts = build_text_llm_attempts(
+            site_parsing_config.provider,
+            site_parsing_config.model,
+            site_parsing_config.cli_model_map,
+            site_parsing_config.cli_effort_map,
+            site_parsing_config.fallback_provider,
+            site_parsing_config.fallback_model,
+            site_parsing_config.fallback_effort,
+            primary_effort=site_parsing_config.effort,
+        )
+        if not attempts:
+            raise RuntimeError("サイト構造解析roleに有効なprovider/modelがありません")
+        logger.info(
+            "サイト構造解析roleを使用: provider=%s, model=%s",
+            site_parsing_config.provider,
+            site_parsing_config.model,
+        )
+        client = LLMClient(
+            model=api_models_from_attempts(attempts),
+            attempts=attempts,
+            cli_model_map=site_parsing_config.cli_model_map,
+            cli_effort_map=site_parsing_config.cli_effort_map,
+            cli_timeout=effective_timeout,
+            reasoning_effort=site_parsing_config.effort,
+            max_api_retries=0,
+        )
+        result = client.extract_data(
+            prompt,
+            temperature=0.0,
+            reasoning_effort=site_parsing_config.effort,
+            timeout=effective_timeout,
+        )
+        if not result or not result.strip():
+            raise RuntimeError("サイト構造解析roleが空の結果を返しました")
+        return _extract_json_content(result)
 
     # 1. OpenAI Responses API を試行
     logger.info(

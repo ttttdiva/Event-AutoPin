@@ -72,7 +72,7 @@ class PaginationConfig:
 
 @dataclass
 class SiteParsingConfig:
-    """サイトパース専用の高性能モデル設定"""
+    """サイト構造解析用モデル。旧 codex/api 設定も後方互換で保持する。"""
 
     codex_model: str = DEFAULT_TEXT_FALLBACK_MODEL
     api_model: str = DEFAULT_TEXT_PRIMARY_MODEL
@@ -80,6 +80,14 @@ class SiteParsingConfig:
     api_reasoning_effort: str = DEFAULT_TEXT_PRIMARY_EFFORT  # none/low/medium/high/xhigh
     prefer_cli: bool = True
     cli_timeout: int = 900
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    cli_model_map: Dict[str, str] = field(default_factory=dict)
+    cli_effort_map: Dict[str, str] = field(default_factory=dict)
+    fallback_provider: Optional[str] = None
+    fallback_model: Optional[str] = None
+    fallback_effort: Optional[str] = None
 
 
 @dataclass

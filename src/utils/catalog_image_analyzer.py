@@ -107,6 +107,9 @@ class CatalogImageAnalyzer:
                             model=attempt["model"],
                             reasoning_effort=attempt.get("effort") or api_reasoning_effort,
                             api_reasoning_effort_map=self.api_reasoning_effort_map,
+                            api_provider_map={
+                                attempt["model"]: attempt.get("provider", "")
+                            },
                         )
                     except Exception as attempt_error:
                         logger.warning(
@@ -677,6 +680,13 @@ class CatalogImageAnalyzer:
                 logger.warning("画像読み取りが時間上限に達したため、設定済みの代替モデルに切り替えます")
                 continue
             except Exception as e:
+                from ..utils.grok_build import GrokBuildError
+
+                if isinstance(e, GrokBuildError) and e.code in {
+                    "unknown_delivery",
+                    "cancelled",
+                }:
+                    raise
                 if deadline is not None:
                     deadline.require_time(stage=stage)
                 last_error = e
@@ -1430,6 +1440,13 @@ REJECTは画像上に明確な除外根拠がある場合だけ許可します�
         except ReprocessDeadlineExceeded:
             raise
         except Exception as e:
+            from ..utils.grok_build import GrokBuildError
+
+            if isinstance(e, GrokBuildError) and e.code in {
+                "unknown_delivery",
+                "cancelled",
+            }:
+                raise
             if deadline is not None:
                 deadline.require_time()
             logger.warning(f"CLI画像解析が失敗しました。APIへフォールバックします: {e}")

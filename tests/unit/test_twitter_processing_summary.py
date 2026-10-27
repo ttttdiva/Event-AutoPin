@@ -145,6 +145,17 @@ def test_fetch_success_counters_are_aggregated_per_target():
     assert summary["tweet_fetch_success_count"] == 2
     assert summary["catalog_found_count"] == 1
     assert summary["no_catalog_found_count"] == 1
+    outcomes = summary["target_outcomes"]
+    assert [item["fetch_outcome"] for item in outcomes] == [
+        "catalog_found",
+        "no_catalog_found",
+    ]
+    assert [item["processing_status"] for item in outcomes] == [
+        "processed",
+        "processed",
+    ]
+    assert all(len(item["circle_identity_sha256"]) == 64 for item in outcomes)
+    assert all("circle_name" not in item and "twitter_url" not in item for item in outcomes)
 
 
 def test_fetch_success_counters_preserve_partial_stage_success():
@@ -196,3 +207,64 @@ def test_fetch_success_counters_preserve_partial_stage_success():
     assert summary["timeline_unresolved_count"] == 1
     assert summary["failed_count"] == 1
     assert summary["status"] == "failed"
+
+
+def test_queue_unavailable_is_separate_from_transport_failure():
+    processor = object.__new__(TwitterPostProcessor)
+    processor.config = SimpleNamespace(
+        enabled=True,
+        debug_limit=None,
+        event_date="2026-09-13",
+        additional_prompt="",
+    )
+    processor.grok_client = None
+    processor.progress = FakeProgress()
+    processor.twitter_extractor = SimpleNamespace(
+        _twscrape_unavailable_reason="queue unavailable for UserTweets",
+        _last_fetch_stats={},
+    )
+    processor._print_summary = lambda _circles: None
+
+    async def queue_exhausted(circle, *_args):
+        processor.twitter_extractor._last_fetch_stats = {
+            "outcome": "queue_unavailable",
+            "reason": "no eligible account in request queue",
+            "user_lookup_success_count": 1,
+            "tweet_fetch_success_count": 0,
+            "failure_stage": "timeline_fetch",
+            "failure_queue": "UserTweets",
+            "failure_code": "NO_ACCOUNT_AVAILABLE",
+            "exception_type": "NoAccountError",
+            "failed_request_dispatched": False,
+            "response_status_code": None,
+            "partial_tweet_count": 0,
+        }
+        return circle
+
+    processor._process_single_circle = queue_exhausted
+    circles = [Circle(name="A", twitter_url="https://x.com/example_a")]
+
+    asyncio.run(
+        processor.process_circles(
+            circles,
+            Event(name="イベント", url="https://example.com", date=None),
+        )
+    )
+
+    summary = processor.last_run_summary
+    assert summary["status"] == "failed"
+    assert summary["queue_unavailable_count"] == 1
+    assert summary["transport_failure_count"] == 0
+    assert summary["timeline_unresolved_count"] == 0
+    assert summary["queue_failure_details"] == [
+        {
+            "target_number": 1,
+            "stage": "timeline_fetch",
+            "queue": "UserTweets",
+            "code": "NO_ACCOUNT_AVAILABLE",
+            "exception_type": "NoAccountError",
+            "failed_request_dispatched": False,
+            "response_status_code": None,
+            "partial_tweet_count": 0,
+        }
+    ]

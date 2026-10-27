@@ -200,9 +200,16 @@ space, name, penname, hall, twitter_url, website_url, pixiv_url, genre, descript
 サークル名に相当するnameを特定できないテーブルはtablesに含めないでください。
 """
         try:
-            response = self.llm_client.extract_data(prompt, temperature=0.0)
-        except TypeError:
-            response = self.llm_client.extract_data(prompt)
+            if self.config.site_parsing_config:
+                response = parse_with_high_end_model(
+                    prompt,
+                    self.config.site_parsing_config,
+                )
+            else:
+                try:
+                    response = self.llm_client.extract_data(prompt, temperature=0.0)
+                except TypeError:
+                    response = self.llm_client.extract_data(prompt)
         except Exception as exc:
             self.logger.warning(f"テーブル列名のLLM判定に失敗: {exc}")
             return {}

@@ -4,7 +4,7 @@ mod history_search;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -331,21 +331,36 @@ fn command_candidate_available(bin: &str) -> bool {
     if candidate.is_absolute() || bin.contains('\\') || bin.contains('/') {
         return candidate.exists();
     }
-    Command::new("where.exe")
+    let mut where_command = Command::new("where.exe");
+    where_command
         .arg(&bin)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    configure_hidden_command(&mut where_command);
+    where_command
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
-        || Command::new("cmd")
-            .args(["/C", "where", bin])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        || {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "where", bin])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            configure_hidden_command(&mut cmd);
+            cmd.status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
 }
+
+#[cfg(target_os = "windows")]
+fn configure_hidden_command(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x08000000);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_hidden_command(_command: &mut Command) {}
 
 #[cfg(target_os = "windows")]
 fn known_windows_command_available(default_bin: &str) -> bool {
@@ -451,21 +466,242 @@ fn fetch_antigravity_cli_models(dotenv: &HashMap<String, String>) -> (Vec<Value>
     )
 }
 
+fn resolve_grok_build_bin(dotenv: &HashMap<String, String>) -> String {
+    if let Some(bin) = env_value(dotenv, &["GROK_BIN"]) {
+        return bin;
+    }
+    if let Some(profile) = env::var_os("USERPROFILE") {
+        let candidate = PathBuf::from(profile)
+            .join(".grok")
+            .join("bin")
+            .join("grok.exe");
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "grok".to_string()
+}
+
+fn grok_acp_advertises_image(bin: &str) -> bool {
+    let mut command = Command::new(bin);
+    command
+        .args(["--no-auto-update", "--tools", "", "agent", "stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        return false;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return false;
+    };
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": {"readTextFile": false, "writeTextFile": false},
+                "terminal": false
+            }
+        }
+    });
+    if writeln!(stdin, "{request}").is_err() || stdin.flush().is_err() {
+        let _ = child.kill();
+        return false;
+    }
+    drop(stdin);
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let mut reader = BufReader::new(stdout);
+        let result = reader.read_line(&mut line).ok().filter(|count| *count > 0).map(|_| line);
+        let _ = sender.send(result);
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(4))
+        .ok()
+        .flatten();
+    let _ = child.kill();
+    let _ = child.wait();
+    let Some(line) = line else {
+        return false;
+    };
+    let Ok(message) = serde_json::from_str::<Value>(&line) else {
+        return false;
+    };
+    let image = message
+        .get("result")
+        .and_then(|result| result.get("agentCapabilities"))
+        .and_then(|capabilities| capabilities.get("promptCapabilities"))
+        .and_then(|capabilities| capabilities.get("image"));
+    image.is_some_and(|value| value.as_bool() == Some(true) || value.is_object())
+}
+
+fn fetch_grok_build_models(dotenv: &HashMap<String, String>) -> (Vec<Value>, &'static str, &'static str, bool) {
+    let bin = resolve_grok_build_bin(dotenv);
+    let mut command = Command::new(&bin);
+    command
+        .args(["--no-auto-update", "models"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let Ok(output) = command.output() else {
+        return (Vec::new(), "fetch-failed", "unknown", false);
+    };
+    if !output.status.success() {
+        return (Vec::new(), "fetch-failed", "unknown", false);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let unauthenticated = text.contains("not authenticated");
+    let image_supported = grok_acp_advertises_image(&bin);
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let candidate = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .unwrap_or("")
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        if !candidate.starts_with("grok-") || !seen.insert(candidate.to_string()) {
+            continue;
+        }
+        let mut model = model_json(candidate, candidate, "grok", "cli-live", "Grok Build");
+        models.push(model_with_capabilities(
+            model.take(),
+            "verified",
+            if image_supported { "verified" } else { "unknown" },
+            if image_supported {
+                "Grok Build ACP initialize promptCapabilities.image"
+            } else {
+                "Grok Build ACP image capability was not confirmed"
+            },
+            "available",
+        ));
+    }
+    let source = if models.is_empty() { "fetch-failed" } else { "cli-live" };
+    let auth = if unauthenticated { "unauthenticated" } else if models.is_empty() { "unknown" } else { "available" };
+    (models, source, auth, image_supported)
+}
+
 #[tauri::command]
-async fn list_model_catalog(project_root: String) -> Result<Value, String> {
-    tokio::task::spawn_blocking(move || list_model_catalog_sync(project_root))
+async fn list_model_catalog(
+    project_root: String,
+    force_refresh: Option<bool>,
+) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || {
+        if force_refresh.unwrap_or(false) {
+            list_model_catalog_sync_with_refresh(project_root, true)
+        } else {
+            list_model_catalog_sync(project_root)
+        }
+    })
         .await
         .map_err(|e| format!("モデル一覧取得タスクが失敗しました: {e}"))?
 }
 
+#[derive(Clone)]
+struct ModelCatalogCacheEntry {
+    stored_at: Instant,
+    value: Value,
+}
+
+fn model_catalog_cache() -> &'static Mutex<HashMap<String, ModelCatalogCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, ModelCatalogCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn invalidate_model_catalog_cache(project_root: &str) {
+    if let Ok(mut cache) = model_catalog_cache().lock() {
+        cache.remove(project_root);
+    }
+}
+
 fn list_model_catalog_sync(project_root: String) -> Result<Value, String> {
+    list_model_catalog_sync_with_refresh(project_root, false)
+}
+
+fn append_stale_cached_models(
+    current_models: &mut Vec<Value>,
+    cached_catalog: &Value,
+    failed_providers: &HashSet<String>,
+) -> usize {
+    let Some(cached_models) = cached_catalog.get("apiModels").and_then(Value::as_array) else {
+        return 0;
+    };
+    let mut stale_count = 0usize;
+    for cached_model in cached_models {
+        let provider = cached_model
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !failed_providers.contains(provider) {
+            continue;
+        }
+        let id = cached_model.get("id").and_then(Value::as_str).unwrap_or("");
+        if current_models.iter().any(|model| {
+            model.get("provider").and_then(Value::as_str) == Some(provider)
+                && model.get("id").and_then(Value::as_str) == Some(id)
+        }) {
+            continue;
+        }
+        let mut stale = cached_model.clone();
+        stale["source"] = Value::String("stale-cache".to_string());
+        stale["source_label"] = Value::String("保存済み候補（更新失敗）".to_string());
+        stale["stale"] = Value::Bool(true);
+        current_models.push(stale);
+        stale_count += 1;
+    }
+    stale_count
+}
+
+fn list_model_catalog_sync_with_refresh(
+    project_root: String,
+    force_refresh: bool,
+) -> Result<Value, String> {
+    const CACHE_TTL: Duration = Duration::from_secs(300);
+    if !force_refresh {
+        if let Ok(cache) = model_catalog_cache().lock() {
+            if let Some(entry) = cache.get(&project_root) {
+                if entry.stored_at.elapsed() < CACHE_TTL {
+                    let mut value = entry.value.clone();
+                    if value.get("cache_state").and_then(Value::as_str) == Some("fresh") {
+                        value["cache_state"] = Value::String("fresh".to_string());
+                    }
+                    return Ok(value);
+                }
+            }
+        }
+    }
+
     let dotenv = read_dotenv(&project_root);
     let config_text =
         fs::read_to_string(PathBuf::from(&project_root).join("config.yaml")).unwrap_or_default();
     let configured_api_models = parse_yaml_list(&config_text, "models");
     let text_model_config = parse_yaml_map(&config_text, "text_llm_cli_models");
 
-    let (api_models, api_errors) = build_api_model_catalog(&dotenv, &configured_api_models);
+    let (mut api_models, api_errors) = build_api_model_catalog(&dotenv, &configured_api_models);
+    let (grok_models, grok_source, grok_auth, grok_image_capability) =
+        fetch_grok_build_models(&dotenv);
     let codex_models = configured_models(
         cli_candidate_models(
             "codex",
@@ -509,7 +745,58 @@ fn list_model_catalog_sync(project_root: String) -> Result<Value, String> {
         "claude",
     );
 
-    Ok(json!({
+    let api_error_providers: HashSet<String> = api_errors
+        .iter()
+        .filter_map(|error| error.get("provider").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let previous = model_catalog_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&project_root).cloned());
+    let mut stale_count = 0usize;
+    if !api_error_providers.is_empty() {
+        if let Some(cached) = previous.as_ref() {
+            stale_count = append_stale_cached_models(
+                &mut api_models,
+                &cached.value,
+                &api_error_providers,
+            );
+        }
+    }
+    let provider_status = |id: &str, label: &str, keys: &[&str]| {
+        let error = api_errors
+            .iter()
+            .find(|error| error.get("provider").and_then(Value::as_str) == Some(id));
+        let credential_configured = env_value(&dotenv, keys).is_some();
+        let status = if let Some(error) = error {
+            error.get("status").and_then(Value::as_str).unwrap_or("error")
+        } else if credential_configured {
+            "available"
+        } else {
+            "credential_not_configured"
+        };
+        json!({
+            "id": id,
+            "label": label,
+            "status": status,
+            "credential_configured": credential_configured,
+            "stale_model_count": api_models
+                .iter()
+                .filter(|model| {
+                    model.get("provider").and_then(Value::as_str) == Some(id)
+                        && model.get("stale").and_then(Value::as_bool) == Some(true)
+                })
+                .count()
+        })
+    };
+    let api_provider_statuses = vec![
+        provider_status("openai", "OpenAI API", &["OPENAI_API_KEY"]),
+        provider_status("gemini", "Gemini API", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+        provider_status("anthropic", "Anthropic API", &["ANTHROPIC_API_KEY"]),
+        provider_status("xai", "xAI API", &["XAI_API_KEY"]),
+    ];
+    let catalog = json!({
         "providers": [
             {
                 "id": "codex",
@@ -517,6 +804,7 @@ fn list_model_catalog_sync(project_root: String) -> Result<Value, String> {
                 "kind": "cli",
                 "available": command_available(&dotenv, "CODEX_BIN", "codex"),
                 "source": "cli-suggested",
+                "authenticated": null,
                 "models": codex_models
             },
             {
@@ -528,6 +816,7 @@ fn list_model_catalog_sync(project_root: String) -> Result<Value, String> {
                         .map(|bin| command_candidate_available(&bin))
                         .unwrap_or(false),
                 "source": antigravity_source,
+                "authenticated": null,
                 "models": antigravity_cli_models
             },
             {
@@ -536,12 +825,40 @@ fn list_model_catalog_sync(project_root: String) -> Result<Value, String> {
                 "kind": "cli",
                 "available": command_available(&dotenv, "CLAUDE_BIN", "claude"),
                 "source": "cli-suggested",
+                "authenticated": null,
                 "models": claude_models
+            },
+            {
+                "id": "grok",
+                "label": "Grok Build",
+                "kind": "cli",
+                "available": command_available(&dotenv, "GROK_BIN", "grok")
+                    || env::var_os("USERPROFILE").map(|profile| {
+                        PathBuf::from(profile).join(".grok").join("bin").join("grok.exe").exists()
+                    }).unwrap_or(false),
+                "source": grok_source,
+                "authenticated": if grok_auth == "unknown" { Value::Null } else { json!(grok_auth == "available") },
+                "auth_status": grok_auth,
+                "image_capability": if grok_image_capability { "verified" } else { "unknown" },
+                "models": grok_models
             }
         ],
+        "apiProviders": api_provider_statuses,
         "apiModels": api_models,
-        "apiErrors": api_errors
-    }))
+        "apiErrors": api_errors,
+        "cache_state": if stale_count > 0 { "stale" } else if !api_error_providers.is_empty() { "partial" } else { "fresh" },
+        "fetched_at": chrono::Utc::now().to_rfc3339()
+    });
+    if let Ok(mut cache) = model_catalog_cache().lock() {
+        cache.insert(
+            project_root,
+            ModelCatalogCacheEntry {
+                stored_at: Instant::now(),
+                value: catalog.clone(),
+            },
+        );
+    }
+    Ok(catalog)
 }
 
 fn read_dotenv(project_root: &str) -> HashMap<String, String> {
@@ -667,7 +984,69 @@ fn model_json(id: &str, label: &str, provider: &str, source: &str, source_label:
         "provider": provider,
         "source": source,
         "source_label": source_label,
+        "availability": "unknown",
+        "capabilities": {"text": "unknown", "image": "unknown"},
+        "capability_source": "unverified",
     })
+}
+
+fn model_with_capabilities(
+    mut model: Value,
+    text: &str,
+    image: &str,
+    source: &str,
+    availability: &str,
+) -> Value {
+    model["capabilities"] = json!({"text": text, "image": image});
+    model["capability_source"] = Value::String(source.to_string());
+    model["availability"] = Value::String(availability.to_string());
+    model
+}
+
+fn openai_documented_capabilities(id: &str) -> (&'static str, &'static str, &'static str) {
+    let documented_models = [
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.5-pro",
+        "gpt-5.5-2026-04-23",
+        "gpt-5.5-pro-2026-04-23",
+        "gpt-5.4",
+        "gpt-5.4-pro",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.4-nano-2026-03-17",
+        "gpt-5.4-2026-03-05",
+        "gpt-5.4-pro-2026-03-05",
+        "gpt-5.4-mini-2026-03-17",
+        "gpt-5.2",
+        "gpt-5.2-pro",
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-5-mini-2025-08-07",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-2025-04-14",
+        "gpt-4.1-mini-2025-04-14",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4o-2024-11-20",
+        "gpt-4o-2024-08-06",
+        "gpt-4o-mini-2024-07-18",
+    ];
+    if documented_models.contains(&id) {
+        return (
+            "verified",
+            "verified",
+            "OpenAI model and vision documentation (verified family/snapshot)",
+        );
+    }
+    ("unknown", "unknown", "OpenAI models list has no modality metadata")
 }
 
 fn cli_candidate_models(provider: &str, models: Vec<(&str, &str)>) -> Vec<Value> {
@@ -706,101 +1085,17 @@ fn configured_models(
 }
 
 fn static_api_models() -> Vec<Value> {
-    vec![
-        model_json(
-            "gemini-3-flash-preview",
-            "Gemini 3 Flash Preview",
-            "gemini",
-            "static-suggested",
-            "候補",
-        ),
-        model_json(
-            "gemini-3-pro-preview",
-            "Gemini 3 Pro Preview",
-            "gemini",
-            "static-suggested",
-            "候補",
-        ),
-        model_json(
-            "gemini-2.5-pro",
-            "Gemini 2.5 Pro",
-            "gemini",
-            "static-suggested",
-            "候補",
-        ),
-        model_json(
-            "gemini-2.5-flash",
-            "Gemini 2.5 Flash",
-            "gemini",
-            "static-suggested",
-            "候補",
-        ),
-        model_json(
-            "gemini-2.5-flash-lite",
-            "Gemini 2.5 Flash-Lite",
-            "gemini",
-            "static-suggested",
-            "候補",
-        ),
-        model_json(
-            "gpt-5.6-sol",
-            "GPT-5.6 Sol",
-            "openai",
-            "static-suggested",
-            "候補",
-        ),
-        model_json(
-            "gpt-5.6-terra",
-            "GPT-5.6 Terra",
-            "openai",
-            "static-suggested",
-            "候補",
-        ),
-        model_json(
-            "gpt-5.6-luna",
-            "GPT-5.6 Luna",
-            "openai",
-            "static-suggested",
-            "候補",
-        ),
-        model_json("gpt-5.2", "GPT-5.2", "openai", "static-suggested", "候補"),
-        model_json("gpt-5.1", "GPT-5.1", "openai", "static-suggested", "候補"),
-        model_json("gpt-5", "GPT-5", "openai", "static-suggested", "候補"),
-        model_json(
-            "gpt-5-mini",
-            "GPT-5 mini",
-            "openai",
-            "static-suggested",
-            "候補",
-        ),
-        model_json(
-            "gpt-5-nano",
-            "GPT-5 nano",
-            "openai",
-            "static-suggested",
-            "候補",
-        ),
-        model_json(
-            "gpt-5.2-pro",
-            "GPT-5.2 pro",
-            "openai",
-            "static-suggested",
-            "候補",
-        ),
-        model_json(
-            "gpt-5-pro",
-            "GPT-5 pro",
-            "openai",
-            "static-suggested",
-            "候補",
-        ),
-        model_json("gpt-4.1", "GPT-4.1", "openai", "static-suggested", "候補"),
-    ]
+    // API key別の一覧やモデル文書を根拠にできない候補は追加しない。
+    Vec::new()
 }
 
 fn provider_for_model_id(id: &str) -> &str {
     if id.starts_with("gemini-") {
         "gemini"
+    } else if id.starts_with("claude-") {
+        "anthropic"
+    } else if id.starts_with("grok-") {
+        "xai"
     } else {
         "openai"
     }
@@ -816,13 +1111,25 @@ fn build_api_model_catalog(
     if let Some(key) = env_value(dotenv, &["OPENAI_API_KEY"]) {
         match fetch_openai_models(&key) {
             Ok(fetched) => models.extend(fetched),
-            Err(error) => errors.push(json!({"provider": "openai", "message": error})),
+            Err(error) => errors.push(api_catalog_error("openai", &error)),
         }
     }
     if let Some(key) = env_value(dotenv, &["GEMINI_API_KEY", "GOOGLE_API_KEY"]) {
         match fetch_gemini_models(&key) {
             Ok(fetched) => models.extend(fetched),
-            Err(error) => errors.push(json!({"provider": "gemini", "message": error})),
+            Err(error) => errors.push(api_catalog_error("gemini", &error)),
+        }
+    }
+    if let Some(key) = env_value(dotenv, &["ANTHROPIC_API_KEY"]) {
+        match fetch_anthropic_models(&key) {
+            Ok(fetched) => models.extend(fetched),
+            Err(error) => errors.push(api_catalog_error("anthropic", &error)),
+        }
+    }
+    if let Some(key) = env_value(dotenv, &["XAI_API_KEY"]) {
+        match fetch_xai_models(&key) {
+            Ok(fetched) => models.extend(fetched),
+            Err(error) => errors.push(api_catalog_error("xai", &error)),
         }
     }
 
@@ -851,34 +1158,64 @@ fn build_api_model_catalog(
     (dedupe_models(models), errors)
 }
 
+fn api_catalog_error(provider: &str, error: &str) -> Value {
+    let status = if error.contains("HTTP 401") || error.contains("HTTP 403") {
+        "permission_denied"
+    } else if error.contains("HTTP 429") {
+        "rate_limited"
+    } else if error.contains("timeout") {
+        "timeout"
+    } else {
+        "transport_error"
+    };
+    json!({"provider": provider, "status": status, "message": error})
+}
+
 fn fetch_openai_models(api_key: &str) -> Result<Vec<Value>, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| if e.is_timeout() { "timeout" } else { "transport_error" }.to_string())?;
     let response = client
         .get("https://api.openai.com/v1/models")
         .bearer_auth(api_key)
         .send()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| if e.is_timeout() { "timeout" } else { "transport_error" }.to_string())?;
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    let data: Value = response.json().map_err(|e| e.to_string())?;
+    let data: Value = response
+        .json()
+        .map_err(|_| "invalid_response".to_string())?;
     let mut models = Vec::new();
     if let Some(items) = data.get("data").and_then(Value::as_array) {
         for item in items {
             let Some(id) = item.get("id").and_then(Value::as_str) else {
                 continue;
             };
-            if id.starts_with("gpt-")
-                || id.starts_with("o1")
-                || id.starts_with("o3")
-                || id.starts_with("o4")
-                || id.starts_with("codex-")
-            {
-                models.push(model_json(id, id, "openai", "provider-api", "API取得"));
-            }
+            let (text_capability, image_capability, source) =
+                openai_documented_capabilities(id);
+            let shutdown_date = item.get("shutdown_date").and_then(Value::as_str);
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let availability = match shutdown_date {
+                Some(date) if date <= today.as_str() => "retired",
+                Some(_) => "scheduled_retirement",
+                None => "available",
+            };
+            let mut model = model_json(id, id, "openai", "provider-api", "API取得");
+            model["owned_by"] = item.get("owned_by").cloned().unwrap_or(Value::Null);
+            model["created"] = item.get("created").cloned().unwrap_or(Value::Null);
+            model["shutdown_date"] = item
+                .get("shutdown_date")
+                .cloned()
+                .unwrap_or(Value::Null);
+            models.push(model_with_capabilities(
+                model,
+                text_capability,
+                image_capability,
+                source,
+                availability,
+            ));
         }
     }
     models.sort_by(|a, b| {
@@ -894,42 +1231,305 @@ fn fetch_gemini_models(api_key: &str) -> Result<Vec<Value>, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
-        .map_err(|e| e.to_string())?;
-    let response = client
-        .get(format!(
-            "https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        ))
-        .send()
-        .map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("HTTP {}", response.status()));
-    }
-    let data: Value = response.json().map_err(|e| e.to_string())?;
+        .map_err(|e| if e.is_timeout() { "timeout" } else { "transport_error" }.to_string())?;
     let mut models = Vec::new();
-    if let Some(items) = data.get("models").and_then(Value::as_array) {
-        for item in items {
-            let Some(name) = item.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let supports_generate = item
-                .get("supportedGenerationMethods")
-                .and_then(Value::as_array)
-                .map(|methods| {
-                    methods
-                        .iter()
-                        .any(|method| method.as_str() == Some("generateContent"))
-                })
-                .unwrap_or(true);
-            if !supports_generate {
-                continue;
-            }
-            let id = name.strip_prefix("models/").unwrap_or(name);
-            let label = item
-                .get("displayName")
-                .and_then(Value::as_str)
-                .unwrap_or(id);
-            models.push(model_json(id, label, "gemini", "provider-api", "API取得"));
+    let mut page_token: Option<String> = None;
+    for page_index in 0..10 {
+        let mut request = client
+            .get("https://generativelanguage.googleapis.com/v1beta/models")
+            .query(&[("key", api_key), ("pageSize", "1000")]);
+        if let Some(token) = page_token.as_deref() {
+            request = request.query(&[("pageToken", token)]);
         }
+        let response = request
+            .send()
+            .map_err(|e| if e.is_timeout() { "timeout" } else { "transport_error" }.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status().as_u16()));
+        }
+        let data: Value = response
+            .json()
+            .map_err(|_| "invalid_response".to_string())?;
+        if let Some(items) = data.get("models").and_then(Value::as_array) {
+            for item in items {
+                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let supports_generate = item
+                    .get("supportedGenerationMethods")
+                    .and_then(Value::as_array)
+                    .is_some_and(|methods| {
+                        methods
+                            .iter()
+                            .any(|method| method.as_str() == Some("generateContent"))
+                    });
+                if !supports_generate {
+                    continue;
+                }
+                let id = name.strip_prefix("models/").unwrap_or(name);
+                let label = item
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id);
+                let mut model = model_json(id, label, "gemini", "provider-api", "API取得");
+                model["supported_generation_methods"] = item
+                    .get("supportedGenerationMethods")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let (text_capability, image_capability, capability_source, availability) =
+                    gemini_documented_capabilities(id);
+                models.push(model_with_capabilities(
+                    model,
+                    text_capability,
+                    image_capability,
+                    capability_source,
+                    availability,
+                ));
+            }
+        }
+        page_token = next_gemini_page_token(&data);
+        if page_token.is_none() {
+            break;
+        }
+        if page_index == 9 {
+            return Err("pagination_limit_reached".to_string());
+        }
+    }
+    models.sort_by(|a, b| {
+        a.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(b.get("id").and_then(Value::as_str).unwrap_or(""))
+    });
+    Ok(models)
+}
+
+fn next_gemini_page_token(data: &Value) -> Option<String> {
+    data.get("nextPageToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
+fn gemini_documented_capabilities(id: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    let generation_only_models = [
+        "gemini-nano-banana-2.1",
+        "gemini-nano-banana-2",
+        "gemini-nano-banana-2-lite",
+        "gemini-nano-banana-pro",
+        "gemini-3.1-flash-lite-image",
+        "gemini-3.1-flash-image",
+        "gemini-3-pro-image",
+        "gemini-2.5-flash-image",
+    ];
+    if generation_only_models.contains(&id) {
+        return (
+            "unsupported",
+            "unsupported",
+            "Google Gemini image-generation model documentation",
+            "available",
+        );
+    }
+    let non_text_tasks = [
+        "gemini-3.8-flash-tts",
+        "gemini-3.5-flash-lite-tts",
+        "gemini-3.1-flash-tts",
+        "gemini-3.5-transcribe",
+        "gemini-3.5-transcribe-live",
+        "gemini-3.8-live",
+        "gemini-3.8-live-extended-thinking",
+    ];
+    if non_text_tasks.contains(&id) {
+        return (
+            "unsupported",
+            "unsupported",
+            "Google Gemini audio/live model documentation",
+            "available",
+        );
+    }
+    let multimodal_text_models = [
+        "gemini-4-argon",
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.7-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-001",
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash-lite-001",
+    ];
+    if multimodal_text_models.contains(&id) {
+        let availability = match id {
+            "gemini-3.5-flash" | "gemini-3.7-flash" => "deprecated",
+            "gemini-2.0-flash"
+            | "gemini-2.0-flash-001"
+            | "gemini-2.0-flash-lite"
+            | "gemini-2.0-flash-lite-001" => "retired",
+            _ => "available",
+        };
+        return (
+            "verified",
+            "verified",
+            "Google Gemini model documentation: text/image input, text output",
+            availability,
+        );
+    }
+    (
+        "verified",
+        "unknown",
+        "Gemini models.list generateContent; image modality not verified",
+        "available",
+    )
+}
+
+fn fetch_anthropic_models(api_key: &str) -> Result<Vec<Value>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|e| if e.is_timeout() { "timeout" } else { "transport_error" }.to_string())?;
+    let mut models = Vec::new();
+    let mut after_id: Option<String> = None;
+    for page_index in 0..10 {
+        let mut request = client
+            .get("https://api.anthropic.com/v1/models")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .query(&[("limit", "1000")]);
+        if let Some(id) = after_id.as_deref() {
+            request = request.query(&[("after_id", id)]);
+        }
+        let response = request
+            .send()
+            .map_err(|e| if e.is_timeout() { "timeout" } else { "transport_error" }.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status().as_u16()));
+        }
+        let data: Value = response
+            .json()
+            .map_err(|_| "invalid_response".to_string())?;
+        if let Some(items) = data.get("data").and_then(Value::as_array) {
+            for item in items {
+                let Some(id) = item.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let lifecycle = item
+                    .get("lifecycle")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let image_supported = item
+                    .get("capabilities")
+                    .and_then(|caps| caps.get("image_input"))
+                    .and_then(|image| image.get("supported"))
+                    .and_then(Value::as_bool);
+                let image = match image_supported {
+                    Some(true) => "verified",
+                    Some(false) => "unsupported",
+                    None => "unknown",
+                };
+                let text = if lifecycle == "retired" { "retired" } else { "verified" };
+                let label = item
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id);
+                let mut model = model_json(id, label, "anthropic", "provider-api", "API取得");
+                model["lifecycle"] = Value::String(lifecycle.to_string());
+                model["capability_source"] = Value::String(
+                    "Anthropic Models API lifecycle/capabilities.image_input".to_string(),
+                );
+                model = model_with_capabilities(
+                    model,
+                    text,
+                    image,
+                    "Anthropic Models API lifecycle/capabilities.image_input",
+                    lifecycle,
+                );
+                models.push(model);
+            }
+        }
+        after_id = next_anthropic_page_id(&data);
+        if after_id.is_none() {
+            break;
+        }
+        if page_index == 9 {
+            return Err("pagination_limit_reached".to_string());
+        }
+    }
+    models.sort_by(|a, b| {
+        a.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(b.get("id").and_then(Value::as_str).unwrap_or(""))
+    });
+    Ok(models)
+}
+
+fn next_anthropic_page_id(data: &Value) -> Option<String> {
+    if !data.get("has_more").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    data.get("last_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn fetch_xai_models(api_key: &str) -> Result<Vec<Value>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|e| if e.is_timeout() { "timeout" } else { "transport_error" }.to_string())?;
+    let response = client
+        .get("https://api.x.ai/v1/language-models")
+        .bearer_auth(api_key)
+        .send()
+        .map_err(|e| if e.is_timeout() { "timeout" } else { "transport_error" }.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status().as_u16()));
+    }
+    let data: Value = response
+        .json()
+        .map_err(|_| "invalid_response".to_string())?;
+    let items = data
+        .get("models")
+        .or_else(|| data.get("data"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut models = Vec::new();
+    for item in items {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let inputs = item.get("input_modalities").and_then(Value::as_array);
+        let outputs = item.get("output_modalities").and_then(Value::as_array);
+        let input_has = |name: &str| {
+            inputs.is_some_and(|values| values.iter().any(|value| value.as_str() == Some(name)))
+        };
+        let text = if input_has("text") { "verified" } else { "unsupported" };
+        let image = if input_has("image") { "verified" } else { "unsupported" };
+        let mut model = model_json(id, id, "xai", "provider-api", "API取得");
+        model["input_modalities"] = inputs.cloned().map(Value::Array).unwrap_or(Value::Null);
+        model["output_modalities"] = outputs.cloned().map(Value::Array).unwrap_or(Value::Null);
+        if let Some(efforts) = item
+            .get("capabilities")
+            .and_then(|value| value.get("reasoning_effort"))
+            .and_then(Value::as_array)
+        {
+            model["reasoning_efforts"] = Value::Array(efforts.clone());
+        }
+        models.push(model_with_capabilities(
+            model,
+            text,
+            image,
+            "xAI language-models input_modalities/output_modalities",
+            "available",
+        ));
     }
     models.sort_by(|a, b| {
         a.get("id")
@@ -1503,14 +2103,45 @@ fn run_python_bridge_sync(
         thread::Builder::new()
             .spawn(move || {
                 let reader = BufReader::new(stderr_pipe);
-                let mut lines = Vec::new();
+                const MAX_CHARS: usize = 24_000;
+                let head_limit = MAX_CHARS / 3;
+                let tail_limit = MAX_CHARS - head_limit;
+                let mut head = Vec::new();
+                let mut tail = VecDeque::new();
+                let mut head_chars = 0usize;
+                let mut tail_chars = 0usize;
+                let mut total_chars = 0usize;
                 for line in reader.lines() {
                     if let Ok(line) = line {
                         let _ = win.emit("pipeline-log", &line);
-                        lines.push(line);
+                        let line_chars = line.chars().count() + 1;
+                        total_chars += line_chars;
+                        if head_chars < head_limit {
+                            head_chars += line_chars;
+                            head.push(line);
+                        } else {
+                            tail_chars += line_chars;
+                            tail.push_back(line);
+                            while tail_chars > tail_limit {
+                                if let Some(removed) = tail.pop_front() {
+                                    tail_chars = tail_chars.saturating_sub(removed.chars().count() + 1);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
-                lines.join("\n")
+                if total_chars <= MAX_CHARS {
+                    head.into_iter().chain(tail).collect::<Vec<_>>().join("\n")
+                } else {
+                    let marker = format!("…<middle truncated total_chars={total_chars}>…");
+                    head.into_iter()
+                        .chain(std::iter::once(marker))
+                        .chain(tail)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
             })
             .map_err(|e| format!("Failed to start stderr reader: {e}"))?
     };
@@ -1534,6 +2165,7 @@ fn run_python_bridge_sync(
 
     // タイムアウト付きでプロセス完了を待つ
     let start = Instant::now();
+    let mut bridge_process_exit_code: Option<i32> = None;
     let termination = loop {
         let cancellation_requested = cancellation
             .as_ref()
@@ -1559,7 +2191,10 @@ fn run_python_bridge_sync(
             .expect("bridge child was just assigned")
             .try_wait()
         {
-            Ok(Some(_)) => break None,
+            Ok(Some(status)) => {
+                bridge_process_exit_code = status.code();
+                break None;
+            }
             Ok(None) => thread::sleep(Duration::from_millis(100)),
             Err(e) => return Err(format!("Failed while waiting for Python bridge: {e}")),
         }
@@ -1569,10 +2204,22 @@ fn run_python_bridge_sync(
     let stdout = stdout.trim().to_string();
     let timed_out = termination == Some(PythonBridgeTermination::TimedOut);
     let cancelled = termination == Some(PythonBridgeTermination::Cancelled);
+    let parsed_output = serde_json::from_str::<Value>(&stdout).ok();
+    let pipeline_returncode = parsed_output
+        .as_ref()
+        .and_then(|value| value.get("returncode"))
+        .and_then(Value::as_i64);
+    let event_key = parsed_output
+        .as_ref()
+        .and_then(|value| value.get("diagnostic"))
+        .and_then(|value| value.get("event"))
+        .and_then(|value| value.get("event_key"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     append_internal_log(
         &project_root,
         &format!(
-            "run_python_bridge finished: job={job}, timed_out={timed_out}, cancelled={cancelled}{run_id_log}, stderr=\n{}\nstdout=\n{}",
+            "run_python_bridge finished: job={job}, timed_out={timed_out}, cancelled={cancelled}, bridge_exit_code={bridge_process_exit_code:?}, pipeline_returncode={pipeline_returncode:?}, event_key={event_key}{run_id_log}, stderr=\n{}\nstdout=\n{}",
             truncate_log_value(&stderr, 12000),
             truncate_log_value(&stdout, 12000)
         ),
@@ -1593,8 +2240,12 @@ fn run_python_bridge_sync(
         ));
     }
 
-    let parsed: Value = serde_json::from_str(&stdout)
-        .map_err(|e| format!("Invalid JSON from bridge: {e}; stdout={stdout}"))?;
+    let parsed = parsed_output.ok_or_else(|| {
+        format!(
+            "Invalid JSON from bridge; stdout={}",
+            truncate_log_value(&stdout, 24000)
+        )
+    })?;
 
     Ok(json!({
         "ok": parsed.get("status").and_then(|s| s.as_str()) == Some("ok"),
@@ -2845,11 +3496,38 @@ fn append_internal_log(project_root: &str, message: &str) {
 }
 
 fn truncate_log_value(value: &str, max_chars: usize) -> String {
-    let mut out: String = value.chars().take(max_chars).collect();
-    if value.chars().count() > max_chars {
-        out.push_str("\n...<truncated>");
+    let total_chars = value.chars().count();
+    if total_chars <= max_chars {
+        return value.to_string();
     }
-    out
+    if max_chars <= 64 {
+        return value.chars().take(max_chars).collect();
+    }
+    let marker = format!("\n…<truncated total_chars={total_chars}>…\n");
+    let remaining = max_chars.saturating_sub(marker.chars().count());
+    let head_chars = remaining / 3;
+    let tail_chars = remaining.saturating_sub(head_chars);
+    let head: String = value.chars().take(head_chars).collect();
+    let tail: String = value
+        .chars()
+        .skip(total_chars.saturating_sub(tail_chars))
+        .collect();
+    format!("{head}{marker}{tail}")
+}
+
+#[cfg(test)]
+mod bounded_diagnostic_log_tests {
+    use super::truncate_log_value;
+
+    #[test]
+    fn bounded_log_keeps_both_start_and_exception_tail() {
+        let value = format!("START:{}:Traceback (most recent call last): KeyError('tail')", "x".repeat(500));
+        let bounded = truncate_log_value(&value, 180);
+        assert!(bounded.starts_with("START:"));
+        assert!(bounded.ends_with("KeyError('tail')"));
+        assert!(bounded.contains("truncated total_chars="));
+        assert!(bounded.chars().count() <= 180);
+    }
 }
 
 #[tauri::command]
@@ -7950,6 +8628,7 @@ fn save_env_keys(project_root: String, keys: EnvKeys) -> Result<Value, String> {
     // watcherを不要に起こさない。
     if output != existing {
         fs::write(&path, output).map_err(|e| format!(".env書き込み失敗: {e}"))?;
+        invalidate_model_catalog_cache(&project_root);
     }
     Ok(json!({"status": "ok"}))
 }
@@ -8658,24 +9337,7 @@ mod native_event_io_tests {
 
 #[cfg(test)]
 mod agy_model_catalog_tests {
-    use super::{parse_agy_models_text, static_api_models};
-
-    #[test]
-    fn static_api_models_include_gpt56_family() {
-        let models = static_api_models();
-
-        for expected in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-            let model = models
-                .iter()
-                .find(|model| model.get("id").and_then(|value| value.as_str()) == Some(expected))
-                .unwrap_or_else(|| panic!("missing static OpenAI model: {expected}"));
-
-            assert_eq!(
-                model.get("provider").and_then(|value| value.as_str()),
-                Some("openai")
-            );
-        }
-    }
+    use super::parse_agy_models_text;
 
     #[test]
     fn parse_agy_models_text_reads_tab_separated_output() {
@@ -8694,6 +9356,131 @@ claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n";
         let parsed = parse_agy_models_text(text);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].0, "gemini-3.5-flash-medium");
+    }
+}
+
+#[cfg(test)]
+mod provider_model_catalog_tests {
+    use super::{
+        api_catalog_error, append_stale_cached_models, gemini_documented_capabilities,
+        model_catalog_cache, save_env_keys, EnvKeys, ModelCatalogCacheEntry,
+        next_anthropic_page_id, next_gemini_page_token, openai_documented_capabilities,
+    };
+    use serde_json::{json, Value};
+    use std::collections::HashSet;
+    use std::fs;
+    use std::time::Instant;
+
+    #[test]
+    fn saving_changed_credentials_invalidates_cached_provider_status() {
+        let project_root = std::env::temp_dir().join(format!(
+            "provider-cache-test-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        fs::create_dir_all(&project_root).unwrap();
+        fs::write(project_root.join(".env"), "OPENAI_API_KEY=old-fixture\n").unwrap();
+        let project_root_text = project_root.to_string_lossy().into_owned();
+        model_catalog_cache().lock().unwrap().insert(
+            project_root_text.clone(),
+            ModelCatalogCacheEntry {
+                stored_at: Instant::now(),
+                value: json!({"apiProviders":[{"id":"openai","status":"credential_not_configured"}]}),
+            },
+        );
+
+        save_env_keys(
+            project_root_text.clone(),
+            EnvKeys {
+                openai_api_key: "new-fixture".to_string(),
+                gemini_api_key: String::new(),
+                xai_api_key: String::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(!model_catalog_cache()
+            .lock()
+            .unwrap()
+            .contains_key(&project_root_text));
+        let _ = fs::remove_dir_all(project_root);
+    }
+
+    #[test]
+    fn documented_provider_capabilities_do_not_guess_unknown_openai_models() {
+        assert_eq!(
+            openai_documented_capabilities("gpt-5.6-luna"),
+            ("verified", "verified", "OpenAI model and vision documentation (verified family/snapshot)")
+        );
+        assert_eq!(
+            openai_documented_capabilities("gpt-live-transcribe"),
+            ("unknown", "unknown", "OpenAI models list has no modality metadata")
+        );
+    }
+
+    #[test]
+    fn gemini_generation_and_audio_only_models_do_not_enter_text_or_vision_roles() {
+        assert_eq!(
+            gemini_documented_capabilities("gemini-3.8-flash"),
+            (
+                "verified",
+                "verified",
+                "Google Gemini model documentation: text/image input, text output",
+                "available"
+            )
+        );
+        let (text, image, _, _) = gemini_documented_capabilities("gemini-3.1-flash-image");
+        assert_eq!((text, image), ("unsupported", "unsupported"));
+        let (text, image, _, _) = gemini_documented_capabilities("gemini-3.8-flash-tts");
+        assert_eq!((text, image), ("unsupported", "unsupported"));
+        assert_eq!(
+            gemini_documented_capabilities("gemini-2.0-flash").3,
+            "retired"
+        );
+    }
+
+    #[test]
+    fn provider_pagination_uses_documented_cursor_fields() {
+        assert_eq!(
+            next_gemini_page_token(&json!({"nextPageToken":"page-2"})),
+            Some("page-2".to_string())
+        );
+        assert_eq!(next_gemini_page_token(&json!({"models":[]})), None);
+        assert_eq!(
+            next_anthropic_page_id(&json!({"has_more":true,"last_id":"claude-2"})),
+            Some("claude-2".to_string())
+        );
+        assert_eq!(
+            next_anthropic_page_id(&json!({"has_more":false,"last_id":"claude-2"})),
+            None
+        );
+    }
+
+    #[test]
+    fn refresh_failure_keeps_only_models_for_failed_provider_as_stale() {
+        let cached = json!({"apiModels":[
+            {"id":"gpt-5.6-luna","provider":"openai","capabilities":{"text":"verified"}},
+            {"id":"claude-sonnet","provider":"anthropic","capabilities":{"text":"verified"}}
+        ]});
+        let mut current = vec![json!({"id":"gpt-6-luna","provider":"openai"})];
+        let failed: HashSet<String> = ["anthropic".to_string()].into_iter().collect();
+
+        let added = append_stale_cached_models(&mut current, &cached, &failed);
+
+        assert_eq!(added, 1);
+        assert_eq!(current.len(), 2);
+        let stale = current
+            .iter()
+            .find(|model| model.get("provider").and_then(Value::as_str) == Some("anthropic"))
+            .unwrap();
+        assert_eq!(stale["source"], "stale-cache");
+        assert_eq!(stale["stale"], true);
+    }
+
+    #[test]
+    fn api_permission_and_rate_limit_errors_remain_distinct() {
+        assert_eq!(api_catalog_error("openai", "HTTP 403")["status"], "permission_denied");
+        assert_eq!(api_catalog_error("xai", "HTTP 429")["status"], "rate_limited");
     }
 }
 

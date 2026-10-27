@@ -108,6 +108,7 @@ def _run_cli_command(
     }
     if os.name == "nt":
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        creation_flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
         if creation_flags:
             popen_kwargs["creationflags"] = creation_flags
     else:
@@ -296,6 +297,17 @@ def execute_cli_prompt(
     timeout_stage: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """CLI LLMにプロンプトを実行し、可能な限りモデル応答だけを返す。"""
+    if provider == "grok":
+        from .grok_build import execute_grok_build_prompt
+
+        return execute_grok_build_prompt(
+            prompt,
+            model=model,
+            timeout=timeout,
+            raise_on_timeout=raise_on_timeout,
+            timeout_stage=timeout_stage,
+        )
+
     use_stdin = provider == "codex" or (
         provider != "antigravity" and len(prompt) > _MAX_ARG_LENGTH
     )
@@ -483,6 +495,22 @@ def analyze_image_cli(
     try:
         for provider in providers:
             logger.info(f"[{provider}] 画像解析: {image_file.name}")
+            if provider == "grok":
+                from .grok_build import execute_grok_build_prompt
+
+                success, output = execute_grok_build_prompt(
+                    prompt,
+                    model=cli_model_map.get(provider),
+                    timeout=timeout,
+                    image_path=image_file,
+                    raise_on_timeout=raise_on_timeout,
+                    timeout_stage=timeout_stage,
+                )
+                if success and output:
+                    result = output
+                    break
+                logger.warning("[grok] 画像解析失敗。次の明示設定済みプロバイダを試行")
+                continue
             provider_cwd = (
                 workspace_path if provider == "antigravity" and workspace_path else None
             )

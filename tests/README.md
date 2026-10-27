@@ -24,19 +24,25 @@ tests/
   fixtures/              # テスト用固定データ（今後追加予定）
   unit/
     test_date_utils.py       # 日付整形（6件）
-    test_desktop_bridge.py   # Tauri橋渡し（25件）
+    test_desktop_bridge.py   # Tauri橋渡し（78件）
     test_circle_master.py    # circle_master.json管理（19件）
     test_json_formatter.py   # event.json整形（12件）
 ```
 
-合計: **62テスト**
+2026-10-26のrole経路修正前に完了した全件実行は **847 passed**。最終role/diagnostic修正後のfocused Python testsは **99 passed**。最新の全件再実行はPlaywrightの`test_help_escape_consumes_document_event_before_map_shortcut`でViteページの`DOMContentLoaded` timeoutとなり、全件結果は未完了扱い。テスト追加時は記録を実測に合わせて更新する。
 
 ## テスト対象外
 
-以下はテストなし（理由あり）:
+次のLLM関連テストは固定fixture/mockを使い、外部APIを呼び出さない。
+
+- `test_grok_build.py` — Grok Build ACPの認証選択、画像content block、rate-limit、timeout/cancel/unknown-deliveryと応答不明後の送信停止
+- `test_llm_provider_routing.py` — xAI/Anthropic API endpoint dispatch、Anthropic画像payload、Grokの応答不明後にfallbackしないこと
+- `test_site_parsing_llm.py` / `test_site_structure_role.py` — site_structure role選択とknown/unknownサイトの呼出し経路
+
+以下は引き続きテストなし（理由あり）:
 
 - `src/adapters/*` — 実サイトHTMLへの依存が大きく、フィクスチャ整備が重い
-- `src/utils/llm_client.py` 等 LLM関連 — 外部APIに依存
+- `src/utils/llm_client.py` の実API応答 — 実APIに依存。transport/payloadはfixtureで検証
 - `src/processors/twitter_post_processor.py` — Twitter API + LLM依存
 - `src/utils/catalog_image_analyzer.py` 等 画像処理 — LLM依存
 

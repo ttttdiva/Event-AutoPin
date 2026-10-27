@@ -316,11 +316,12 @@ class TwitterExtractor:
         return all_cookies
 
     def _create_api_instance(self) -> API:
-        """twscrapeが全アカウントロック時に長時間待たないAPIを作る。"""
+        """共有project poolを使い、全アカウントロック時は長時間待たないAPIを作る。"""
+        accounts_db = Path(__file__).resolve().parents[2] / "accounts.db"
         try:
-            return API(raise_when_no_account=True)
+            return API(str(accounts_db), raise_when_no_account=True)
         except TypeError:
-            return API()
+            return API(str(accounts_db))
 
     def _is_no_account_error(self, exc: Exception) -> bool:
         if NoAccountError is not None and isinstance(exc, NoAccountError):
@@ -392,6 +393,13 @@ class TwitterExtractor:
             "user_lookup_success_count": 0,
             "tweet_fetch_success_count": 0,
             "catalog_tweet_count": 0,
+            "failure_stage": None,
+            "failure_queue": None,
+            "failure_code": None,
+            "exception_type": None,
+            "failed_request_dispatched": None,
+            "response_status_code": None,
+            "partial_tweet_count": 0,
         }
         self._last_fetch_stats = stats
         await self.initialize()
@@ -496,9 +504,13 @@ class TwitterExtractor:
                     
                 except Exception as e:
                     if self._is_no_account_error(e):
-                        logger.warning(f"アカウント {self.current_account_index}/{len(self.api_instances)} でレート制限: {e}")
-                        self._mark_twscrape_unavailable(str(e))
-                        stats.update(outcome="transport_unresolved", reason="no account available")
+                        self._record_queue_unavailable(
+                            stats,
+                            exception=e,
+                            stage="timeline_fetch",
+                            queue="UserTweets",
+                            partial_tweet_count=tweet_count,
+                        )
                         return catalog_tweets
                     if self._is_twscrape_unknown_error(e):
                         logger.warning(
@@ -517,9 +529,12 @@ class TwitterExtractor:
             except Exception as e:
                 last_exception = e
                 if self._is_no_account_error(e):
-                    logger.warning(f"すべてのアカウントが利用不可です: {e}")
-                    self._mark_twscrape_unavailable(str(e))
-                    stats.update(outcome="transport_unresolved", reason="no account available")
+                    self._record_queue_unavailable(
+                        stats,
+                        exception=e,
+                        stage="user_lookup",
+                        queue="UserByScreenName",
+                    )
                     return catalog_tweets
                 if self._is_twscrape_unknown_error(e):
                     logger.warning(
@@ -540,9 +555,13 @@ class TwitterExtractor:
         
         # すべての試行が失敗した場合
         if last_exception and self._is_no_account_error(last_exception):
-            logger.warning(f"すべてのアカウントでレート制限に達しました: @{username}")
-            self._mark_twscrape_unavailable(str(last_exception))
-            return catalog_tweets  # レート制限の場合は空を返す
+            self._record_queue_unavailable(
+                stats,
+                exception=last_exception,
+                stage="user_lookup",
+                queue="UserByScreenName",
+            )
+            return catalog_tweets  # 利用可能なキューがなければ空を成功扱いせず返す
         
         # tweetsが定義されていない場合（すべて失敗）
         if tweets is None:
@@ -682,6 +701,41 @@ class TwitterExtractor:
         )
 
         return catalog_tweets
+
+    def _record_queue_unavailable(
+        self,
+        stats: Dict[str, Any],
+        *,
+        exception: Exception,
+        stage: str,
+        queue: str,
+        partial_tweet_count: int = 0,
+    ) -> None:
+        """Record queue exhaustion without treating it as an HTTP/auth failure."""
+        safe_queue = queue if queue in {"UserByScreenName", "UserTweets"} else "unknown"
+        safe_stage = stage if stage in {"user_lookup", "timeline_fetch"} else "unknown"
+        exception_type = type(exception).__name__
+        if not exception_type.isidentifier() or len(exception_type) > 64:
+            exception_type = "Exception"
+
+        stats.update(
+            outcome="queue_unavailable",
+            reason="no eligible account in request queue",
+            failure_stage=safe_stage,
+            failure_queue=safe_queue,
+            failure_code="NO_ACCOUNT_AVAILABLE",
+            exception_type=exception_type,
+            failed_request_dispatched=False,
+            response_status_code=None,
+            partial_tweet_count=max(0, int(partial_tweet_count)),
+        )
+        safe_reason = f"queue unavailable for {safe_queue}"
+        logger.warning(
+            "twscrapeの要求キューを利用できません: "
+            f"段階={safe_stage}, キュー={safe_queue}, "
+            f"分類=NO_ACCOUNT_AVAILABLE, 例外型={exception_type}"
+        )
+        self._mark_twscrape_unavailable(safe_reason)
     
     def _is_catalog_tweet(self, tweet: Tweet) -> bool:
         """お品書きツイートかどうか判定"""

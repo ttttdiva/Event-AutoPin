@@ -4,7 +4,7 @@ import logging
 from openai import OpenAI
 import json
 import base64
-import google.generativeai as genai
+import mimetypes
 import requests
 import time
 import re
@@ -77,6 +77,8 @@ class LLMClient:
         reasoning_effort: Optional[str] = None,
         api_reasoning_effort_map: Optional[Dict[str, str]] = None,
         attempts: Optional[List[Dict[str, Any]]] = None,
+        api_provider_map: Optional[Dict[str, str]] = None,
+        max_api_retries: Optional[int] = None,
     ):
         """初期化
 
@@ -92,7 +94,14 @@ class LLMClient:
         self.cli_cwd = cli_cwd
         self.reasoning_effort = reasoning_effort
         self.api_reasoning_effort_map = api_reasoning_effort_map or {}
+        self.max_api_retries = max_api_retries
         self.attempts = attempts or []
+        self.api_provider_map = dict(api_provider_map or {})
+        for attempt in self.attempts:
+            if attempt.get("kind") == "api" and attempt.get("model"):
+                self.api_provider_map.setdefault(
+                    attempt["model"], attempt.get("provider", "")
+                )
 
         # モデルをリスト形式に統一
         if isinstance(model, str):
@@ -133,43 +142,74 @@ class LLMClient:
         self.client = self.clients[0]["client"] if self.clients else None
 
     def _init_client(
-        self, model_name: str, api_key: Optional[str] = None
+        self,
+        model_name: str,
+        api_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """個別のクライアントを初期化"""
-        if model_name.startswith("gemini"):
+        provider = (self.api_provider_map.get(model_name) or "").strip().lower()
+        if not provider:
+            if model_name.startswith("gemini"):
+                provider = "gemini"
+            elif model_name.startswith("claude-"):
+                provider = "anthropic"
+            elif model_name.startswith("grok-"):
+                provider = "xai"
+            else:
+                provider = "openai"
+
+        if provider == "gemini":
             # Gemini API
-            actual_api_key = api_key or os.getenv("GEMINI_API_KEY")
+            actual_api_key = (
+                api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            )
             if not actual_api_key:
                 raise ValueError(
                     f"Gemini APIキーが設定されていません（モデル: {model_name}）"
                 )
 
-            # 新しい設定インスタンスを作成
-            genai.configure(api_key=actual_api_key)
-            client = genai.GenerativeModel(model_name)
-
             return {
                 "model": model_name,
                 "api_type": "gemini",
-                "client": client,
+                "client": None,
                 "api_key": actual_api_key,
             }
-        else:
-            # OpenAI API (gpt-3.5-turbo, gpt-5-mini など)
-            actual_api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if provider == "anthropic":
+            actual_api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
             if not actual_api_key:
                 raise ValueError(
-                    f"OpenAI APIキーが設定されていません（モデル: {model_name}）"
+                    f"Anthropic APIキーが設定されていません（モデル: {model_name}）"
                 )
-
-            client = OpenAI(api_key=actual_api_key)
-
             return {
                 "model": model_name,
-                "api_type": "openai",
-                "client": client,
+                "api_type": "anthropic",
+                "client": None,
                 "api_key": actual_api_key,
             }
+
+        if provider not in {"openai", "xai"}:
+            raise ValueError(f"未対応APIプロバイダーです: {provider}")
+
+        actual_api_key = api_key or (
+            os.getenv("XAI_API_KEY") if provider == "xai" else os.getenv("OPENAI_API_KEY")
+        )
+        if not actual_api_key:
+            label = "xAI" if provider == "xai" else "OpenAI"
+            raise ValueError(f"{label} APIキーが設定されていません（モデル: {model_name}）")
+
+        client_kwargs: Dict[str, Any] = {"api_key": actual_api_key}
+        if self.max_api_retries is not None:
+            client_kwargs["max_retries"] = self.max_api_retries
+        if provider == "xai":
+            client_kwargs["base_url"] = "https://api.x.ai/v1"
+        client = OpenAI(**client_kwargs)
+
+        return {
+            "model": model_name,
+            "api_type": provider,
+            "client": client,
+            "api_key": actual_api_key,
+        }
 
     def _normalize_response_text(self, content: str) -> str:
         content = content.strip()
@@ -395,6 +435,79 @@ class LLMClient:
         return text, data.get("usageMetadata") or {}
 
     @staticmethod
+    def _image_mime_type(image_path: str) -> str:
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if mime_type in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+            return mime_type
+        try:
+            with open(image_path, "rb") as image_file:
+                signature = image_file.read(16)
+        except OSError:
+            raise
+        if signature.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if signature.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if signature.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if signature.startswith(b"RIFF") and signature[8:12] == b"WEBP":
+            return "image/webp"
+        raise ValueError("unsupported image MIME type")
+
+    @staticmethod
+    def _generate_anthropic_content(
+        model_name: str,
+        api_key: str,
+        prompt: str,
+        *,
+        image_path: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        content: List[Dict[str, Any]]
+        if image_path:
+            mime_type = LLMClient._image_mime_type(image_path)
+            with open(image_path, "rb") as image_file:
+                image_data = base64.b64encode(image_file.read()).decode("ascii")
+            content = [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime_type,
+                        "data": image_data,
+                    },
+                },
+                {"type": "text", "text": prompt},
+            ]
+        else:
+            content = [{"type": "text", "text": prompt}]
+
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model_name,
+                "max_tokens": 4096,
+                "system": "あなたは入力データを解析し、依頼された結果だけを返すアシスタントです。",
+                "messages": [{"role": "user", "content": content}],
+            },
+            timeout=180 if timeout is None else timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        blocks = data.get("content", [])
+        text = "".join(
+            str(block.get("text", ""))
+            for block in blocks
+            if isinstance(block, dict) and block.get("type") == "text"
+        ).strip()
+        return text, data.get("usage") or {}
+
+    @staticmethod
     def _client_with_timeout(client: Any, timeout: Optional[float]) -> Any:
         """Return an OpenAI client with a per-call timeout when supported."""
 
@@ -534,6 +647,8 @@ class LLMClient:
                     model=model_name,
                     reasoning_effort=attempt.get("effort") or reasoning_effort or self.reasoning_effort,
                     api_reasoning_effort_map=self.api_reasoning_effort_map,
+                    api_provider_map={model_name: attempt.get("provider", "")},
+                    max_api_retries=self.max_api_retries,
                 )
                 return api_client.extract_data(
                     prompt,
@@ -542,6 +657,13 @@ class LLMClient:
                     deadline=deadline,
                 )
             except Exception as e:
+                from .grok_build import GrokBuildError
+
+                if isinstance(e, GrokBuildError) and e.code in {
+                    "unknown_delivery",
+                    "cancelled",
+                }:
+                    raise
                 if deadline is not None:
                     deadline.require_time()
                 last_error = e
@@ -623,6 +745,19 @@ class LLMClient:
                             usage_metadata.get("promptTokenCount", 0),
                             usage_metadata.get("candidatesTokenCount", 0),
                         )
+                elif client_info["api_type"] == "anthropic":
+                    content, usage_metadata = self._generate_anthropic_content(
+                        client_info["model"],
+                        client_info["api_key"],
+                        prompt,
+                        timeout=effective_timeout,
+                    )
+                    if usage_metadata:
+                        cost_tracker.add_tokens(
+                            client_info["model"],
+                            usage_metadata.get("input_tokens", 0),
+                            usage_metadata.get("output_tokens", 0),
+                        )
                 elif self._uses_responses_api(client_info["model"]):
                     client = self._client_with_timeout(
                         client_info["client"],
@@ -665,7 +800,7 @@ class LLMClient:
                     )
                     if actual_temperature is not None:
                         api_kwargs["temperature"] = actual_temperature
-                    if effective_reasoning_effort and client_info["api_type"] == "openai":
+                    if effective_reasoning_effort and client_info["api_type"] in {"openai", "xai"}:
                         api_kwargs["reasoning_effort"] = effective_reasoning_effort
 
                     client = self._client_with_timeout(
@@ -780,8 +915,7 @@ HTML:
 
                 if client_info["api_type"] == "gemini":
                     # Gemini API
-                    image_suffix = os.path.splitext(image_path)[1].lower()
-                    mime_type = "image/png" if image_suffix == ".png" else "image/jpeg"
+                    mime_type = self._image_mime_type(image_path)
                     with open(image_path, "rb") as image_file:
                         base64_image = base64.b64encode(image_file.read()).decode(
                             "utf-8"
@@ -816,6 +950,20 @@ HTML:
                             usage_metadata.get("promptTokenCount", 0),
                             usage_metadata.get("candidatesTokenCount", 0),
                         )
+                elif client_info["api_type"] == "anthropic":
+                    content, usage_metadata = self._generate_anthropic_content(
+                        client_info["model"],
+                        client_info["api_key"],
+                        prompt,
+                        image_path=image_path,
+                        timeout=effective_timeout,
+                    )
+                    if usage_metadata:
+                        cost_tracker.add_tokens(
+                            client_info["model"],
+                            usage_metadata.get("input_tokens", 0),
+                            usage_metadata.get("output_tokens", 0),
+                        )
                 else:
                     # OpenAI API
                     # 画像をbase64エンコード
@@ -828,8 +976,7 @@ HTML:
                     model_name = model or client_info["model"]
 
                     if self._uses_responses_api(model_name):
-                        image_suffix = os.path.splitext(image_path)[1].lower()
-                        mime_type = "image/png" if image_suffix == ".png" else "image/jpeg"
+                        mime_type = self._image_mime_type(image_path)
                         client = self._client_with_timeout(
                             client_info["client"],
                             effective_timeout,
@@ -874,7 +1021,10 @@ HTML:
                                         {
                                             "type": "image_url",
                                             "image_url": {
-                                                "url": f"data:image/jpeg;base64,{base64_image}"
+                                                "url": (
+                                                    f"data:{self._image_mime_type(image_path)};"
+                                                    f"base64,{base64_image}"
+                                                )
                                             },
                                         },
                                     ],

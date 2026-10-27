@@ -16,6 +16,8 @@ desktop-app/src/file-asset-path.test.ts
 desktop-app/src/history-search-ui.test.ts
 desktop-app/src/history-search-ui.ts
 desktop-app/src/main.ts
+desktop-app/src/model-role-capabilities.ts
+desktop-app/src/model-role-capabilities.test.ts
 desktop-app/src/openai-model-capabilities.test.ts
 desktop-app/src/openai-model-capabilities.ts
 desktop-app/src/purchase-status.ts
@@ -234,7 +236,9 @@ src/utils/catalog_image_analyzer.py
 src/utils/catalog_post_analyzer.py
 src/utils/catalog_updater.py
 src/utils/circle_master.py
+src/utils/circle_cut_vision.py
 src/utils/cli_llm.py
+src/utils/grok_build.py
 src/utils/antigravity_models.py
 src/utils/cookie_loader.py
 src/utils/date_utils.py
@@ -272,12 +276,14 @@ tests/unit/test_circle_master.py
 tests/unit/test_date_utils.py
 tests/unit/test_desktop_release_gate.py
 tests/unit/test_desktop_bridge.py
+tests/unit/test_grok_build.py
 tests/unit/test_generic_adapter.py
 tests/unit/test_json_formatter.py
 tests/unit/test_json_reprocessor.py
 tests/unit/test_kowauta_adapter.py
 tests/unit/test_learned_pattern_header_validation.py
 tests/unit/test_llm_client_event_keywords.py
+tests/unit/test_llm_provider_routing.py
 tests/unit/test_main_output_cleanup.py
 tests/unit/test_ocr_engine_numbers.py
 tests/unit/test_ocr_engine_runner.py
@@ -287,6 +293,7 @@ tests/unit/test_public_dependency_closure.py
 tests/unit/test_reprocess_helpers.py
 tests/unit/test_reprocess_deadline.py
 tests/unit/test_site_parsing_llm.py
+tests/unit/test_site_structure_role.py
 tests/unit/test_sync_public_repo_script.py
 tests/unit/test_twitter_extractor_fail_fast.py
 tests/unit/test_twitter_post_processor_items.py

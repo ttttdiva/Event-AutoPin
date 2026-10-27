@@ -12,6 +12,15 @@ import { listen } from "@tauri-apps/api/event";
 import { appWindow } from "@tauri-apps/api/window";
 import { open as dialogOpen } from "@tauri-apps/api/dialog";
 import {
+  modelStatusForRole,
+  modelStatusLabel,
+  modelsForRole,
+  modelPreflightSlotsForOperation,
+  selectActiveModelPreflightChecks,
+  type ModelPreflightSlot,
+  type ModelRole,
+} from "./model-role-capabilities";
+import {
   invokeBridgeJob as rawInvokeBridgeJob,
   type BridgeJobResult,
 } from "./bridge-job";
@@ -191,6 +200,14 @@ type ModelOption = {
   provider?: string;
   source?: string;
   source_label?: string;
+  availability?: string;
+  stale?: boolean;
+  capabilities?: {
+    text?: "verified" | "unsupported" | "unknown";
+    image?: "verified" | "unsupported" | "unknown";
+  };
+  capability_source?: string;
+  reasoning_efforts?: string[];
 };
 
 type ModelProviderOption = {
@@ -198,14 +215,28 @@ type ModelProviderOption = {
   label: string;
   kind: "cli" | "api";
   available: boolean;
+  authenticated?: boolean | null;
+  auth_status?: string;
+  image_capability?: string;
   source?: string;
   models: ModelOption[];
 };
 
+type ApiProviderStatus = {
+  id: string;
+  label: string;
+  status: string;
+  credential_configured: boolean;
+  stale_model_count?: number;
+};
+
 type ModelCatalog = {
   providers: ModelProviderOption[];
+  apiProviders?: ApiProviderStatus[];
   apiModels: ModelOption[];
-  apiErrors?: { provider: string; message: string }[];
+  apiErrors?: { provider: string; status?: string; message: string }[];
+  cache_state?: string;
+  fetched_at?: string;
 };
 
 type TextProviderSelection = {
@@ -753,21 +784,30 @@ const FALLBACK_MODEL_CATALOG: ModelCatalog = {
         { id: "opusplan", label: "opusplan", source_label: "候補" },
       ],
     },
+    {
+      id: "grok",
+      label: "Grok Build",
+      kind: "cli",
+      available: false,
+      authenticated: false,
+      auth_status: "unknown",
+      models: [
+        { id: "grok-4.7", label: "grok-4.7", source_label: "CLI候補", capabilities: { text: "verified", image: "verified" }, availability: "available" },
+        { id: "grok-4.7-build-fast", label: "grok-4.7-build-fast", source_label: "CLI候補", capabilities: { text: "verified", image: "verified" }, availability: "available" },
+        { id: "grok-4.6", label: "grok-4.6", source_label: "CLI候補", capabilities: { text: "verified", image: "verified" }, availability: "available" },
+        { id: "grok-4.5", label: "grok-4.5", source_label: "CLI候補", capabilities: { text: "verified", image: "verified" }, availability: "available" },
+      ],
+    },
+  ],
+  apiProviders: [
+    { id: "openai", label: "OpenAI API", status: "unknown", credential_configured: false },
+    { id: "gemini", label: "Gemini API", status: "unknown", credential_configured: false },
+    { id: "anthropic", label: "Anthropic API", status: "unknown", credential_configured: false },
+    { id: "xai", label: "xAI API", status: "unknown", credential_configured: false },
   ],
   apiModels: [
-    { id: "gemini-3-flash-preview", label: "Gemini 3 Flash Preview", provider: "gemini", source_label: "候補" },
-    { id: "gemini-3-pro-preview", label: "Gemini 3 Pro Preview", provider: "gemini", source_label: "候補" },
-    { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", provider: "gemini", source_label: "候補" },
-    { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", provider: "gemini", source_label: "候補" },
-    { id: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash-Lite", provider: "gemini", source_label: "候補" },
-    ...GPT_56_API_MODELS.map((model) => ({ ...model })),
-    { id: "gpt-5.2", label: "GPT-5.2", provider: "openai", source_label: "候補" },
-    { id: "gpt-5.1", label: "GPT-5.1", provider: "openai", source_label: "候補" },
-    { id: "gpt-5", label: "GPT-5", provider: "openai", source_label: "候補" },
-    { id: "gpt-5-mini", label: "GPT-5 mini", provider: "openai", source_label: "候補" },
-    { id: "gpt-5-nano", label: "GPT-5 nano", provider: "openai", source_label: "候補" },
-    { id: "gpt-5.2-pro", label: "GPT-5.2 pro", provider: "openai", source_label: "候補" },
-    { id: "gpt-5-pro", label: "GPT-5 pro", provider: "openai", source_label: "候補" },
+    { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", provider: "openai", source: "default-config", source_label: "保存済み設定", availability: "unknown", capabilities: { text: "verified", image: "verified" }, capability_source: "OpenAI model/vision documentation" },
+    { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", provider: "openai", source: "default-config", source_label: "保存済み設定", availability: "unknown", capabilities: { text: "verified", image: "verified" }, capability_source: "OpenAI model/vision documentation" },
   ],
 };
 
@@ -795,7 +835,23 @@ const DEFAULT_MODEL_SELECTIONS = {
     model: "gpt-5.6-sol",
     effort: "medium",
   },
+  siteStructure: {
+    provider: "api:openai",
+    model: "gpt-5.6-luna",
+    effort: "max",
+  },
+  catalogPost: {
+    provider: "api:openai",
+    model: "gpt-5.6-luna",
+    effort: "max",
+  },
 } as const;
+
+let legacySiteStructureFallback: {
+  fallback_provider?: string;
+  fallback_model?: string;
+  fallback_effort?: string;
+} | null = null;
 
 const ANTIGRAVITY_MODEL_UNAVAILABLE_MESSAGE =
   "選択したAntigravityモデルは現在利用できません。モデル候補を再取得してください。";
@@ -811,6 +867,8 @@ type ModelControlPreferences = {
   textFallback?: ModelSelectionPreference;
   image?: ModelSelectionPreference;
   imageFallback?: ModelSelectionPreference;
+  siteStructure?: ModelSelectionPreference;
+  catalogPost?: ModelSelectionPreference;
 };
 
 const DEFAULT_REASONING_EFFORT = "medium";
@@ -1517,20 +1575,34 @@ function providerModels(providerId: string): ModelOption[] {
   return modelProvider(providerId)?.models ?? [];
 }
 
+const API_PROVIDER_LABELS: Record<string, string> = {
+  openai: "OpenAI API",
+  gemini: "Gemini API",
+  anthropic: "Anthropic API",
+  xai: "xAI API",
+};
+
+function apiProviderState(providerId: string): ApiProviderStatus | undefined {
+  return modelCatalog.apiProviders?.find((provider) => provider.id === providerId);
+}
+
 function apiProviderLabel(providerId: string): string {
-  if (providerId === "openai") return "OpenAI API";
-  if (providerId === "gemini") return "Gemini API";
-  return providerId || "API";
+  const label = API_PROVIDER_LABELS[providerId] || providerId || "API";
+  const status = apiProviderState(providerId)?.status;
+  if (status === "credential_not_configured") return `${label}（認証情報未設定）`;
+  if (status === "permission_denied") return `${label}（権限エラー）`;
+  if (status === "rate_limited") return `${label}（制限中）`;
+  return label;
+}
+
+function modelOptionForId(modelId: string): ModelOption | undefined {
+  return [...modelCatalog.apiModels, ...FALLBACK_MODEL_CATALOG.apiModels].find(
+    (model) => model.id === modelId,
+  );
 }
 
 function apiProviderOptions() {
-  const providers = Array.from(
-    new Set(
-      [...FALLBACK_MODEL_CATALOG.apiModels, ...modelCatalog.apiModels]
-        .map((model) => model.provider)
-        .filter((provider): provider is string => !!provider),
-    ),
-  );
+  const providers = Object.keys(API_PROVIDER_LABELS);
   return providers.map((provider) => ({
     value: provider,
     label: apiProviderLabel(provider),
@@ -1539,19 +1611,6 @@ function apiProviderOptions() {
 
 function providerConfigValue(selection: TextProviderSelection): string {
   return `${selection.kind}:${selection.provider}`;
-}
-
-function apiModelsForProvider(providerId: string): ModelOption[] {
-  const merged = [...modelCatalog.apiModels];
-  for (const fallback of FALLBACK_MODEL_CATALOG.apiModels) {
-    if (
-      fallback.provider === providerId &&
-      !merged.some((model) => model.id === fallback.id && model.provider === fallback.provider)
-    ) {
-      merged.push(fallback);
-    }
-  }
-  return merged.filter((model) => model.provider === providerId);
 }
 
 function reasoningEffortLabel(effort: string): string {
@@ -1596,6 +1655,8 @@ function reasoningEffortsForSelection(selection: TextProviderSelection, modelId:
   if (selection.kind === "api") {
     if (selection.provider === "openai") return openAiEffortsForModel(modelId);
     if (selection.provider === "gemini") return geminiApiEffortsForModel(modelId);
+    const advertised = modelOptionForId(modelId)?.reasoning_efforts;
+    if (selection.provider === "xai" && advertised?.length) return advertised;
     return NO_REASONING_EFFORTS;
   }
   if (selection.provider === "codex") return CODEX_REASONING_EFFORTS;
@@ -1627,6 +1688,8 @@ function inferApiProviderFromModel(modelId: string): string {
   );
   if (found?.provider) return found.provider;
   if (modelId.startsWith("gemini-")) return "gemini";
+  if (modelId.startsWith("claude-")) return "anthropic";
+  if (modelId.startsWith("grok-")) return "xai";
   return "openai";
 }
 
@@ -1639,7 +1702,11 @@ function textProviderOptions() {
     })),
     ...modelCatalog.providers.map((provider) => ({
       value: `cli:${provider.id}`,
-      label: provider.label,
+      label: provider.authenticated === false
+        ? `${provider.label}（未認証）`
+        : provider.available
+          ? provider.label
+          : `${provider.label}（未検出）`,
       disabled: false,
     })),
   ];
@@ -1664,7 +1731,7 @@ function textProviderValueFromConfig(provider: string, modelId: string): string 
   if (normalized.startsWith("api:") || normalized.startsWith("cli:")) {
     return normalized;
   }
-  if (normalized === "openai" || normalized === "gemini") {
+  if (normalized === "openai" || normalized === "gemini" || normalized === "anthropic" || normalized === "xai") {
     return `api:${normalized}`;
   }
   return `cli:${normalized}`;
@@ -1684,16 +1751,38 @@ function updateProviderModelSelect(
   modelSelectId: string,
   effortSelectId: string,
   preferredValue?: string,
+  role: ModelRole = "text",
 ) {
   const providerSelect = document.getElementById(providerSelectId) as HTMLSelectElement;
   const modelSelect = document.getElementById(modelSelectId) as HTMLSelectElement;
   const effortSelect = document.getElementById(effortSelectId) as HTMLSelectElement;
   const selection = parseTextProviderValue(providerSelect.value);
-  const models =
+  const allModels =
     selection.kind === "cli"
       ? providerModels(selection.provider)
-      : apiModelsForProvider(selection.provider);
-  setSelectOptions(modelSelect, modelOptions(models), preferredValue);
+      : [...modelCatalog.apiModels, ...FALLBACK_MODEL_CATALOG.apiModels].filter(
+          (model) => model.provider === selection.provider,
+        );
+  const providerStatus =
+    selection.kind === "api" ? apiProviderState(selection.provider) : undefined;
+  const models = selection.kind === "cli"
+    ? role === "image"
+      ? modelsForRole(allModels, role)
+      : allModels
+    : modelsForRole(allModels, role, providerStatus);
+  const options = modelOptions(models, role, providerStatus);
+  const currentModel = preferredValue || modelSelect.value;
+  if (currentModel && !options.some((option) => option.value === currentModel)) {
+    const saved = allModels.find((model) => model.id === currentModel);
+    const status = saved
+      ? modelStatusForRole(saved, role, providerStatus)
+      : "unknown";
+    options.push({
+      value: currentModel,
+      label: `${currentModel}（${modelStatusLabel(status)}）`,
+    });
+  }
+  setSelectOptions(modelSelect, options, preferredValue);
   setEffortOptions(
     effortSelectId,
     effortSelect?.value,
@@ -1707,6 +1796,7 @@ function updateVisionModelSelect(preferredValue?: string) {
     "visionModelId",
     "visionReasoningEffort",
     preferredValue,
+    "image",
   );
 }
 
@@ -1725,6 +1815,7 @@ function updateVisionFallbackModelSelect(preferredValue?: string) {
     "visionFallbackModel",
     "visionFallbackReasoningEffort",
     preferredValue,
+    "image",
   );
 }
 
@@ -1767,10 +1858,20 @@ function cliProviderOptions(includeNone = false) {
   return options;
 }
 
-function modelOptions(models: ModelOption[]) {
+function modelOptions(
+  models: ModelOption[],
+  role: ModelRole = "text",
+  providerStatus?: ApiProviderStatus,
+) {
   return models.map((model) => ({
     value: model.id,
-    label: [model.label, model.source_label].filter(Boolean).join(" / "),
+    label: [
+      model.label,
+      model.source_label,
+      modelStatusForRole(model, role, providerStatus) === "available"
+        ? ""
+        : modelStatusLabel(modelStatusForRole(model, role, providerStatus)),
+    ].filter(Boolean).join(" / "),
   }));
 }
 
@@ -2020,14 +2121,76 @@ function hydrateModelControls(preferences: ModelControlPreferences = {}) {
     hydratedImageFallbackEfforts,
     imageFallbackEffortDefault,
   );
+
+  const mirroredTextRole = {
+    provider: controlValue("modelProvider") || DEFAULT_MODEL_SELECTIONS.text.provider,
+    model: controlValue("model") || DEFAULT_MODEL_SELECTIONS.text.model,
+    effort: controlValue("textReasoningEffort") || DEFAULT_MODEL_SELECTIONS.text.effort,
+  };
+  hydrateRoleControls(
+    "siteStructureModelProvider",
+    "siteStructureModel",
+    "siteStructureReasoningEffort",
+    preferences.siteStructure || mirroredTextRole,
+    "text",
+  );
+  hydrateRoleControls(
+    "catalogPostModelProvider",
+    "catalogPostModel",
+    "catalogPostReasoningEffort",
+    preferences.catalogPost || mirroredTextRole,
+    "text",
+  );
 }
 
-async function loadModelCatalog() {
+function hydrateRoleControls(
+  providerId: string,
+  modelId: string,
+  effortId: string,
+  preference: ModelSelectionPreference,
+  role: ModelRole,
+) {
+  const providerSelect = document.getElementById(providerId) as HTMLSelectElement | null;
+  const modelSelect = document.getElementById(modelId) as HTMLSelectElement | null;
+  if (!providerSelect || !modelSelect) return;
+  const defaultSelection =
+    modelId === "siteStructureModel"
+      ? DEFAULT_MODEL_SELECTIONS.siteStructure
+      : DEFAULT_MODEL_SELECTIONS.catalogPost;
+  const providerValue = firstNonEmpty(
+    preference.provider,
+    controlValue(providerId),
+    defaultSelection.provider,
+  );
+  setSelectOptions(providerSelect, textProviderOptions(), providerValue);
+  const modelValue = firstNonEmpty(
+    preference.model,
+    controlValue(modelId),
+    providerValue === defaultSelection.provider ? defaultSelection.model : "",
+  );
+  updateProviderModelSelect(providerId, modelId, effortId, modelValue || undefined, role);
+  const selection = parseTextProviderValue(providerSelect.value || providerValue);
+  const efforts = reasoningEffortsForSelection(selection, modelSelect.value);
+  setEffortOptions(
+    effortId,
+    firstNonEmpty(
+      preference.effort,
+      controlValue(effortId),
+      providerValue === defaultSelection.provider && modelSelect.value === defaultSelection.model
+        ? defaultSelection.effort
+        : undefined,
+    ),
+    efforts,
+  );
+}
+
+async function loadModelCatalog(forceRefresh = false) {
   if (modelCatalogStatusEl) modelCatalogStatusEl.textContent = "取得中...";
   if (refreshModelCatalogBtn) refreshModelCatalogBtn.disabled = true;
   try {
     modelCatalog = await invoke<ModelCatalog>("list_model_catalog", {
       projectRoot: projectRootEl.value || ".",
+      forceRefresh,
     });
     modelCatalogLoaded = true;
     const apiCount = modelCatalog.apiModels.length;
@@ -2035,28 +2198,124 @@ async function loadModelCatalog() {
       (sum, provider) => sum + provider.models.length,
       0,
     );
-    const errors = modelCatalog.apiErrors?.length
-      ? ` / API取得エラー ${modelCatalog.apiErrors.length}件`
-      : "";
+    const failures = (modelCatalog.apiProviders || []).filter((provider) =>
+      ["permission_denied", "rate_limited", "transport_error", "timeout"].includes(provider.status),
+    ).length;
+    const stale = modelCatalog.cache_state === "stale" ? " / 前回取得候補を表示" : "";
+    const errors = failures ? ` / API取得失敗 ${failures}件` : "";
+    const retiredCount = modelCatalog.apiModels.filter((model) =>
+      ["retired", "scheduled_retirement", "deprecated"].includes(model.availability || ""),
+    ).length;
+    const unknownCount = modelCatalog.apiModels.filter((model) =>
+      model.availability === "available" &&
+      (model.capabilities?.text !== "verified" || model.capabilities?.image === "unknown"),
+    ).length;
+    const unauthenticatedCli = modelCatalog.providers.filter(
+      (provider) => provider.authenticated === false,
+    ).length;
     if (modelCatalogStatusEl) {
-      modelCatalogStatusEl.textContent = `API ${apiCount}件 / CLI ${cliCount}件${errors}`;
+      modelCatalogStatusEl.textContent =
+        `API ${apiCount}件 / CLI ${cliCount}件 / 未確認 ${unknownCount}件 / 提供終了等 ${retiredCount}件${unauthenticatedCli ? ` / CLI未認証 ${unauthenticatedCli}件` : ""}${errors}${stale}`;
     }
   } catch (e) {
-    modelCatalog = FALLBACK_MODEL_CATALOG;
-    modelCatalogLoaded = true;
     console.warn("モデルカタログ読み込みスキップ:", e);
-    if (modelCatalogStatusEl) modelCatalogStatusEl.textContent = "候補表示";
+    if (!modelCatalogLoaded) {
+      modelCatalog = FALLBACK_MODEL_CATALOG;
+      modelCatalogLoaded = true;
+    }
+    if (modelCatalogStatusEl) {
+      modelCatalogStatusEl.textContent = "更新失敗 / 前回候補を保持";
+    }
   } finally {
     if (refreshModelCatalogBtn) refreshModelCatalogBtn.disabled = false;
   }
   hydrateModelControls();
 }
 
-async function preflightSelectedAntigravityModel(): Promise<boolean> {
-  const selection = selectedImageProvider();
-  if (selection.kind !== "cli" || selection.provider !== "antigravity") {
-    return true;
+async function preflightSelectedModels(
+  activeSlots: readonly ModelPreflightSlot[],
+): Promise<boolean> {
+  const allRoleChecks: Array<{
+    slot: ModelPreflightSlot;
+    selection: TextProviderSelection;
+    model: string;
+    role: ModelRole;
+  }> = [
+    { slot: "text", selection: selectedTextProvider(), model: selectedTextModel(), role: "text" },
+    { slot: "text_fallback", selection: selectedTextFallbackProvider(), model: selectedTextFallbackModel(), role: "text" },
+    {
+      slot: "site_structure",
+      selection: parseTextProviderValue(controlValue("siteStructureModelProvider")),
+      model: controlValue("siteStructureModel"),
+      role: "text",
+    },
+    {
+      slot: "oshinagaki_post",
+      selection: parseTextProviderValue(controlValue("catalogPostModelProvider")),
+      model: controlValue("catalogPostModel"),
+      role: "text",
+    },
+    { slot: "vision", selection: selectedImageProvider(), model: selectedImageModel(), role: "image" },
+    { slot: "vision_fallback", selection: selectedImageFallbackProvider(), model: selectedImageFallbackModel(), role: "image" },
+  ];
+  const roleChecks = selectActiveModelPreflightChecks(allRoleChecks, activeSlots);
+  const apiRoles = roleChecks.filter((role) => role.selection.kind === "api");
+  if (apiRoles.some((role) => role.selection.kind === "api") && !modelCatalogLoaded) {
+    await loadModelCatalog();
   }
+  for (const role of apiRoles) {
+    if (role.selection.kind !== "api" || !role.model) continue;
+    const providerStatus = apiProviderState(role.selection.provider);
+    const providerLabel = API_PROVIDER_LABELS[role.selection.provider] || role.selection.provider;
+    if (providerStatus?.status === "credential_not_configured") {
+      resultEl.textContent = `${providerLabel}の認証情報が未設定です。モデル候補は保存しましたが処理を開始しません。`;
+      return false;
+    }
+    if (providerStatus?.status === "permission_denied") {
+      resultEl.textContent = `${providerLabel}のモデル一覧取得で権限エラーが確認されました。API要求を開始しません。`;
+      return false;
+    }
+    const model = [...modelCatalog.apiModels, ...FALLBACK_MODEL_CATALOG.apiModels].find(
+      (candidate) => candidate.provider === role.selection.provider && candidate.id === role.model,
+    );
+    const status = model
+      ? modelStatusForRole(model, role.role, providerStatus)
+      : "unknown";
+    if (status === "retired") {
+      resultEl.textContent = `${role.model}は${modelStatusLabel(status)}のため実行しません。候補を再取得してください。`;
+      return false;
+    }
+    if (status === "unknown" || status === "unsupported" || status === "availability_unknown") {
+      resultEl.textContent = `${role.model}の${role.role === "image" ? "画像" : "テキスト"}能力または利用状態を確認できません。候補を再取得してください。`;
+      return false;
+    }
+  }
+
+  if (roleChecks.some((role) => role.selection.kind === "cli" && role.selection.provider === "grok")) {
+    if (!modelCatalogLoaded) await loadModelCatalog();
+    const grokProvider = modelProvider("grok");
+    if (!grokProvider?.available) {
+      resultEl.textContent = "Grok Build CLIが見つかりません。モデル候補を再取得して状態を確認してください。";
+      return false;
+    }
+    if (grokProvider.authenticated === false) {
+      resultEl.textContent = "Grok Buildは未認証です。新しいログインは行っていません。既存認証を設定した後、モデル候補を再取得してください。";
+      return false;
+    }
+    for (const role of roleChecks) {
+      if (role.selection.kind !== "cli" || role.selection.provider !== "grok" || role.role !== "image") continue;
+      const capability = grokProvider.models.find((model) => model.id === role.model)?.capabilities?.image;
+      if (capability !== "verified") {
+        resultEl.textContent = "選択したGrok Buildモデルの画像入力能力を確認できません。画像解析を開始しません。";
+        return false;
+      }
+    }
+  }
+
+  const antigravityChecks = roleChecks.filter(
+    (role) => role.selection.kind === "cli" && role.selection.provider === "antigravity",
+  );
+  if (!antigravityChecks.length) return true;
 
   if (!modelCatalogLoaded) {
     await loadModelCatalog();
@@ -2065,14 +2324,15 @@ async function preflightSelectedAntigravityModel(): Promise<boolean> {
   const provider = modelProvider("antigravity");
   if (provider?.source !== "cli-live") return true;
 
-  const selectedModel = selectedImageModel();
-  const availableInLiveCatalog = provider.models.some(
-    (model) =>
-      model.id === selectedModel && model.source === "cli-live",
-  );
-  if (!availableInLiveCatalog) {
-    resultEl.textContent = ANTIGRAVITY_MODEL_UNAVAILABLE_MESSAGE;
-    return false;
+  for (const role of antigravityChecks) {
+    if (provider?.source !== "cli-live") continue;
+    const availableInLiveCatalog = provider.models.some(
+      (model) => model.id === role.model && model.source === "cli-live",
+    );
+    if (!availableInLiveCatalog) {
+      resultEl.textContent = ANTIGRAVITY_MODEL_UNAVAILABLE_MESSAGE;
+      return false;
+    }
   }
   return true;
 }
@@ -2225,6 +2485,58 @@ function selectedImageFallbackEffort(): string {
     controlValue("visionFallbackReasoningEffort"),
     reasoningEffortsForSelection(selection, model),
     defaultEffort,
+  );
+}
+
+function selectedRoleSettings(
+  providerId: string,
+  modelId: string,
+  effortId: string,
+  defaultSelection: ModelSelectionPreference,
+) {
+  const selection = parseTextProviderValue(
+    controlValue(providerId) || defaultSelection.provider || "api:openai",
+  );
+  const model = controlValue(modelId) || defaultSelection.model || "";
+  const effort = normalizeReasoningEffortFor(
+    controlValue(effortId) || defaultSelection.effort,
+    reasoningEffortsForSelection(selection, model),
+    defaultSelection.effort,
+  );
+  const cliModelMap = selection.kind === "cli" && model && model !== "default"
+    ? { [selection.provider]: model }
+    : {};
+  const cliEffortMap = selection.kind === "cli"
+    ? { [selection.provider]: effort }
+    : {};
+  return {
+    provider: providerConfigValue(selection),
+    model,
+    effort,
+    cli_model_map: cliModelMap,
+    cli_effort_map: cliEffortMap,
+  };
+}
+
+function selectedSiteStructureRole() {
+  return {
+    ...selectedRoleSettings(
+      "siteStructureModelProvider",
+      "siteStructureModel",
+      "siteStructureReasoningEffort",
+      DEFAULT_MODEL_SELECTIONS.siteStructure,
+    ),
+    ...(legacySiteStructureFallback || {}),
+    cli_timeout: 900,
+  };
+}
+
+function selectedCatalogPostRole() {
+  return selectedRoleSettings(
+    "catalogPostModelProvider",
+    "catalogPostModel",
+    "catalogPostReasoningEffort",
+    DEFAULT_MODEL_SELECTIONS.catalogPost,
   );
 }
 
@@ -6325,7 +6637,10 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
     );
     return;
   }
-  if (!(await preflightSelectedAntigravityModel())) return;
+  const requiredModelSlots = modelPreflightSlotsForOperation(
+    job.source === "post" ? "circle_post" : "circle_image",
+  );
+  if (!(await preflightSelectedModels(requiredModelSlots))) return;
 
   resultEl.textContent = `「${job.circleName}」の変更を保存中...`;
   const pendingSave = saveNow(INTERNAL_OPERATION_SAVE);
@@ -6408,6 +6723,9 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
     image_fallback_llm_model: selectedImageFallbackModel(),
     image_fallback_llm_effort: selectedImageFallbackEffort(),
     image_api_reasoning_effort_map: selectedImageApiEffortMap(),
+    ...(job.source === "post"
+      ? { oshinagaki_post: selectedCatalogPostRole() }
+      : {}),
     tweet_llm_cli_providers: selectedTweetProviders(),
     tweet_llm_cli_models: selectedTweetModelMap(),
     tweet_llm_cli_efforts: selectedTweetEffortMap(),
@@ -7294,7 +7612,7 @@ function attachItemPanelListeners() {
   document.getElementById("saveConfigBtn") as HTMLButtonElement
 ).addEventListener("click", saveConfig);
 unlimitedOcrDoctorBtn?.addEventListener("click", runUnlimitedOcrDoctor);
-refreshModelCatalogBtn?.addEventListener("click", () => loadModelCatalog());
+refreshModelCatalogBtn?.addEventListener("click", () => loadModelCatalog(true));
 (document.getElementById("pingBtn") as HTMLButtonElement).addEventListener(
   "click",
   () => runJob("ping", {}),
@@ -7325,7 +7643,9 @@ function setEventPipelineButtonsDisabled(disabled: boolean): void {
   applyOperationEvent({ type: "request-pipeline" });
   setEventPipelineButtonsDisabled(true);
   try {
-  if (!(await preflightSelectedAntigravityModel())) return;
+  if (!(await preflightSelectedModels(
+    modelPreflightSlotsForOperation("catalog_reprocess"),
+  ))) return;
   const pendingCrawlMeta = captureCrawlMetaSnapshot();
   cancelCrawlMetaSave();
   await flushCrawlMetaSnapshot(pendingCrawlMeta, INTERNAL_OPERATION_SAVE);
@@ -7595,6 +7915,8 @@ function buildPipelinePayload() {
     image_fallback_llm_model: selectedImageFallbackModel(),
     image_fallback_llm_effort: selectedImageFallbackEffort(),
     image_api_reasoning_effort_map: selectedImageApiEffortMap(),
+    site_parsing: selectedSiteStructureRole(),
+    oshinagaki_post: selectedCatalogPostRole(),
     map_url: sourceConfig.mapUrls[0] || "",
     map_urls: sourceConfig.mapUrls,
     enable_twitter_catalog: boolFromSelect("enableTwitter"),
@@ -7647,7 +7969,12 @@ function isValidEventDate(value: unknown): value is string {
   applyOperationEvent({ type: "request-pipeline" });
   setEventPipelineButtonsDisabled(true);
   try {
-  if (!(await preflightSelectedAntigravityModel())) return;
+  if (!(await preflightSelectedModels(
+    modelPreflightSlotsForOperation(
+      "pipeline",
+      boolFromSelect("enableTwitter"),
+    ),
+  ))) return;
   const pendingCrawlMeta = captureCrawlMetaSnapshot();
   cancelCrawlMetaSave();
   await flushCrawlMetaSnapshot(pendingCrawlMeta, INTERNAL_OPERATION_SAVE);
@@ -7799,6 +8126,7 @@ function isValidEventDate(value: unknown): value is string {
     parseResult = (await runJob("parse_site_preview", {
       project_root: payload.project_root,
       url: payload.url,
+      event_name: payload.event_name,
       model: payload.model,
       text_llm_provider: payload.text_llm_provider,
       text_llm_cli_models: payload.text_llm_cli_models,
@@ -7816,6 +8144,7 @@ function isValidEventDate(value: unknown): value is string {
       image_fallback_llm_model: payload.image_fallback_llm_model,
       image_fallback_llm_effort: payload.image_fallback_llm_effort,
       image_api_reasoning_effort_map: payload.image_api_reasoning_effort_map,
+      site_parsing: payload.site_parsing,
       catalog_additional_prompt: payload.catalog_additional_prompt,
       cookie_file: payload.cookie_file,
     })) as any;
@@ -8032,6 +8361,7 @@ function showScrapePreviewModalAsync(
               text_fallback_llm_provider: pipelinePayload.text_fallback_llm_provider,
               text_fallback_llm_model: pipelinePayload.text_fallback_llm_model,
               text_fallback_llm_effort: pipelinePayload.text_fallback_llm_effort,
+              site_parsing: pipelinePayload.site_parsing,
             })) as any;
 
             if (result?.circles?.length > 0) {
@@ -8648,6 +8978,69 @@ async function loadProjectConfig(): Promise<boolean> {
       };
     }
 
+    legacySiteStructureFallback = null;
+    const structureProvider = parseYamlNestedValue(raw, "site_parsing", "provider");
+    const structureModel = parseYamlNestedValue(raw, "site_parsing", "model");
+    const legacyStructureApiModel = parseYamlNestedValue(raw, "site_parsing", "api_model");
+    const legacyStructureCliModel = parseYamlNestedValue(raw, "site_parsing", "codex_model");
+    const structureEffort = firstNonEmpty(
+      parseYamlNestedValue(raw, "site_parsing", "effort"),
+      parseYamlNestedValue(raw, "site_parsing", "reasoning_effort"),
+      parseYamlNestedValue(raw, "site_parsing", "api_reasoning_effort"),
+      apiReasoningEffort,
+    );
+    if (structureProvider && structureModel) {
+      modelPreferences.siteStructure = {
+        provider: textProviderValueFromConfig(structureProvider, structureModel),
+        model: structureModel,
+        effort: structureEffort || undefined,
+      };
+    } else if (legacyStructureApiModel) {
+      modelPreferences.siteStructure = {
+        provider: textProviderValueFromConfig("api", legacyStructureApiModel),
+        model: legacyStructureApiModel,
+        effort: structureEffort || undefined,
+      };
+    }
+    const structureFallbackProvider = parseYamlNestedValue(
+      raw,
+      "site_parsing",
+      "fallback_provider",
+    );
+    const structureFallbackModel = firstNonEmpty(
+      parseYamlNestedValue(raw, "site_parsing", "fallback_model"),
+      structureFallbackProvider ? "" : legacyStructureCliModel,
+    );
+    const preferLegacyCli =
+      parseYamlNestedValue(raw, "site_parsing", "prefer_cli") !== "false";
+    if (structureFallbackProvider && structureFallbackModel) {
+      legacySiteStructureFallback = {
+        fallback_provider: textProviderValueFromConfig(
+          structureFallbackProvider,
+          structureFallbackModel,
+        ),
+        fallback_model: structureFallbackModel,
+        fallback_effort: parseYamlNestedValue(raw, "site_parsing", "fallback_effort") || structureEffort,
+      };
+    } else if (!structureProvider && legacyStructureCliModel && preferLegacyCli) {
+      legacySiteStructureFallback = {
+        fallback_provider: "cli:codex",
+        fallback_model: legacyStructureCliModel,
+        fallback_effort: structureEffort,
+      };
+    }
+
+    const catalogPostProvider = parseYamlNestedValue(raw, "oshinagaki_post", "provider");
+    const catalogPostModel = parseYamlNestedValue(raw, "oshinagaki_post", "model");
+    const catalogPostEffort = parseYamlNestedValue(raw, "oshinagaki_post", "effort");
+    if (catalogPostProvider && catalogPostModel) {
+      modelPreferences.catalogPost = {
+        provider: textProviderValueFromConfig(catalogPostProvider, catalogPostModel),
+        model: catalogPostModel,
+        effort: catalogPostEffort || undefined,
+      };
+    }
+
     // 保存済み設定を最優先にし、未指定の項目は現在のUI state、最後に
     // DEFAULT_MODEL_SELECTIONSへ落とす。未知の候補もhydrate側で保持する。
     hydrateModelControls(modelPreferences);
@@ -8742,6 +9135,48 @@ function buildConfigYaml(): string {
     : 'catalog_additional_prompt: ""';
   const yamlQuote = (value: string) =>
     value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const yamlMapLines = (name: string, value: unknown, indent: string) => {
+    const entries =
+      value && typeof value === "object" && !Array.isArray(value)
+        ? Object.entries(value as Record<string, unknown>).filter(
+            ([, entry]) => typeof entry === "string" && entry.length > 0,
+          )
+        : [];
+    return entries.length
+      ? [
+          `${indent}${name}:`,
+          ...entries.map(
+            ([key, entry]) => `${indent}  ${key}: "${yamlQuote(String(entry))}"`,
+          ),
+        ]
+      : [`${indent}${name}: {}`];
+  };
+  const siteStructureRole = selectedSiteStructureRole();
+  const siteParsingYamlLines = [
+    "site_parsing:",
+    `  provider: "${yamlQuote(String(siteStructureRole.provider || ""))}"`,
+    `  model: "${yamlQuote(String(siteStructureRole.model || ""))}"`,
+    `  effort: "${yamlQuote(String(siteStructureRole.effort || ""))}"`,
+    "  cli_timeout: 900",
+    ...yamlMapLines("cli_model_map", siteStructureRole.cli_model_map, "  "),
+    ...yamlMapLines("cli_effort_map", siteStructureRole.cli_effort_map, "  "),
+    ...(siteStructureRole.fallback_provider
+      ? [
+          `  fallback_provider: "${yamlQuote(String(siteStructureRole.fallback_provider))}"`,
+          `  fallback_model: "${yamlQuote(String(siteStructureRole.fallback_model || ""))}"`,
+          `  fallback_effort: "${yamlQuote(String(siteStructureRole.fallback_effort || ""))}"`,
+        ]
+      : []),
+  ];
+  const catalogPostRole = selectedCatalogPostRole();
+  const catalogPostYamlLines = [
+    "oshinagaki_post:",
+    `  provider: "${yamlQuote(String(catalogPostRole.provider || ""))}"`,
+    `  model: "${yamlQuote(String(catalogPostRole.model || ""))}"`,
+    `  effort: "${yamlQuote(String(catalogPostRole.effort || ""))}"`,
+    ...yamlMapLines("cli_model_map", catalogPostRole.cli_model_map, "  "),
+    ...yamlMapLines("cli_effort_map", catalogPostRole.cli_effort_map, "  "),
+  ];
   const configUrls = parseEventUrlList(val("eventUrl"));
   const yamlSourceUrls = configUrls.length ? configUrls : parseEventUrlList(val("eventUrl"));
   const configSource = buildEventSourcesPayload(yamlSourceUrls, val("mapUrl"), promptRaw);
@@ -8811,6 +9246,8 @@ function buildConfigYaml(): string {
     `image_fallback_llm_model: "${selectedImageFallbackModel()}"`,
     `image_fallback_llm_effort: "${selectedImageFallbackEffort()}"`,
     ...imageApiEffortMapYamlLines,
+    ...siteParsingYamlLines,
+    ...catalogPostYamlLines,
     "",
     `skip_circle_images: ${sel("skipCircleImages")}`,
     "",
@@ -8843,6 +9280,12 @@ const FORM_IDS = [
   "modelProvider",
   "model",
   "textReasoningEffort",
+  "siteStructureModelProvider",
+  "siteStructureModel",
+  "siteStructureReasoningEffort",
+  "catalogPostModelProvider",
+  "catalogPostModel",
+  "catalogPostReasoningEffort",
   "textFallbackModelProvider",
   "textFallbackModel",
   "textFallbackReasoningEffort",
@@ -8910,6 +9353,28 @@ function restoreFormValues() {
     updateTextFallbackModelSelect(data.textFallbackModel);
     updateVisionModelSelect(data.visionModelId);
     updateVisionFallbackModelSelect(data.visionFallbackModel);
+    hydrateRoleControls(
+      "siteStructureModelProvider",
+      "siteStructureModel",
+      "siteStructureReasoningEffort",
+      {
+        provider: data.siteStructureModelProvider,
+        model: data.siteStructureModel,
+        effort: data.siteStructureReasoningEffort,
+      },
+      "text",
+    );
+    hydrateRoleControls(
+      "catalogPostModelProvider",
+      "catalogPostModel",
+      "catalogPostReasoningEffort",
+      {
+        provider: data.catalogPostModelProvider,
+        model: data.catalogPostModel,
+        effort: data.catalogPostReasoningEffort,
+      },
+      "text",
+    );
   } catch {
     /* ignore */
   }
@@ -10507,7 +10972,9 @@ async function runMapAutoPlacement(useCalibration: boolean) {
   let backendSucceeded = false;
   let reloadCommitted = false;
   try {
-    if (!(await preflightSelectedAntigravityModel())) {
+    if (!(await preflightSelectedModels(
+      modelPreflightSlotsForOperation("map_auto"),
+    ))) {
       logToFile("[map-auto] blocked: selected Antigravity model is not in live catalog");
       return;
     }
@@ -13138,6 +13605,26 @@ document.getElementById("visionFallbackModelProvider")?.addEventListener("change
   updateVisionFallbackModelSelect();
   saveFormValues();
 });
+document.getElementById("siteStructureModelProvider")?.addEventListener("change", () => {
+  updateProviderModelSelect(
+    "siteStructureModelProvider",
+    "siteStructureModel",
+    "siteStructureReasoningEffort",
+    undefined,
+    "text",
+  );
+  saveFormValues();
+});
+document.getElementById("catalogPostModelProvider")?.addEventListener("change", () => {
+  updateProviderModelSelect(
+    "catalogPostModelProvider",
+    "catalogPostModel",
+    "catalogPostReasoningEffort",
+    undefined,
+    "text",
+  );
+  saveFormValues();
+});
 [
   "model",
   "textReasoningEffort",
@@ -13147,12 +13634,18 @@ document.getElementById("visionFallbackModelProvider")?.addEventListener("change
   "visionReasoningEffort",
   "visionFallbackModel",
   "visionFallbackReasoningEffort",
+  "siteStructureModel",
+  "siteStructureReasoningEffort",
+  "catalogPostModel",
+  "catalogPostReasoningEffort",
 ].forEach((id) => {
   document.getElementById(id)?.addEventListener("change", () => {
     if (id === "model") updateTextModelSelect((document.getElementById("model") as HTMLSelectElement).value);
     if (id === "textFallbackModel") updateTextFallbackModelSelect((document.getElementById("textFallbackModel") as HTMLSelectElement).value);
     if (id === "visionModelId") updateVisionModelSelect((document.getElementById("visionModelId") as HTMLSelectElement).value);
     if (id === "visionFallbackModel") updateVisionFallbackModelSelect((document.getElementById("visionFallbackModel") as HTMLSelectElement).value);
+    if (id === "siteStructureModel") updateProviderModelSelect("siteStructureModelProvider", "siteStructureModel", "siteStructureReasoningEffort", controlValue("siteStructureModel"), "text");
+    if (id === "catalogPostModel") updateProviderModelSelect("catalogPostModelProvider", "catalogPostModel", "catalogPostReasoningEffort", controlValue("catalogPostModel"), "text");
     saveFormValues();
   });
 });

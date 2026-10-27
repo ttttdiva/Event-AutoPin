@@ -4,7 +4,9 @@ Twitter Post Processor
 """
 
 import asyncio
+import hashlib
 import re
+import unicodedata
 from functools import partial
 from typing import Awaitable, List, Dict, Any, Optional
 from datetime import datetime
@@ -44,6 +46,50 @@ from ..utils.llm_attempts import (
     DEFAULT_TEXT_PRIMARY_MODEL,
     DEFAULT_TEXT_PRIMARY_PROVIDER,
 )
+
+
+_SAFE_FETCH_OUTCOMES = {
+    "catalog_found",
+    "no_catalog_found",
+    "queue_unavailable",
+    "timeline_unresolved",
+    "user_lookup_unresolved",
+    "not_observed",
+    "processing_error",
+    "outcome_unavailable",
+}
+
+
+def _safe_fetch_outcome(value: Any) -> str:
+    outcome = str(value or "").strip().lower()
+    if outcome in _SAFE_FETCH_OUTCOMES:
+        return outcome
+    if outcome.startswith("user_lookup"):
+        return "user_lookup_unresolved"
+    if outcome.startswith("timeline"):
+        return "timeline_unresolved"
+    if outcome:
+        return "transport_failure"
+    return "outcome_unavailable"
+
+
+def _twitter_target_identity_sha256(circle: Circle) -> str:
+    identity = unicodedata.normalize(
+        "NFKC",
+        str(getattr(circle, "space", "") or "").strip()
+        + "\t"
+        + str(getattr(circle, "name", "") or "").strip(),
+    ).lower()
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _safe_catalog_status(circle: Circle) -> str:
+    status = str(getattr(circle, "catalog_status", "") or "").strip().lower()
+    if status in {"confirmed", "preview", "no_extractable_items"}:
+        return status
+    if getattr(circle, "absence_status", None):
+        return "absence"
+    return "none"
 
 logger = setup_logger(__name__)
 
@@ -210,6 +256,8 @@ class TwitterConfig:
             'api_reasoning_effort_map',
             {},
         )
+        post_role = config_dict.get('oshinagaki_post')
+        self.oshinagaki_post_role = post_role if isinstance(post_role, dict) else None
 
 
 class TwitterPostProcessor:
@@ -235,23 +283,50 @@ class TwitterPostProcessor:
         text_primary_model = (
             config.model[0] if isinstance(config.model, list) and config.model else config.model
         )
-        text_attempts = build_text_llm_attempts(
-            config.text_llm_provider,
-            text_primary_model,
-            config.text_llm_cli_models,
-            config.text_llm_cli_efforts,
-            config.text_fallback_llm_provider,
-            config.text_fallback_llm_model,
-            config.text_fallback_llm_effort,
-            primary_effort=config.api_reasoning_effort,
-        )
+        if config.oshinagaki_post_role:
+            role = config.oshinagaki_post_role
+            post_provider = role.get('provider') or config.text_llm_provider
+            post_model = role.get('model') or text_primary_model
+            post_cli_models = role.get('cli_model_map')
+            if not isinstance(post_cli_models, dict):
+                post_cli_models = config.text_llm_cli_models
+            post_cli_efforts = role.get('cli_effort_map')
+            if not isinstance(post_cli_efforts, dict):
+                post_cli_efforts = config.text_llm_cli_efforts
+            post_effort = role.get('effort') or config.api_reasoning_effort
+            text_attempts = build_text_llm_attempts(
+                post_provider,
+                post_model,
+                post_cli_models,
+                post_cli_efforts,
+                primary_effort=post_effort,
+            )
+            post_cli_providers = (
+                [post_provider.split(':', 1)[1]]
+                if isinstance(post_provider, str) and post_provider.startswith('cli:')
+                else []
+            )
+        else:
+            post_cli_models = config.tweet_llm_cli_models
+            post_cli_efforts = config.tweet_llm_cli_efforts
+            post_cli_providers = config.tweet_llm_cli_providers
+            text_attempts = build_text_llm_attempts(
+                config.text_llm_provider,
+                text_primary_model,
+                config.text_llm_cli_models,
+                config.text_llm_cli_efforts,
+                config.text_fallback_llm_provider,
+                config.text_fallback_llm_model,
+                config.text_fallback_llm_effort,
+                primary_effort=config.api_reasoning_effort,
+            )
         self.twitter_extractor = TwitterExtractor(
             model=api_models_from_attempts(text_attempts),
             additional_prompt=config.additional_prompt,
             event_date=config.event_date,
-            cli_providers=config.tweet_llm_cli_providers,
-            cli_model_map=config.tweet_llm_cli_models,
-            cli_effort_map=config.tweet_llm_cli_efforts,
+            cli_providers=post_cli_providers,
+            cli_model_map=post_cli_models,
+            cli_effort_map=post_cli_efforts,
             cli_timeout=config.tweet_llm_cli_timeout,
             reasoning_effort=config.api_reasoning_effort,
             api_reasoning_effort_map=config.api_reasoning_effort_map,
@@ -296,10 +371,13 @@ class TwitterPostProcessor:
             "tweet_fetch_success_count": 0,
             "catalog_found_count": 0,
             "no_catalog_found_count": 0,
+            "queue_unavailable_count": 0,
+            "queue_failure_details": [],
             "transport_failure_count": 0,
             "timeline_unresolved_count": 0,
             "user_lookup_unresolved_count": 0,
             "unresolved_targets": [],
+            "target_outcomes": [],
             "reason": None,
         }
 
@@ -621,6 +699,8 @@ class TwitterPostProcessor:
             "tweet_fetch_success_count": 0,
             "catalog_found_count": 0,
             "no_catalog_found_count": 0,
+            "queue_unavailable_count": 0,
+            "queue_failure_details": [],
             "transport_failure_count": 0,
             "timeline_unresolved_count": 0,
             "user_lookup_unresolved_count": 0,
@@ -665,6 +745,31 @@ class TwitterPostProcessor:
 
         self.last_run_summary["target_count"] = len(circles_with_twitter)
 
+        target_outcomes = []
+        for ordinal, circle in enumerate(circles_with_twitter, start=1):
+            circle_index = getattr(circle, "_circle_index", None)
+            target_outcomes.append(
+                {
+                    "target_ordinal": ordinal,
+                    "circle_index": (
+                        circle_index
+                        if isinstance(circle_index, int)
+                        and not isinstance(circle_index, bool)
+                        else None
+                    ),
+                    "circle_identity_sha256": _twitter_target_identity_sha256(circle),
+                    "fetch_outcome": "not_observed",
+                    "processing_status": "not_attempted",
+                    "catalog_status": "none",
+                    "item_count": 0,
+                    "item_image_count": 0,
+                    "persistence_status": "not_evaluated",
+                    "persisted_update": None,
+                    "completion_status": "unknown",
+                }
+            )
+        self.last_run_summary["target_outcomes"] = target_outcomes
+
         if not circles_with_twitter:
             logger.warning("No circles with Twitter URLs found")
             self.last_run_summary["status"] = "no_targets"
@@ -693,6 +798,13 @@ class TwitterPostProcessor:
                 failed_count=len(circles_with_twitter),
                 reason="イベント日付を特定できません",
             )
+            for target_outcome in target_outcomes:
+                target_outcome.update(
+                    fetch_outcome="not_observed",
+                    processing_status="failed",
+                    persistence_status="not_saved_after_processing_failure",
+                    persisted_update=False,
+                )
             return circles
         logger.info(f"Parsed event date: {event_date}")
 
@@ -703,6 +815,7 @@ class TwitterPostProcessor:
         for circle in circles:
             circle._twitter_processing_succeeded = False
         for i, circle in enumerate(circles_with_twitter):
+            target_outcome = target_outcomes[i]
             self.last_run_summary["attempted_count"] += 1
             processing_error = None
             try:
@@ -719,6 +832,13 @@ class TwitterPostProcessor:
                 processing_error = e
 
             if processing_error is not None:
+                target_outcome.update(
+                    fetch_outcome="processing_error",
+                    processing_status="failed",
+                    catalog_status=_safe_catalog_status(circle),
+                    item_count=len(getattr(circle, "items", []) or []),
+                    item_image_count=len(getattr(circle, "item_images", []) or []),
+                )
                 if continue_on_error and not getattr(
                     self.twitter_extractor, "_twscrape_unavailable_reason", None
                 ):
@@ -754,9 +874,41 @@ class TwitterPostProcessor:
                     bool(fetch_stats.get("tweet_fetch_success_count"))
                 )
             outcome = fetch_stats.get("outcome") if isinstance(fetch_stats, dict) else None
+            safe_outcome = _safe_fetch_outcome(outcome)
+            target_outcome.update(
+                fetch_outcome=safe_outcome,
+                processing_status=(
+                    "processed"
+                    if outcome in {None, "catalog_found", "no_catalog_found"}
+                    else "unresolved"
+                ),
+                catalog_status=_safe_catalog_status(circle),
+                item_count=len(getattr(circle, "items", []) or []),
+                item_image_count=len(getattr(circle, "item_images", []) or []),
+            )
             if outcome not in {None, "catalog_found", "no_catalog_found"}:
                 self._record_unresolved_target(circle, outcome, fetch_stats.get("reason"))
-                if outcome.startswith("user_lookup"):
+                if fetch_stats.get("failure_code") == "NO_ACCOUNT_AVAILABLE":
+                    self.last_run_summary["queue_unavailable_count"] += 1
+                    self.last_run_summary["queue_failure_details"].append(
+                        {
+                            "target_number": i + 1,
+                            "stage": fetch_stats.get("failure_stage"),
+                            "queue": fetch_stats.get("failure_queue"),
+                            "code": fetch_stats.get("failure_code"),
+                            "exception_type": fetch_stats.get("exception_type"),
+                            "failed_request_dispatched": fetch_stats.get(
+                                "failed_request_dispatched"
+                            ),
+                            "response_status_code": fetch_stats.get(
+                                "response_status_code"
+                            ),
+                            "partial_tweet_count": int(
+                                fetch_stats.get("partial_tweet_count") or 0
+                            ),
+                        }
+                    )
+                elif outcome.startswith("user_lookup"):
                     self.last_run_summary["user_lookup_unresolved_count"] += 1
                 elif outcome.startswith("timeline"):
                     self.last_run_summary["timeline_unresolved_count"] += 1

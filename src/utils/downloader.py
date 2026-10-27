@@ -4,6 +4,7 @@ from typing import Optional, Dict, List, Tuple
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import os
 
 
 class Downloader:
@@ -58,6 +59,84 @@ class Downloader:
                     time.sleep(2**attempt)  # 指数バックオフ
 
         return False
+
+    def download_file_limited(
+        self,
+        url: str,
+        output_path: Path,
+        *,
+        max_bytes: int,
+        timeout_seconds: float,
+        max_total_seconds: Optional[float] = None,
+    ) -> tuple[bool, str]:
+        """Download one untrusted image with byte and elapsed-time bounds.
+
+        This method intentionally does not include the URL or exception text
+        in its result/logs because image URLs can contain signed credentials.
+        """
+
+        if max_bytes <= 0 or timeout_seconds <= 0:
+            return False, "invalid_limits"
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        partial_path = output_path.with_name(output_path.name + ".part")
+        response = None
+        started = time.monotonic()
+        total_timeout = max_total_seconds or timeout_seconds
+        connect_read_timeout = min(5.0, float(timeout_seconds))
+        try:
+            response = self.session.get(
+                url,
+                headers=self.headers,
+                timeout=(connect_read_timeout, connect_read_timeout),
+                stream=True,
+            )
+            response.raise_for_status()
+            declared_size = response.headers.get("Content-Length")
+            try:
+                if declared_size is not None and int(declared_size) > max_bytes:
+                    return False, "image_size_limit"
+            except (TypeError, ValueError):
+                pass
+
+            downloaded = 0
+            with open(partial_path, "wb") as stream:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if time.monotonic() - started > total_timeout:
+                        return False, "download_timeout"
+                    if not chunk:
+                        continue
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        return False, "image_size_limit"
+                    stream.write(chunk)
+
+            if time.monotonic() - started > total_timeout:
+                return False, "download_timeout"
+            if downloaded == 0:
+                return False, "empty_image"
+            os.replace(partial_path, output_path)
+            return True, "downloaded"
+        except requests.exceptions.Timeout:
+            return False, "download_timeout"
+        except requests.exceptions.RequestException:
+            return False, "download_failed"
+        except OSError:
+            return False, "local_write_failed"
+        except Exception:
+            return False, "download_failed"
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            try:
+                if partial_path.exists():
+                    partial_path.unlink()
+            except OSError:
+                pass
 
     def download_multiple(
         self, download_tasks: List[Tuple[str, Path, str]]

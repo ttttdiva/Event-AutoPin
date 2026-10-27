@@ -16,11 +16,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -457,6 +459,7 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         "skip_circle_images",
         "force_relearn_pattern",
         "site_parsing",
+        "oshinagaki_post",
         "cookie_file",
         "pagination",
         "days_before",
@@ -704,7 +707,7 @@ def _missing_coordinate_diagnostic() -> Dict[str, Any]:
 
 
 _DIAGNOSTIC_SECRET_RE = re.compile(
-    r"(?i)\b(?:api[_-]?key|token|password|passwd|secret|authorization|cookie)\b"
+    r"(?i)\b(?:api[_-]?key|auth[_-]?token|token|password|passwd|secret|authorization|cookie)\b"
     r"\s*[:=]\s*[^\s,;]+"
 )
 _DIAGNOSTIC_BEARER_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
@@ -720,10 +723,13 @@ _DIAGNOSTIC_POSIX_PATH_RE = re.compile(
 _DIAGNOSTIC_URL_QUERY_KEY_RE = re.compile(
     r"(?i)([?&](?:key|api_key|access_token)=)[^&\s\"']+"
 )
+_DIAGNOSTIC_COOKIE_FILE_RE = re.compile(
+    r"(?i)(Cookieファイルからアカウントを追加:|Cookieファイルの読み込みに失敗:|auth_tokenまたはct0が見つかりません:)\s*[^\s]+"
+)
 
 
-def _safe_diagnostic_text(value: Any, *, max_chars: int = 2000) -> str:
-    """stderr/stdoutをGUIへ返す前にsecretと絶対パスを除去する。"""
+def _redact_diagnostic_text(value: Any) -> str:
+    """Boundを適用する前の診断テキストからsecretと絶対パスを除去する。"""
     text = str(value or "")
 
     def redact_secret(match: re.Match[str]) -> str:
@@ -733,11 +739,17 @@ def _safe_diagnostic_text(value: Any, *, max_chars: int = 2000) -> str:
 
     text = _DIAGNOSTIC_SECRET_RE.sub(redact_secret, text)
     text = _DIAGNOSTIC_URL_QUERY_KEY_RE.sub(r"\1<redacted>", text)
+    text = _DIAGNOSTIC_COOKIE_FILE_RE.sub(r"\1<account-file>", text)
     text = _DIAGNOSTIC_BEARER_RE.sub("Bearer <redacted>", text)
     text = _DIAGNOSTIC_TOKEN_RE.sub("<redacted-token>", text)
     text = _DIAGNOSTIC_WINDOWS_PATH_RE.sub("<path>", text)
     text = _DIAGNOSTIC_POSIX_PATH_RE.sub("<path>", text)
-    text = text.strip()
+    return text
+
+
+def _safe_diagnostic_text(value: Any, *, max_chars: int = 2000) -> str:
+    """stderr/stdoutをGUIへ返す前にsecretと絶対パスを除去する。"""
+    text = _redact_diagnostic_text(value).strip()
     if len(text) > max_chars:
         return "…" + text[-(max_chars - 1) :]
     return text
@@ -748,6 +760,142 @@ def _safe_diagnostic_stream(value: Any) -> str:
 
     text = str(value or "")
     return "\n".join(_safe_diagnostic_text(line) for line in text.splitlines())
+
+
+_MAX_PIPELINE_DIAGNOSTIC_CHARS = 24000
+
+
+class _BoundedDiagnosticLines:
+    def __init__(self, max_chars: int = _MAX_PIPELINE_DIAGNOSTIC_CHARS) -> None:
+        self._max_chars = max_chars
+        self._head: List[str] = []
+        self._tail: List[str] = []
+        self._head_chars = 0
+        self._tail_chars = 0
+        self._head_limit = max_chars // 3
+        self._tail_limit = max_chars - self._head_limit
+        self.total_chars = 0
+        self.truncated = False
+
+    def append(self, line: str) -> None:
+        line_chars = len(line) + 1
+        self.total_chars += line_chars
+        self.truncated = self.total_chars > self._max_chars
+        if self._head_chars < self._head_limit:
+            self._head.append(line)
+            self._head_chars += line_chars
+            return
+        self._tail.append(line)
+        self._tail_chars += line_chars
+        while self._tail and self._tail_chars > self._tail_limit:
+            removed = self._tail.pop(0)
+            self._tail_chars -= len(removed) + 1
+
+    def lines(self) -> List[str]:
+        if not self._head and not self._tail:
+            return []
+        if self._head_chars + self._tail_chars <= self._max_chars:
+            return [*self._head, *self._tail]
+        return [
+            *self._head,
+            f"…<middle truncated total_chars={self.total_chars}>…",
+            *self._tail,
+        ]
+
+
+def _bounded_diagnostic_stream(value: Any, *, max_chars: int = _MAX_PIPELINE_DIAGNOSTIC_CHARS) -> str:
+    """Keep useful startup and exception-tail context within a fixed budget."""
+    text = _redact_diagnostic_text(value).strip()
+    if len(text) <= max_chars:
+        return text
+    marker = f"\n…<truncated total_chars={len(text)}>…\n"
+    remaining = max(0, max_chars - len(marker))
+    head_size = min(6000, remaining // 3)
+    tail_size = remaining - head_size
+    return text[:head_size] + marker + text[-tail_size:]
+
+
+def _pipeline_event_identity(config: Mapping[str, Any]) -> Dict[str, Any]:
+    url = str(config.get("url") or "")
+    event_name = str(config.get("event_name") or "")
+    event_date = str(config.get("event_date") or "")
+    material = "\n".join((url, event_date, event_name)).encode("utf-8", errors="replace")
+    host = urlsplit(url).hostname or ""
+    return {
+        "event_key": hashlib.sha256(material).hexdigest()[:16],
+        "event_date": event_date or None,
+        "source_host": host or None,
+    }
+
+
+def _pipeline_failure_stage(stderr_lines: Iterable[str], returncode: Any) -> Optional[str]:
+    lines = list(stderr_lines)
+    if returncode in (None, 0):
+        twitter_result = _extract_twitter_processing_result(lines)
+        if isinstance(twitter_result, dict) and twitter_result.get("status") in {
+            "failed",
+            "partial",
+        }:
+            return "twitter_post_processing"
+        return None
+    text = "\n".join(lines)
+    if "=== Twitter処理を開始します ===" in text or "Starting Twitter processing" in text:
+        return "twitter_post_processing"
+    if "サークル情報" in text or "circles" in text.lower():
+        return "circle_extraction_or_save"
+    return "unknown"
+
+
+def _twitter_account_diagnostic(stderr_lines: Iterable[str]) -> Dict[str, Any]:
+    text = "\n".join(stderr_lines)
+    loaded = len(re.findall(r"Cookieファイルからアカウントを追加:", text))
+    started = "=== Twitter処理を開始します ===" in text or "Starting Twitter processing" in text
+    auth_failure = bool(
+        re.search(r"(?i)invalid auth|unauthori[sz]ed|account.*(?:locked|disabled)|auth_token.*(?:invalid|expired)|HTTP\s+(?:401|403)", text)
+    )
+    if auth_failure:
+        state = "authentication_failure_observed"
+    elif loaded:
+        state = "configured_accounts_detected_auth_unconfirmed"
+    elif started:
+        state = "no_usable_account_detected"
+    else:
+        state = "not_observed"
+    return {"state": state, "configured_account_count": loaded}
+
+
+def _pipeline_diagnostic_fields(
+    config: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    returncode: Any,
+    stdout: Any,
+    stderr_lines: Iterable[str],
+    *,
+    stderr_total_chars: Optional[int] = None,
+    stderr_was_truncated: Optional[bool] = None,
+) -> Dict[str, Any]:
+    safe_stdout = _redact_diagnostic_text(stdout).strip()
+    safe_stderr = _redact_diagnostic_text("\n".join(stderr_lines)).strip()
+    diagnostic: Dict[str, Any] = {
+        "run_id": _safe_diagnostic_text(payload.get("run_id"), max_chars=128) or None,
+        "event": _pipeline_event_identity(config),
+        "returncode": returncode,
+        "failure_stage": _pipeline_failure_stage(stderr_lines, returncode),
+        "stdout_total_chars": len(safe_stdout),
+        "stderr_total_chars": stderr_total_chars if stderr_total_chars is not None else len(safe_stderr),
+        "stdout_truncated": len(safe_stdout) > _MAX_PIPELINE_DIAGNOSTIC_CHARS,
+        "stderr_truncated": (
+            stderr_was_truncated
+            if stderr_was_truncated is not None
+            else len(safe_stderr) > _MAX_PIPELINE_DIAGNOSTIC_CHARS
+        ),
+        "twitter_auth": _twitter_account_diagnostic(stderr_lines),
+    }
+    return {
+        "stdout": _bounded_diagnostic_stream(safe_stdout),
+        "stderr": _bounded_diagnostic_stream(safe_stderr),
+        "diagnostic": diagnostic,
+    }
 
 
 def _configured_flag(value: Any) -> bool:
@@ -1139,6 +1287,12 @@ def _job_ping(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _hidden_process_options() -> Dict[str, int]:
+    if os.name != "nt":
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
 def _job_extract_twitter_catalogs(payload: Dict[str, Any]) -> Dict[str, Any]:
     cmd = _build_extract_command(payload)
     run_cwd = payload.get("project_root")
@@ -1152,6 +1306,7 @@ def _job_extract_twitter_catalogs(payload: Dict[str, Any]) -> Dict[str, Any]:
         errors="replace",
         cwd=run_cwd,
         env=sub_env,
+        **_hidden_process_options(),
     )
 
     return {
@@ -1176,6 +1331,7 @@ def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
+            **_hidden_process_options(),
         )
     else:
         proc.terminate()
@@ -1250,9 +1406,10 @@ def _run_main_process(
         errors="replace",
         cwd=str(run_dir),
         env=env,
+        **_hidden_process_options(),
     )
 
-    stderr_lines: List[str] = []
+    stderr_lines = _BoundedDiagnosticLines()
     stdout_output = ""
     try:
         if proc.stderr is not None:
@@ -1263,7 +1420,7 @@ def _run_main_process(
                 sys.stderr.flush()
 
         stdout_output = (
-            _safe_diagnostic_stream(proc.stdout.read())
+            proc.stdout.read()
             if proc.stdout is not None
             else ""
         )
@@ -1276,12 +1433,19 @@ def _run_main_process(
         "job": "run_main_pipeline",
         "timestamp": _utc_now_iso(),
         "returncode": proc.returncode,
-        "command": cmd,
-        "cwd": str(run_dir),
-        "project_root": str(project_root),
+        "command": [_safe_diagnostic_text(value, max_chars=300) for value in cmd],
+        "cwd": "<path>",
+        "project_root": "<path>",
         "config_used": _safe_config_for_result(config),
-        "stdout": stdout_output,
-        "stderr": "\n".join(stderr_lines),
+        **_pipeline_diagnostic_fields(
+            config,
+            payload,
+            proc.returncode,
+            stdout_output,
+            stderr_lines.lines(),
+            stderr_total_chars=stderr_lines.total_chars,
+            stderr_was_truncated=stderr_lines.truncated,
+        ),
     }
     coordinate_diagnostics = (
         _collect_coordinate_diagnostics(
@@ -1302,7 +1466,7 @@ def _run_main_process(
             result["status"] = "error"
             result["returncode"] = 1
             result["stderr"] += "\n座標生成が全マップで失敗しました。"
-    twitter_processing = _extract_twitter_processing_result(stderr_lines)
+    twitter_processing = _extract_twitter_processing_result(stderr_lines.lines())
     if twitter_processing:
         result["twitter_processing"] = twitter_processing
     return result
@@ -1777,10 +1941,11 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
             errors="replace",
             cwd=str(temp_dir_path),
             env=env,
+            **_hidden_process_options(),
         )
 
         # stderrを1行ずつ読んで自身のstderrにリアルタイム転送
-        stderr_lines: List[str] = []
+        stderr_lines = _BoundedDiagnosticLines()
         stdout_output = ""
         try:
             for line in proc.stderr:
@@ -1789,7 +1954,7 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
                 sys.stderr.write(line_stripped + "\n")
                 sys.stderr.flush()
 
-            stdout_output = _safe_diagnostic_stream(proc.stdout.read())
+            stdout_output = proc.stdout.read()
             proc.wait()
         finally:
             _terminate_process_tree(proc)
@@ -1799,12 +1964,19 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
             "job": "run_main_pipeline",
             "timestamp": _utc_now_iso(),
             "returncode": proc.returncode,
-            "command": cmd,
-            "cwd": str(temp_dir_path),
-            "project_root": str(project_root),
+            "command": [_safe_diagnostic_text(value, max_chars=300) for value in cmd],
+            "cwd": "<path>",
+            "project_root": "<path>",
             "config_used": _safe_config_for_result(config),
-            "stdout": stdout_output,
-            "stderr": "\n".join(stderr_lines),
+            **_pipeline_diagnostic_fields(
+                config,
+                payload,
+                proc.returncode,
+                stdout_output,
+                stderr_lines.lines(),
+                stderr_total_chars=stderr_lines.total_chars,
+                stderr_was_truncated=stderr_lines.truncated,
+            ),
         }
         coordinate_diagnostics = (
             _collect_coordinate_diagnostics(
@@ -1826,7 +1998,7 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
                 result["status"] = "error"
                 result["returncode"] = 1
                 result["stderr"] += "\n座標生成が全マップで失敗しました。"
-        twitter_processing = _extract_twitter_processing_result(stderr_lines)
+        twitter_processing = _extract_twitter_processing_result(stderr_lines.lines())
         if twitter_processing:
             result["twitter_processing"] = twitter_processing
         return result
@@ -2012,6 +2184,7 @@ def _job_reprocess_circle_from_post_impl(
         "image_api_reasoning_effort_map": payload.get(
             "image_api_reasoning_effort_map", {}
         ),
+        "oshinagaki_post": payload.get("oshinagaki_post"),
         "tweet_llm_cli_providers": payload.get("tweet_llm_cli_providers", []),
         "tweet_llm_cli_models": payload.get(
             "tweet_llm_cli_models",
@@ -2308,7 +2481,70 @@ def _job_save_event_json(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Missing required payload field: data")
 
     path = Path(event_json)
+    expected_fingerprint = payload.get("expected_fingerprint")
+    expected_sha256 = payload.get("expected_sha256")
+    backup_path_value = payload.get("backup_path")
+    original_bytes: Optional[bytes] = None
+    original_sha256: Optional[str] = None
+
+    if expected_fingerprint is not None or expected_sha256 is not None:
+        if not path.is_file():
+            raise FileNotFoundError(f"event.json not found: {path}")
+        original_bytes = path.read_bytes()
+        actual_fingerprint = _event_file_fingerprint(path, original_bytes)
+        actual_sha256 = hashlib.sha256(original_bytes).hexdigest()
+        if expected_fingerprint is not None:
+            if not isinstance(expected_fingerprint, Mapping):
+                raise ValueError("expected_fingerprint must be an object")
+            fingerprint_keys = (
+                "modified_ms",
+                "modified_ns",
+                "file_size",
+                "content_hash",
+            )
+            provided_keys = [
+                key for key in fingerprint_keys if key in expected_fingerprint
+            ]
+            if not provided_keys or any(
+                expected_fingerprint[key] != actual_fingerprint[key]
+                for key in provided_keys
+            ):
+                raise ValueError("event.json fingerprint conflict")
+        if expected_sha256 is not None:
+            expected_digest = str(expected_sha256).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+                raise ValueError("expected_sha256 must be a SHA-256 digest")
+            if actual_sha256 != expected_digest:
+                raise ValueError("event.json SHA-256 conflict")
+        original_sha256 = actual_sha256
+
+    if backup_path_value is not None:
+        if original_bytes is None or original_sha256 is None:
+            raise ValueError("backup_path requires expected_fingerprint or expected_sha256")
+        project_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+        local_root = (project_root / ".local").resolve()
+        backup_path = Path(backup_path_value).resolve()
+        if backup_path == path.resolve() or local_root not in backup_path.parents:
+            raise ValueError("backup_path must be a separate file under project .local")
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with backup_path.open("xb") as backup_file:
+                backup_file.write(original_bytes)
+                backup_file.flush()
+                os.fsync(backup_file.fileno())
+        except FileExistsError as exc:
+            raise FileExistsError("event.json backup already exists") from exc
+        if hashlib.sha256(backup_path.read_bytes()).hexdigest() != original_sha256:
+            raise OSError("event.json backup verification failed")
+
+    if original_bytes is not None:
+        if not path.is_file() or path.read_bytes() != original_bytes:
+            raise ValueError("event.json changed during guarded save")
     _write_json_atomic(path, data)
+    saved_bytes = path.read_bytes()
+    saved_data = json.loads(saved_bytes.decode("utf-8"))
+    if saved_data != data:
+        raise OSError("event.json readback did not match saved data")
 
     circle_count = len(data.get("circles", []))
     return {
@@ -2317,6 +2553,538 @@ def _job_save_event_json(payload: Dict[str, Any]) -> Dict[str, Any]:
         "timestamp": _utc_now_iso(),
         "event_json": str(path),
         "saved_circles": circle_count,
+        "modified_fingerprint": _event_file_fingerprint(path, saved_bytes),
+        "sha256": hashlib.sha256(saved_bytes).hexdigest(),
+        "backup_sha256": original_sha256 if backup_path_value is not None else None,
+    }
+
+
+def _circle_cut_cohort_fingerprint(circles: List[Mapping[str, Any]]) -> str:
+    """Match the accepted browser/event order digest without exposing identities."""
+    normalized = [
+        unicodedata.normalize(
+            "NFKC",
+            str(circle.get("space") or "").strip()
+            + "\t"
+            + str(circle.get("name") or "").strip(),
+        ).lower()
+        for circle in circles
+    ]
+    payload = "\n".join(normalized).encode("utf-16le")
+    fnv = 2166136261
+    djb2a = 5381
+    for byte in payload:
+        fnv = ((fnv ^ byte) * 16777619) & 0xFFFFFFFF
+        djb2a = ((djb2a * 33) ^ byte) & 0xFFFFFFFF
+    return f"{fnv:08x}{djb2a:08x}"
+
+
+def _circle_cut_candidate_mapping_fingerprint(
+    circles: List[Mapping[str, Any]], candidate_assignments: List[Mapping[str, Any]]
+) -> str:
+    """Bind candidate order, source position, circle identity, and image hash."""
+    rows = []
+    for assignment in candidate_assignments:
+        index = assignment.get("circle_index")
+        if not isinstance(index, int) or index < 0 or index >= len(circles):
+            raise ValueError("circle-cut candidate mapping index is invalid")
+        circle = circles[index]
+        identity = unicodedata.normalize(
+            "NFKC",
+            str(circle.get("space") or "").strip()
+            + "\t"
+            + str(circle.get("name") or "").strip(),
+        ).lower()
+        rows.append(
+            "\t".join(
+                str(value)
+                for value in (
+                    assignment.get("candidate_order"),
+                    assignment.get("source_page_index"),
+                    assignment.get("source_index"),
+                    index,
+                    hashlib.sha256(identity.encode("utf-16le")).hexdigest(),
+                    str(assignment.get("image_sha256") or "").lower(),
+                )
+            )
+        )
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+
+
+def _circle_identity_sha256(circle: Mapping[str, Any]) -> str:
+    identity = unicodedata.normalize(
+        "NFKC",
+        str(circle.get("space") or "").strip()
+        + "\t"
+        + str(circle.get("name") or "").strip(),
+    ).lower()
+    return hashlib.sha256(identity.encode("utf-16le")).hexdigest()
+
+
+def _same_resolved_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return False
+
+
+def _has_explicit_circle_cut_choice(
+    circle: Mapping[str, Any],
+    *,
+    existing_path: Path,
+    event_dir: Path,
+) -> Optional[str]:
+    """Return a grounded retained-choice reason for an existing event image."""
+    declared_source = str(
+        circle.get("circle_cut_source") or circle.get("circle_cut_provenance") or ""
+    ).strip().casefold()
+    if declared_source in {"manual", "user", "local"}:
+        return "preserved_by_explicit_manual_choice"
+
+    confirmed_catalog = circle.get("catalog_status") == "confirmed"
+    for item in circle.get("item_images") or []:
+        if isinstance(item, Mapping):
+            item_ref = str(item.get("path") or "").strip()
+            source = str(item.get("source") or "").strip().casefold()
+        else:
+            item_ref = str(item or "").strip()
+            source = ""
+        if not item_ref:
+            continue
+        item_path = Path(item_ref)
+        if not item_path.is_absolute():
+            item_path = event_dir / item_path
+        if not _same_resolved_path(item_path, existing_path):
+            continue
+        if source in {"manual", "user", "local"}:
+            return "preserved_by_explicit_manual_choice"
+        if confirmed_catalog and source in {"twitter", "catalog"}:
+            return "preserved_by_confirmed_catalog"
+    return None
+
+
+def _canonical_default_cut_sha256(
+    circle: Mapping[str, Any],
+    *,
+    circle_master_data: Optional[Mapping[str, Any]],
+    default_cuts_dir: Optional[Path],
+) -> Optional[str]:
+    if not isinstance(circle_master_data, Mapping) or default_cuts_dir is None:
+        return None
+    master_circles = circle_master_data.get("circles")
+    if not isinstance(master_circles, Mapping):
+        return None
+    entry = master_circles.get(str(circle.get("name") or ""))
+    if not isinstance(entry, Mapping):
+        return None
+    default_cut = str(entry.get("default_cut") or "").strip()
+    if not default_cut:
+        return None
+    relative_path = Path(default_cut)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        return None
+    cuts_root = default_cuts_dir.resolve()
+    source_path = (cuts_root / relative_path).resolve()
+    if cuts_root not in source_path.parents or not source_path.is_file():
+        return None
+    return hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+
+def _apply_verified_circle_cut_cohort_updates(
+    event_data: Dict[str, Any],
+    *,
+    event_dir: Path,
+    event_key: str,
+    expected_event_key: str,
+    expected_cohort_fingerprint: str,
+    expected_candidate_mapping_fingerprint: str,
+    ordered_candidate_sha256: str,
+    source_host: str,
+    expected_source_host: str,
+    source_url_sha256: str,
+    expected_source_url_sha256: str,
+    image_manifest_sha256: str,
+    expected_image_manifest_sha256: str,
+    samples: List[Dict[str, Any]],
+    candidate_assignments: List[Dict[str, Any]],
+    candidate_count: int,
+    model_call_count: int,
+    defaulted_count: int,
+    assignment_projection_count: int,
+    circle_master_data: Optional[Mapping[str, Any]] = None,
+    default_cuts_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Persist the sample gate and full hash-bound candidate-to-circle cohort."""
+    circles = event_data.get("circles")
+    if (
+        not isinstance(circles, list)
+        or candidate_count < 3
+        or len(circles) != candidate_count
+    ):
+        raise ValueError("circle-cut cohort count conflict")
+    for circle in circles:
+        if not isinstance(circle, dict):
+            raise ValueError("circle-cut cohort contains a non-object")
+    cohort_fingerprint = _circle_cut_cohort_fingerprint(circles)
+    if cohort_fingerprint != expected_cohort_fingerprint:
+        raise ValueError("circle-cut cohort fingerprint conflict")
+    if model_call_count != len(samples) or len(samples) != 3 or defaulted_count != 0:
+        raise ValueError("circle-cut sample acceptance counts are invalid")
+    if assignment_projection_count != candidate_count:
+        raise ValueError("circle-cut cohort assignment projection is incomplete")
+    if not re.fullmatch(r"[0-9a-f]{64}", ordered_candidate_sha256.lower()):
+        raise ValueError("ordered candidate digest is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", source_url_sha256.lower()):
+        raise ValueError("source URL digest is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", image_manifest_sha256.lower()):
+        raise ValueError("image manifest digest is invalid")
+    if not re.fullmatch(
+        r"[0-9a-f]{64}", expected_candidate_mapping_fingerprint.lower()
+    ):
+        raise ValueError("candidate mapping digest is invalid")
+    if (
+        not isinstance(event_key, str)
+        or not event_key.strip()
+        or len(event_key) > 128
+        or not re.fullmatch(r"[a-z0-9.-]+", source_host.strip().lower())
+        or event_key != expected_event_key
+        or source_host.strip().lower() != expected_source_host.strip().lower()
+        or source_url_sha256.lower() != expected_source_url_sha256.lower()
+        or image_manifest_sha256.lower() != expected_image_manifest_sha256.lower()
+    ):
+        raise ValueError("circle-cut source/event provenance conflict")
+
+    metadata = event_data.setdefault("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("event metadata must be an object")
+    existing = metadata.get("circle_cut_visual_verification")
+    sample_hashes = [str(sample.get("image_sha256") or "").lower() for sample in samples]
+    if existing is not None:
+        if not (
+            isinstance(existing, dict)
+            and existing.get("event_key") == event_key
+            and existing.get("source_host") == source_host
+            and existing.get("source_url_sha256") == source_url_sha256.lower()
+            and existing.get("image_manifest_sha256") == image_manifest_sha256.lower()
+            and existing.get("candidate_cohort_fingerprint") == cohort_fingerprint
+            and existing.get("ordered_candidate_sha256") == ordered_candidate_sha256
+            and existing.get("candidate_mapping_fingerprint", expected_candidate_mapping_fingerprint.lower())
+            == expected_candidate_mapping_fingerprint.lower()
+            and existing.get("sample_image_hashes") == sample_hashes
+        ):
+            raise ValueError("circle-cut visual verification metadata conflict")
+
+    expected_sample_orders = {"first": 1, "second": 2, "last": candidate_count}
+    samples_by_order: Dict[int, Dict[str, Any]] = {}
+    for sample in samples:
+        role = str(sample.get("role") or "")
+        order = sample.get("candidate_order")
+        if role not in expected_sample_orders or order != expected_sample_orders[role]:
+            raise ValueError("circle-cut sample order/role conflict")
+        if order in samples_by_order:
+            raise ValueError("circle-cut sample order is duplicated")
+        samples_by_order[order] = sample
+        if (
+            not isinstance(sample.get("circle_index"), int)
+            or sample["circle_index"] < 0
+            or sample["circle_index"] >= candidate_count
+            or not isinstance(sample.get("source_index"), int)
+            or sample["source_index"] < 0
+            or sample.get("decision") != "circle_cut"
+        ):
+            raise ValueError("circle-cut sample mapping/decision conflict")
+        image_sha256 = str(sample.get("image_sha256") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", image_sha256):
+            raise ValueError("circle-cut sample image digest is invalid")
+
+    if set(samples_by_order) != set(expected_sample_orders.values()):
+        raise ValueError("circle-cut first/second/last samples are incomplete")
+    if len(set(sample_hashes)) != len(sample_hashes):
+        raise ValueError("circle-cut first/second/last samples are not distinct")
+
+    def validate_asset(asset: Mapping[str, Any]) -> tuple[Path, str]:
+        image_sha256 = str(asset.get("image_sha256") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", image_sha256):
+            raise ValueError("circle-cut candidate image digest is invalid")
+        relative_path = Path(str(asset.get("asset_path") or ""))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError("circle-cut candidate asset path is invalid")
+        asset_path = (event_dir / relative_path).resolve()
+        if event_dir.resolve() not in asset_path.parents or not asset_path.is_file():
+            raise ValueError("circle-cut candidate asset is missing or outside the event")
+        if hashlib.sha256(asset_path.read_bytes()).hexdigest() != image_sha256:
+            raise ValueError("circle-cut candidate asset digest conflict")
+        return relative_path, image_sha256
+
+    if len(candidate_assignments) != candidate_count:
+        raise ValueError("circle-cut candidate assignment count conflict")
+    assignments_by_order: Dict[int, Dict[str, Any]] = {}
+    mapped_circle_indices: set[int] = set()
+    source_positions: set[tuple[int, int]] = set()
+    for assignment in candidate_assignments:
+        order = assignment.get("candidate_order")
+        circle_index = assignment.get("circle_index")
+        page_index = assignment.get("source_page_index")
+        source_index = assignment.get("source_index")
+        if (
+            not isinstance(order, int)
+            or order < 1
+            or order > candidate_count
+            or order in assignments_by_order
+            or not isinstance(circle_index, int)
+            or circle_index < 0
+            or circle_index >= candidate_count
+            or circle_index in mapped_circle_indices
+            or not isinstance(page_index, int)
+            or page_index < 0
+            or not isinstance(source_index, int)
+            or source_index < 0
+            or (page_index, source_index) in source_positions
+        ):
+            raise ValueError("circle-cut candidate-to-circle mapping is invalid")
+        validate_asset(assignment)
+        mapped_circle_indices.add(circle_index)
+        source_positions.add((page_index, source_index))
+        assignments_by_order[order] = assignment
+
+    if (
+        set(assignments_by_order) != set(range(1, candidate_count + 1))
+        or mapped_circle_indices != set(range(candidate_count))
+    ):
+        raise ValueError("circle-cut candidate mapping does not cover every circle")
+    if [item.get("candidate_order") for item in candidate_assignments] != list(
+        range(1, candidate_count + 1)
+    ):
+        raise ValueError("circle-cut candidate assignment order is invalid")
+    candidate_mapping_fingerprint = _circle_cut_candidate_mapping_fingerprint(
+        circles, candidate_assignments
+    )
+    if candidate_mapping_fingerprint != expected_candidate_mapping_fingerprint.lower():
+        raise ValueError("circle-cut candidate-to-circle identity fingerprint conflict")
+    for order, sample in samples_by_order.items():
+        assignment = assignments_by_order[order]
+        if any(
+            assignment.get(key) != sample.get(key)
+            for key in ("circle_index", "source_index", "image_sha256")
+        ):
+            raise ValueError("circle-cut sample identity conflicts with cohort mapping")
+        if (
+            sample.get("source_page_index") is not None
+            and assignment.get("source_page_index") != sample.get("source_page_index")
+        ):
+            raise ValueError("circle-cut sample source page conflicts with cohort mapping")
+
+    previous_assignments_by_order: Dict[int, Dict[str, Any]] = {}
+    if isinstance(existing, dict) and existing.get("cohort_assignment_count") == candidate_count:
+        previous_assignments = existing.get("cohort_assignments")
+        if not isinstance(previous_assignments, list) or len(previous_assignments) != candidate_count:
+            raise ValueError("stored circle-cut cohort assignment receipt is incomplete")
+        for previous, order in zip(previous_assignments, range(1, candidate_count + 1)):
+            current = assignments_by_order[order]
+            if any(
+                previous.get(key) != current.get(key)
+                for key in (
+                    "candidate_order",
+                    "circle_index",
+                    "source_page_index",
+                    "source_index",
+                    "image_sha256",
+                )
+            ):
+                raise ValueError("stored circle-cut cohort assignment conflicts")
+            previous_assignments_by_order[order] = previous
+
+    reason_counts = {
+        "newly_assigned": 0,
+        "already_correct": 0,
+        "replaced_verified_legacy_default": 0,
+        "preserved_by_confirmed_catalog": 0,
+        "preserved_by_explicit_manual_choice": 0,
+        "blocked_mapping": 0,
+    }
+    planned_assignments: List[Dict[str, Any]] = []
+    for order in range(1, candidate_count + 1):
+        assignment = assignments_by_order[order]
+        relative_path, image_sha256 = validate_asset(assignment)
+        circle_index = assignment["circle_index"]
+        circle = circles[circle_index]
+        circle_identity_sha256 = _circle_identity_sha256(circle)
+        canonical_default_sha256 = _canonical_default_cut_sha256(
+            circle,
+            circle_master_data=circle_master_data,
+            default_cuts_dir=default_cuts_dir,
+        )
+        previous_assignment = previous_assignments_by_order.get(order)
+        existing_cut = str(circle.get("circle_cut_filename") or "").strip()
+        existing_cut_sha256 = None
+        mapping_reason = None
+        legacy_default_is_verified = False
+        if not existing_cut:
+            reason = "newly_assigned"
+        else:
+            existing_path = Path(existing_cut)
+            if not existing_path.is_absolute():
+                existing_path = event_dir / existing_path
+            resolved_existing = existing_path.resolve()
+            if event_dir.resolve() not in resolved_existing.parents:
+                reason = "blocked_mapping"
+                mapping_reason = "existing_cut_path_outside_event"
+            elif not resolved_existing.is_file():
+                reason = "blocked_mapping"
+                mapping_reason = "existing_cut_file_missing"
+            else:
+                existing_cut_sha256 = hashlib.sha256(
+                    resolved_existing.read_bytes()
+                ).hexdigest()
+                if existing_cut_sha256 == image_sha256:
+                    # Keep the original assignment provenance stable across an
+                    # idempotent save, while requiring the recorded identity,
+                    # candidate hash, and source mapping to still match.
+                    previous_reason = (
+                        previous_assignment.get("assignment_reason")
+                        if previous_assignment
+                        else None
+                    )
+                    if (
+                        previous_reason == "replaced_verified_legacy_default"
+                        and previous_assignment.get("asset_path")
+                        == relative_path.as_posix()
+                    ):
+                        existing_cut_sha256 = previous_assignment.get(
+                            "existing_cut_sha256"
+                        )
+                        reason = "replaced_verified_legacy_default"
+                    elif (
+                        previous_reason == "newly_assigned"
+                        and previous_assignment.get("asset_path")
+                        == relative_path.as_posix()
+                    ):
+                        existing_cut_sha256 = previous_assignment.get(
+                            "existing_cut_sha256"
+                        )
+                        reason = "newly_assigned"
+                    else:
+                        reason = "already_correct"
+                else:
+                    expected_default_name_prefix = f"{circle_index:04d}_default_"
+                    legacy_default_is_verified = (
+                        Path(existing_cut).name.startswith(expected_default_name_prefix)
+                        and canonical_default_sha256 is not None
+                        and existing_cut_sha256 == canonical_default_sha256
+                    )
+                    if legacy_default_is_verified:
+                        reason = "replaced_verified_legacy_default"
+                    else:
+                        explicit_choice_reason = _has_explicit_circle_cut_choice(
+                            circle,
+                            existing_path=resolved_existing,
+                            event_dir=event_dir,
+                        )
+                        if explicit_choice_reason:
+                            reason = explicit_choice_reason
+                        else:
+                            reason = "blocked_mapping"
+                            mapping_reason = "existing_cut_provenance_unknown"
+        reason_counts[reason] += 1
+        planned_assignments.append(
+            {
+                "candidate_order": order,
+                "circle_index": circle_index,
+                "source_page_index": assignment["source_page_index"],
+                "source_index": assignment["source_index"],
+                "image_sha256": image_sha256,
+                "asset_path": relative_path.as_posix(),
+                "association_basis": (
+                    "actual_positive_sample"
+                    if order in samples_by_order
+                    else "accepted_sampled_cohort_projection"
+                ),
+                "circle_identity_sha256": circle_identity_sha256,
+                "assignment_reason": reason,
+                "existing_cut_sha256": existing_cut_sha256,
+                "mapping_reason": mapping_reason
+                if reason == "blocked_mapping"
+                else None,
+            }
+        )
+
+    # A verified event-specific candidate supersedes only a proven legacy
+    # default. Explicit catalog/manual choices remain intact; unknown existing
+    # references are blocked and left unchanged.
+    circle_refs_changed = False
+    for assignment in planned_assignments:
+        if assignment["assignment_reason"] in {
+            "newly_assigned",
+            "replaced_verified_legacy_default",
+        }:
+            circle = circles[assignment["circle_index"]]
+            if circle.get("circle_cut_filename") != assignment["asset_path"]:
+                circle["circle_cut_filename"] = assignment["asset_path"]
+                circle_refs_changed = True
+
+    sample_records: List[Dict[str, Any]] = []
+    for role in ("first", "second", "last"):
+        sample = samples_by_order[expected_sample_orders[role]]
+        assignment = planned_assignments[expected_sample_orders[role] - 1]
+        sample_records.append(
+            {
+                "role": role,
+                "candidate_order": sample["candidate_order"],
+                "circle_index": sample["circle_index"],
+                "source_page_index": sample.get("source_page_index"),
+                "source_index": sample["source_index"],
+                "decision": "circle_cut",
+                "image_sha256": str(sample["image_sha256"]).lower(),
+                "asset_path": str(sample["asset_path"]).replace("\\", "/"),
+                "assigned_as_circle_cut": assignment["assignment_reason"]
+                in {
+                    "newly_assigned",
+                    "replaced_verified_legacy_default",
+                    "already_correct",
+                },
+                "preserved_existing_cut": assignment["assignment_reason"]
+                in {
+                    "preserved_by_confirmed_catalog",
+                    "preserved_by_explicit_manual_choice",
+                },
+                "assignment_reason": assignment["assignment_reason"],
+            }
+        )
+
+    metadata_record = dict(existing) if isinstance(existing, dict) else {}
+    metadata_record.update({
+        "schema_version": 1,
+        "status": (
+            "PASS_NORMAL_SELECTOR_CONTRACT_ON_EXACT_SAVED_COHORT"
+            if reason_counts["blocked_mapping"] == 0
+            else "PARTIAL_BLOCKED_MAPPING"
+        ),
+        "event_key": event_key,
+        "source_host": source_host,
+        "source_url_sha256": source_url_sha256.lower(),
+        "image_manifest_sha256": image_manifest_sha256.lower(),
+        "candidate_count": candidate_count,
+        "candidate_cohort_fingerprint": cohort_fingerprint,
+        "candidate_mapping_fingerprint": candidate_mapping_fingerprint,
+        "ordered_candidate_sha256": ordered_candidate_sha256.lower(),
+        "selection_contract": "first_positive_next_distinct_positive_actual_last",
+        "sample_count": len(sample_records),
+        "model_call_count": model_call_count,
+        "assignment_projection_count": assignment_projection_count,
+        "unverified_images_defaulted": defaulted_count,
+        "sample_image_hashes": sample_hashes,
+        "samples": sample_records,
+        "cohort_assignment_count": len(planned_assignments),
+        "cohort_assignment_reason_counts": reason_counts,
+        "cohort_assignments": planned_assignments,
+    })
+    metadata["circle_cut_visual_verification"] = metadata_record
+    metadata_changed = existing != metadata_record
+    return {
+        "status": "applied" if circle_refs_changed or metadata_changed else "already_applied",
+        "sample_count": len(sample_records),
+        "cohort_assignment_count": len(planned_assignments),
+        "assignment_reason_counts": reason_counts,
     }
 
 
@@ -2890,20 +3658,26 @@ def _job_unlimited_ocr_doctor(payload: Dict[str, Any]) -> Dict[str, Any]:
         empty_overrides=isinstance(raw_config, dict),
     )
     repo_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+    # A submitted GUI mapping owns these paths. If a field is absent or blank,
+    # use the project-local defaults instead of a stale parent-process env value.
+    gui_config = raw_config if isinstance(raw_config, dict) else None
+    raw_venv_path = gui_config.get("venv_path") if gui_config is not None else config.venv_path
+    raw_model_path = gui_config.get("model_path") if gui_config is not None else config.model_path
+    raw_hf_home = gui_config.get("hf_home") if gui_config is not None else config.hf_home
     venv_dir = Path(
-        config.venv_path
+        raw_venv_path
         or (
             repo_root / "temp" / "unlimited_ocr_venv"
-            if isinstance(raw_config, dict)
+            if gui_config is not None
             else os.environ.get("UNLIMITED_OCR_VENV", repo_root / "temp" / "unlimited_ocr_venv")
         )
     )
     python_path = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    model_source = Path(config.model_path).expanduser() if config.model_path else None
-    configured_hub_cache = "" if isinstance(raw_config, dict) else os.environ.get("HF_HUB_CACHE", "").strip()
-    hf_home = Path(config.hf_home).expanduser() if config.hf_home else Path(
+    model_source = Path(raw_model_path).expanduser() if raw_model_path else None
+    configured_hub_cache = "" if gui_config is not None else os.environ.get("HF_HUB_CACHE", "").strip()
+    hf_home = Path(raw_hf_home).expanduser() if raw_hf_home else Path(
         repo_root / "temp" / "hf_cache"
-        if isinstance(raw_config, dict)
+        if gui_config is not None
         else os.environ.get("HF_HOME", repo_root / "temp" / "hf_cache")
     )
     hub_cache = Path(configured_hub_cache).expanduser() if configured_hub_cache else hf_home / "hub"
@@ -2971,6 +3745,7 @@ def _job_unlimited_ocr_doctor(payload: Dict[str, Any]) -> Dict[str, Any]:
             probe = subprocess.run(
                 [str(python_path), "-c", "import torch; print(torch.__version__); print(torch.cuda.is_available())"],
                 cwd=repo_root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+                **_hidden_process_options(),
             )
             lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
             torch_info = {
@@ -3910,11 +4685,20 @@ def _job_parse_site_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "cli_timeout",
                 payload.get("text_llm_cli_timeout", 900),
             ),
+            provider=sp_raw.get("provider"),
+            model=sp_raw.get("model"),
+            effort=sp_raw.get("effort"),
+            cli_model_map=sp_raw.get("cli_model_map", {}),
+            cli_effort_map=sp_raw.get("cli_effort_map", {}),
+            fallback_provider=sp_raw.get("fallback_provider"),
+            fallback_model=sp_raw.get("fallback_model"),
+            fallback_effort=sp_raw.get("fallback_effort"),
         )
 
     site_config = SiteConfig(
         site_type=site_type,
         base_url=url,
+        event_name=str(payload.get("event_name") or ""),
         extractor_config=ExtractorConfig(),
         use_llm=True,
         llm_model=models[0] if models else "gpt-5.6-sol",
@@ -4108,6 +4892,14 @@ JSONのみを返してください。
                 "cli_timeout",
                 payload.get("text_llm_cli_timeout", 900),
             ),
+            provider=sp_raw.get("provider"),
+            model=sp_raw.get("model"),
+            effort=sp_raw.get("effort"),
+            cli_model_map=sp_raw.get("cli_model_map", {}),
+            cli_effort_map=sp_raw.get("cli_effort_map", {}),
+            fallback_provider=sp_raw.get("fallback_provider"),
+            fallback_model=sp_raw.get("fallback_model"),
+            fallback_effort=sp_raw.get("fallback_effort"),
         )
         try:
             result = parse_with_high_end_model(prompt, spc)

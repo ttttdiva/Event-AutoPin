@@ -44,6 +44,181 @@ from src.utils.json_reprocessor import JSONReprocessor
 from src.utils.output_cleanup import protected_output_entry_names
 
 
+def _reprocess_completion_summary(
+    initial_targets: List[Dict[str, Any]],
+    remaining_targets: List[Dict[str, Any]],
+    persisted_update_count: int,
+) -> Dict[str, int]:
+    """Separate processing attempts and saved updates from target completion."""
+
+    def circle_indexes(targets: List[Dict[str, Any]]) -> set[int]:
+        return {
+            index
+            for target in targets
+            if isinstance(target, dict)
+            and isinstance((index := target.get("circle_index")), int)
+        }
+
+    initially_pending = circle_indexes(initial_targets)
+    still_pending = circle_indexes(remaining_targets)
+    return {
+        # Compatibility field: count event updates produced, not circles whose
+        # processing function returned without an exception.
+        "saved_successful_count": max(0, int(persisted_update_count)),
+        "accepted_completion_count": len(initially_pending - still_pending),
+        "remaining_target_count": len(remaining_targets),
+    }
+
+
+def _merge_reprocess_target_outcomes(
+    previous_summary: Any,
+    current_summary: Dict[str, Any],
+    persisted_update_indices: set[int],
+    remaining_target_indices: set[int],
+) -> List[Dict[str, Any]]:
+    """Keep safe per-circle outcomes across bounded reprocess continuations."""
+    allowed_fetch_outcomes = {
+        "catalog_found",
+        "no_catalog_found",
+        "queue_unavailable",
+        "timeline_unresolved",
+        "user_lookup_unresolved",
+        "transport_failure",
+        "not_observed",
+        "processing_error",
+        "outcome_unavailable",
+    }
+    allowed_processing_statuses = {
+        "processed",
+        "unresolved",
+        "failed",
+        "not_attempted",
+    }
+    allowed_catalog_statuses = {
+        "none",
+        "confirmed",
+        "preview",
+        "no_extractable_items",
+        "absence",
+    }
+    allowed_persistence_statuses = {
+        "not_evaluated",
+        "saved_update",
+        "not_attempted",
+        "not_saved_after_processing_failure",
+        "normal_no_match",
+        "candidate_found_no_persistable_update",
+        "no_persistable_update",
+        "prior_update_retained",
+    }
+    allowed_completion_statuses = {"pending", "completed", "unknown"}
+
+    def sanitize(record: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(record, dict):
+            return None
+        index = record.get("circle_index")
+        identity_hash = str(record.get("circle_identity_sha256") or "").lower()
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or index < 0
+            or not re.fullmatch(r"[0-9a-f]{64}", identity_hash)
+        ):
+            return None
+
+        def bounded_count(value: Any) -> int:
+            if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
+                return value
+            return 0
+
+        fetch_outcome = str(record.get("fetch_outcome") or "outcome_unavailable")
+        processing_status = str(record.get("processing_status") or "not_attempted")
+        catalog_status = str(record.get("catalog_status") or "none")
+        persistence_status = record.get("persistence_status")
+        completion_status = record.get("completion_status")
+        return {
+            "target_ordinal": bounded_count(record.get("target_ordinal")),
+            "circle_index": index,
+            "circle_identity_sha256": identity_hash,
+            "fetch_outcome": fetch_outcome if fetch_outcome in allowed_fetch_outcomes else "outcome_unavailable",
+            "processing_status": processing_status if processing_status in allowed_processing_statuses else "failed",
+            "catalog_status": catalog_status if catalog_status in allowed_catalog_statuses else "none",
+            "item_count": bounded_count(record.get("item_count")),
+            "item_image_count": bounded_count(record.get("item_image_count")),
+            "persistence_status": (
+                persistence_status
+                if isinstance(persistence_status, str)
+                and persistence_status in allowed_persistence_statuses
+                else "not_evaluated"
+            ),
+            "persisted_update": record.get("persisted_update") if isinstance(record.get("persisted_update"), bool) else None,
+            "completion_status": (
+                completion_status
+                if isinstance(completion_status, str)
+                and completion_status in allowed_completion_statuses
+                else "unknown"
+            ),
+        }
+
+    merged: Dict[tuple[int, str], Dict[str, Any]] = {}
+    previous_records = (
+        previous_summary.get("target_outcomes", [])
+        if isinstance(previous_summary, dict)
+        else []
+    )
+    current_records = current_summary.get("target_outcomes", [])
+    for record in previous_records if isinstance(previous_records, list) else []:
+        safe = sanitize(record)
+        if safe:
+            merged[(safe["circle_index"], safe["circle_identity_sha256"])] = safe
+
+    for record in current_records if isinstance(current_records, list) else []:
+        safe = sanitize(record)
+        if not safe:
+            continue
+        key = (safe["circle_index"], safe["circle_identity_sha256"])
+        if safe["processing_status"] == "not_attempted" and key in merged:
+            previous = merged[key]
+            previous["completion_status"] = (
+                "pending"
+                if safe["circle_index"] in remaining_target_indices
+                else "completed"
+            )
+            continue
+        index = safe["circle_index"]
+        previous = merged.get(key)
+        if index in persisted_update_indices:
+            safe["persistence_status"] = "saved_update"
+            safe["persisted_update"] = True
+        elif previous and previous.get("persisted_update") is True:
+            safe["persistence_status"] = "prior_update_retained"
+            safe["persisted_update"] = True
+        elif safe["processing_status"] == "not_attempted":
+            safe["persistence_status"] = "not_attempted"
+            safe["persisted_update"] = None
+        elif safe["processing_status"] in {"failed", "unresolved"}:
+            safe["persistence_status"] = "not_saved_after_processing_failure"
+            safe["persisted_update"] = False
+        elif safe["fetch_outcome"] == "no_catalog_found":
+            safe["persistence_status"] = "normal_no_match"
+            safe["persisted_update"] = False
+        elif safe["fetch_outcome"] == "catalog_found":
+            safe["persistence_status"] = "candidate_found_no_persistable_update"
+            safe["persisted_update"] = False
+        else:
+            safe["persistence_status"] = "no_persistable_update"
+            safe["persisted_update"] = False
+        safe["completion_status"] = (
+            "pending" if index in remaining_target_indices else "completed"
+        )
+        merged[key] = safe
+
+    return sorted(
+        merged.values(),
+        key=lambda record: (record["circle_index"], record["target_ordinal"]),
+    )
+
+
 def _coordinate_failure_payload(
     code: str,
     message: str,
@@ -219,9 +394,22 @@ class CircleListGenerator:
                 reasoning_effort=site_reasoning_effort,
                 api_reasoning_effort=site_reasoning_effort,
                 prefer_cli=sp_raw.get("prefer_cli", True),
+                provider=sp_raw.get("provider"),
+                model=sp_raw.get("model"),
+                effort=sp_raw.get("effort"),
+                cli_model_map=sp_raw.get("cli_model_map", {}),
+                cli_effort_map=sp_raw.get("cli_effort_map", {}),
+                fallback_provider=sp_raw.get("fallback_provider"),
+                fallback_model=sp_raw.get("fallback_model"),
+                fallback_effort=sp_raw.get("fallback_effort"),
             )
             self.logger.info(
-                f"サイトパース専用モデル: CLI={site_parsing_config.codex_model}, API={site_parsing_config.api_model}"
+                "サイト構造解析モデル: "
+                + (
+                    f"{site_parsing_config.provider}/{site_parsing_config.model}"
+                    if site_parsing_config.provider and site_parsing_config.model
+                    else f"CLI={site_parsing_config.codex_model}, API={site_parsing_config.api_model}"
+                )
             )
 
         # ページネーション設定
@@ -551,6 +739,7 @@ class CircleListGenerator:
                         "image_api_reasoning_effort_map": self.config.get(
                             "image_api_reasoning_effort_map", {}
                         ),
+                        "oshinagaki_post": self.config.get("oshinagaki_post"),
                     }
                 )
                 twitter_processor = TwitterPostProcessor(twitter_config)
@@ -855,6 +1044,7 @@ class CircleListGenerator:
                     "image_api_reasoning_effort_map": self.config.get(
                         "image_api_reasoning_effort_map", {}
                     ),
+                    "oshinagaki_post": self.config.get("oshinagaki_post"),
                 }
             )
             twitter_processor = TwitterPostProcessor(twitter_config)
@@ -948,10 +1138,9 @@ class CircleListGenerator:
                 ]
                 self.logger.warning(
                     "⚠️ 一部のサークルが未解決です。"
-                    f"成功した{len(updated_circles)}件を保存し、"
-                    "失敗したサークルの既存データを保持します"
+                    f"処理完了判定{len(updated_circles)}件を更新候補として扱い、"
+                    "未解決対象の既存データを保持します"
                 )
-                twitter_summary["saved_successful_count"] = len(updated_circles)
                 # 保存の有無をGUIにも機械可読な結果として通知する。
                 print(
                     "TWITTER_PROCESSING_RESULT="
@@ -973,13 +1162,49 @@ class CircleListGenerator:
                 if update:
                     update_data.append(update)
 
+            previous_twitter_summary = dict(
+                (event_data.get("metadata") or {}).get("twitter_processing") or {}
+            )
             event_data = reprocessor.update_catalog_links(event_data, update_data)
             event_data = reprocessor.apply_default_cuts_for_missing(event_data)
+            remaining_targets = reprocessor.extract_circles_without_catalog(event_data)
+            twitter_summary.update(
+                _reprocess_completion_summary(
+                    circles_without_catalog,
+                    remaining_targets,
+                    len(update_data),
+                )
+            )
+            persisted_update_indices = {
+                update.get("circle_index")
+                for update in update_data
+                if isinstance(update.get("circle_index"), int)
+                and not isinstance(update.get("circle_index"), bool)
+            }
+            remaining_target_indices = {
+                target.get("circle_index")
+                for target in remaining_targets
+                if isinstance(target, dict)
+                and isinstance(target.get("circle_index"), int)
+                and not isinstance(target.get("circle_index"), bool)
+            }
+            twitter_summary["target_outcomes"] = _merge_reprocess_target_outcomes(
+                previous_twitter_summary,
+                twitter_summary,
+                persisted_update_indices,
+                remaining_target_indices,
+            )
             event_data.setdefault("metadata", {})["twitter_processing"] = twitter_summary
             reprocessor.save_updated_json(event_data)
+            print(
+                "TWITTER_PROCESSING_RESULT="
+                + json.dumps(twitter_summary, ensure_ascii=False),
+                file=sys.stderr,
+                flush=True,
+            )
 
             reprocess_progress.update(1, "event.json保存完了")
-            self.logger.info(f"✅ {len(update_data)}件のおしながきリンクを追加しました")
+            self.logger.info(f"✅ {len(update_data)}件のおしながき結果を保存しました")
 
             coordinate_requested = bool(
                 regenerate_coordinates and self._should_generate_coordinates()

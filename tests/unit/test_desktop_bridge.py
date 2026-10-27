@@ -10,6 +10,8 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import threading
 import zipfile
@@ -20,12 +22,16 @@ import pytest
 from src.commands.desktop_bridge import (
     _build_extract_command,
     _build_main_config,
+    _bounded_diagnostic_stream,
+    _hidden_process_options,
+    _pipeline_diagnostic_fields,
     _aggregate_twitter_processing_results,
     _extract_twitter_processing_result,
     _job_create_mobile_zip,
     _job_reprocess_circle_from_image,
     _job_reprocess_circle_from_post,
     _job_run_main_pipeline,
+    _job_parse_site_preview,
     _merge_multi_event_outputs,
     _payload_url_list,
     _job_auto_place_map_pins,
@@ -37,6 +43,63 @@ from src.commands.desktop_bridge import (
     run_job,
 )
 from src.utils.reprocess_deadline import ReprocessDeadlineExceeded
+
+
+def test_site_preview_passes_known_event_name_into_generic_adapter_config(tmp_path, monkeypatch):
+    from src.adapters import adapter_factory
+    from src.models import Event, SiteType
+    from src.utils import cookie_loader, downloader, llm_client, pattern_manager
+
+    captured = {}
+
+    class FakeDownloader:
+        def __init__(self, **_kwargs):
+            self.session = object()
+
+        def fetch_content(self, _url):
+            return "<html><title>Synthetic fixture</title></html>"
+
+    class FakeLLMClient:
+        def __init__(self, **_kwargs):
+            pass
+
+    class FakeAdapter:
+        def __init__(self, site_config):
+            captured["site_type"] = site_config.site_type
+            captured["event_name"] = site_config.event_name
+
+        def extract_event_info(self, _soup):
+            return Event(name=captured["event_name"], url="http://fixture.invalid/events/")
+
+        def extract_circles(self, _soup):
+            return []
+
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        adapter_factory.AdapterFactory,
+        "detect_site_type",
+        staticmethod(lambda _url: SiteType.CUSTOM),
+    )
+    monkeypatch.setattr(
+        adapter_factory.AdapterFactory,
+        "create_adapter",
+        staticmethod(lambda site_config, *_args, **_kwargs: FakeAdapter(site_config)),
+    )
+    monkeypatch.setattr(downloader, "Downloader", FakeDownloader)
+    monkeypatch.setattr(cookie_loader, "load_cookies_for_url", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(llm_client, "LLMClient", FakeLLMClient)
+    monkeypatch.setattr(pattern_manager, "PatternManager", lambda: object())
+
+    result = _job_parse_site_preview(
+        {
+            "project_root": str(tmp_path),
+            "url": "http://fixture.invalid/events/",
+            "event_name": "Synthetic QA Event",
+        }
+    )
+
+    assert result["status"] == "ok"
+    assert captured == {"site_type": SiteType.CUSTOM, "event_name": "Synthetic QA Event"}
 
 
 def test_twitter_processing_resultをstderrマーカーから復元できる():
@@ -885,6 +948,96 @@ class TestBuildMainConfig:
         )
         assert config["text_llm_cli_timeout"] == 900
 
+    def test_role別LLM設定がbridge_configまで届く(self, tmp_path: Path):
+        payload = {
+            "url": "https://example.com/list",
+            "output_dir": str(tmp_path / "out"),
+            "project_root": str(tmp_path),
+            "site_parsing": {
+                "provider": "cli:grok",
+                "model": "grok-4.7",
+                "effort": "high",
+                "cli_model_map": {"grok": "grok-4.7"},
+            },
+            "oshinagaki_post": {
+                "provider": "api:xai",
+                "model": "grok-4.7",
+                "effort": "high",
+            },
+        }
+
+        config = _build_main_config(payload)
+
+        assert config["site_parsing"] == payload["site_parsing"]
+        assert config["oshinagaki_post"] == payload["oshinagaki_post"]
+
+
+def test_pipeline_diagnostic_keeps_exception_tail_and_redacts_secret():
+    raw = "START " + "x" * 900 + "\nTraceback (most recent call last):\nKeyError('tail')"
+    value = _bounded_diagnostic_stream(raw, max_chars=240)
+
+    assert value.startswith("START ")
+    assert value.endswith("KeyError('tail')")
+    assert "truncated total_chars=" in value
+    assert len(value) <= 240
+
+
+def test_pipeline_diagnostic_keeps_only_safe_run_event_and_auth_classification():
+    fields = _pipeline_diagnostic_fields(
+        {
+            "url": "https://list.example.test/circles?private=1",
+            "event_name": "event title",
+            "event_date": "2026-11-01",
+        },
+        {"run_id": "run-abc"},
+        1,
+        "partial output",
+        [
+            "=== Twitter処理を開始します ===",
+            "Cookieファイルからアカウントを追加: private-cookie-name.txt",
+            "invalid auth_token=not-a-real-token",
+            "Traceback (most recent call last): KeyError('tail')",
+        ],
+    )
+
+    assert fields["diagnostic"]["run_id"] == "run-abc"
+    assert fields["diagnostic"]["event"]["source_host"] == "list.example.test"
+    assert fields["diagnostic"]["returncode"] == 1
+    assert fields["diagnostic"]["failure_stage"] == "twitter_post_processing"
+    assert fields["diagnostic"]["twitter_auth"] == {
+        "state": "authentication_failure_observed",
+        "configured_account_count": 1,
+    }
+    assert "private-cookie-name.txt" not in fields["stderr"]
+    assert "not-a-real-token" not in fields["stderr"]
+    assert fields["stdout"] == "partial output"
+
+
+@pytest.mark.parametrize("twitter_status", ["failed", "partial"])
+def test_pipeline_diagnostic_marks_twitter_stage_when_partial_run_exits_zero(
+    twitter_status,
+):
+    fields = _pipeline_diagnostic_fields(
+        {"url": "https://list.example.test/event", "event_date": "2026-11-01"},
+        {"run_id": "run-partial"},
+        0,
+        "",
+        [
+            "TWITTER_PROCESSING_RESULT="
+            + json.dumps(
+                {
+                    "status": twitter_status,
+                    "target_count": 3,
+                    "processed_count": 1,
+                    "failed_count": 2,
+                }
+            )
+        ],
+    )
+
+    assert fields["diagnostic"]["returncode"] == 0
+    assert fields["diagnostic"]["failure_stage"] == "twitter_post_processing"
+
     def test_multiple_urls_are_preserved_as_sources(self, tmp_path: Path):
         payload = {
             "url": "https://one.test/list/\nhttps://two.test/list/",
@@ -1189,6 +1342,14 @@ def test_main_pipeline_stream_redaction_hides_path_and_secret(
     assert private_path not in encoded
     assert "<redacted>" in encoded
     assert "<path>" in encoded
+
+
+def test_bridge_subprocesses_are_hidden_on_windows():
+    options = _hidden_process_options()
+    if os.name == "nt":
+        assert options["creationflags"] & subprocess.CREATE_NO_WINDOW
+    else:
+        assert options == {}
 
 
 class TestMultiEventHelpers:
@@ -1509,6 +1670,56 @@ class TestValidateMobileJson:
 
 
 class TestReprocessCircleFromPost:
+    def test_oshinagaki_post_role_reaches_direct_post_processor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        event_json = tmp_path / "event.json"
+        event_json.write_text(
+            json.dumps(
+                {
+                    "event": {"name": "Event"},
+                    "circles": [{"name": "Circle A", "space": "A-01", "items": []}],
+                    "metadata": {},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        role = {
+            "provider": "api:xai",
+            "model": "grok-4.7",
+            "effort": "high",
+            "cli_model_map": {},
+            "cli_effort_map": {},
+        }
+        received = {}
+        import src.processors.twitter_post_processor as tpp
+
+        class FakeProcessor:
+            def __init__(self, config):
+                received["role"] = config.oshinagaki_post_role
+
+            async def process_circle_from_post_url(self, circle, *_args, **_kwargs):
+                circle.items = [{"name": "New Book"}]
+                return True
+
+        monkeypatch.setattr(tpp, "TwitterPostProcessor", FakeProcessor)
+
+        result = _job_reprocess_circle_from_post(
+            {
+                "event_json": str(event_json),
+                "circle_index": 0,
+                "circle_identity": {"name": "Circle A", "space": "A-01"},
+                "post_url": "https://x.com/user/status/1234567890",
+                "output_dir": str(tmp_path),
+                "project_root": str(tmp_path),
+                "oshinagaki_post": role,
+            }
+        )
+
+        assert result["status"] == "ok"
+        assert received["role"] == role
+
     def test_latest_event_json_is_patched_without_overwriting_parallel_edits(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
