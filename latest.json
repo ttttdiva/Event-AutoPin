@@ -1,9 +1,9 @@
 {
   "desktop": {
-    "version": "0.1.28",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.28/EventAutoPin.exe",
-    "notes": "ヘルプのEscapeでマップ配置モードを解除しないよう修正",
-    "date": "2026-10-17"
+    "version": "0.1.29",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.29/EventAutoPin.exe",
+    "notes": "サークルカット画像判定・全候補割当・モデル役割と失敗診断の修正",
+    "date": "2026-10-27"
   },
   "mobile": {
     "version": "1.4.71",
