@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 
 from ..core import BaseSiteAdapter
 from ..models import Circle, Event, CircleImage
+from ..utils.embedded_data import find_largest_record_list
 
 
 # スペース番号の候補を抽出する際に使用する正規表現
@@ -20,11 +21,74 @@ SPACE_TOKEN_PATTERN = re.compile(
 
 class SockbaseAdapter(BaseSiteAdapter):
     """Sockbase (list.sockbase.net) 用アダプター"""
-    
+
+    # 現行のSockbase一覧は、全サークルをAstro islandのpropsへ埋め込む。
+    # 見えるHTMLにはtableが無く、併催イベントも1つのpropsにまとまる。
+    _EMBEDDED_REQUIRED_KEYS = ["circleName", "spaceName"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._embedded_records: List[dict] = []
+
     def can_handle(self, url: str) -> bool:
         """Sockbase のURLかどうか判定"""
         return 'sockbase.net' in url
+
+    def preprocess_html(self, html: str) -> str:
+        """埋め込みの全サークルレコードを復元して保持する"""
+        records = find_largest_record_list(html, self._EMBEDDED_REQUIRED_KEYS)
+        if records:
+            self._embedded_records = records
+            self.logger.info(f"埋め込みデータから {len(records)} 件のサークルレコードを復元")
+        return html
+
+    def has_candidate_circle_table(self, soup: BeautifulSoup) -> bool:
+        return bool(self._embedded_records) or super().has_candidate_circle_table(soup)
+
+    def _circles_from_embedded(self) -> List[Circle]:
+        circles: List[Circle] = []
+        for record in self._embedded_records:
+            name = str(record.get('circleName') or '').strip()
+            if not name:
+                continue
+            links = record.get('links') if isinstance(record.get('links'), dict) else {}
+            space = self._normalize_space_display(str(record.get('spaceName') or ''))
+            screen_name = str(links.get('twitterScreenName') or '').strip().lstrip('@')
+            pixiv_id = str(links.get('pixivUserId') or '').strip()
+            circle = Circle(
+                name=name,
+                penname=str(record.get('penName') or '').strip() or None,
+                space=space or None,
+                hall=space.split('-')[0] if re.match(r'^[A-Za-z]-', space) else None,
+                twitter_url=f'https://x.com/{screen_name}' if screen_name else None,
+                website_url=str(links.get('websiteURL') or '').strip(),
+                pixiv_url=f'https://www.pixiv.net/users/{pixiv_id}' if pixiv_id else None,
+                raw_data=record,
+            )
+            circle.sub_event = str(record.get('eventName') or '').strip() or None
+            circle.menu_url = str(links.get('menuURL') or '').strip() or None
+            circles.append(circle)
+        return circles
     
+    def _host_page_table_circles(self, soup: BeautifulSoup, known_names: set) -> List[Circle]:
+        """iframe展開で取り込んだ一覧の外（公式サイト側）にある表のサークル・企業を拾う。
+
+        公式サイトは一覧の隣に「出展企業」表などを別途載せることがある。
+        展開したフレームの中身は除き、見出しが明確な表だけを直接読む。
+        """
+        if not soup.find(attrs={"data-inlined-frame": True}):
+            return []
+        host_soup = BeautifulSoup(str(soup), "html.parser")
+        for frame in host_soup.find_all(attrs={"data-inlined-frame": True}):
+            frame.decompose()
+        extra: List[Circle] = []
+        for circle in self.try_direct_table_extraction(host_soup):
+            if circle.name in known_names:
+                continue
+            known_names.add(circle.name)
+            extra.append(circle)
+        return extra
+
     def extract_event_info(self, soup: BeautifulSoup) -> Event:
         """イベント情報を抽出"""
         event_name = self._extract_event_name(soup)
@@ -40,8 +104,17 @@ class SockbaseAdapter(BaseSiteAdapter):
     
     def extract_circles(self, soup: BeautifulSoup) -> List[Circle]:
         """サークル情報を抽出"""
-        circles = []
-        
+        circles = self._circles_from_embedded()
+        if circles:
+            self.logger.info(f"抽出されたサークル数: {len(circles)}（埋め込みデータ）")
+            extra = self._host_page_table_circles(soup, {c.name for c in circles})
+            if extra:
+                self.logger.info(
+                    f"埋め込み一覧の外にある表から {len(extra)} 件を追加（出展企業など）"
+                )
+                circles.extend(extra)
+            return circles
+
         # テーブルベースの抽出を試みる
         tables = soup.find_all('table')
         if tables:
@@ -57,6 +130,16 @@ class SockbaseAdapter(BaseSiteAdapter):
     def extract_circle_images(self, soup: BeautifulSoup) -> List[Tuple[int, str]]:
         """サークル画像URLを抽出"""
         image_urls: List[Tuple[int, str]] = []
+        if self._embedded_records:
+            # 各サークルの公式サークルカット。indexは抽出したサークルの並びと一致させる。
+            records = [r for r in self._embedded_records if str(r.get('circleName') or '').strip()]
+            for index, record in enumerate(records):
+                url = str(record.get('circleCutURL') or '').strip()
+                if url.startswith('http'):
+                    image_urls.append((index, url))
+            self.logger.info(f"抽出された画像数: {len(image_urls)}（埋め込みデータ）")
+            return image_urls
+
         seen_urls = set()
         global_index = 0
 

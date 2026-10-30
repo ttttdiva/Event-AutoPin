@@ -168,6 +168,12 @@ class LearnedPatternAdapter(BaseSiteAdapter):
             if matched_schema:
                 continue
 
+            # 組み込みの列名だけで全列を説明できる表は、保存済みschemaが無くても確定できる
+            builtin = self.builtin_header_mapping(headers)
+            if builtin is not None:
+                header_mappings[table_index] = builtin
+                continue
+
             # schema未保存の旧パターンだけ、組み込みラベルの完全一致を許可する。
             if not learned_schemas:
                 exact_map = {
@@ -557,6 +563,11 @@ class LearnedPatternAdapter(BaseSiteAdapter):
             delegate.logger = self.logger
             return delegate.extract_circle_images(soup)
         
+        # 表の行から抽出したサークルは、同じ行の画像をそのサークルのカットにする
+        row_images = self.row_bound_circle_images(soup)
+        if row_images:
+            return row_images
+
         # 基本的な画像抽出ロジック
         image_urls = []
         

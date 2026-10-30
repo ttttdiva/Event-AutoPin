@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -161,3 +161,39 @@ def test_create_api_instance_keeps_project_pool_when_cwd_is_temporary(monkeypatc
     assert Path(expected_db).is_absolute()
     assert Path(expected_db).parent != tmp_path
     assert calls == [(expected_db, {"raise_when_no_account": True})]
+
+
+def test_timeline_scan_continues_past_isolated_old_tweet():
+    """固定ポストやRTの塊で日付順が崩れても、後ろの期間内ポストまで読み進める。"""
+    def tweet(day, month=10):
+        return SimpleNamespace(
+            id=day, date=datetime(2026, month, day, tzinfo=timezone.utc), rawContent="", retweetedTweet=None,
+            media=None, quotedTweet=None, inReplyToTweetId=None, url="",
+        )
+
+    order = [tweet(18, 5), tweet(3), tweet(3), tweet(18, 5), tweet(29), tweet(29)]
+
+    class UnorderedTimelineApi:
+        consumed = 0
+
+        async def user_by_login(self, _username):
+            return SimpleNamespace(id=1)
+
+        async def user_tweets(self, _user_id, limit=-1):
+            for t in order:
+                UnorderedTimelineApi.consumed += 1
+                yield t
+
+    extractor = make_extractor([UnorderedTimelineApi()])
+    try:
+        asyncio.run(
+            extractor.extract_catalog_tweets(
+                username="sample_profile",
+                event_date=datetime(2026, 11, 1),
+                event_name="sample event",
+            )
+        )
+    except Exception:
+        pass  # 後段の判定が未設定でも、タイムラインを最後まで読んだかだけを確認する。
+
+    assert UnorderedTimelineApi.consumed == len(order)

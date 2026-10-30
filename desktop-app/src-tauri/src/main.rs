@@ -702,20 +702,14 @@ fn list_model_catalog_sync_with_refresh(
     let (mut api_models, api_errors) = build_api_model_catalog(&dotenv, &configured_api_models);
     let (grok_models, grok_source, grok_auth, grok_image_capability) =
         fetch_grok_build_models(&dotenv);
+    let codex_candidates = codex_candidate_models();
     let codex_models = configured_models(
         cli_candidate_models(
             "codex",
-            vec![
-                ("gpt-5.5", "GPT-5.5"),
-                ("gpt-5.4", "GPT-5.4"),
-                ("gpt-5.4-mini", "GPT-5.4 Mini"),
-                ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"),
-                ("gpt-5.3-codex", "GPT-5.3 Codex"),
-                ("gpt-5.2-codex", "GPT-5.2 Codex"),
-                ("gpt-5.1-codex-max", "GPT-5.1 Codex Max"),
-                ("gpt-5.1-codex", "GPT-5.1 Codex"),
-                ("gpt-5-codex", "GPT-5 Codex"),
-            ],
+            codex_candidates
+                .iter()
+                .map(|(id, label)| (id.as_str(), label.as_str()))
+                .collect(),
         ),
         &[text_model_config.get("codex").cloned()],
         "codex",
@@ -1047,6 +1041,48 @@ fn openai_documented_capabilities(id: &str) -> (&'static str, &'static str, &'st
         );
     }
     ("unknown", "unknown", "OpenAI models list has no modality metadata")
+}
+
+/// Codex CLI自身のモデルcache（`~/.codex/models_cache.json`）から、表示対象のモデルを読む。
+/// 読めない場合は従来の固定候補へ戻る。
+fn codex_candidate_models() -> Vec<(String, String)> {
+    let mut models: Vec<(String, String)> = Vec::new();
+    if let Some(profile) = env::var_os("USERPROFILE") {
+        let path = PathBuf::from(profile).join(".codex").join("models_cache.json");
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                if let Some(items) = value.get("models").and_then(Value::as_array) {
+                    for item in items {
+                        let visible = item.get("visibility").and_then(Value::as_str) == Some("list");
+                        let slug = item.get("slug").and_then(Value::as_str).unwrap_or("");
+                        if !visible || slug.is_empty() {
+                            continue;
+                        }
+                        let label = item
+                            .get("display_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(slug);
+                        models.push((slug.to_string(), label.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    if models.is_empty() {
+        models = [
+            ("gpt-6.1-sol", "GPT-6.1 Sol"),
+            ("gpt-6-sol", "GPT-6 Sol"),
+            ("gpt-6-luna", "GPT-6 Luna"),
+            ("gpt-5.6-sol", "GPT-5.6 Sol"),
+            ("gpt-5.6-luna", "GPT-5.6 Luna"),
+            ("gpt-5.5", "GPT-5.5"),
+            ("gpt-5.4", "GPT-5.4"),
+        ]
+        .iter()
+        .map(|(id, label)| (id.to_string(), label.to_string()))
+        .collect();
+    }
+    models
 }
 
 fn cli_candidate_models(provider: &str, models: Vec<(&str, &str)>) -> Vec<Value> {

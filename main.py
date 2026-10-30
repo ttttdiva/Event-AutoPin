@@ -42,6 +42,19 @@ from src.processors import TwitterPostProcessor, TwitterConfig
 from src.utils.pattern_manager import PatternManager
 from src.utils.json_reprocessor import JSONReprocessor
 from src.utils.output_cleanup import protected_output_entry_names
+from src.utils.settled_catalog import SettledCatalog, load_settled_catalog
+
+
+def _merge_x_account_metadata(event_data: Dict[str, Any], twitter_processor: Any) -> Dict[str, Any]:
+    """再処理で得たXアカウント状態を既存metadataへ統合する(取得済みサークルの古い状態は消す)。"""
+    from src.utils.x_account_status import merge_x_account_status
+
+    merged = merge_x_account_status(
+        (event_data.get("metadata") or {}).get("x_account_status"),
+        getattr(twitter_processor, "x_account_status", None),
+        event_data.get("circles") or [],
+    )
+    return {"x_account_status": merged} if merged else {}
 
 
 def _reprocess_completion_summary(
@@ -399,9 +412,14 @@ class CircleListGenerator:
                 effort=sp_raw.get("effort"),
                 cli_model_map=sp_raw.get("cli_model_map", {}),
                 cli_effort_map=sp_raw.get("cli_effort_map", {}),
-                fallback_provider=sp_raw.get("fallback_provider"),
-                fallback_model=sp_raw.get("fallback_model"),
-                fallback_effort=sp_raw.get("fallback_effort"),
+                # 構造解析の主モデルが容量超過などで落ちても、初見サイトの一覧を
+                # 取りこぼさないよう、未指定なら通常のテキストLLM設定へ切り替える。
+                fallback_provider=sp_raw.get("fallback_provider")
+                or self.config.get("text_llm_provider"),
+                fallback_model=sp_raw.get("fallback_model")
+                or (models[0] if isinstance(models, list) and models else models),
+                fallback_effort=sp_raw.get("fallback_effort")
+                or self.config.get("api_reasoning_effort"),
             )
             self.logger.info(
                 "サイト構造解析モデル: "
@@ -472,6 +490,33 @@ class CircleListGenerator:
             pagination=pagination_config,
         )
 
+    def _probe_list_frames(self, site_config: SiteConfig) -> List[str]:
+        """一覧ページがiframeで別ページを埋め込んでいるかを調べる（アダプター選択用）"""
+        if site_config.pagination and site_config.pagination.url_template:
+            return []
+        try:
+            from src.utils import Downloader
+            from src.utils.cookie_loader import load_cookies_for_url
+            from src.utils.frame_inliner import find_list_frames
+
+            downloader = Downloader(
+                headers=site_config.headers,
+                timeout=site_config.timeout,
+                retry_count=site_config.retry_count,
+                cookies=load_cookies_for_url(
+                    site_config.base_url, cookie_file=site_config.cookie_file
+                ),
+            )
+            page_url = site_config.get_full_url(site_config.list_page_path or "")
+            html = downloader.fetch_content(page_url)
+            frames = find_list_frames(html or "", page_url)
+            if frames:
+                self.logger.info(f"一覧ページがiframeで別ページを埋め込んでいます: {frames}")
+            return frames
+        except Exception as exc:
+            self.logger.warning(f"iframe埋め込みの確認に失敗: {exc}")
+            return []
+
     def _create_output_config(self) -> OutputConfig:
         """出力設定を作成"""
         output_format = OutputFormat.JSON
@@ -506,12 +551,24 @@ class CircleListGenerator:
             )
             coordinate_ok = True
 
-            # output_dirの既存ファイルをクリア（フルパイプラインは最初からやり直す）
+            # output_dirの既存ファイルをクリア（フルパイプラインは最初からやり直す）。
+            # ただし、おしながきが確定済みのサークルは取り込み済みとして保持し、やり直さない。
             output_dir = Path(self.config["output_dir"])
+            settled_catalog = (
+                load_settled_catalog(output_dir)
+                if self.config.get("incremental_rerun", True)
+                else SettledCatalog()
+            )
+            if len(settled_catalog):
+                self.logger.info(
+                    f"確定済みのおしながき {len(settled_catalog)} 件を保持し、"
+                    "未取得・予告のみ・要再確認のサークルだけ再処理します"
+                )
             if output_dir.exists():
                 import shutil
 
                 protected_names = protected_output_entry_names(output_dir)
+                protected_names |= settled_catalog.protected_names()
                 for item in output_dir.iterdir():
                     if item.name in protected_names:
                         # logsはロガー使用中、event.jsonとイベント画像はユーザー設定を保持
@@ -542,6 +599,7 @@ class CircleListGenerator:
 
             # 設定を作成
             site_config = self._create_site_config()
+            site_config.frame_urls = self._probe_list_frames(site_config)
             output_config = self._create_output_config()
 
             # LLMクライアントを準備
@@ -609,6 +667,25 @@ class CircleListGenerator:
             if not result["success"]:
                 self.logger.error(f"❌ エラーが発生しました: {result.get('error')}")
                 return False
+
+            preserved_count = (
+                settled_catalog.apply(result.get("circles", []))
+                if len(settled_catalog)
+                else 0
+            )
+            if preserved_count:
+                self.logger.info(
+                    f"確定済みのおしながき {preserved_count} 件を引き継ぎました（X処理の対象外）"
+                )
+                if result.get("event_obj"):
+                    extras = dict(getattr(formatter, "metadata_extras", None) or {})
+                    extras["incremental_rerun"] = {
+                        "preserved_circles": preserved_count,
+                        "reprocessed_circles": len(result["circles"]) - preserved_count,
+                    }
+                    formatter.metadata_extras = extras
+                    kept = formatter.format_data(result["circles"], result["event_obj"])
+                    formatter.save(kept, "event.json")
 
             # GenericAdapterを使用した場合はパターンを保存
             from src.adapters.generic_adapter import GenericAdapter
@@ -693,6 +770,10 @@ class CircleListGenerator:
                         ),  # 追加プロンプト
                         "event_date": self.config.get("event_date"),
                         "use_grok_search": self.config.get("use_grok_search", False),
+                        "use_grok_rescue": self.config.get("use_grok_rescue", True),
+                        "grok_rescue_batch_size": self.config.get("grok_rescue_batch_size", 12),
+                        "grok_rescue_timeout": self.config.get("grok_rescue_timeout", 900),
+                        "grok_rescue_model": self.config.get("grok_rescue_model"),
                         "tweet_llm_cli_providers": self.config.get(
                             "tweet_llm_cli_providers",
                             (
@@ -844,6 +925,11 @@ class CircleListGenerator:
 
                     # 更新されたデータでevent.jsonを再生成
                     self.logger.info("Twitter情報を反映したevent.jsonを再生成中...")
+                    # Grok再探索の結果(凍結・未公開などのXアカウント状態)も通常出力に載せる。
+                    formatter.metadata_extras = {
+                        **(getattr(formatter, "metadata_extras", None) or {}),
+                        **(getattr(twitter_processor, "metadata_for_event_json", None) or dict)(),
+                    }
                     data = formatter.format_data(updated_circles, event)
                     data.setdefault("metadata", {})["twitter_processing"] = twitter_summary
                     output_path = formatter.save(data, "event.json")
@@ -998,6 +1084,10 @@ class CircleListGenerator:
                     ),
                     "event_date": self.config.get("event_date"),
                     "use_grok_search": False,
+                    "use_grok_rescue": self.config.get("use_grok_rescue", True),
+                    "grok_rescue_batch_size": self.config.get("grok_rescue_batch_size", 12),
+                    "grok_rescue_timeout": self.config.get("grok_rescue_timeout", 900),
+                    "grok_rescue_model": self.config.get("grok_rescue_model"),
                     "tweet_llm_cli_providers": self.config.get(
                         "tweet_llm_cli_providers",
                         (
@@ -1195,6 +1285,9 @@ class CircleListGenerator:
                 remaining_target_indices,
             )
             event_data.setdefault("metadata", {})["twitter_processing"] = twitter_summary
+            event_data["metadata"].update(
+                _merge_x_account_metadata(event_data, twitter_processor)
+            )
             reprocessor.save_updated_json(event_data)
             print(
                 "TWITTER_PROCESSING_RESULT="

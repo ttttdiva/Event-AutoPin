@@ -786,6 +786,148 @@ def test_catalog_geometry_mixed_horizontal_rows_and_vertical_islands() -> None:
     assert quality["gate"]["passed"] is True
 
 
+def _folded_island_numbers(left_x: int, rows: int, *, drop_top_row: bool = False) -> list:
+    """Two-column island: left column descends rows..1, right rows+1..2*rows."""
+    top_skip = 1 if drop_top_row else 0
+    items = []
+    for index in range(top_skip, rows):
+        y = 100 + index * 50
+        items.append({"number": f"{rows - index:02d}", "x": left_x, "y": y, "width": 80, "height": 40})
+        items.append({"number": f"{rows + 1 + index:02d}", "x": left_x + 64, "y": y, "width": 80, "height": 40})
+    return items
+
+
+def test_catalog_geometry_folded_two_column_islands_with_minor_unobserved_prefix() -> None:
+    # Several islands, each with a left and a right number column.  Neighbouring
+    # islands share number ranges at the same y, so row/pair heuristics see
+    # fake "horizontal" structure; adjacent columns are closer together than
+    # the OCR bbox width.  E is a tiny island whose numbers OCR did not read.
+    rows = 10
+    catalog = {
+        "order": ["A", "B", "C", "E"],
+        # Catalog heuristic labels every prefix with a large number as horizontal.
+        "horizontal_labels": ["A", "B", "C"],
+        "vertical_labels": ["E"],
+        "spaces": [
+            _space(f"{prefix}{number:02d}", prefix, number)
+            for prefix in "ABC"
+            for number in range(1, 2 * rows + 1)
+        ] + [_space("E03", "E", 3)],
+    }
+    numbers = (
+        _folded_island_numbers(300, rows, drop_top_row=True)
+        + _folded_island_numbers(700, rows)
+        + _folded_island_numbers(1100, rows)
+    )
+
+    grid = _build_catalog_geometry_grid(numbers, catalog, (2000, 1000))
+    quality = _catalog_geometry_quality(numbers, catalog, grid, (2000, 1000))
+    by_id = {item["space_id"]: item for item in grid}
+
+    assert quality["orientation"]["horizontal_labels"] == []
+    assert quality["orientation"]["vertical_labels"] == ["A", "B", "C", "E"]
+    # E has no observed column: it must stay unplaced instead of borrowing one.
+    assert "E03" not in by_id
+    assert len(grid) == 3 * 2 * rows
+    for prefix, left_x in (("A", 300), ("B", 700), ("C", 1100)):
+        for number in range(1, rows + 1):
+            point = by_id[f"{prefix}{number:02d}"]
+            assert point["x"] == left_x + 40
+            assert point["y"] == 100 + (rows - number) * 50 + 20
+        for number in range(rows + 1, 2 * rows + 1):
+            point = by_id[f"{prefix}{number:02d}"]
+            assert point["x"] == left_x + 64 + 40
+            assert point["y"] == 100 + (number - rows - 1) * 50 + 20
+    # Only the five observed-top-row-less A slots are imputed.
+    assert quality["observed"] == 3 * 2 * rows - 2
+
+
+def test_catalog_geometry_ignores_candidates_with_unknown_printed_prefix() -> None:
+    catalog = {
+        "order": ["V"],
+        "horizontal_labels": [],
+        "vertical_labels": ["V"],
+        "spaces": [_space("V03", "V", 3)],
+    }
+    numbers = [
+        {"number": "03", "x": 100, "y": 100, "width": 36, "height": 29},
+        # Same column, but printed as a different booth series (e.g. corporate).
+        {"number": "03", "x": 100, "y": 300, "width": 36, "height": 29, "prefix": "X"},
+    ]
+
+    grid = _build_catalog_geometry_grid(numbers, catalog, (1000, 1000))
+    quality = _catalog_geometry_quality(numbers, catalog, grid, (1000, 1000))
+
+    assert [(item["space_id"], item["y"]) for item in grid] == [("V03", 114)]
+    assert quality["ambiguous"] == 0
+    assert quality["gate"]["passed"] is True
+
+
+def test_supplemental_recovery_requires_validated_numbers_and_a_passing_gate() -> None:
+    catalog = {
+        "order": ["A", "E"],
+        "horizontal_labels": [],
+        "vertical_labels": ["A", "E"],
+        "spaces": [_space(f"A{n:02d}", "A", n) for n in range(1, 7)] + [_space("E03", "E", 3)],
+    }
+    primary = [
+        {"number": f"{n:02d}", "x": 100, "y": 100 + n * 60, "width": 40, "height": 30}
+        for n in range(1, 7)
+    ]
+    island = [{"number": "03", "x": 700, "y": 400, "width": 36, "height": 29}]
+    size = (1000, 800)
+    grid = _build_catalog_geometry_grid(primary, catalog, size)
+    quality = _catalog_geometry_quality(primary, catalog, grid, size)
+    assert quality["gate"]["passed"] is False  # E03 has no evidence at all
+
+    class Validator:
+        def __init__(self, status: str, accepted: list) -> None:
+            self.status, self.accepted = status, accepted
+
+        def validate_numbers(self, image_path, candidates):
+            return NumberValidationResult(status=self.status, numbers=list(self.accepted), diagnostics={})
+
+    recover = acg._recover_geometry_with_supplemental_numbers
+    recovered = recover(island, Validator("validated", island), "map.png", primary, catalog, size, quality)
+    assert recovered is not None
+    numbers, new_grid, new_quality = recovered
+    assert new_quality["gate"]["passed"] is True
+    assert {item["space_id"] for item in new_grid} >= {"E03"}
+    assert len(numbers) == 7
+
+    # An unvalidated (skipped) or empty validation never feeds the geometry.
+    assert recover(island, Validator("skipped_error", island), "map.png", primary, catalog, size, quality) is None
+    assert recover(island, Validator("validated", []), "map.png", primary, catalog, size, quality) is None
+    assert recover([], Validator("validated", island), "map.png", primary, catalog, size, quality) is None
+
+
+def test_ink_refinement_moves_table_cell_boxes_onto_digits_with_one_shift_per_column() -> None:
+    import numpy as np
+
+    image = np.full((400, 400, 3), 235, dtype=np.uint8)
+    # A booth outline running through every row, right next to the digits.
+    image[:, 40:44] = 40
+    rows = (60, 140, 220)
+    for top in rows:
+        # Two-digit label: glyph centre x = 110 even though the OCR cell is
+        # centred at x = 150.
+        image[top : top + 16, 98:106] = 40
+        image[top : top + 16, 114:122] = 40
+    numbers = [
+        {"number": f"{index + 1:02d}", "x": 100, "y": top - 12, "width": 100, "height": 40}
+        for index, top in enumerate(rows)
+    ]
+
+    refined = acg._refine_number_boxes_to_ink(image, numbers)
+
+    assert [item["x"] + item["width"] / 2 for item in refined] == [110.0, 110.0, 110.0]
+    assert all(item["y"] + item["height"] / 2 == top + 8 for item, top in zip(refined, rows))
+    # Input is not mutated and nothing printed means nothing moves.
+    assert numbers[0]["x"] == 100
+    blank = np.full((400, 400, 3), 235, dtype=np.uint8)
+    assert [item["x"] for item in acg._refine_number_boxes_to_ink(blank, numbers)] == [100, 100, 100]
+
+
 def test_analyze_catalog_excludes_unassigned_circles_only_for_multi_map(tmp_path) -> None:
     event_json = tmp_path / "event.json"
     payload = {
@@ -924,6 +1066,12 @@ def test_generator_resolves_right_to_left_horizontal_row_and_passes_quality(tmp_
 
     monkeypatch.setattr("src.space_locator.auto_coordinate_generator.NumberValidator", KeepValidator)
     monkeypatch.setattr("src.space_locator.auto_coordinate_generator.PatternAnalyzer", FakeAnalyzer)
+    # The fixture image does not print these synthetic numbers; keep the test on
+    # the OCR boxes (ink refinement has its own test).
+    monkeypatch.setattr(
+        "src.space_locator.auto_coordinate_generator._refine_number_boxes_to_ink",
+        lambda image, numbers: [dict(item) for item in numbers],
+    )
     result = generate_coordinates_from_map(
         str(image_path),
         str(event_json),

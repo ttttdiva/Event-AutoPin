@@ -61,13 +61,15 @@ export interface ImportCircle {
   memo?: string;
   absence_status?: string;
   existing_only_status?: string;
-  catalog_status?: string;
+  catalog_status?: string | null;
+  sub_event?: string | null;
+  menu_url?: string | null;
   source_event_name?: string | null;
   source_event_url?: string | null;
   extracted_at?: string;
   // マップ座標
-  pin_x?: number;
-  pin_y?: number;
+  pin_x?: number | null;
+  pin_y?: number | null;
   map_number?: number;
   // エクスポート時の購入状態
   checked?: number; // 0=未購入, 1=買えた, 2=買えなかった, 3=見送り
@@ -157,6 +159,12 @@ export const PURCHASE_STATUS_LABELS: Record<
 
 // --- アプリ内部の型 ---
 
+export const CATALOG_STATUS_LABELS: Record<string, string> = {
+  confirmed: "確定",
+  preview: "予告",
+  needs_recheck: "要確認",
+};
+
 /** イベント */
 export interface Event {
   id: number;
@@ -209,6 +217,8 @@ export interface Circle {
   absenceStatus: string | null;
   existingOnlyStatus: string | null;
   catalogStatus: string | null;
+  subEvent: string | null;
+  menuUrl: string | null;
   rawJson: string | null;
   /** 一覧用projection由来の派生revision（export/rawモデルには存在しない）。 */
   renderRevision?: number;

@@ -10,6 +10,8 @@ class CircleImage:
     filename: Optional[str] = None
     width: int = 182
     height: int = 256
+    # 採用理由の追跡用。kind: site_cut / default_cut / oshinagaki_substitute / manual
+    source: Optional[Dict[str, Any]] = None
     
     def __post_init__(self):
         if not self.filename:
@@ -66,11 +68,25 @@ class Circle:
     pin_y: Optional[float] = None
     map_number: Optional[int] = None
 
+    # 併催イベント名、お品書きURL（サイトが提供する場合のみ出力）
+    sub_event: Optional[str] = None
+    menu_url: Optional[str] = None
+
     # 購入状態（0=未購入, 1=買えた, 2=買えなかった, 3=見送り）
     checked: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
         """辞書形式に変換"""
+        data = self._base_dict()
+        if self.sub_event:
+            data['sub_event'] = self.sub_event
+        if self.menu_url:
+            data['menu_url'] = self.menu_url
+        if self.circle_cut and self.circle_cut.source:
+            data['circle_cut_origin'] = self.circle_cut.source
+        return data
+
+    def _base_dict(self) -> Dict[str, Any]:
         return {
             'name': self.name,
             'penname': self.penname,

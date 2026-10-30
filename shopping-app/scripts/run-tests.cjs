@@ -11,6 +11,7 @@ const testCases = [
   ["lib/crawl/post-reprocess.test.js"],
   ["lib/crawl/image-downloader.test.js"],
   ["lib/database-core.test.ts", "runDatabaseCoreTests"],
+  ["lib/database-catalog.test.js", "runDatabaseCatalogTests"],
   ["lib/database-filesystem.test.ts"],
   ["lib/database-instrumentation.test.ts"],
   ["lib/database-lifetime.test.ts"],
@@ -29,6 +30,8 @@ const testCases = [
   ["lib/mutation-epoch.test.ts", "runMutationEpochTests"],
   ["lib/performance-core.test.ts"],
   ["lib/priority-row-theme.test.ts", "runPriorityRowThemeTests"],
+  ["lib/statusbar-appearance.test.js", "runStatusBarAppearanceTests"],
+  ["lib/theme-appearance.test.ts", "runThemeAppearanceTests"],
   ["lib/text-collation.test.ts", "runTextCollationTests"],
   ["lib/update-service.test.js"],
 ];
@@ -121,7 +124,7 @@ function runAllTests() {
     const completed = spawnSync(
       process.execPath,
       [__filename, childMarker, relativePath, exportedRunner],
-      { cwd: appRoot, encoding: "utf8" },
+      { cwd: appRoot, encoding: "utf8", windowsHide: true },
     );
     if (completed.stdout) process.stdout.write(completed.stdout);
     if (completed.stderr) process.stderr.write(completed.stderr);

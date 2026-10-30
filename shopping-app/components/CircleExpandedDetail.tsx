@@ -35,7 +35,7 @@ import { useTheme } from "@/lib/theme-context";
 import { getColors } from "@/constants/Colors";
 import { useEvent } from "@/lib/event-context";
 import { beginSqlMetricsScope, recordUiMetric } from "@/lib/performance";
-import { ITEM_CATEGORIES } from "@/lib/types";
+import { CATALOG_STATUS_LABELS, ITEM_CATEGORIES } from "@/lib/types";
 import ImageViewer from "@/components/ImageViewer";
 import ItemPurchaseRow from "@/components/ItemPurchaseRow";
 import type { Circle, Item, ItemImage, PurchaseStatusValue } from "@/lib/types";
@@ -112,6 +112,7 @@ export default function CircleExpandedDetail({
 }: CircleExpandedDetailProps) {
   const { effectiveScheme } = useTheme();
   const colors = getColors(effectiveScheme);
+  const catalogStatusLabel = CATALOG_STATUS_LABELS[circle.catalogStatus ?? ""];
   const { refreshStats } = useEvent();
   const circleRef = useRef(circle);
   const [items, setItems] = useState<Item[]>([]);
@@ -462,6 +463,19 @@ export default function CircleExpandedDetail({
         </View>
       )}
 
+      {(catalogStatusLabel || circle.subEvent) && (
+        <View style={styles.sectionCompact}>
+          {catalogStatusLabel && (
+            <Text style={{ fontSize: 12, color: colors.text }}>
+              おしながき: {catalogStatusLabel}
+            </Text>
+          )}
+          {circle.subEvent && (
+            <Text style={{ fontSize: 12, color: colors.textSecondary }}>{circle.subEvent}</Text>
+          )}
+        </View>
+      )}
+
       {/* M12: 要素順見直し - 購入ステータス → お品書き → 頒布物 → リンク → メモ → 優先度 → マップ → タグ */}
 
       <View style={styles.sectionCompact}>
@@ -505,6 +519,7 @@ export default function CircleExpandedDetail({
       {(circle.twitterUrl ||
         circle.websiteUrl ||
         circle.pixivUrl ||
+        circle.menuUrl ||
         tagUrls.length > 0) && (
         <View style={styles.sectionCompact}>
           <View style={styles.linkRow}>
@@ -538,8 +553,17 @@ export default function CircleExpandedDetail({
                 </Text>
               </Pressable>
             )}
+            {circle.menuUrl && (
+              <Pressable
+                accessibilityRole="link"
+                style={[styles.linkBtn, { borderColor: colors.border }]}
+                onPress={() => openUrl(circle.menuUrl)}
+              >
+                <Text style={[styles.linkBtnText, { color: colors.tint }]}>おしながき</Text>
+              </Pressable>
+            )}
             {/* M7: おしながきリンク（タグから抽出したURL） */}
-            {tagUrls.map((url, i) => (
+            {tagUrls.filter((url) => url !== circle.menuUrl).map((url, i) => (
               <Pressable
                 key={`tag-url-${i}`}
                 style={[styles.linkBtn, { borderColor: colors.border }]}

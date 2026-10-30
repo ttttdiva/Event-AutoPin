@@ -152,6 +152,9 @@ class SiteConfig:
     # ページネーション設定
     pagination: Optional[PaginationConfig] = None
 
+    # 一覧ページがiframeで埋め込んでいる別ページのURL（main.pyが事前に検出する）
+    frame_urls: List[str] = field(default_factory=list)
+
     # イベント情報設定
     catalog_additional_prompt: str = ""
     event_date: Optional[str] = None  # YYYY-MM-DD形式

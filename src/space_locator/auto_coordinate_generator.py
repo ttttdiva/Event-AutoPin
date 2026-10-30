@@ -213,6 +213,12 @@ def expand_space_ids(space: str) -> List[Dict[str, Any]]:
         part = part.strip("- ")
         if not part:
             continue
+        # "A-15,A-16": a member that repeats the same hall prefix is another
+        # booth of the same space, not text to be ignored.
+        if prefix and part[: len(prefix)].casefold() == prefix.casefold():
+            repeated = part[len(prefix):].lstrip(" -‐‑‒–—−ー－")
+            if repeated[:1].isdigit():
+                part = repeated
         range_match = re.match(r"^(\d+)[A-Za-z]?\s*-\s*(\d+)[A-Za-z]?$", part)
         if range_match:
             start = int(range_match.group(1))
@@ -920,6 +926,72 @@ def _catalog_geometry_row_clusters(
     return by_y(horizontal), by_y(vertical)
 
 
+def _catalog_order_violations(track: Sequence[Mapping[str, Any]], sort_axis: str) -> int:
+    """Count adjacent number steps that break the track's dominant direction.
+
+    A genuine booth line is numbered monotonically along its own axis.  Two
+    parallel lines that were merged into one cluster interleave their numbers
+    and therefore produce many reversals or repeated values.
+    """
+    ordered = sorted(track, key=lambda item: (float(item[sort_axis]), int(item["number"])))
+    steps = [
+        int(right["number"]) - int(left["number"])
+        for left, right in zip(ordered[:-1], ordered[1:])
+    ]
+    if not steps:
+        return 0
+    rising = sum(1 for step in steps if step > 0)
+    falling = sum(1 for step in steps if step < 0)
+    return len(steps) - max(rising, falling)
+
+
+def _catalog_split_interleaved_track(
+    track: Sequence[Dict[str, Any]],
+    cross_axis: str,
+    sort_axis: str,
+    typical_extent: float,
+    *,
+    depth: int = 0,
+) -> List[List[Dict[str, Any]]]:
+    """Split a cluster that merged several parallel booth lines.
+
+    The cross-axis clustering threshold is derived from OCR bbox size, which can
+    exceed the centre-to-centre distance of two adjacent parallel columns (for
+    example the two number columns of one island).  When the merged cluster is
+    not monotonic along its axis, cut it at the widest gap on the cross axis and
+    keep the cut only when it removes order violations from the resulting parts.
+    """
+    members = sorted(track, key=lambda item: (float(item[cross_axis]), float(item[sort_axis])))
+    if depth >= 3 or len(members) < 6:
+        return [list(members)]
+    before = _catalog_order_violations(members, sort_axis)
+    if before < max(2, int(len(members) * 0.15)):
+        return [list(members)]
+    min_gap = max(6.0, typical_extent * 0.2)
+    gaps = [
+        (float(right[cross_axis]) - float(left[cross_axis]), index)
+        for index, (left, right) in enumerate(zip(members[:-1], members[1:]), start=1)
+    ]
+    gap, cut = max(gaps)
+    if gap < min_gap:
+        return [list(members)]
+    first, second = members[:cut], members[cut:]
+    after = _catalog_order_violations(first, sort_axis) + _catalog_order_violations(second, sort_axis)
+    if after >= before:
+        return [list(members)]
+    parts: List[List[Dict[str, Any]]] = []
+    for part in (first, second):
+        parts.extend(
+            _catalog_split_interleaved_track(
+                part, cross_axis, sort_axis, typical_extent, depth=depth + 1
+            )
+        )
+    return [
+        sorted(part, key=lambda item: (item[sort_axis], item[cross_axis], item["number"]))
+        for part in parts
+    ]
+
+
 def _catalog_geometry_axis_tracks(
     numbers: Sequence[Mapping[str, Any]],
     image_width: float,
@@ -970,7 +1042,13 @@ def _catalog_geometry_axis_tracks(
             result.append(sorted(members, key=lambda item: (item[sort_axis], item[axis], item["number"])))
         return result
 
-    return cluster("_cy", y_threshold, "_cx"), cluster("_cx", x_threshold, "_cy"), invalid
+    columns = cluster("_cx", x_threshold, "_cy")
+    columns = [
+        part
+        for column in columns
+        for part in _catalog_split_interleaved_track(column, "_cx", "_cy", median_width)
+    ]
+    return cluster("_cy", y_threshold, "_cx"), columns, invalid
 
 
 def _catalog_lcs_length(left: Sequence[int], right: Sequence[int]) -> int:
@@ -1007,6 +1085,10 @@ def _catalog_track_support(
     return len(unique), max(forward, backward) / len(unique)
 
 
+def normalize_prefix_text(value: Any) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+
+
 def _catalog_infer_layout(
     numbers: Sequence[Mapping[str, Any]],
     expected: Sequence[Mapping[str, Any]],
@@ -1020,6 +1102,18 @@ def _catalog_infer_layout(
         prefix = str(item["prefix"])
         if prefix not in order:
             order.append(prefix)
+    # A candidate that carries its own printed prefix (for example the "企-03"
+    # corporate booths) can only describe a catalog circle with that prefix.
+    known_prefixes = {normalize_prefix_text(label) for label in order}
+    numbers = [
+        item
+        for item in numbers
+        if not (
+            isinstance(item, Mapping)
+            and str(item.get("prefix") or "").strip()
+            and normalize_prefix_text(item.get("prefix")) not in known_prefixes
+        )
+    ]
     expected_by_prefix = {
         prefix: sorted({int(item["number"]) for item in expected if item["prefix"] == prefix})
         for prefix in order
@@ -1049,6 +1143,23 @@ def _catalog_infer_layout(
             elif dy > dx * 2:
                 pair_vertical += 1
     geometry_is_vertical = pair_vertical > pair_horizontal * 1.35
+
+    # Pair counting can be fooled by islands made of several parallel columns:
+    # neighbouring islands share nearly the same numbers at the same y, which
+    # looks like horizontal adjacency.  Compare how many candidates sit on a
+    # genuinely monotonic line in each direction instead.
+    def monotonic_line_items(lines: Sequence[Sequence[Mapping[str, Any]]], sort_axis: str) -> int:
+        return sum(
+            len(line)
+            for line in lines
+            if len(line) >= 4
+            and _catalog_order_violations(line, sort_axis) <= max(0, len(line) // 10)
+        )
+
+    column_evidence = monotonic_line_items(columns, "_cy")
+    row_evidence = monotonic_line_items(rows, "_cx")
+    if column_evidence >= 8 and column_evidence > row_evidence * 1.5:
+        geometry_is_vertical = True
     if geometry_is_vertical:
         prior_is_mixed = False
 
@@ -1095,6 +1206,9 @@ def _catalog_infer_layout(
                 row
                 for row in rows
                 if len({_catalog_geometry_number(item.get("number")) for item in row}) >= 3
+                # A physical row is numbered monotonically along x.  A cross
+                # section through parallel columns repeats/interleaves numbers.
+                and _catalog_order_violations(row, "_cx") <= max(0, len(row) // 10)
             ],
             key=lambda row: statistics.median(item["_cy"] for item in row),
         )
@@ -1236,17 +1350,30 @@ def _catalog_infer_layout(
             return cache[key]
         if prefix_index >= len(remaining):
             return (-0.03 * (len(columns) - column_index), (), float("inf"))
-        prefixes_left = len(remaining) - prefix_index - 1
         candidates: List[Tuple[float, Tuple[Tuple[int, int], ...], float]] = []
+        # Evidence from a prefix with only a handful of catalog numbers is weak
+        # (any column containing that number "matches"), so it must not steal a
+        # column that a numerous prefix needs.  Weight evidence by how many
+        # catalog numbers the prefix explains; prefixes with enough numbers keep
+        # full weight.  A prefix may also be left without any observed column
+        # (an island whose numbers OCR did not read) instead of being forced
+        # onto an unrelated one.
+        prefix_weight = min(1.0, len(expected_by_prefix[remaining[prefix_index]]) / 8.0)
+        suffix_score, suffix, suffix_margin = partition(prefix_index + 1, column_index)
+        candidates.append((
+            suffix_score - 0.7 * prefix_weight,
+            ((column_index, 0),) + suffix,
+            suffix_margin,
+        ))
         max_start = min(len(columns), column_index + 4)
         for start in range(column_index, max_start):
-            max_count = min(4, len(columns) - start - prefixes_left)
+            max_count = min(4, len(columns) - start)
             for count in range(1, max_count + 1):
                 group_score = vertical_group_score(remaining[prefix_index], columns[start : start + count])
                 if group_score < 0:
                     continue
                 suffix_score, suffix, suffix_margin = partition(prefix_index + 1, start + count)
-                total = group_score + suffix_score - 0.04 * (start - column_index)
+                total = group_score * prefix_weight + suffix_score - 0.04 * (start - column_index)
                 candidates.append((total, ((start, count),) + suffix, suffix_margin))
         if not candidates:
             best = (-float("inf"), (), 0.0)
@@ -1726,6 +1853,7 @@ def _build_catalog_geometry_grid(
             number = _catalog_geometry_number(candidate.get("number"))
             if number is not None:
                 by_number[number].append(candidate)
+        accepted_observed_numbers: set[int] = set()
         track_models: List[Tuple[List[int], float, float, float, float]] = []
         zero_slope_fallbacks: Dict[
             int,
@@ -1789,6 +1917,7 @@ def _build_catalog_geometry_grid(
                     float(observation["_cx"]) - vertical_offset,
                     float(observation["_cy"]),
                 )
+                accepted_observed_numbers.add(int(number))
                 continue
 
             sequence_models = [
@@ -1870,7 +1999,13 @@ def _build_catalog_geometry_grid(
         # When OCR instead places those two tokens vertically (or collapses
         # them), derive the connector from the two long-track axes and their
         # local pitch.  This uses only assigned OCR geometry and numbering.
-        if {1, 2}.issubset({item["number"] for item in expected_items}):
+        # An exactly observed 01/02 that already agrees with its own track model
+        # is a real printed number, not a collapsed connector token; only
+        # unobserved/rejected endpoints are re-derived from the fold geometry.
+        if {1, 2}.issubset({item["number"] for item in expected_items}) and not {
+            1,
+            2,
+        }.issubset(accepted_observed_numbers):
             strong_models = [model for model in track_models if len(model[0]) >= 3 and model[4] > 0]
             if len(strong_models) >= 2:
                 pair = centers.get((prefix, 1)), centers.get((prefix, 2))
@@ -2938,6 +3073,188 @@ def _resolve_pattern_analyzer_attempt(
     return None
 
 
+def _ink_glyph_centre(
+    gray: Any,
+    bbox: Tuple[float, float, float, float],
+) -> Optional[Tuple[float, float]]:
+    """Centre of the printed digits that belong to one OCR box, or ``None``.
+
+    Table-style OCR output reports the *cell* a number sits in, so the box can be
+    wider than the glyphs, offset from them, or even cut them.  Find the digit
+    connected components around the box (long booth outlines are rejected by
+    size), group neighbouring digits and return the group nearest the box.
+    """
+    import cv2
+    import numpy as np
+
+    x, y, w, h = bbox
+    height_px, width_px = gray.shape[:2]
+    x0 = int(max(0, math.floor(x - 0.6 * w)))
+    x1 = int(min(width_px, math.ceil(x + 1.6 * w)))
+    y0 = int(max(0, math.floor(y - 0.1 * h)))
+    y1 = int(min(height_px, math.ceil(y + 1.1 * h)))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    window = gray[y0:y1, x0:x1]
+    background = float(np.median(window))
+    if background < 120:
+        return None  # light-on-dark maps: leave the OCR box untouched
+    ink = (window < min(background - 60.0, 150.0)).astype(np.uint8)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    parts: List[Tuple[float, float, float, float]] = []
+    for index in range(1, count):
+        left, top, width, height, area = (int(v) for v in stats[index])
+        if area < 4 or not (0.3 * h <= height <= 1.3 * h) or width > 1.4 * height:
+            continue
+        # Booth outlines run through the whole window; a glyph is always
+        # fully inside it, so anything touching the top/bottom edge is a line.
+        if top <= 0 or top + height >= window.shape[0]:
+            continue
+        centre_y = y0 + top + height / 2.0
+        if not (y - 0.1 * h <= centre_y <= y + 1.1 * h):
+            continue
+        parts.append((x0 + left, y0 + top, x0 + left + width, y0 + top + height))
+    if not parts:
+        return None
+    parts.sort()
+    median_height = statistics.median(part[3] - part[1] for part in parts)
+    groups: List[List[Tuple[float, float, float, float]]] = [[parts[0]]]
+    for part in parts[1:]:
+        if part[0] - max(item[2] for item in groups[-1]) <= 0.7 * median_height:
+            groups[-1].append(part)
+        else:
+            groups.append([part])
+    box_cx = x + w / 2.0
+    best: Optional[Tuple[float, float, float]] = None
+    for group in groups:
+        left = min(item[0] for item in group)
+        right = max(item[2] for item in group)
+        top = min(item[1] for item in group)
+        bottom = max(item[3] for item in group)
+        if right - left > 3.6 * median_height:
+            continue
+        centre = ((left + right) / 2.0, (top + bottom) / 2.0)
+        distance = abs(centre[0] - box_cx)
+        if best is None or distance < best[0]:
+            best = (distance, centre[0], centre[1])
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def _refine_number_boxes_to_ink(image: Any, numbers: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Move OCR boxes onto the printed digits, one shared offset per column.
+
+    Pins are placed at the box centre, which for table-derived boxes can sit
+    tens of pixels away from the digits (even over the neighbouring booth
+    outline).  The glyph offset is measured per candidate, then the *median
+    offset of each physical column* is applied to every member so a few
+    unreadable or mis-grouped candidates cannot pull individual pins around.
+    A column whose measurements disagree is left as OCR reported it.
+    """
+    result = [dict(item) for item in numbers]
+    try:
+        import cv2
+
+        if image is None or getattr(image, "ndim", 0) < 2:
+            return result
+        gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        boxes: List[Optional[Tuple[float, float, float, float]]] = [
+            _catalog_geometry_bbox(item) for item in result
+        ]
+        offsets: List[Optional[Tuple[float, float]]] = []
+        for bbox in boxes:
+            centre = _ink_glyph_centre(gray, bbox) if bbox else None
+            offsets.append(
+                (centre[0] - (bbox[0] + bbox[2] / 2.0), centre[1] - (bbox[1] + bbox[3] / 2.0))
+                if bbox and centre
+                else None
+            )
+        # Columns: candidates whose OCR box centres share an x position.
+        order = sorted(
+            (index for index, bbox in enumerate(boxes) if bbox),
+            key=lambda index: boxes[index][0] + boxes[index][2] / 2.0,  # type: ignore[index]
+        )
+        columns: List[List[int]] = []
+        for index in order:
+            bbox = boxes[index]
+            centre_x = bbox[0] + bbox[2] / 2.0  # type: ignore[index]
+            if columns:
+                last = boxes[columns[-1][-1]]
+                last_x = last[0] + last[2] / 2.0  # type: ignore[index]
+                if centre_x - last_x <= max(6.0, 0.15 * bbox[2]):  # type: ignore[index]
+                    columns[-1].append(index)
+                    continue
+            columns.append([index])
+        for members in columns:
+            measured = [offsets[i] for i in members if offsets[i] is not None]
+            if not measured or len(measured) < max(1, math.ceil(len(members) / 2)):
+                continue
+            dxs = [value[0] for value in measured]  # type: ignore[index]
+            dys = [value[1] for value in measured]  # type: ignore[index]
+            dx = statistics.median(dxs)
+            dy = statistics.median(dys)
+            width = statistics.median(boxes[i][2] for i in members)  # type: ignore[index]
+            spread = statistics.median(abs(value - dx) for value in dxs)
+            if abs(dx) > 0.9 * width or spread > max(4.0, 0.15 * width):
+                continue
+            for i in members:
+                result[i]["x"] = int(round(float(result[i]["x"]) + dx))
+                result[i]["y"] = int(round(float(result[i]["y"]) + dy))
+                result[i]["ink_refined"] = True
+    except Exception:  # refinement is best-effort; OCR geometry stays valid
+        return [dict(item) for item in numbers]
+    return result
+
+
+def _recover_geometry_with_supplemental_numbers(
+    supplemental: List[Dict[str, Any]],
+    validator: Any,
+    image_path: str,
+    numbers: List[Dict[str, Any]],
+    catalog_info: Mapping[str, Any],
+    image_size: Tuple[int, int],
+    quality: Mapping[str, Any],
+    refine: Optional[Any] = None,
+) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]]:
+    """Retry geometry with numbers that only skipped context crops could see.
+
+    OCR candidate selection stops at the catalog size, so a small island read
+    only by a later crop is dropped and its spaces cannot be placed.  When the
+    gate fails, validate those extra candidates with the same image validator
+    and accept the retry only if the gate then passes; the original failure is
+    otherwise kept untouched (no relaxed threshold, no unvalidated evidence).
+    """
+    logger = logging.getLogger(__name__)
+    if not supplemental or validator is None:
+        return None
+    try:
+        result = validator.validate_numbers(image_path, supplemental)
+        if getattr(result, "status", None) != "validated":
+            return None
+        extra = list(result.numbers)
+        if not extra:
+            return None
+        if refine is not None:
+            extra = list(refine(extra))
+        combined = list(numbers) + extra
+        grid = _build_catalog_geometry_grid(combined, catalog_info, image_size)
+        retry_quality = _catalog_geometry_quality(combined, catalog_info, grid, image_size)
+    except Exception as exc:
+        logger.warning("supplemental OCR recovery failed: %s", type(exc).__name__)
+        return None
+    gate = retry_quality.get("gate") if isinstance(retry_quality, Mapping) else None
+    if not isinstance(gate, Mapping) or not gate.get("passed"):
+        return None
+    logger.info(
+        "supplemental OCR recovery accepted: +%d candidates, coverage %s -> %s",
+        len(extra),
+        quality.get("coverage"),
+        retry_quality.get("coverage"),
+    )
+    return combined, grid, retry_quality
+
+
 def generate_coordinates_from_map(
     image_path: str,
     event_json_path: str,
@@ -3713,6 +4030,7 @@ def generate_coordinates_from_map(
         candidate_count=len(raw_numbers),
         validated_count=len(numbers),
     )
+    numbers = _refine_number_boxes_to_ink(img, numbers)
     try:
         complete_grid = _build_catalog_geometry_grid(
             numbers,
@@ -3771,6 +4089,20 @@ def generate_coordinates_from_map(
         )
         return None
     gate = geometry_quality.get("gate")
+    if (not isinstance(gate, Mapping) or not gate.get("passed")) and not ocr_result_path:
+        recovered = _recover_geometry_with_supplemental_numbers(
+            list(getattr(ocr_engine, "supplemental_numbers", None) or []),
+            validator,
+            image_path,
+            numbers,
+            catalog_info,
+            (image_width, image_height),
+            geometry_quality,
+            refine=lambda extra: _refine_number_boxes_to_ink(img, extra),
+        )
+        if recovered is not None:
+            numbers, complete_grid, geometry_quality = recovered
+            gate = geometry_quality.get("gate")
     if not isinstance(gate, Mapping) or not gate.get("passed"):
         logger.error("catalog geometry quality gate failed: %s", geometry_quality)
         _write_failure_artifact(

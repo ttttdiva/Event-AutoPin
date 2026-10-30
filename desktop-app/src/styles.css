@@ -708,6 +708,11 @@ html.dark {
     color: var(--text-primary);
     border: 1px solid var(--border-default);
   }
+  .circle-preview-badge {
+    @apply rounded px-1 ml-1 text-xs;
+    color: var(--text-primary);
+    border: 1px dashed var(--border-default);
+  }
   .item-table {
     width: 100% !important;
     table-layout: auto !important;

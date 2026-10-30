@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 class CatalogPostAnalyzer:
     """既存の画像モデル設定を使う、投稿単位のAPI解析。
 
-    APIのみの設定で使用する。CLIを明示した既存設定は呼び出し側が従来経路を使う。
+    API、またはGrok Build(複数画像を1プロンプトで送れるCLI)のみの設定で使用する。
+    それ以外のCLIを明示した既存設定は呼び出し側が従来経路を使う。
     不正応答・要確認項目だけを一度再確認し、未解決なら設定済みAPIへ切り替える。
     """
 
@@ -28,7 +29,11 @@ class CatalogPostAnalyzer:
 
     @staticmethod
     def supports(attempts: Sequence[Dict[str, Any]]) -> bool:
-        return bool(attempts) and all(a.get("kind") == "api" for a in attempts)
+        return bool(attempts) and all(
+            a.get("kind") == "api"
+            or (a.get("kind") == "cli" and a.get("provider") == "grok")
+            for a in attempts
+        )
 
     @staticmethod
     def _check_deadline(deadline: Any) -> Optional[float]:
@@ -48,6 +53,7 @@ class CatalogPostAnalyzer:
 セット内訳やカテゴリ見出しを独立商品にしないでください。ただし別売価格が明示された単品は残してください。
 商品名は原文どおり転記し、価格の500/5000等の桁、各商品の共通価格、セット価格を確認してください。価格を推測・補完してはいけません。
 価格の矛盾が明示的な訂正で解決できない、商品名を読めない等はneeds_review=trueとreview_reasonに理由を書いてください。
+ただし題名の〇・●・×・伏せ字・記号・装飾文字は作者が意図した表記です。画像に見えるとおり原文のまま転記すれば読めているので、判読困難としてneeds_reviewにしないでください。
 根拠がない矛盾を「訂正」と見なさないでください。画像で読める商品を本文にないという理由だけで削除しないでください。
 
 出力形式（全フィールド必須）:
@@ -144,28 +150,53 @@ not_shownの場合だけprice_text=""かつprice_image_index=null。本文由来
         self._check_deadline(deadline)
         return text
 
+    def _request_grok(self, model: str, prompt: str, image_paths: Sequence[Path],
+                      deadline: Any) -> str:
+        """Grok Build(ACP)へ本文と全画像を1回で送る。曖昧な送信後は再送しない。"""
+        from .grok_build import GrokBuildError, execute_grok_build_prompt
+
+        remaining = self._check_deadline(deadline)
+        # fallbackが長く居座って本処理を止めないよう、1回の上限は5分にする。
+        timeout = min(300.0, remaining) if remaining else 300.0
+        ordered = ("\n画像は次の順に添付されています: "
+                   + ", ".join(f"image_index={i}" for i in range(1, len(image_paths) + 1))
+                   if image_paths else "")
+        ok, output = execute_grok_build_prompt(
+            prompt + ordered, model=model or None, timeout=timeout,
+            image_paths=list(image_paths), raise_on_timeout=deadline is not None,
+            timeout_stage="catalog.joint",
+        )
+        if not ok or not output:
+            raise GrokBuildError("transport_error", "Grok Build did not return an analysis")
+        self._check_deadline(deadline)
+        return output
+
     def analyze(self, image_paths: Sequence[Path], post_text: str, event_name: str = "",
                 event_date: str = "", additional_prompt: str = "", deadline: Any = None) -> Dict[str, Any]:
         post_text = str(post_text or "")
         if not image_paths and not post_text.strip():
             raise ValueError("投稿本文と画像が空です")
         if not self.supports(self.attempts):
-            raise ValueError("同時解析にはAPIのみの画像モデル設定が必要です")
+            raise ValueError("同時解析にはAPIまたはGrok Buildのみの画像モデル設定が必要です")
         self._check_deadline(deadline)
         images = self._image_data(image_paths)
         prompt = self.build_prompt(post_text, event_name, str(event_date or ""), additional_prompt, len(images))
         last_error = None
         for attempt in self.attempts:
             model = attempt.get("model", "")
-            llm = self.api_clients.get(model)
-            if llm is None:
+            is_grok = attempt.get("kind") == "cli"
+            llm = None if is_grok else self.api_clients.get(model)
+            if llm is None and not is_grok:
                 last_error = RuntimeError(f"画像APIが初期化されていません: {model}")
                 continue
             current_prompt = prompt
             for retry in range(2):
                 self._check_deadline(deadline)
                 try:
-                    response = self._request(llm, model, current_prompt, images, deadline)
+                    if is_grok:
+                        response = self._request_grok(model, current_prompt, image_paths, deadline)
+                    else:
+                        response = self._request(llm, model, current_prompt, images, deadline)
                     result = self.parse(response, len(images), post_text)
                     result["model"] = model
                     self._check_deadline(deadline)

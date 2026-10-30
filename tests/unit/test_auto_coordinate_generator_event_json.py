@@ -24,6 +24,13 @@ def test_expand_space_ids_handles_ranges_and_comma():
     ]
 
 
+def test_expand_space_ids_keeps_members_that_repeat_the_hall_prefix():
+    assert [item["space_id"] for item in expand_space_ids("A-15,A-16")] == ["A15", "A16"]
+    assert [item["space_id"] for item in expand_space_ids("E-03,E-04")] == ["E03", "E04"]
+    # A different prefix is never silently merged into the first hall.
+    assert [item["space_id"] for item in expand_space_ids("A-15,B-01")] == ["A15"]
+
+
 def test_expand_circle_space_ids_combines_hall_prefix_with_numeric_space():
     assert combine_hall_and_space("14", "E-") == "E-14"
     assert [item["space_id"] for item in expand_circle_space_ids("14", "E-")] == ["E14"]

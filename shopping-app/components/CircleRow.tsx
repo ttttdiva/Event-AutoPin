@@ -2,7 +2,7 @@ import React from 'react';
 import { StyleSheet, View, Text, Pressable } from 'react-native';
 import { Image } from 'expo-image';
 import FontAwesome from '@expo/vector-icons/FontAwesome';
-import { PURCHASE_STATUS, PURCHASE_STATUS_LABELS } from '@/lib/types';
+import { CATALOG_STATUS_LABELS, PURCHASE_STATUS, PURCHASE_STATUS_LABELS } from '@/lib/types';
 import { getColors } from '@/constants/Colors';
 import { useTheme } from '@/lib/theme-context';
 import { usePriorityColors } from '@/lib/priority-color-context';
@@ -41,6 +41,7 @@ function CircleRowInner({
 
   // ホール + スペース番号
   const spaceLabel = [circle.hall, circle.space].filter(Boolean).join(' ');
+  const catalogStatusLabel = CATALOG_STATUS_LABELS[circle.catalogStatus ?? ''];
 
   const imagePath = circle.circleCutFilename
     ? circle.circleCutFilename.startsWith('file://') || circle.circleCutFilename.startsWith('/')
@@ -139,6 +140,16 @@ function CircleRowInner({
               {circle.penname}
             </Text>
           )}
+          {catalogStatusLabel && (
+            <Text style={[styles.penname, { color: surface.ink }]}>
+              おしながき: {catalogStatusLabel}
+            </Text>
+          )}
+          {circle.subEvent && (
+            <Text style={[styles.penname, { color: surface.secondary }]} numberOfLines={1}>
+              {circle.subEvent}
+            </Text>
+          )}
           {/* メモ (あれば) */}
           {circle.memo !== '' && (
             <Text style={[styles.memo, { color: surface.secondary }]} numberOfLines={1}>
@@ -225,6 +236,8 @@ export default React.memo(CircleRowInner, (prev, next) => {
     a.absenceStatus === b.absenceStatus &&
     a.existingOnlyStatus === b.existingOnlyStatus &&
     a.catalogStatus === b.catalogStatus &&
+    a.subEvent === b.subEvent &&
+    a.menuUrl === b.menuUrl &&
     a.rawJson === b.rawJson &&
     a.renderRevision === b.renderRevision &&
     prev.isExpanded === next.isExpanded &&

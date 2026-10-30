@@ -97,6 +97,10 @@ def contains_credentialed_url(url: str) -> bool:
         sensitive_exact_names = {"auth", "authorization", "cookie", "jwt", "key", "sid", "sig", "ticket"}
         for name, _ in parse_qsl(parsed.query, keep_blank_values=True):
             normalized = name.casefold().replace("_", "").replace("-", "")
+            # S3/R2互換の署名付きURL（公開サムネイルの期限付きリンク）は
+            # 利用者の認証情報ではない。画像本体だけをモデルへ渡し、URLは渡さない。
+            if normalized.startswith("xamz"):
+                continue
             if normalized in sensitive_exact_names or normalized.endswith("key"):
                 return True
             if any(

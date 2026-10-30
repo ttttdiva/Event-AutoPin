@@ -38,3 +38,5 @@ caico_desktop.log
 # Claude Code
 desktop-app/.claude/
 app_backup.ab
+/.local/
+/.worktrees/

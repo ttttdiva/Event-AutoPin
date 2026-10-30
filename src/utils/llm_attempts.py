@@ -1,5 +1,7 @@
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+logger = logging.getLogger(__name__)
 
 Attempt = Dict[str, Any]
 
@@ -17,8 +19,12 @@ DEFAULT_TEXT_FALLBACK_EFFORT = "medium"
 DEFAULT_IMAGE_PRIMARY_PROVIDER = "api:openai"
 DEFAULT_IMAGE_PRIMARY_MODEL = "gpt-5.6-luna"
 DEFAULT_IMAGE_PRIMARY_EFFORT = "max"
-DEFAULT_IMAGE_FALLBACK_PROVIDER = "api:openai"
-DEFAULT_IMAGE_FALLBACK_MODEL = "gpt-5.6-sol"
+# The image fallback must not share a provider with the primary: a 429/quota
+# stop on OpenAI would otherwise take the fallback down with it.  Grok Build is
+# a separate vendor, authenticated through the user's own CLI login, and
+# accepts several images in one ACP prompt.
+DEFAULT_IMAGE_FALLBACK_PROVIDER = "cli:grok"
+DEFAULT_IMAGE_FALLBACK_MODEL = "grok-4.7"
 DEFAULT_IMAGE_FALLBACK_EFFORT = "medium"
 
 # Short aliases are useful to integrations that refer to the contract as
@@ -53,6 +59,52 @@ def split_fallback_provider(provider: Optional[str], default_api_provider: str =
     if value.startswith("cli:"):
         return "cli", value.split(":", 1)[1]
     return "api", value
+
+
+def _provider_name(attempt: Attempt) -> str:
+    # 主枠の "api" はプロバイダ名が空で、OpenAIを意味する。
+    return attempt.get("provider") or ("openai" if attempt.get("kind") == "api" else "")
+
+
+def _same_attempt(first: Attempt, second: Attempt) -> bool:
+    return (
+        first.get("kind") == second.get("kind")
+        and _provider_name(first) == _provider_name(second)
+        and (first.get("model") or "") == (second.get("model") or "")
+    )
+
+
+def _same_vendor(first: Attempt, second: Attempt) -> bool:
+    if first.get("kind") != second.get("kind"):
+        return False
+    return _provider_name(first) == _provider_name(second)
+
+
+def distinct_fallback(
+    attempts: List[Attempt], default_fallback: Attempt, role: str
+) -> List[Attempt]:
+    """Keep a fallback that actually adds a second path.
+
+    A fallback identical to the primary can never help, so it is replaced by the
+    documented default.  A fallback that only differs by model but shares the
+    primary's provider is kept (it was explicitly requested) with a warning,
+    because account-level quota errors hit both.
+    """
+    if len(attempts) < 2:
+        return attempts
+    primary, fallback = attempts[0], attempts[-1]
+    if _same_attempt(primary, fallback) and not _same_attempt(primary, default_fallback):
+        logger.warning(
+            "%sのfallbackが主モデルと同一のため、既定のfallback(%s:%s)に置き換えます",
+            role, default_fallback.get("provider"), default_fallback.get("model"),
+        )
+        return attempts[:-1] + [dict(default_fallback)]
+    if _same_vendor(primary, fallback):
+        logger.warning(
+            "%sのfallbackが主モデルと同じprovider(%s)です。provider単位の429/障害ではfallbackが効きません",
+            role, fallback.get("provider") or fallback.get("kind"),
+        )
+    return attempts
 
 
 def unique_models(models: List[Optional[str]]) -> List[str]:
@@ -142,7 +194,20 @@ def build_text_llm_attempts(
             }
         )
 
-    return attempts
+    return distinct_fallback(
+        attempts,
+        {
+            **_split_default(DEFAULT_TEXT_FALLBACK_PROVIDER),
+            "model": DEFAULT_TEXT_FALLBACK_MODEL,
+            "effort": DEFAULT_TEXT_FALLBACK_EFFORT,
+        },
+        "text",
+    )
+
+
+def _split_default(provider: str) -> Attempt:
+    kind, name = split_fallback_provider(provider)
+    return {"kind": kind, "provider": name}
 
 
 def build_image_llm_attempts(
@@ -202,4 +267,12 @@ def build_image_llm_attempts(
             }
         )
 
-    return attempts
+    return distinct_fallback(
+        attempts,
+        {
+            **_split_default(DEFAULT_IMAGE_FALLBACK_PROVIDER),
+            "model": DEFAULT_IMAGE_FALLBACK_MODEL,
+            "effort": DEFAULT_IMAGE_FALLBACK_EFFORT,
+        },
+        "image",
+    )

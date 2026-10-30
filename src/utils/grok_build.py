@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .reprocess_deadline import ReprocessDeadlineExceeded
 
@@ -292,14 +292,16 @@ def execute_grok_build_prompt(
     model: Optional[str] = None,
     timeout: float = 900,
     image_path: Optional[str | Path] = None,
+    image_paths: Optional[Sequence[str | Path]] = None,
     raise_on_timeout: bool = False,
     timeout_stage: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """Send exactly one Grok Build ACP prompt; never resend an ambiguous request."""
     executable = resolve_grok_bin()
     content = [build_text_content(prompt)]
-    if image_path is not None:
-        content.append(build_image_content(image_path))
+    all_images = ([image_path] if image_path is not None else []) + list(image_paths or [])
+    for one_image in all_images:
+        content.append(build_image_content(one_image))
 
     chunks: list[str] = []
     stderr_lines: list[str] = []
@@ -350,7 +352,7 @@ def execute_grok_build_prompt(
                 deadline=deadline,
                 text_chunks=chunks,
             )
-            if image_path is not None and not acp_image_prompt_supported(init):
+            if all_images and not acp_image_prompt_supported(init):
                 raise GrokBuildError("image_unsupported", "ACP initialize did not advertise image prompts")
 
             auth_method = reusable_acp_auth_method(

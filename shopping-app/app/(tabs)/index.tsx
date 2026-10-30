@@ -794,6 +794,8 @@ export default function EventListScreen() {
     >
       <StatusBar
         barStyle={effectiveScheme === "dark" ? "light-content" : "dark-content"}
+        backgroundColor="transparent"
+        translucent
       />
       <View style={{ flex: 1 }}>
         {loadError && (

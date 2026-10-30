@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Any
 import logging
 
+from .circle_cut_policy import KIND_DEFAULT_CUT, KIND_SUBSTITUTE, make_origin
 from .circle_master import CircleMasterManager
 from .atomic_json import atomic_write_json
 from .reprocess_helpers import (
@@ -181,6 +182,12 @@ class JSONReprocessor:
             )
             if default_cut_path:
                 circle['circle_cut_filename'] = default_cut_path.name
+                master_kind = self.circle_master.get_default_cut_kind(name)
+                circle['circle_cut_origin'] = make_origin(
+                    KIND_SUBSTITUTE if master_kind == KIND_SUBSTITUTE else KIND_DEFAULT_CUT,
+                    reason='no_site_cut_in_event',
+                    master_kind=master_kind or 'legacy_unknown',
+                )
                 updated_count += 1
             else:
                 # お品書き画像で代用 + デフォルトカットとして登録
@@ -190,12 +197,17 @@ class JSONReprocessor:
                     if not item_path:
                         continue
                     circle['circle_cut_filename'] = item_path
+                    circle['circle_cut_origin'] = make_origin(
+                        KIND_SUBSTITUTE, reason='no_site_cut_found', item_image=item_path
+                    )
                     fallback_count += 1
-                    # デフォルトカットに登録（次回以降も使えるように）
+                    # 代用画像として登録（本来のカットが取れたら置き換えられる）
                     if item_path:
                         full_path = self.output_dir / item_path
                         penname = circle.get('penname', '')
-                        self.circle_master.register_default_cut(name, penname, full_path)
+                        self.circle_master.register_default_cut(
+                            name, penname, full_path, kind=KIND_SUBSTITUTE
+                        )
 
         if updated_count > 0:
             self.logger.info(f"✅ {updated_count}サークルにデフォルトカットを適用しました")

@@ -325,6 +325,8 @@ export default function CircleListScreen() {
       absenceStatus: row.absenceStatus,
       existingOnlyStatus: row.existingOnlyStatus,
       catalogStatus: row.catalogStatus,
+      subEvent: row.subEvent,
+      menuUrl: row.menuUrl,
       rawJson: null,
       renderRevision: row.renderRevision,
     };
@@ -1486,6 +1488,8 @@ export default function CircleListScreen() {
     >
       <StatusBar
         barStyle={effectiveScheme === "dark" ? "light-content" : "dark-content"}
+        backgroundColor="transparent"
+        translucent
       />
       <View style={{ flex: 1 }}>
         {viewMode === "map" && renderFilters()}

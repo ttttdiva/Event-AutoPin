@@ -10,8 +10,11 @@ class FakeCircleMaster:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, Path]] = []
 
-    def register_default_cut(self, circle_name: str, penname: str, image_path: Path) -> bool:
+    def register_default_cut(
+        self, circle_name: str, penname: str, image_path: Path, kind: str = "default_cut"
+    ) -> bool:
         self.calls.append((circle_name, penname, image_path))
+        self.kinds = getattr(self, "kinds", []) + [kind]
         return True
 
 
@@ -34,6 +37,9 @@ def test_register_missing_cuts_also_sets_current_circle_cut(tmp_path: Path):
     assert circle.circle_cut is not None
     assert circle.circle_cut.url == ""
     assert circle.circle_cut.filename == item_file.name
+    # 代用であることが追跡でき、標準カットにも代用として登録される
+    assert circle.circle_cut.source["kind"] == "oshinagaki_substitute"
+    assert pipeline.circle_master.kinds == ["oshinagaki_substitute"]
     assert pipeline.circle_master.calls == [
         ("Circle A", "Author A", tmp_path / item_file.name)
     ]

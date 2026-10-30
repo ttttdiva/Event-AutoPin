@@ -6,6 +6,7 @@ import json
 
 from ..core import BaseSiteAdapter
 from ..models import Circle, Event, CircleImage
+from ..utils.embedded_data import find_largest_record_list
 from ..utils.llm_client import LLMClient
 from ..utils.pattern_manager import PatternManager
 from ..utils.site_parsing_llm import parse_with_high_end_model
@@ -27,6 +28,67 @@ class GenericAdapter(BaseSiteAdapter):
         self.extracted_event = None  # 抽出したイベント情報を記録
         self.extracted_circles_sample = []  # 抽出したサークルのサンプルを記録
         self.table_header_schemas: List[Dict[str, Any]] = []
+        self._embedded_records: List[Dict[str, Any]] = []
+        # 抽出元の件数と抽出件数の突き合わせ結果（一部だけを全件と誤認しないため）
+        self.extraction_coverage: Dict[str, Any] = {}
+
+    _CONTEXT_CHUNK_CHARS = 45000
+    _EMBEDDED_RECORDS_PER_CHUNK = 30
+
+    def preprocess_html(self, html: str) -> str:
+        """見える表が無くても、埋め込みJSONのレコード配列を全件保持する"""
+        records = find_largest_record_list(html)
+        self._embedded_records = records if len(records) >= 5 else []
+        if self._embedded_records:
+            self.logger.info(
+                f"埋め込みデータから {len(self._embedded_records)} 件のレコードを検出"
+            )
+        return html
+
+    @staticmethod
+    def _compact_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        """署名付きURLなど長いクエリはLLMに不要なので落とす"""
+
+        def compact(value: Any) -> Any:
+            if (
+                isinstance(value, str)
+                and value.startswith("http")
+                and "?" in value
+                and (len(value) > 200 or re.search(r"X-Amz-|signature=", value, re.I))
+            ):
+                return value.split("?", 1)[0]
+            if isinstance(value, dict):
+                return {k: compact(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [compact(v) for v in value]
+            return value
+
+        return compact(record)
+
+    def _circle_contexts(self, soup: BeautifulSoup) -> List[str]:
+        """LLMへ渡す文脈を、切り捨てずに全件を覆う複数チャンクとして返す"""
+        if self._embedded_records:
+            records = [self._compact_record(r) for r in self._embedded_records]
+            size = self._EMBEDDED_RECORDS_PER_CHUNK
+            return [
+                json.dumps(records[i : i + size], ensure_ascii=False)
+                for i in range(0, len(records), size)
+            ]
+        context = self._get_circle_context(soup, limit=None)
+        limit = self._CONTEXT_CHUNK_CHARS
+        if len(context) <= limit:
+            return [context]
+        chunks: List[str] = []
+        start = 0
+        while start < len(context):
+            end = min(len(context), start + limit)
+            if end < len(context):
+                boundary = context.rfind(">", start, end)
+                if boundary > start:
+                    end = boundary + 1
+            chunks.append(context[start:end])
+            start = end
+        return chunks
 
     def can_handle(self, url: str) -> bool:
         """常にTrue（フォールバック用）"""
@@ -121,11 +183,41 @@ class GenericAdapter(BaseSiteAdapter):
     def extract_circles(self, soup: BeautifulSoup) -> List[Circle]:
         """初回サイトは列名をLLM判定し、既知の対応で機械抽出する。"""
         has_candidate_table = self.has_candidate_circle_table(soup)
-        header_mappings = (
-            self._infer_table_header_mappings(soup)
-            if self.config.use_llm and has_candidate_table
-            else {}
-        )
+        header_mappings: Dict[int, Dict[int, str]] = {}
+        if has_candidate_table:
+            # 組み込みの列名だけで説明できる表はLLMに頼らず確定し、
+            # 未知の列名がある表だけ列名をLLMで判定する（LLM障害でも既知の表は読める）。
+            unmatched: List[int] = []
+            for table_index, table in enumerate(soup.find_all("table")):
+                rows = table.find_all("tr")
+                if len(rows) < 2:
+                    continue
+                headers = [
+                    cell.get_text(strip=True) for cell in rows[0].find_all(["th", "td"])
+                ]
+                if len(headers) < 2:
+                    continue
+                builtin = self.builtin_header_mapping(headers)
+                if builtin is None:
+                    unmatched.append(table_index)
+                    continue
+                header_mappings[table_index] = builtin
+                self.table_header_schemas.append(
+                    {
+                        "headers": headers,
+                        "field_map": {str(i): f for i, f in builtin.items()},
+                    }
+                )
+            if header_mappings:
+                self.logger.info(
+                    f"組み込みの列名で対応付けできた表: {len(header_mappings)}件"
+                )
+            if self.config.use_llm and unmatched:
+                header_mappings.update(
+                    self._infer_table_header_mappings(
+                        soup, only_table_indices=unmatched
+                    )
+                )
         circles = self.try_direct_table_extraction(
             soup,
             header_mappings=header_mappings,
@@ -252,13 +344,13 @@ space, name, penname, hall, twitter_url, website_url, pixiv_url, genre, descript
                 mappings[actual_index] = field_map
 
         if mappings:
-            self.table_header_schemas = [
+            self.table_header_schemas.extend(
                 {
                     "headers": table_headers[table_indices.index(table_index)],
                     "field_map": {str(index): field for index, field in field_map.items()},
                 }
                 for table_index, field_map in mappings.items()
-            ]
+            )
             self.logger.info(
                 f"LLMでテーブル列名を判定しました: {len(mappings)}テーブル"
             )
@@ -271,6 +363,30 @@ space, name, penname, hall, twitter_url, website_url, pixiv_url, genre, descript
             return []
 
         image_urls = []
+
+        # 表の行から抽出したサークルは、同じ行にある画像をそのサークルのカットにする。
+        # （ページ全体のimg連番をサークル番号として使うと、別サークルに紐づく）
+        row_images = self.row_bound_circle_images(soup)
+        if row_images:
+            self.logger.info(f"表の行に対応付いた画像候補: {len(row_images)} 件")
+            return row_images
+
+        # 埋め込みレコードがあり、抽出したサークルと1対1に対応するなら、
+        # レコード内のカット画像URLをそのサークルの候補にする。
+        if self._embedded_records and self.extraction_coverage.get(
+            "extracted_count"
+        ) == len(self._embedded_records):
+            for index, record in enumerate(self._embedded_records):
+                for key, value in record.items():
+                    if (
+                        isinstance(value, str)
+                        and value.startswith("http")
+                        and re.search(r"cut|image|img|thumb", key, re.I)
+                    ):
+                        image_urls.append((index, value))
+                        break
+            if image_urls:
+                return image_urls
 
         # 設定に基づいて画像を探す
         if self.config.extractor_config.image_selector:
@@ -310,16 +426,21 @@ space, name, penname, hall, twitter_url, website_url, pixiv_url, genre, descript
             return {}
 
     def _extract_circles_with_llm(self, soup: BeautifulSoup) -> List[Circle]:
-        """LLMを使用してサークル情報を抽出"""
-        # site_parsing_config がある場合は高性能モデルを使用
-        if self.config.site_parsing_config:
-            llm_data = self._extract_circles_with_high_end_llm(soup)
-        else:
-            llm_data = self._extract_with_llm(soup, "circles")
+        """LLMを使用してサークル情報を全件抽出する（チャンク分割・件数突き合わせ付き）"""
+        contexts = self._circle_contexts(soup)
+        circle_dicts: List[Dict[str, Any]] = []
+        for index, context in enumerate(contexts, start=1):
+            if len(contexts) > 1:
+                self.logger.info(f"サークル抽出 チャンク {index}/{len(contexts)}")
+            if self.config.site_parsing_config:
+                llm_data = self._extract_circles_with_high_end_llm(soup, context)
+            else:
+                llm_data = self._extract_with_llm_context(context)
+            circle_dicts.extend(llm_data.get("circles", []) or [])
 
         circles = []
-
-        for circle_data in llm_data.get("circles", []):
+        seen = set()
+        for circle_data in circle_dicts:
             circle = Circle(
                 name=circle_data.get("name", ""),
                 penname=circle_data.get("penname"),
@@ -331,21 +452,48 @@ space, name, penname, hall, twitter_url, website_url, pixiv_url, genre, descript
                 genres=circle_data.get("genres", []),
                 raw_data=circle_data,
             )
+            if not circle.name:
+                continue
+            key = (circle.space or "", circle.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            circles.append(circle)
+            # サンプルとして最初の5件を記録
+            if len(self.extracted_circles_sample) < 5:
+                self.extracted_circles_sample.append(circle_data)
 
-            if circle.name:
-                circles.append(circle)
-                # サンプルとして最初の5件を記録
-                if len(self.extracted_circles_sample) < 5:
-                    self.extracted_circles_sample.append(circle_data)
-
+        source_count = len(self._embedded_records) or None
+        self.extraction_coverage = {
+            "chunks": len(contexts),
+            "source_record_count": source_count,
+            "extracted_count": len(circles),
+        }
+        if source_count and len(circles) < source_count:
+            self.logger.warning(
+                f"抽出件数が元データより少ない: 元 {source_count} 件 / 抽出 {len(circles)} 件"
+            )
         return circles
 
-    def _extract_circles_with_high_end_llm(self, soup: BeautifulSoup) -> Dict[str, Any]:
-        """高性能モデル（Codex CLI / GPT-5.4 API）でサークル情報を抽出"""
-        context = self._get_circle_context(soup)
+    def _extract_with_llm_context(self, context: str) -> Dict[str, Any]:
+        """通常のテキストLLMで1チャンク分のサークルを抽出する"""
+        prompt = self._create_circle_prompt(context)
+        response = self.llm_client.extract_data(prompt)
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            self.logger.error(f"LLMレスポンスのパースに失敗: {response}")
+            return {}
+
+    def _extract_circles_with_high_end_llm(
+        self, soup: BeautifulSoup, context: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """サイト構造解析role（Codex CLI等）で1チャンク分のサークル情報を抽出"""
+        if context is None:
+            context = self._get_circle_context(soup)
         prompt = self._create_circle_prompt(context)
 
-        self.logger.info("高性能モデルでサークル抽出を試行中...")
+        self.logger.info("サイト構造解析roleでサークル抽出を試行中...")
         try:
             response = parse_with_high_end_model(
                 prompt,
@@ -354,9 +502,9 @@ space, name, penname, hall, twitter_url, website_url, pixiv_url, genre, descript
             return json.loads(response)
         except Exception as e:
             self.logger.warning(
-                f"高性能モデルでの抽出失敗、通常LLMにフォールバック: {e}"
+                f"サイト構造解析roleでの抽出失敗、通常LLMにフォールバック: {e}"
             )
-            return self._extract_with_llm(soup, "circles")
+            return self._extract_with_llm_context(context)
 
     def save_extraction_pattern(self):
         """LLMで抽出したパターンを保存"""
@@ -512,23 +660,29 @@ space, name, penname, hall, twitter_url, website_url, pixiv_url, genre, descript
 
         return "\n".join(context_parts)
 
-    def _get_circle_context(self, soup: BeautifulSoup) -> str:
-        """サークル情報抽出用のコンテキストを取得"""
+    def _get_circle_context(
+        self, soup: BeautifulSoup, limit: Optional[int] = 50000
+    ) -> str:
+        """サークル情報抽出用のコンテキストを取得（limit=Noneなら切り捨てない）"""
+
+        def clip(text: str) -> str:
+            return text if limit is None else text[:limit]
+
         # テーブルまたは主要コンテンツを取得
         tables = soup.find_all("table")
         if tables:
             # 最大のテーブル
             main_table = max(tables, key=lambda t: len(str(t)))
-            return str(main_table)[:50000]
+            return clip(str(main_table))
 
         # メインコンテンツエリアを探す
         main_content = soup.find("main") or soup.find(
             "div", class_=re.compile(r"content|main", re.I)
         )
         if main_content:
-            return str(main_content)[:50000]
+            return clip(str(main_content))
 
-        return str(soup.body)[:50000] if soup.body else ""
+        return clip(str(soup.body)) if soup.body else ""
 
     def _create_event_prompt(self, context: str) -> str:
         """イベント情報抽出用のプロンプトを作成"""

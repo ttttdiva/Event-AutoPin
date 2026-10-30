@@ -169,6 +169,7 @@ async def process_direct_post(processor: Any, circle: Any, tweet_id: str, post_u
     from .twitter_post_processor import _call_with_optional_deadline
 
     _check(deadline)
+    processor._last_direct_post_outcome = None
     key = (tweet_id, event_name, str(getattr(processor.config, "event_date", "")),
            getattr(processor, "effective_additional_prompt", ""))
     cache = getattr(processor, "_joint_post_cache", None)
@@ -182,13 +183,16 @@ async def process_direct_post(processor: Any, circle: Any, tweet_id: str, post_u
                                                deadline=deadline, run_id=run_id, trace=trace)
     _check(deadline)
     if not tweet or not (tweet.get("text") or tweet.get("media_urls")):
+        processor._last_direct_post_outcome = "fetch_failed"
         return False
     staged = copy.copy(circle)
     status = await process_post(processor, staged, tweet.get("text", ""), tweet.get("media_urls", []) or [],
                                 event_name, post_url=post_url, deadline=deadline, run_id=run_id, trace=trace)
     _check(deadline)
     if status is None:
+        processor._last_direct_post_outcome = "not_catalog"
         return False
+    processor._last_direct_post_outcome = "adopted"
     state = _snapshot(staged) if status == "confirmed" else {"catalog_status": "preview"}
     _check(deadline)
     cache[key] = copy.deepcopy(state)

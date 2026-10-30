@@ -129,6 +129,7 @@ shopping-app/components/useColorScheme.web.ts
 shopping-app/constants/Colors.ts
 shopping-app/eas.json
 shopping-app/lib/circle-expanded-actions.test.js
+shopping-app/lib/database-catalog.test.js
 shopping-app/lib/circle-reprocess-lifecycle.test.js
 shopping-app/lib/crawl/adapter-factory.ts
 shopping-app/lib/crawl/adapters/generic.ts
@@ -173,8 +174,11 @@ shopping-app/lib/performance.ts
 shopping-app/lib/priority-color-context.tsx
 shopping-app/lib/priority-colors.ts
 shopping-app/lib/settings-store.ts
+shopping-app/lib/statusbar-appearance.test.js
 shopping-app/lib/sync-logger.ts
 shopping-app/lib/theme-context.tsx
+shopping-app/lib/theme-appearance.test.ts
+shopping-app/lib/theme-appearance.ts
 shopping-app/lib/text-collation.test.ts
 shopping-app/lib/text-collation.ts
 shopping-app/lib/types.ts
@@ -217,6 +221,7 @@ src/models/event.py
 src/processors/__init__.py
 src/processors/twitter_post_processor.py
 src/processors/catalog_post.py
+src/processors/grok_rescue.py
 src/space_locator/__init__.py
 src/space_locator/auto_coordinate_generator.py
 src/space_locator/catalog_geometry_assignment.py
@@ -237,12 +242,17 @@ src/utils/catalog_post_analyzer.py
 src/utils/catalog_updater.py
 src/utils/circle_master.py
 src/utils/circle_cut_vision.py
+src/utils/circle_cut_policy.py
 src/utils/cli_llm.py
 src/utils/grok_build.py
+src/utils/grok_build_x_search.py
+src/utils/x_account_status.py
 src/utils/antigravity_models.py
 src/utils/cookie_loader.py
 src/utils/date_utils.py
 src/utils/downloader.py
+src/utils/embedded_data.py
+src/utils/frame_inliner.py
 src/utils/gemini_client.py
 src/utils/grok_search_client.py
 src/utils/image_processor.py
@@ -256,6 +266,7 @@ src/utils/past_event_enricher.py
 src/utils/pattern_manager.py
 src/utils/progress_logger.py
 src/utils/reprocess_deadline.py
+src/utils/settled_catalog.py
 src/utils/reprocess_helpers.py
 src/utils/reprocess_trace.py
 src/utils/site_parsing_llm.py
@@ -277,6 +288,7 @@ tests/unit/test_date_utils.py
 tests/unit/test_desktop_release_gate.py
 tests/unit/test_desktop_bridge.py
 tests/unit/test_grok_build.py
+tests/unit/test_grok_rescue.py
 tests/unit/test_generic_adapter.py
 tests/unit/test_json_formatter.py
 tests/unit/test_json_reprocessor.py

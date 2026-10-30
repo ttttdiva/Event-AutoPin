@@ -467,6 +467,7 @@ class TwitterExtractor:
                     
                     tweet_count = 0
                     found_period_tweet = False  # 期間内のツイートを見つけたかどうか
+                    consecutive_old = 0
                     
                     async for tweet in api.user_tweets(user.id, limit=limit):
                         tweet_count += 1
@@ -474,10 +475,16 @@ class TwitterExtractor:
                         if start_date <= tweet.date <= end_date:
                             tweets.append(tweet)
                             found_period_tweet = True
-                        # 期間より前のツイートに到達し、かつ既に期間内のツイートを見つけていたら終了
+                        # タイムラインは固定ポストやRTの塊で日付順が崩れる。古い投稿を1件見ただけで
+                        # 打ち切ると後ろの本物のお品書きを取り逃すため、連続して古い場合だけ終了する。
                         elif tweet.date < start_date and found_period_tweet:
-                            logger.info(f"Reached tweets before target period at tweet #{tweet_count}, stopping")
-                            break
+                            consecutive_old += 1
+                            if consecutive_old >= 8:
+                                logger.info(f"Reached tweets before target period at tweet #{tweet_count}, stopping")
+                                break
+                            continue
+                        if tweet.date >= start_date:
+                            consecutive_old = 0
                         # まだ期間内のツイートを見つけていない場合は継続
                     
                     logger.info(f"Fetched {tweet_count} tweets total, {len(tweets)} within target period")

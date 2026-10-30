@@ -98,7 +98,7 @@ async function runCircleExpandedActionsTests() {
     "@/lib/theme-context": { useTheme: () => ({ effectiveScheme: "dark" }) },
     "@/constants/Colors": { getColors: () => colors },
     "@/lib/event-context": { useEvent: () => ({ refreshStats: () => { refreshes++; } }) },
-    "@/lib/types": { ITEM_CATEGORIES: ["", "合同誌"] },
+    "@/lib/types": { ...require("./types"), ITEM_CATEGORIES: ["", "合同誌"] },
     "@/lib/database": {
       getItemsByCircle: async () => [item], getItemImagesByCircle: async () => [image],
       getBoughtItemNameKeysForCircle: async () => new Set(), normalizePurchaseLookupKey: (value) => value,

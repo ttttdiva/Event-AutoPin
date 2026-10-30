@@ -978,6 +978,15 @@ def _select_context_elements_by_candidate_budget(
         ]
 
     return selected_elements, {
+        # Private hand-off for supplemental recovery; OCREngine removes it
+        # before the selection summary is stored as diagnostics.
+        "_unselected_segments": [
+            {
+                "rectangle_index": segment["rectangle_index"],
+                "elements": list(segment["elements"]),
+            }
+            for segment in remaining
+        ],
         "applied": True,
         "mode": "candidate_budget",
         "expected_candidate_count": expected,
@@ -990,6 +999,90 @@ def _select_context_elements_by_candidate_budget(
         "selected_calls": selected_calls,
         "evaluations": evaluations,
     }
+
+
+def _novel_unselected_context_candidates(
+    segments: List[Dict[str, Any]],
+    selected_numbers: List[Dict[str, Any]],
+    context_calls: List[Dict[str, Any]],
+    image_size: Optional[tuple[int, int]],
+) -> List[Dict[str, Any]]:
+    """Candidates seen only by context crops that the budget selection skipped.
+
+    The budget selection stops as soon as the candidate count reaches the
+    catalog size, which also drops numbers that only a later crop could see (a
+    small island whose numbers are not in the selected crop).  Return those
+    numbers when they are physically new: they must not overlap any selected
+    candidate and must not be clipped by the crop border (text cut at a crop
+    edge is a frequent source of phantom digits).  They are *not* part of the
+    primary result; callers use them only to recover otherwise unobserved
+    catalog spaces.
+    """
+    rectangles = {
+        call.get("rectangle_index"): call
+        for call in context_calls
+        if isinstance(call, dict)
+    }
+
+    def near_selected(entry: Dict[str, Any], pool: List[Dict[str, Any]]) -> bool:
+        center_x = entry["x"] + entry["width"] / 2
+        center_y = entry["y"] + entry["height"] / 2
+        for other in pool:
+            if (
+                other["x"] < entry["x"] + entry["width"]
+                and entry["x"] < other["x"] + other["width"]
+                and other["y"] < entry["y"] + entry["height"]
+                and entry["y"] < other["y"] + other["height"]
+            ):
+                return True
+            other_x = other["x"] + other["width"] / 2
+            other_y = other["y"] + other["height"] / 2
+            reach = 0.6 * max(other["width"], other["height"], entry["width"], entry["height"])
+            if math.hypot(center_x - other_x, center_y - other_y) <= reach:
+                return True
+        return False
+
+    margin = 4
+    novel: List[Dict[str, Any]] = []
+    selected_heights = [float(item["height"]) for item in selected_numbers if item.get("height")]
+    median_height = median(selected_heights) if selected_heights else None
+    for segment in segments:
+        call = rectangles.get(segment.get("rectangle_index")) or {}
+        origin = call.get("origin")
+        size = call.get("size")
+        for entry in _elements_to_numbers(list(segment.get("elements") or [])):
+            if origin and size and len(origin) == 2 and len(size) == 2:
+                left, top = float(origin[0]), float(origin[1])
+                right, bottom = left + float(size[0]), top + float(size[1])
+                width_limit = image_size[0] if image_size else None
+                height_limit = image_size[1] if image_size else None
+                clipped = (
+                    (left > 0 and entry["x"] <= left + margin)
+                    or (top > 0 and entry["y"] <= top + margin)
+                    or (
+                        (width_limit is None or right < width_limit)
+                        and entry["x"] + entry["width"] >= right - margin
+                    )
+                    or (
+                        (height_limit is None or bottom < height_limit)
+                        and entry["y"] + entry["height"] >= bottom - margin
+                    )
+                )
+                if clipped:
+                    continue
+            # Printed booth numbers share one font size and are wider than tall.
+            # Digits pulled out of logos/titles are typically much taller than
+            # the booth numbers or have a portrait box.
+            if median_height and not (
+                0.4 * median_height <= float(entry["height"]) <= 1.8 * median_height
+            ):
+                continue
+            if float(entry["width"]) < 0.8 * float(entry["height"]):
+                continue
+            if near_selected(entry, selected_numbers) or near_selected(entry, novel):
+                continue
+            novel.append(entry)
+    return novel
 
 
 class OCREngine:
@@ -1010,6 +1103,9 @@ class OCREngine:
         # GUI/CLIへ返せる診断情報。番号配列の既存契約は変更しない。
         self.last_error: Dict[str, Any] | None = None
         self.last_run: Dict[str, Any] = {}
+        # Numbers only visible in context crops skipped by the candidate-budget
+        # selection (see _novel_unselected_context_candidates).
+        self.supplemental_numbers: List[Dict[str, Any]] = []
         self._attempted = False
         self._runner_started = False
 
@@ -1054,6 +1150,7 @@ class OCREngine:
         self.last_error = None
         self._attempted = True
         self._runner_started = False
+        self.supplemental_numbers = []
         self.last_run = {
             "image": str(image_path),
             "strategy": self.config.strategy,
@@ -1254,6 +1351,27 @@ class OCREngine:
             )
         )
         numbers = _elements_to_numbers(selected_elements)
+        unselected_segments = (
+            context_selection.pop("_unselected_segments", [])
+            if isinstance(context_selection, dict)
+            else []
+        )
+        image_for_size = _read_image_unicode_safe(image_path)
+        image_size = (
+            (int(image_for_size.shape[1]), int(image_for_size.shape[0]))
+            if image_for_size is not None
+            else None
+        )
+        context_calls = (first_result.get("context_fallback") or {}).get("calls") or []
+        try:
+            self.supplemental_numbers = _novel_unselected_context_candidates(
+                unselected_segments,
+                numbers,
+                context_calls if isinstance(context_calls, list) else [],
+                image_size,
+            )
+        except Exception:  # supplemental recovery must never break OCR
+            self.supplemental_numbers = []
         self.last_run.update(
             {
                 "model": payload.get("model"),

@@ -1027,6 +1027,8 @@ export interface CircleListRow {
   absenceStatus: string | null;
   existingOnlyStatus: string | null;
   catalogStatus: string | null;
+  subEvent: string | null;
+  menuUrl: string | null;
   renderRevision: number;
 }
 
@@ -1046,8 +1048,10 @@ export async function getCircleListRows(eventId: number): Promise<CircleListRow[
       c.genres, c.tags, c.circle_cut_filename, c.priority_color, c.memo,
       c.checked, c.pin_x, c.pin_y, c.map_number, c.absence_status,
       c.existing_only_status, c.catalog_status,
+      json_extract(c.raw_json, '$.sub_event') AS sub_event,
+      json_extract(c.raw_json, '$.menu_url') AS menu_url,
       CASE
-        WHEN c.catalog_status = 'needs_recheck' THEN 0
+        WHEN c.catalog_status IN ('preview', 'needs_recheck') THEN 0
         WHEN c.catalog_status IS NOT NULL AND c.catalog_status != '' THEN 1
         WHEN EXISTS (SELECT 1 FROM item_images ii WHERE ii.circle_id = c.id)
           OR EXISTS (SELECT 1 FROM items i WHERE i.circle_id = c.id)
@@ -1080,6 +1084,8 @@ export async function getCircleListRows(eventId: number): Promise<CircleListRow[
     absenceStatus: row.absence_status ?? null,
     existingOnlyStatus: row.existing_only_status ?? null,
     catalogStatus: row.catalog_status ?? null,
+    subEvent: row.sub_event ?? null,
+    menuUrl: row.menu_url ?? null,
     // UI VM の comparator 用。表示・フィルター・アクションに関わる全フィールドを
     // revisionへ含め、編集後にmemo行が古いまま残らないようにする。
     renderRevision: renderRevisionHash([
@@ -1088,7 +1094,7 @@ export async function getCircleListRows(eventId: number): Promise<CircleListRow[
       row.genres, row.tags, row.circle_cut_filename, row.priority_color,
       row.memo, row.has_catalog_post, row.checked, row.pin_x, row.pin_y,
       row.map_number, row.absence_status, row.existing_only_status,
-      row.catalog_status,
+      row.catalog_status, row.sub_event, row.menu_url,
     ].map((value) => String(value ?? "")).join("\u0001")),
   }));
 }
@@ -1103,8 +1109,10 @@ export async function getCirclesByEvent(eventId: number): Promise<Circle[]> {
       c.genres, c.tags, c.circle_cut_filename, c.priority_color, c.memo,
       c.checked, c.pin_x, c.pin_y, c.map_number, c.absence_status,
       c.existing_only_status, c.catalog_status,
+      json_extract(c.raw_json, '$.sub_event') AS sub_event,
+      json_extract(c.raw_json, '$.menu_url') AS menu_url,
       CASE
-        WHEN c.catalog_status = 'needs_recheck' THEN 0
+        WHEN c.catalog_status IN ('preview', 'needs_recheck') THEN 0
         WHEN c.catalog_status IS NOT NULL AND c.catalog_status != '' THEN 1
         WHEN EXISTS (SELECT 1 FROM item_images ii WHERE ii.circle_id = c.id)
           OR EXISTS (SELECT 1 FROM items i WHERE i.circle_id = c.id)
@@ -1128,8 +1136,11 @@ async function getCirclesByEventForExport(eventId: number): Promise<Circle[]> {
   const txDb = await getDatabase();
   const rows = await measuredGetAll<any>(
     txDb,
-    `SELECT c.*, CASE
-      WHEN c.catalog_status = 'needs_recheck' THEN 0
+    `SELECT c.*,
+      json_extract(c.raw_json, '$.sub_event') AS sub_event,
+      json_extract(c.raw_json, '$.menu_url') AS menu_url,
+      CASE
+      WHEN c.catalog_status IN ('preview', 'needs_recheck') THEN 0
       WHEN c.catalog_status IS NOT NULL AND c.catalog_status != '' THEN 1
       WHEN EXISTS (SELECT 1 FROM item_images ii WHERE ii.circle_id = c.id)
         OR EXISTS (SELECT 1 FROM items i WHERE i.circle_id = c.id)
@@ -1148,7 +1159,9 @@ export async function getCircle(id: number): Promise<Circle | null> {
     `SELECT id, event_id, name, penname, space, hall,
       twitter_url, website_url, pixiv_url, description, genres, tags,
       circle_cut_filename, priority_color, memo, checked, pin_x, pin_y,
-      map_number, absence_status, existing_only_status, catalog_status
+      map_number, absence_status, existing_only_status, catalog_status,
+      json_extract(raw_json, '$.sub_event') AS sub_event,
+      json_extract(raw_json, '$.menu_url') AS menu_url
      FROM circles WHERE id = ?`,
     id,
   );
@@ -5657,9 +5670,9 @@ export async function exportEventData(
       memo: c.memo || undefined,
       absence_status: c.absenceStatus ?? undefined,
       existing_only_status: c.existingOnlyStatus ?? undefined,
-      catalog_status: c.catalogStatus ?? undefined,
-      pin_x: c.pinX ?? undefined,
-      pin_y: c.pinY ?? undefined,
+      catalog_status: c.catalogStatus ?? (baseCircle.catalog_status === null ? null : undefined),
+      pin_x: c.pinX ?? (baseCircle.pin_x === null ? null : undefined),
+      pin_y: c.pinY ?? (baseCircle.pin_y === null ? null : undefined),
       map_number: c.mapNumber ?? undefined,
       checked: c.purchaseStatus,
       items: items.map((i) => ({
@@ -6264,6 +6277,8 @@ function mapCircle(row: any): Circle {
     absenceStatus: row.absence_status,
     existingOnlyStatus: row.existing_only_status,
     catalogStatus: row.catalog_status ?? null,
+    subEvent: row.sub_event ?? null,
+    menuUrl: row.menu_url ?? null,
     rawJson: row.raw_json ?? null,
   };
 }

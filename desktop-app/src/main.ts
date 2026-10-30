@@ -741,15 +741,13 @@ const FALLBACK_MODEL_CATALOG: ModelCatalog = {
       kind: "cli",
       available: false,
       models: [
+        { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", source_label: "CLI候補" },
+        { id: "gpt-6-sol", label: "GPT-6 Sol", source_label: "CLI候補" },
+        { id: "gpt-6-luna", label: "GPT-6 Luna", source_label: "CLI候補" },
+        { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", source_label: "CLI候補" },
+        { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", source_label: "CLI候補" },
         { id: "gpt-5.5", label: "GPT-5.5", source_label: "CLI候補" },
         { id: "gpt-5.4", label: "GPT-5.4", source_label: "CLI候補" },
-        { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", source_label: "CLI候補" },
-        { id: "gpt-5.3-codex-spark", label: "GPT-5.3 Codex Spark", source_label: "CLI候補" },
-        { id: "gpt-5.3-codex", label: "GPT-5.3 Codex", source_label: "CLI候補" },
-        { id: "gpt-5.2-codex", label: "GPT-5.2 Codex", source_label: "CLI候補" },
-        { id: "gpt-5.1-codex-max", label: "GPT-5.1 Codex Max", source_label: "CLI候補" },
-        { id: "gpt-5.1-codex", label: "GPT-5.1 Codex", source_label: "CLI候補" },
-        { id: "gpt-5-codex", label: "GPT-5 Codex", source_label: "CLI候補" },
       ],
     },
     {
@@ -5424,6 +5422,10 @@ function renderCircleEditor() {
       const hasCatalogPost = circleHasCatalogPost(circle, row);
       if (catalogFilter === "with" && !hasCatalogPost) return;
       if (catalogFilter === "without" && hasCatalogPost) return;
+      // 予告（preview）と確定（confirmed）は別物として絞り込めるようにする。
+      const catalogStatus = String(circle?.catalog_status || "").trim();
+      if (catalogFilter === "confirmed" && catalogStatus !== "confirmed") return;
+      if (catalogFilter === "preview" && catalogStatus !== "preview") return;
     }
     if (
       globalSearchQuery &&
@@ -5527,6 +5529,10 @@ function renderCircleEditor() {
               itemCount > 0
                 ? ` <span class="item-count-badge">${itemCount}</span>`
                 : "";
+            const previewBadge =
+              eventJsonData.circles[realIdx]?.catalog_status === "preview"
+                ? ' <span class="circle-preview-badge" title="お品書きの予告のみ（品目は未確定）">予告</span>'
+                : "";
             const circleItems = eventJsonData.circles[realIdx]?.items || [];
             const hiddenItemNames = circleItems
               .map((it: any) => it.name)
@@ -5535,7 +5541,7 @@ function renderCircleEditor() {
             const srOnly = hiddenItemNames
               ? `<span class="sr-only">${escapeHtml(hiddenItemNames)}</span>`
               : "";
-            return `<td class="relative"><input data-row="${realIdx}" data-col="${escapeHtml(h)}" value="${escapeHtml(val)}" />${badge}${absenceBadge}${srOnly}</td>`;
+            return `<td class="relative"><input data-row="${realIdx}" data-col="${escapeHtml(h)}" value="${escapeHtml(val)}" />${badge}${previewBadge}${absenceBadge}${srOnly}</td>`;
           }
           // URL値: リンク＋編集欄（複数URL改行区切りの場合は最初のURLを「開く」対象に）
           const firstUrl = val

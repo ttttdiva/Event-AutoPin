@@ -50,6 +50,16 @@ class AdapterFactory:
             logger.info("KowaUtaAdapterを使用")
             return KowaUtaAdapter(site_config)
 
+        # Sockbaseは全サークルを埋め込みJSONで配信するため専用アダプターを優先する
+        # （汎用LLM経路では見える範囲だけを読み、一部を全件と誤認する）
+        # 独自ドメインの公式サイトがSockbaseの一覧をiframeで埋め込む場合も同じ扱いにする。
+        if "list.sockbase.net" in site_config.base_url.lower() or any(
+            "list.sockbase.net" in frame_url.lower()
+            for frame_url in getattr(site_config, "frame_urls", None) or []
+        ):
+            logger.info("SockbaseAdapterを使用（埋め込みデータ全件）")
+            return SockbaseAdapter(site_config)
+
         # 学習済みパターンがある場合は優先的に使用
         if pattern_manager.has_pattern(site_config.base_url):
             logger.info("学習済みパターンアダプターを使用")

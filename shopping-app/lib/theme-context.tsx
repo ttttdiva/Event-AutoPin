@@ -5,11 +5,17 @@ import React, {
   useMemo,
   useEffect,
   useCallback,
+  useRef,
 } from "react";
-import { useColorScheme } from "react-native";
+import { Appearance, useColorScheme } from "react-native";
 import { getSetting, setSetting } from "./database";
+import {
+  restoreStoredThemeMode,
+  setNativeAppearanceForThemeMode,
+  type ThemeMode,
+} from "./theme-appearance";
 
-export type ThemeMode = "light" | "dark" | "auto";
+export type { ThemeMode } from "./theme-appearance";
 
 const THEME_SETTING_KEY = "theme_mode";
 
@@ -25,26 +31,58 @@ const ThemeContext = createContext<ThemeContextType>({
   setThemeMode: () => {},
 });
 
-export function ThemeProvider({ children }: { children: React.ReactNode }) {
+function applyNativeThemeMode(mode: ThemeMode) {
+  setNativeAppearanceForThemeMode(
+    mode,
+    Appearance.setColorScheme?.bind(Appearance),
+  );
+}
+
+export function ThemeProvider({
+  children,
+  onHydrated,
+}: {
+  children: React.ReactNode;
+  onHydrated?: () => void;
+}) {
   const systemScheme = useColorScheme();
   const [themeMode, setThemeModeState] = useState<ThemeMode>("light");
+  const [isHydrated, setIsHydrated] = useState(false);
+  const hydrationRevision = useRef(0);
 
-  // 起動時にDBから読み込み
+  // 保存値を読み、nativeへ反映を要求してから画面を表示する。
   useEffect(() => {
-    getSetting(THEME_SETTING_KEY)
-      .then((saved) => {
-        if (saved === "light" || saved === "dark" || saved === "auto") {
-          setThemeModeState(saved);
-        }
-      })
-      .catch(() => {});
-  }, []);
+    let active = true;
+    const startedAtRevision = hydrationRevision.current;
 
-  // テーマ変更時にDBに保存
+    void restoreStoredThemeMode({
+      readStoredMode: () => getSetting(THEME_SETTING_KEY),
+      isCurrent: () =>
+        active && hydrationRevision.current === startedAtRevision,
+      applyNativeMode: applyNativeThemeMode,
+      setThemeMode: setThemeModeState,
+      onHydrated: () => {
+        setIsHydrated(true);
+        onHydrated?.();
+      },
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [onHydrated]);
+
+  // 明示変更は復元中の非同期読み込みより優先する。
   const setThemeMode = useCallback((mode: ThemeMode) => {
+    hydrationRevision.current += 1;
+    applyNativeThemeMode(mode);
     setThemeModeState(mode);
+    if (!isHydrated) {
+      onHydrated?.();
+      setIsHydrated(true);
+    }
     setSetting(THEME_SETTING_KEY, mode).catch(() => {});
-  }, []);
+  }, [isHydrated, onHydrated]);
 
   const effectiveScheme = useMemo(() => {
     if (themeMode === "auto") {
@@ -55,7 +93,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <ThemeContext.Provider value={{ themeMode, effectiveScheme, setThemeMode }}>
-      {children}
+      {isHydrated ? children : null}
     </ThemeContext.Provider>
   );
 }

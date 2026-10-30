@@ -144,6 +144,13 @@ class CircleMasterManager:
         logger.warning(f"デフォルトカット画像が見つかりません: {image_path}")
         return None
 
+    def get_default_cut_kind(self, circle_name: str) -> Optional[str]:
+        """標準カットの種別。未記録（旧データ）はNone、代用画像は oshinagaki_substitute"""
+        entry = self.data["circles"].get(circle_name)
+        if not entry or not entry.get("default_cut"):
+            return None
+        return entry.get("default_cut_kind") or None
+
     def has_default_cut(self, circle_name: str) -> bool:
         """デフォルトカットが存在するか確認"""
         return self.get_default_cut(circle_name) is not None
@@ -176,12 +183,30 @@ class CircleMasterManager:
                     pass
         return f"{max_num + 1:04d}.jpg"
 
-    def register_default_cut(self, circle_name: str, penname: str, image_path: Path) -> bool:
-        """おしながき画像をデフォルトカットとして登録する"""
+    def register_default_cut(
+        self,
+        circle_name: str,
+        penname: str,
+        image_path: Path,
+        kind: str = "default_cut",
+    ) -> bool:
+        """画像をデフォルトカットとして登録する。
+
+        kind: "default_cut"（画像認識で確認した本来のカット）または
+        "oshinagaki_substitute"（本来のカットが無いときのおしながき代用）。
+        代用画像・出自不明の旧データが登録済みでも、本来のカットで置き換える（旧画像ファイルは消さない）。
+        """
         existing = self.data["circles"].get(circle_name)
+        replace_existing = False
         if existing and existing.get("default_cut"):
-            logger.debug(f"デフォルトカット登録済み、スキップ: {circle_name}")
-            return False
+            # 本来のカットは、代用画像と、出自不明の旧データ（代用の可能性がある）を置き換える
+            replace_existing = (
+                kind == "default_cut"
+                and existing.get("default_cut_kind") != "default_cut"
+            )
+            if not replace_existing:
+                logger.debug(f"デフォルトカット登録済み、スキップ: {circle_name}")
+                return False
 
         if not image_path.exists():
             logger.warning(f"登録元画像が見つかりません: {image_path}")
@@ -199,6 +224,7 @@ class CircleMasterManager:
 
         entry = self._ensure_entry(circle_name)
         entry["default_cut"] = filename
+        entry["default_cut_kind"] = kind
         if penname and not entry.get("penname"):
             entry["penname"] = penname
 

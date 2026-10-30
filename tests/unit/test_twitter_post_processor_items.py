@@ -979,3 +979,18 @@ def test_direct_post_deadline_does_not_cache_partial_image_result(tmp_path, monk
         and event["outcome"] == "timeout"
         for event in trace
     )
+
+
+def test_merge_results_keeps_same_name_circles_in_different_spaces_apart():
+    first = Circle(name="センター・ゲームセンター", space="A-15,A-16")
+    second = Circle(name="センター・ゲームセンター", space="D-17,D-18")
+    other = Circle(name="別サークル", space="A-01")
+    updated_second = Circle(name="センター・ゲームセンター", space="D-17,D-18", catalog_status="confirmed")
+
+    merged = TwitterPostProcessor._merge_results(
+        [first, other, second], [first, second], [RuntimeError("失敗"), updated_second]
+    )
+
+    assert merged[0] is first and merged[0].space == "A-15,A-16"
+    assert merged[1] is other
+    assert merged[2] is updated_second

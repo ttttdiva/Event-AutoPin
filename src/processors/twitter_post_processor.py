@@ -188,6 +188,12 @@ class TwitterConfig:
         self.additional_prompt = config_dict.get('catalog_additional_prompt', '')  # 追加プロンプト
         self.event_date = config_dict.get('event_date')  # YYYY-MM-DD形式
         self.use_grok_search = config_dict.get('use_grok_search', False)
+        # twscrape後もお品書きが空のサークルを、Grok Build(grok.exe, web検索)で再探索する段。
+        # use_grok_search(xAI API版)とは別物。grok.exeが無い/未ログインなら理由を記録して続行する。
+        self.use_grok_rescue = bool(config_dict.get('use_grok_rescue', True))
+        self.grok_rescue_batch_size = int(config_dict.get('grok_rescue_batch_size') or 12)
+        self.grok_rescue_timeout = float(config_dict.get('grok_rescue_timeout') or 900)
+        self.grok_rescue_model = config_dict.get('grok_rescue_model') or None
         self.image_llm_provider = config_dict.get('image_llm_provider') or DEFAULT_IMAGE_PRIMARY_PROVIDER
         if ':' in self.image_llm_provider:
             self.image_provider_kind, self.image_llm_provider_name = self.image_llm_provider.split(':', 1)
@@ -360,6 +366,8 @@ class TwitterPostProcessor:
         self.output_path = Path(config.output_dir)
         self.output_path.mkdir(exist_ok=True)
         self._post_reprocess_cache: Dict[str, Dict[str, Any]] = {}
+        # サークル名 -> Xアカウントの状態(凍結/存在なし/未公開など)。event.json metadata.x_account_status へ出力する。
+        self.x_account_status: Dict[str, Dict[str, Any]] = {}
         self.last_run_summary: Dict[str, Any] = {
             "status": "not_started",
             "target_count": 0,
@@ -390,6 +398,11 @@ class TwitterPostProcessor:
                 logger.info("Grok search client initialized")
             except Exception as e:
                 logger.warning(f"Grok検索の初期化に失敗（twscrapeにフォールバック）: {e}")
+
+    def metadata_for_event_json(self) -> Dict[str, Any]:
+        """event.json の metadata へ載せる、Xアカウント状態(空なら何も載せない)。"""
+        status = getattr(self, "x_account_status", None)
+        return {"x_account_status": dict(status)} if status else {}
 
     @staticmethod
     def _extract_tweet_id_from_url(post_url: str) -> Optional[str]:
@@ -670,6 +683,17 @@ class TwitterPostProcessor:
                     changed = True
         return changed
 
+    @staticmethod
+    def _merge_results(circles, circles_with_twitter, results):
+        """処理結果を元の並び順へ戻す。同名サークルが別スペースにあっても取り違えないよう、名前ではなく元のオブジェクトで対応づける。"""
+        replacements = {}
+        for original, result in zip(circles_with_twitter, results):
+            if isinstance(result, Exception):
+                logger.error(f"Error processing circle {original.name}: {result}")
+            elif isinstance(result, Circle):
+                replacements[id(original)] = result
+        return [replacements.get(id(c), c) for c in circles]
+
     async def process_circles(
         self,
         circles: List[Circle],
@@ -721,7 +745,12 @@ class TwitterPostProcessor:
         # Twitter URLを持つサークルのみフィルター
         circles_with_twitter = []
         invalid_url_count = 0
+        settled_skipped = 0
         for circle in circles:
+            if getattr(circle, "_catalog_settled", False):
+                # おしながきが確定済み（前回の取り込み分）。再取得・上書きしない。
+                settled_skipped += 1
+                continue
             if not circle.twitter_url:
                 continue
             normalized = normalize_twitter_profile_url(circle.twitter_url)
@@ -735,6 +764,8 @@ class TwitterPostProcessor:
             circle.twitter_url = normalized
             circles_with_twitter.append(circle)
         logger.info(f"Found {len(circles_with_twitter)} circles with Twitter URLs")
+        if settled_skipped:
+            logger.info(f"確定済みのおしながきを保持するため {settled_skipped} 件をX処理から除外しました")
         self.last_run_summary["invalid_url_count"] = invalid_url_count
 
         # デバッグモードの場合は処理数を制限
@@ -945,19 +976,20 @@ class TwitterPostProcessor:
                 if asyncio.iscoroutine(callback_result):
                     await callback_result
 
+        # twscrape後もお品書きが空のサークルをGrok Build(web検索)で再探索する。
+        # 画像の解析は設定の画像モデルが行い、Grokの回答は投稿URLと状態の候補としてのみ使う。
+        try:
+            from .grok_rescue import run_grok_rescue
+
+            self.last_run_summary["grok_rescue"] = await run_grok_rescue(
+                self, circles_with_twitter, results, event, event_date,
+                target_outcomes, on_circle_complete=on_circle_complete,
+            )
+        except Exception as rescue_error:  # noqa: BLE001 - 救済段は本処理を止めない
+            logger.warning("Grok再探索を実行できませんでした(続行): %s", type(rescue_error).__name__)
+
         # 結果を統合
-        circle_map = {c.name: c for c in circles}
-
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"Error processing circle {circles_with_twitter[i].name}: {result}")
-                continue
-            elif isinstance(result, Circle):
-                # 更新されたサークル情報を反映
-                circle_map[result.name] = result
-
-        # 元の順序を保持して返す
-        updated_circles = [circle_map.get(c.name, c) for c in circles]
+        updated_circles = self._merge_results(circles, circles_with_twitter, results)
 
         self.progress.end_task()
 
@@ -1031,6 +1063,10 @@ class TwitterPostProcessor:
             days_after=self.config.days_after_event,
             additional_prompt=self.effective_additional_prompt,
         )
+
+        if result.get("error"):
+            # APIエラー/接続失敗を「お品書きなし」として握りつぶさず、twscrapeへ落とす。
+            raise RuntimeError(f"Grok API error: {str(result['error'])[:200]}")
 
         if not result.get("found"):
             logger.info(f"Grok: お品書きツイートなし - {circle.name} (@{username})")

@@ -19,6 +19,7 @@ async function runCircleReprocessLifecycleTests() {
   const previousCache = new Map(Object.entries(require.cache));
   const hiddenCircleIds = new Set();
   const alerts = [];
+  const openedUrls = [];
   const unexpectedWrites = [];
   const circle = {
     id: 1, eventId: 21, name: "検証サークルA", penname: "検証作者",
@@ -27,9 +28,11 @@ async function runCircleReprocessLifecycleTests() {
     purchaseStatus: 0, twitterUrl: null, websiteUrl: null, pixivUrl: null,
     circleCutFilename: null, pinX: null, pinY: null, mapNumber: null,
     hasCatalogPost: true, absenceStatus: 0, existingOnlyStatus: 0,
-    catalogStatus: "done", renderRevision: 0,
+    catalogStatus: "confirmed", subEvent: "併催テスト", menuUrl: "https://example.com/menu", renderRevision: 0,
   };
-  const circles = [circle, { ...circle, id: 2, name: "検証サークルB", space: "A-02" }];
+  const circles = [circle, { ...circle, id: 2, name: "検証サークルB", space: "A-02" },
+    { ...circle, id: 3, name: "Miotec", space: "C-23,C-24" },
+    { ...circle, id: 4, name: "Miotec", space: "D-15,D-16" }];
   const item = {
     id: 101, circleId: 1, name: "検証頒布物", price: 1200,
     purchaseStatus: 0, purchaseStatusSource: "manual", type: "本",
@@ -72,7 +75,7 @@ async function runCircleReprocessLifecycleTests() {
           React.createElement("Cell", { key: props.keyExtractor(entry) }, props.renderItem({ item: entry })))),
       StyleSheet: { create: (value) => value, absoluteFillObject: {}, hairlineWidth: 1 },
       LayoutAnimation: { configureNext() {}, Presets: { easeInEaseOut: {} } },
-      Alert: { alert: (...args) => alerts.push(args) }, Linking: { openURL() {} },
+      Alert: { alert: (...args) => alerts.push(args) }, Linking: { openURL: (url) => openedUrls.push(url) },
       Platform: { OS: "android", select: (choices) => choices.android ?? choices.default },
       useWindowDimensions: () => ({ width: 412, height: 915, scale: 1, fontScale: 1 }),
     },
@@ -109,14 +112,38 @@ async function runCircleReprocessLifecycleTests() {
   };
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   let tree;
+  let probe;
   try {
     const Screen = require("../app/event/[id]").default;
     const Detail = require("../components/CircleExpandedDetail").default;
+    const Row = require("../components/CircleRow").default;
     const ItemRow = require("../components/ItemPurchaseRow").default;
     const step = async (action) => {
       await act(async () => { await action(); });
       await act(async () => { await new Promise((resolve) => setImmediate(resolve)); });
     };
+    const rowProps = { isExpanded: false, onToggleExpand() {}, onCyclePurchaseStatus() {} };
+    const renderProbe = (value) => React.createElement("CatalogProbe", null,
+      React.createElement("RowHost", null, React.createElement(Row, { ...rowProps, circle: value })),
+      React.createElement("DetailHost", null, React.createElement(Detail, { circle: value, onCircleUpdated() {} })));
+    for (const [status, label] of [["confirmed", "確定"], ["preview", "予告"], ["needs_recheck", "要確認"], [null, null], ["future", null]]) {
+      const value = { ...circle, catalogStatus: status, subEvent: status === null ? null : "併催表示テスト", menuUrl: null };
+      await step(() => {
+        if (probe) probe.update(renderProbe(value));
+        else probe = create(renderProbe(value));
+      });
+      for (const host of ["RowHost", "DetailHost"]) {
+        const text = textOf(probe.root.findByType(host));
+        assert.equal(text.includes("おしながき: "), label !== null, `${host}: ${status}のラベル有無`);
+        if (label) assert.ok(text.includes(`おしながき: ${label}`), `${host}: ${status}の日本語ラベル`);
+        assert.equal(text.includes("併催表示テスト"), value.subEvent !== null, `${host}: 値がある場合だけ併催名を表示`);
+      }
+    }
+    for (const [field, value] of [["catalogStatus", "preview"], ["subEvent", "別の併催"], ["menuUrl", "https://example.com/new-menu"]]) {
+      assert.equal(Row.compare({ ...rowProps, circle }, { ...rowProps, circle: { ...circle, [field]: value } }), false, `${field}だけの更新でも行を再描画`);
+    }
+    await step(() => probe.unmount());
+    probe = null;
     const press = (label, root = tree.root) => {
       const matches = root.findAllByType("Pressable").filter((node) => textOf(node).trim() === label);
       assert.equal(matches.length, 1, `${label}の操作が一意に存在すること`);
@@ -136,9 +163,15 @@ async function runCircleReprocessLifecycleTests() {
       assert.equal(reprocessModals().length, 1, "新しい長押し要求で再処理を表示すること");
     };
     await step(() => { tree = create(React.createElement(Screen)); });
+    const duplicateRows = tree.root.findAllByType("Cell").filter((node) => textOf(node).includes("Miotec"));
+    assert.equal(duplicateRows.length, 2, "同名Miotecの別スペースがそれぞれ行に残ること");
+    assert.ok(textOf(duplicateRows[0]).includes("C-23,C-24") && textOf(duplicateRows[1]).includes("D-15,D-16"));
     await step(() => row().props.onPress());
     assertClosed("通常タップで再処理モーダルを表示しないこと");
     const detail = tree.root.findByType(Detail);
+    assert.ok(textOf(detail).includes("おしながき: 確定") && textOf(detail).includes("併催テスト"), "一覧projectionから詳細へ状態・併催名を渡すこと");
+    await step(() => press("おしながき", detail));
+    assert.deepEqual(openedUrls, [circle.menuUrl], "menu_urlを詳細のリンクから開くこと");
     for (const label of ["検証頒布物", "1,200", "検証メモ", "検証タグ", "イラスト"]) {
       assert.ok(textOf(detail).includes(label), `${label}を展開欄に残すこと`);
     }
@@ -198,7 +231,9 @@ async function runCircleReprocessLifecycleTests() {
     assert.ok(alerts.at(-1)[2].some((button) => button.style === "cancel"));
     assert.deepEqual(unexpectedWrites, [], "表示・取消だけでDB書込/削除/外部再処理を行わないこと");
     console.log("再処理ライフサイクル: 実React親子接続、3種の取消、折り畳み/再マウント、長押し管理と商品編集の維持 PASS");
+    console.log("おしながきUI: 5状態×行/詳細、併催名の有無、memo更新判定、同名Miotec別スペース、menu_urlリンク PASS");
   } finally {
+    if (probe) await act(async () => probe.unmount());
     if (tree) await act(async () => tree.unmount());
     Module._load = originalLoad;
     globalThis.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;

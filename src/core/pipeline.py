@@ -9,7 +9,7 @@ import shutil
 import tempfile
 import warnings
 from bs4 import BeautifulSoup
-from PIL import Image, ImageOps
+from PIL import Image, ImageFile, ImageOps
 
 import requests as _requests
 
@@ -18,6 +18,7 @@ from ..utils import Downloader, setup_logger
 from ..utils.circle_master import CircleMasterManager
 from ..utils.catalog_image_analyzer import CatalogImageAnalyzer
 from ..utils.cookie_loader import load_cookies_for_url
+from ..utils.frame_inliner import find_list_frames, inline_frames
 from ..utils.llm_attempts import api_models_from_attempts, build_image_llm_attempts
 from ..utils.circle_cut_vision import (
     CIRCLE_CUT_DOWNLOAD_TIMEOUT_SECONDS,
@@ -28,6 +29,13 @@ from ..utils.circle_cut_vision import (
     build_circle_cut_model_attempts,
     contains_credentialed_url,
     inspect_circle_cut_assets,
+)
+from ..utils.circle_cut_policy import (
+    KIND_DEFAULT_CUT,
+    KIND_SITE_CUT,
+    KIND_SUBSTITUTE,
+    make_origin,
+    strip_url_query,
 )
 from .base_adapter import BaseSiteAdapter
 from .base_formatter import BaseOutputFormatter
@@ -63,40 +71,55 @@ def _infer_genre(items: List[Dict[str, Any]]) -> str:
 
 
 def _normalize_circle_cut_image(source_path: Path, output_path: Path) -> Optional[str]:
-    """Decode and normalize an untrusted image before model upload/use."""
+    """Decode and normalize an untrusted image before model use.
 
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(source_path) as image:
-                if image.format not in {"JPEG", "PNG", "WEBP", "GIF", "BMP"}:
-                    raise ValueError("unsupported image format")
-                width, height = image.size
-                if width <= 0 or height <= 0 or width * height > _MAX_CIRCLE_CUT_IMAGE_PIXELS:
-                    raise ValueError("image dimensions exceed limit")
-                image.seek(0)
-                image = ImageOps.exif_transpose(image.copy())
-                image.thumbnail(
-                    (_MAX_CIRCLE_CUT_IMAGE_EDGE, _MAX_CIRCLE_CUT_IMAGE_EDGE),
-                    Image.Resampling.LANCZOS,
-                )
-                if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
-                    rgba = image.convert("RGBA")
-                    background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-                    background.alpha_composite(rgba)
-                    image = background.convert("RGB")
-                else:
-                    image = image.convert("RGB")
-                image.save(output_path, format="JPEG", quality=88, optimize=True)
-        if output_path.stat().st_size > MAX_CIRCLE_CUT_IMAGE_BYTES:
-            raise ValueError("normalized image exceeds limit")
-        return hashlib.sha256(output_path.read_bytes()).hexdigest()
-    except (OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
+    ブラウザでは表示できるが、補助チャンク（iCCP等）のCRCが壊れたPNGをPillowは
+    既定で拒否する。まず厳密に読み、失敗したときだけ補助チャンクの破損を許容して
+    読み直す（画像本体のデータは検証されたまま）。
+    """
+
+    for tolerate_ancillary_errors in (False, True):
+        previous = ImageFile.LOAD_TRUNCATED_IMAGES
+        ImageFile.LOAD_TRUNCATED_IMAGES = tolerate_ancillary_errors
         try:
-            output_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return None
+            return _normalize_circle_cut_image_once(source_path, output_path)
+        except (OSError, ValueError, SyntaxError, Image.DecompressionBombError,
+                Image.DecompressionBombWarning):
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        finally:
+            ImageFile.LOAD_TRUNCATED_IMAGES = previous
+    return None
+
+
+def _normalize_circle_cut_image_once(source_path: Path, output_path: Path) -> str:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        with Image.open(source_path) as image:
+            if image.format not in {"JPEG", "PNG", "WEBP", "GIF", "BMP"}:
+                raise ValueError("unsupported image format")
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > _MAX_CIRCLE_CUT_IMAGE_PIXELS:
+                raise ValueError("image dimensions exceed limit")
+            image.seek(0)
+            image = ImageOps.exif_transpose(image.copy())
+            image.thumbnail(
+                (_MAX_CIRCLE_CUT_IMAGE_EDGE, _MAX_CIRCLE_CUT_IMAGE_EDGE),
+                Image.Resampling.LANCZOS,
+            )
+            if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                background.alpha_composite(rgba)
+                image = background.convert("RGB")
+            else:
+                image = image.convert("RGB")
+            image.save(output_path, format="JPEG", quality=88, optimize=True)
+    if output_path.stat().st_size > MAX_CIRCLE_CUT_IMAGE_BYTES:
+        raise ValueError("normalized image exceeds limit")
+    return hashlib.sha256(output_path.read_bytes()).hexdigest()
 
 
 def _has_site_image_credentials(site_config: SiteConfig, cookies: Any) -> bool:
@@ -281,11 +304,26 @@ class ExtractionPipeline:
         if not html_content:
             raise ValueError(f"HTMLの取得に失敗しました: {url}")
 
+        # 一覧をiframeで埋め込むサイトは、中身を展開してから前処理する
+        html_content = self._inline_list_frames(html_content, url)
+
         # 前処理
         html_content = self.adapter.preprocess_html(html_content)
 
         self.logger.info(f"HTML取得完了: {len(html_content)} 文字")
         return html_content
+
+    def _inline_list_frames(self, html: str, page_url: str) -> str:
+        """一覧が別ページのiframeにある場合、その中身を元HTMLへ展開する"""
+        merged, inlined = inline_frames(
+            html,
+            page_url,
+            self.downloader.fetch_content,
+            frame_urls=self.site_config.frame_urls or None,
+        )
+        if inlined:
+            self.logger.info(f"iframe内の一覧を取り込みました: {inlined}")
+        return merged
 
     def _fetch_all_pages(self) -> List[str]:
         """ページネーション設定に基づいて全ページのHTMLを取得"""
@@ -310,6 +348,7 @@ class ExtractionPipeline:
                 self.logger.info(f"ページ {page_num}: レスポンスなし、取得終了")
                 break
 
+            html = self._inline_list_frames(html, url)
             html = self.adapter.preprocess_html(html)
 
             # 空ページの検出（サークルデータがない場合は終了）
@@ -527,12 +566,47 @@ class ExtractionPipeline:
                 continue
             asset_by_index.setdefault(asset.circle_index, asset)
 
+        verified_hashes = {
+            image_hash
+            for image_hash, verdict in inspection.verdicts_by_hash.items()
+            if verdict.decision is True
+        }
         for circle_index, asset in asset_by_index.items():
             circle = circles[circle_index]
+            verified = asset.image_hash in verified_hashes
             circle.circle_cut = circle.circle_cut or CircleImage(
-                url=asset.url,
+                url=strip_url_query(asset.url),
                 filename=asset.image_path.name,
+                source=make_origin(
+                    KIND_SITE_CUT,
+                    verification=(
+                        "model_circle_cut"
+                        if verified
+                        else "projected_from_sampled_cohort"
+                        if inspection.sampled_orders
+                        else "unverified"
+                    ),
+                    image_sha256=asset.image_hash,
+                    candidate_order=asset.order,
+                ),
             )
+
+        # 確認済みの本来のカットは、次回以降の標準カットとして保持する（代用画像は置き換える）。
+        registered_master = 0
+        for circle_index, asset in asset_by_index.items():
+            circle = circles[circle_index]
+            if circle.circle_cut and circle.circle_cut.source and (
+                circle.circle_cut.source.get("kind") == KIND_SITE_CUT
+            ):
+                if self.circle_master.register_default_cut(
+                    circle.name,
+                    circle.penname or "",
+                    asset.image_path,
+                    kind=KIND_DEFAULT_CUT,
+                ):
+                    registered_master += 1
+        if registered_master:
+            self.logger.info(f"サークルカット {registered_master} 件を標準カットへ登録しました")
 
         # Preserve the existing default-cut fallback for missing, failed, or
         # visually rejected candidates.
@@ -543,7 +617,11 @@ class ExtractionPipeline:
                 circle.name, self.output_dir, prefix=f"{index:04d}_default_"
             )
             if default_cut_path:
-                circle.circle_cut = CircleImage(url="", filename=default_cut_path.name)
+                circle.circle_cut = CircleImage(
+                    url="",
+                    filename=default_cut_path.name,
+                    source=self._default_cut_origin(circle.name, "no_verified_site_cut"),
+                )
                 self.logger.info(f"標準カットを使用: {circle.name}")
 
         unique_hashes = {asset.image_hash for asset in assets}
@@ -702,6 +780,15 @@ class ExtractionPipeline:
             "last": dict(empty),
         }
 
+    def _default_cut_origin(self, circle_name: str, reason: str) -> Dict[str, Any]:
+        """マスターの標準カットが代用画像由来かを区別して記録する。"""
+        master_kind = self.circle_master.get_default_cut_kind(circle_name)
+        return make_origin(
+            KIND_SUBSTITUTE if master_kind == KIND_SUBSTITUTE else KIND_DEFAULT_CUT,
+            reason=reason,
+            master_kind=master_kind or "legacy_unknown",
+        )
+
     def _apply_default_cuts(self, circles: List[Circle]):
         """全サークルにデフォルトカットを適用"""
         for index, circle in enumerate(circles):
@@ -709,9 +796,11 @@ class ExtractionPipeline:
                 circle.name, self.output_dir, prefix=f"{index:04d}_default_"
             )
             if default_cut_path:
-                circle.circle_cut = type(
-                    "CircleImage", (), {"url": "", "filename": default_cut_path.name}
-                )()
+                circle.circle_cut = CircleImage(
+                    url="",
+                    filename=default_cut_path.name,
+                    source=self._default_cut_origin(circle.name, "image_fetch_skipped"),
+                )
 
     def _detect_and_save_genres(self, circles: List[Circle]):
         """item_imagesを持つサークルのおしながき画像を解析してジャンルを設定する。
@@ -774,11 +863,20 @@ class ExtractionPipeline:
                 continue
             item_path = self.output_dir / circle.item_images[0].path
             penname = circle.penname or ""
-            if self.circle_master.register_default_cut(circle.name, penname, item_path):
-                circle.circle_cut = CircleImage(
-                    url="", filename=circle.item_images[0].path
-                )
+            if self.circle_master.register_default_cut(
+                circle.name, penname, item_path, kind=KIND_SUBSTITUTE
+            ):
                 registered += 1
+            # 本来のカットが無いときだけの代用。採用元を残し、後で本物に置き換えられる。
+            circle.circle_cut = CircleImage(
+                url="",
+                filename=circle.item_images[0].path,
+                source=make_origin(
+                    KIND_SUBSTITUTE,
+                    reason="no_site_cut_found",
+                    item_image=circle.item_images[0].path,
+                ),
+            )
         if registered > 0:
             self.logger.info(
                 f"✅ {registered}サークルのおしながき画像をデフォルトカットに登録しました"
@@ -803,6 +901,18 @@ class ExtractionPipeline:
     def _format_and_save(self, circles: List[Circle], event: Event) -> Dict[str, str]:
         """データをフォーマットして保存"""
         self.logger.info("データをフォーマット中...")
+
+        # 取得の追跡情報（サークルカットの画像判定、抽出件数の突き合わせ）をevent.jsonへ残す。
+        extras: Dict[str, Any] = {}
+        if self._circle_image_validation:
+            extras["circle_cut_vision"] = self._circle_image_validation
+        coverage = getattr(self.adapter, "extraction_coverage", None)
+        extras["site_extraction"] = {
+            "adapter": type(self.adapter).__name__,
+            "extracted_count": len(circles),
+            **(coverage or {}),
+        }
+        self.formatter.metadata_extras = extras
 
         # event.jsonスキーマに変換
         data = self.formatter.format_data(circles, event)

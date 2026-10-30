@@ -143,7 +143,13 @@ def _apply_missing_circle_cut_from_catalog(
     latest_circle: Dict[str, Any],
     circle_patch: Dict[str, Any],
 ) -> None:
-    if latest_circle.get("circle_cut_filename") or circle_patch.get("circle_cut_filename"):
+    from ..utils.circle_cut_policy import KIND_SUBSTITUTE, is_substitute, make_origin
+
+    # 本来のカットが無い（または以前の代用だけの）ときだけ、おしながきで代用する。
+    existing_cut = latest_circle.get("circle_cut_filename") or circle_patch.get(
+        "circle_cut_filename"
+    )
+    if existing_cut and not is_substitute(latest_circle):
         return
 
     image_ref = ""
@@ -161,6 +167,9 @@ def _apply_missing_circle_cut_from_catalog(
         return
 
     circle_patch["circle_cut_filename"] = image_ref
+    circle_patch["circle_cut_origin"] = make_origin(
+        KIND_SUBSTITUTE, reason="no_site_cut_found", item_image=image_ref
+    )
     try:
         from ..utils.circle_master import CircleMasterManager
 
@@ -172,6 +181,7 @@ def _apply_missing_circle_cut_from_catalog(
             str(latest_circle.get("name") or ""),
             str(latest_circle.get("penname") or ""),
             image_path,
+            kind=KIND_SUBSTITUTE,
         )
     except Exception:
         # event.jsonへのサークルカット反映は継続し、マスター登録失敗は再処理全体を落とさない。

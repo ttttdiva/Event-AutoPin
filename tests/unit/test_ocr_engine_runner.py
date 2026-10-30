@@ -436,3 +436,66 @@ def test_runner_clears_stale_hf_env_for_explicit_gui_config(tmp_path, monkeypatc
     assert "HF_HUB_CACHE" not in captured["env"]
     assert captured["env"]["HF_HOME"] == "Z"
     assert captured["env"]["UNLIMITED_OCR_MODEL"] == "baidu/Unlimited-OCR"
+
+
+def test_budget_selection_keeps_numbers_only_seen_by_skipped_crops_as_supplemental(tmp_path, monkeypatch):
+    """The catalog-size budget drops a small island read only by a later crop.
+
+    Those numbers must stay out of the primary result but be offered as
+    supplemental candidates, minus overlaps, crop-border artifacts and
+    logo-sized digits.
+    """
+
+    def element(text: str, x: int, y: int, width: int = 40, height: int = 30) -> dict:
+        return {"text": text, "x1": x, "y1": y, "x2": x + width, "y2": y + height}
+
+    base_and_selected = [element(f"{number:02d}", 100 + number * 60, 100) for number in range(1, 5)]
+    skipped = [
+        element("09", 100 + 60, 100),  # overlaps selected 01 -> duplicate hypothesis
+        element("03", 900, 400, 36, 29),  # genuine small island numbers
+        element("04", 900, 450, 36, 27),
+        element("03", 802, 500, 24, 44),  # sits on the crop's left border
+        element("05", 1200, 400, 73, 129),  # logo-sized portrait digits
+    ]
+    result = {
+        "elements": base_and_selected + skipped,
+        "context_fallback": {
+            "enabled": True,
+            "call_count": 2,
+            "calls": [
+                {
+                    "tier": "A",
+                    "rectangle_index": 0,
+                    "origin": [0, 0],
+                    "size": [800, 800],
+                    "element_count": 4,
+                    "appended_element_count": 4,
+                },
+                {
+                    "tier": "A",
+                    "rectangle_index": 1,
+                    "origin": [800, 0],
+                    "size": [800, 800],
+                    "element_count": 5,
+                    "appended_element_count": 5,
+                },
+            ],
+        },
+    }
+    # base has no elements (all appended); the first call alone reaches the budget.
+    selected, info = ocr_engine._select_context_elements_by_candidate_budget(result, 4)
+    segments = info.pop("_unselected_segments")
+    selected_numbers = ocr_engine._elements_to_numbers(selected)
+    assert [item["number"] for item in selected_numbers] == ["01", "02", "03", "04"]
+
+    supplemental = ocr_engine._novel_unselected_context_candidates(
+        segments,
+        selected_numbers,
+        result["context_fallback"]["calls"],
+        (2000, 1000),
+    )
+
+    assert [(item["number"], item["x"], item["y"]) for item in supplemental] == [
+        ("03", 900, 400),
+        ("04", 900, 450),
+    ]

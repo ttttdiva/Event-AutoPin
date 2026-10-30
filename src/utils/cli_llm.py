@@ -225,7 +225,8 @@ def _build_command(
 
     if provider == "codex":
         bin_path = _resolve_cli_bin(os.getenv("CODEX_BIN", "codex"))
-        cmd = [bin_path, "exec"]
+        # read-only・ephemeralで呼ぶため、git管理外のcwdでも失敗させない
+        cmd = [bin_path, "exec", "--skip-git-repo-check"]
         effective_model = model or os.getenv("CODEX_MODEL")
         if effective_model:
             cmd.extend(["--model", effective_model])

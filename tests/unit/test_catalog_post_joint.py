@@ -43,7 +43,9 @@ def parse(raw, text=POST, count=2):
 
 
 def make_analyzer():
-    return CatalogPostAnalyzer(SimpleNamespace(attempts=build_image_llm_attempts(),
+    return CatalogPostAnalyzer(SimpleNamespace(attempts=build_image_llm_attempts(
+                                                  fallback_provider="api:openai", fallback_model=SOL,
+                                                  fallback_effort="medium"),
                                               api_clients={LUNA: object(), SOL: object()}))
 
 
@@ -51,7 +53,7 @@ def test_defaults_use_luna_max_for_text_and_images():
     assert build_text_llm_attempts()[0]["model"] == LUNA
     assert build_image_llm_attempts() == [
         {"kind": "api", "provider": "openai", "model": LUNA, "effort": "max"},
-        {"kind": "api", "provider": "openai", "model": SOL, "effort": "medium"},
+        {"kind": "cli", "provider": "grok", "model": "grok-4.7", "effort": "medium"},
     ]
     config = TwitterConfig({})
     assert (config.image_llm_provider, config.image_llm_model, config.image_llm_effort) == ("api:openai", LUNA, "max")
@@ -416,3 +418,56 @@ def test_duplicate_json_keys_are_rejected():
     response = json.dumps(result()).replace('"price": 500', '"price": 50, "price": 500')
     with pytest.raises(ValueError, match="重複"):
         CatalogPostAnalyzer.parse(response, 2, POST)
+
+
+def grok_analyzer():
+    return CatalogPostAnalyzer(SimpleNamespace(attempts=build_image_llm_attempts(),
+                                              api_clients={LUNA: object()}))
+
+
+def test_default_image_fallback_is_a_different_vendor_than_the_primary():
+    primary, fallback = build_image_llm_attempts()
+    assert (primary["kind"], primary["provider"]) == ("api", "openai")
+    assert (fallback["kind"], fallback["provider"]) == ("cli", "grok")
+    assert CatalogPostAnalyzer.supports(build_image_llm_attempts())
+    # 同じOpenAIの主+fallbackなら429で道連れ、という設定が既定に戻らないこと
+    assert text_fallback_is_distinct()
+
+
+def text_fallback_is_distinct():
+    primary, fallback = build_text_llm_attempts()
+    return (primary["kind"], primary["provider"]) != (fallback["kind"], fallback["provider"])
+
+
+def test_fallback_identical_to_primary_is_replaced_by_default_fallback():
+    attempts = build_image_llm_attempts("api:openai", SOL, "medium", "api:openai", SOL, "medium")
+    assert attempts[0]["model"] == SOL
+    assert (attempts[1]["kind"], attempts[1]["provider"]) == ("cli", "grok")
+    text = build_text_llm_attempts("api", SOL, None, None, "api:openai", SOL, "medium")
+    assert (text[1]["kind"], text[1]["provider"]) == ("cli", "codex")
+
+
+def test_explicit_other_model_fallback_is_kept():
+    attempts = build_image_llm_attempts("api:openai", LUNA, "max", "api:openai", SOL, "medium")
+    assert [a["model"] for a in attempts] == [LUNA, SOL]
+
+
+def test_openai_429_falls_back_to_grok_build_with_all_images(monkeypatch, tmp_path):
+    analyzer = grok_analyzer()
+    images = []
+    for name in ("a.png", "b.png"):
+        path = tmp_path / name
+        Image.new("RGB", (8, 8), "white").save(path)
+        images.append(path)
+    monkeypatch.setattr(analyzer, "_request", Mock(side_effect=RuntimeError("429 rate limit")))
+    sent = []
+
+    def fake_grok(prompt, **kwargs):
+        sent.append((prompt, kwargs))
+        return True, json.dumps(result(product(), catalog_image_indices=[1, 2]))
+
+    monkeypatch.setattr("src.utils.grok_build.execute_grok_build_prompt", fake_grok)
+    parsed = analyzer.analyze(images, POST)
+    assert parsed["model"] == "grok-4.7"
+    assert len(sent) == 1 and sent[0][1]["image_paths"] == images
+    assert "image_index=2" in sent[0][0]
