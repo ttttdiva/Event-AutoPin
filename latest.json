@@ -1,9 +1,9 @@
 {
   "desktop": {
-    "version": "0.1.35",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.35/EventAutoPin.exe",
-    "notes": "画像操作・再処理履歴・JSON解析・手動関連投稿抽出を更新",
-    "date": "2026-10-31"
+    "version": "0.1.37",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.37/EventAutoPin.exe",
+    "notes": "旧モバイル送信・受信方式を復元し、その他の機能を保持",
+    "date": "2026-11-01"
   },
   "mobile": {
     "version": "1.4.79",
