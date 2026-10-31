@@ -1,8 +1,8 @@
 {
   "desktop": {
-    "version": "0.1.32",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.32/EventAutoPin.exe",
-    "notes": "モバイル連携を4ボタンへ整理し、安全なZIP取り込み・中止とQR1回の比較同期に対応",
+    "version": "0.1.33",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.33/EventAutoPin.exe",
+    "notes": "ポスト解析の指定モデルと予備候補の実行順を統一し、APIモデル一覧を動的に更新",
     "date": "2026-10-31"
   },
   "mobile": {
