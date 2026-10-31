@@ -1,8 +1,8 @@
 {
   "desktop": {
-    "version": "0.1.31",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.31/EventAutoPin.exe",
-    "notes": "モバイル連携を4ボタンへ整理し、安全なローカルZIP取り込みと同期中断の再試行に対応",
+    "version": "0.1.32",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.32/EventAutoPin.exe",
+    "notes": "モバイル連携を4ボタンへ整理し、安全なZIP取り込み・中止とQR1回の比較同期に対応",
     "date": "2026-10-31"
   },
   "mobile": {
