@@ -1,8 +1,8 @@
 {
   "desktop": {
-    "version": "0.1.33",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.33/EventAutoPin.exe",
-    "notes": "ポスト解析の指定モデルと予備候補の実行順を統一し、APIモデル一覧を動的に更新",
+    "version": "0.1.34",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.34/EventAutoPin.exe",
+    "notes": "10項目以下のプルダウンを数字キーで選択し、優先度順を最優先からに統一",
     "date": "2026-10-31"
   },
   "mobile": {
