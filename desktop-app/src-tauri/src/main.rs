@@ -10226,6 +10226,20 @@ fn ack_received_upload_impl(
         .remove(&upload_id)
         .ok_or_else(|| "ack対象のuploadIdが見つかりません".to_string())?;
     drop(registry);
+    if pending.local_only && !success {
+        if let Some(stage) = &pending.import_stage {
+            let _ = fs::remove_dir_all(&stage.stage_root);
+        }
+        if let Some(stage) = &pending.event_sync_stage {
+            let _ = fs::remove_dir_all(&stage.stage_root);
+        }
+        match fs::remove_file(&pending.zip_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("local ZIP削除失敗: {error}")),
+        }
+        return Ok(json!({"status": "ok", "cancelled": true}));
+    }
     if !success {
         if let Some(stage) = &pending.import_stage {
             let _ = fs::remove_dir_all(&stage.stage_root);
@@ -11648,6 +11662,35 @@ mod received_event_sync_tests {
         assert_eq!(plan["eventName"], "Legacy Event");
         assert_eq!(plan["targetExists"], false);
         remove_pending_received_upload(&upload_id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_zip_cancel_cleans_private_zip_without_remote_ack_waiter() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let root = unique_test_root("local-zip-cancel");
+        fs::create_dir_all(root.join("events")).unwrap();
+        fs::write(root.join("circle_master.json"), br#"{"circles":{"keep":{}}}"#).unwrap();
+        let master_before = fs::read(root.join("circle_master.json")).unwrap();
+        let source = root.join("local.zip");
+        write_local_import_zip(&source, "event_local_cancel", true, None);
+        let registered = register_local_zip_import(source.to_string_lossy().to_string()).unwrap();
+        let upload_id = registered["uploadId"].as_str().unwrap().to_string();
+        let private_zip = PathBuf::from(registered["zipPath"].as_str().unwrap());
+        claim_received_upload(upload_id.clone()).unwrap();
+        let plan = plan_received_result_import(upload_id.clone(), root.to_string_lossy().to_string())
+            .unwrap();
+        assert_eq!(plan["localOnly"], true);
+        let cancelled = cancel_received_upload(
+            upload_id.clone(),
+            Some("user cancelled".to_string()),
+        )
+        .unwrap();
+        assert_eq!(cancelled["cancelled"], true);
+        assert!(!pending_received_uploads().lock().unwrap().contains_key(&upload_id));
+        assert!(!private_zip.exists());
+        assert_eq!(fs::read(root.join("circle_master.json")).unwrap(), master_before);
+        assert_eq!(fs::read_dir(root.join("events")).unwrap().count(), 0);
         let _ = fs::remove_dir_all(root);
     }
 
