@@ -1,5 +1,5 @@
 import type { ImportData } from "./types";
-import { stableSourceIdentityKeys } from "./database-core";
+import { sha256Hex, stableSourceIdentityKeys } from "./database-core";
 
 export interface SingleEventSyncUploadTarget {
   url: URL;
@@ -7,6 +7,7 @@ export interface SingleEventSyncUploadTarget {
   targetUid: string;
   targetName: string | null;
   targetDate: string | null;
+  direction: "send" | "receive";
 }
 
 function queryValue(url: URL, key: string, required = false): string | null {
@@ -62,10 +63,12 @@ export function parseSingleEventSyncUploadUrl(value: string): SingleEventSyncUpl
   }
   assertLanHttpUrl(url);
   if (url.pathname !== "/upload") throw new Error("同期QRの送信先が不正です");
-  assertAllowedQueryKeys(url, ["token", "mode", "target_uid", "target_name", "target_date"]);
+  assertAllowedQueryKeys(url, ["token", "mode", "target_uid", "target_name", "target_date", "direction"]);
   const token = queryValue(url, "token", true) as string;
   const mode = queryValue(url, "mode", true);
   const targetUid = queryValue(url, "target_uid", true) as string;
+  const direction = queryValue(url, "direction", true);
+  if (direction !== "send" && direction !== "receive") throw new Error("同期QRのdirectionが不正です");
   if (mode !== "single-event-sync") throw new Error("同期QRのmodeが不正です");
   if (token.length > 2048 || /[\u0000-\u001f\u007f]/.test(token)) {
     throw new Error("同期QRのtokenが不正です");
@@ -79,6 +82,7 @@ export function parseSingleEventSyncUploadUrl(value: string): SingleEventSyncUpl
     targetUid,
     targetName: optionalPairingText(url, "target_name"),
     targetDate: optionalPairingText(url, "target_date"),
+    direction,
   };
 }
 
@@ -217,6 +221,17 @@ export function parseSingleEventSyncSessionResponse(
   }
   if (message) return { state: "error", targetUid, downloadUrl, message, delivered };
   return { state: "unknown", targetUid, downloadUrl, message, delivered };
+}
+
+/** Validate the authenticated GET response against the QR session. */
+export function validateSingleEventSyncSession(value: string, expectedUid: string, token: string): SingleEventSyncSessionResult {
+  const result = parseSingleEventSyncSessionResponse(value, expectedUid);
+  const record = responseRecord(JSON.parse(value));
+  if (result.targetUid !== expectedUid) throw new Error("同期セッションの対象UIDが一致しません");
+  if (record.sessionId !== sha256Hex(new TextEncoder().encode(token))) {
+    throw new Error("同期セッションがQRと一致しません");
+  }
+  return result;
 }
 
 export type SyncIdentityAction = "matched" | "link-required";

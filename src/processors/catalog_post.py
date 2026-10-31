@@ -33,6 +33,24 @@ def _snapshot(circle: Any) -> Dict[str, Any]:
 
 
 def _apply(processor: Any, circle: Any, state: Dict[str, Any], post_url: str) -> None:
+    if state.get("_partial_review"):
+        # キャッシュには解析結果のみを入れ、各サークルの手編集値を適用時に守る。
+        known = {processor._catalog_item_key(item) for item in circle.items}
+        for item in copy.deepcopy(state["items"]):
+            key = processor._catalog_item_key(item)
+            if key not in known:
+                item["checked"] = 3
+                circle.items.append(item)
+                known.add(key)
+        existing_paths = {image.path for image in circle.item_images}
+        circle.item_images.extend(copy.deepcopy(image) for image in state["item_images"] if image.path not in existing_paths)
+        circle.catalog_status = "needs_recheck"
+        for note in state["review_notes"]:
+            if note not in (circle.memo or ""):
+                circle.memo = (circle.memo + "\n" if circle.memo else "") + note
+        if post_url and post_url not in (circle.memo or ""):
+            circle.memo = (circle.memo + "\n" if circle.memo else "") + post_url
+        return
     # 最新の購買状態は解析結果や他サークルのキャッシュで上書きしない。
     checked = {processor._catalog_item_key(item): item.get("checked") for item in circle.items}
     for key, value in copy.deepcopy(state).items():
@@ -125,12 +143,17 @@ async def process_post(processor: Any, circle: Any, post_text: str, media_urls: 
                  "existing_only_status": "既刊のみ" if analysis["is_existing_only"] else None,
                  "_detected_genre": processor._infer_genre_from_items(items),
                  "_product_types": list(dict.fromkeys(item["type"] for item in items if item["type"]))}
+        if manual and analysis.get("review_notes"):
+            state = {"_partial_review": True, "items": items, "item_images": state["item_images"],
+                     "review_notes": analysis["review_notes"]}
         # 全応答を検証した後で画像を公開する。非採用画像と一時ファイルは自動破棄される。
         for i in indices:
             _check(deadline)
             os.replace(paths[i - 1], processor.output_path / names[i - 1])
         _check(deadline)
         _apply(processor, circle, state, post_url)
+        if state.get("_partial_review"):
+            circle._joint_partial_state = state
         logger.info("本文と%d枚の画像から%d件の商品を同時解析しました (%s)", len(paths), len(items), analysis["model"])
         return status
 
@@ -198,6 +221,8 @@ async def process_direct_post(processor: Any, circle: Any, tweet_id: str, post_u
         processor._last_direct_post_outcome = "fetch_failed"
         return False
     staged = copy.copy(circle)
+    staged.items = copy.deepcopy(circle.items)
+    staged.item_images = copy.deepcopy(circle.item_images)
     status = await process_post(processor, staged, tweet.get("text", ""), tweet.get("media_urls", []) or [],
                                 event_name, post_url=post_url, deadline=deadline, run_id=run_id, trace=trace, manual=manual)
     _check(deadline)
@@ -205,7 +230,7 @@ async def process_direct_post(processor: Any, circle: Any, tweet_id: str, post_u
         processor._last_direct_post_outcome = "not_catalog"
         return False
     processor._last_direct_post_outcome = "adopted"
-    state = (_snapshot(staged) if status == "confirmed" else
+    state = (getattr(staged, "_joint_partial_state", None) or _snapshot(staged) if status == "confirmed" else
              {"absence_status": "欠席"} if status == "absence" else {"catalog_status": "preview"})
     _check(deadline)
     cache[key] = copy.deepcopy(state)

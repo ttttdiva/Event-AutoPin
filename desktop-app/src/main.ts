@@ -127,7 +127,6 @@ import {
 } from "./history-search-ui";
 import { mergeCommittedEventMetaPreservingUnknown } from "./state/event-meta-merge";
 import {
-  buildEventSyncPreview,
   eventSyncFingerprintsMatch,
   type EventSyncChangeKind,
   type EventSyncPreview,
@@ -8936,6 +8935,7 @@ type DesktopEventSyncSession = {
   phase: EventSyncPhase;
   targetSlug: string;
   targetDir: string;
+  direction: "send" | "receive";
   targetUid: string | null;
   sessionId?: string;
   targetName: string;
@@ -9018,9 +9018,9 @@ function handleEventSyncSessionState(payload: EventSyncSessionStatePayload): voi
     setEventSyncStage("eventSyncPcFollowup", true);
     const followupStatus = document.getElementById("eventSyncPcFollowupStatus");
     if (followupStatus) {
-      followupStatus.textContent = "PCのZIPを同じ同期接続で送信しました。モバイル側の差分確認と適用を待っています。";
+      followupStatus.textContent = "PCのデータをモバイルへ送信しています。反映の完了を待っています。";
     }
-    setEventSyncStatus("PC側のデータを送信しました。モバイル側の確認・適用を待っています…");
+    setEventSyncStatus("PC側のデータを送信しました。モバイル側の反映完了を待っています…");
     return;
   }
   if (state !== "mobile-applied" && state !== "cancelled" && state !== "error") return;
@@ -9278,14 +9278,6 @@ async function ensureSelectedEventSyncUid(expectedSlug: string, expectedDir: str
         const prepared = prepareFullSyncEventDocument(bundle.data, createDesktopEventUid);
         uid = prepared.eventUid;
         if (!prepared.changed) return;
-        const confirmed = window.confirm(
-          `同期用UIDの登録を確認してください。\n\n` +
-            `対象: ${owner.meta.name || owner.slug}\n` +
-            "このイベントに端末間の同定用UIDだけを登録します。登録したUIDは、あとで同期を中断しても残ります。\n" +
-            "登録処理で既存のイベント内容を置き換えることはありません。\n\n" +
-            "UIDを登録して比較同期を開始しますか？",
-        );
-        if (!confirmed) throw new EventSyncUidRegistrationDeclined();
         const beforeSave = await invoke<{ modified_ms?: number; file_size?: number }>(
           "event_file_fingerprint",
           { eventJson: eventJsonPath },
@@ -9382,7 +9374,7 @@ async function cleanupEventSyncOutboundFile(syncSession: DesktopEventSyncSession
   }
 }
 
-async function startDesktopEventSync(): Promise<void> {
+async function startDesktopEventSync(direction: "send" | "receive"): Promise<void> {
   if (activeEventSyncSession) return;
   if (mobileTransferBusyKind) {
     setEventSyncStatus(
@@ -9405,6 +9397,7 @@ async function startDesktopEventSync(): Promise<void> {
     phase: "starting",
     targetSlug: owner.slug,
     targetDir: normalizeEventPath(owner.dir),
+    direction,
     targetUid: null,
     targetName: owner.meta.name || owner.slug,
     outboundServerStarted: false,
@@ -9448,7 +9441,9 @@ async function startDesktopEventSync(): Promise<void> {
     const sessionId = typeof response.sessionId === "string" ? response.sessionId.trim() : "";
     if (!sessionId) throw new Error("比較同期のsession IDを受け取れませんでした。");
     session.sessionId = sessionId;
-    session.sessionUrl = response.url;
+    const pairingUrl = new URL(response.url);
+    pairingUrl.searchParams.set("direction", direction);
+    session.sessionUrl = pairingUrl.toString();
     const responseExpirySeconds = Number(response.expiresInSeconds);
     if (Number.isFinite(responseExpirySeconds) && responseExpirySeconds > 0) {
       session.pairingExpiresInSeconds = responseExpirySeconds;
@@ -9460,13 +9455,13 @@ async function startDesktopEventSync(): Promise<void> {
       ? `QRの有効期限: 約${Math.ceil(expirySeconds / 60)}分`
       : "QRの有効期限: サーバー側の期限管理中";
     eventSyncElement<HTMLElement>("eventSyncPairingTarget").textContent =
-      `対象: ${session.targetName}（UID ${session.targetUid}）。別イベントのZIPはこの比較に使われません。${expiryLabel}`;
-    eventSyncElement<HTMLElement>("eventSyncQrUrl").textContent = response.url;
+      `対象: ${session.targetName}。${direction === "send" ? "PCから送信" : "PCで受信"}します。${expiryLabel}`;
+    eventSyncElement<HTMLElement>("eventSyncQrUrl").textContent = "";
     eventSyncElement<HTMLElement>("eventSyncQrExpiry").textContent = expiryLabel;
     const QRCode = (await import("qrcode")).default;
-    await QRCode.toCanvas(eventSyncElement<HTMLCanvasElement>("eventSyncQrCanvas"), response.url, { width: 256, margin: 2 });
+    await QRCode.toCanvas(eventSyncElement<HTMLCanvasElement>("eventSyncQrCanvas"), session.sessionUrl, { width: 256, margin: 2 });
     setEventSyncStage("eventSyncPairing", true);
-    setEventSyncStatus(`QRを読み取り、モバイル側からこのイベントのデータを送信してください。（${expiryLabel}）`);
+    setEventSyncStatus(`モバイル側で${direction === "send" ? "受信" : "送信"}を選び、このQRを読み取ってください。（${expiryLabel}）`);
     logToFile(`比較同期: QR待機開始 slug=${session.targetSlug} uid=${session.targetUid}`);
   } catch (error) {
     if (activeEventSyncSession === session) activeEventSyncSession = null;
@@ -9608,19 +9603,10 @@ async function handleReceivedEventSyncUpload(payload: {
     session.targetSlug = preview.targetSlug;
     session.fingerprint = preview.fingerprint;
     session.phase = "preview";
-    const diff = buildEventSyncPreview(preview.desktopData, preview.mobileData, preview.assetDiff);
-    eventSyncElement<HTMLElement>("eventSyncPreviewTarget").textContent =
-      `対象: ${session.targetName}（${preview.targetSlug} / UID ${session.targetUid}）。PCとモバイルの差分を確認してください。`;
-    renderEventSyncPreview(diff);
-    resetEventSyncSourceChoice();
     setEventSyncStage("eventSyncPairing", false);
-    setEventSyncStage("eventSyncPreview", true);
-    setEventSyncStatus(`差分 ${diff.total}件を表示しています。同期元を選び、確認欄にチェックしてください。`);
-    logToFile(`比較同期: preview slug=${preview.targetSlug} diff=${diff.total} upload=${uploadId}`);
-
-    const choice = await waitForEventSyncChoice(session);
-    session.resolveChoice = undefined;
-    if (choice === "cancel" || session.cancelRequested) {
+    setEventSyncStatus("対象イベントを確認しました。選択した方向に同期しています…");
+    const choice: EventSyncChoice = session.direction === "send" ? "desktop" : "mobile";
+    if (session.cancelRequested) {
       await cancelEventSyncUpload(uploadId, "ユーザーが差分確認後に比較同期を中断しました");
       try { await invoke("stop_receive_server"); } catch { /* best effort */ }
       if (activeEventSyncSession === session) activeEventSyncSession = null;
@@ -9785,8 +9771,8 @@ async function handleReceivedEventSyncUpload(payload: {
       setEventSyncStage("eventSyncPcFollowup", true);
       setEventSyncStage("eventSyncPreview", false);
       eventSyncElement<HTMLElement>("eventSyncPcFollowupStatus").textContent =
-        "PC側のZIPを同じ同期接続で送信しました。モバイル側の差分確認と適用を待っています。";
-      setEventSyncStatus("PC側のデータを送信しました。モバイル側の確認・適用を待っています…", "success");
+        "PC側のデータを送信しました。モバイル側の反映完了を待っています。";
+      setEventSyncStatus("PC側のデータを送信しました。モバイル側の反映完了を待っています…", "success");
       resultEl.textContent = `比較同期: PC側を正として同じ接続で送信中\n対象: ${target.meta.name || target.slug}`;
       logToFile(`比較同期: desktopを正として同一session送信 slug=${target.slug} upload=${uploadId}`);
       const terminalState = await waitForEventSyncTerminal(session);
@@ -9842,8 +9828,15 @@ async function handleReceivedEventSyncUpload(payload: {
 }
 
 document.getElementById("startEventSyncBtn")?.addEventListener("click", () => {
-  void startDesktopEventSync();
+  setEventSyncStage("eventSyncDirection", true);
 });
+for (const direction of ["send", "receive"] as const) {
+  document.getElementById(direction === "send" ? "eventSyncSendBtn" : "eventSyncReceiveBtn")?.addEventListener("click", () => {
+    setEventSyncStage("eventSyncDirection", false);
+    void startDesktopEventSync(direction);
+  });
+}
+document.getElementById("eventSyncDirectionCancelBtn")?.addEventListener("click", () => setEventSyncStage("eventSyncDirection", false));
 document.getElementById("cancelEventSyncBtn")?.addEventListener("click", () => {
   void requestCancelDesktopEventSync();
 });

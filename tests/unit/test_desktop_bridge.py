@@ -1787,6 +1787,28 @@ class TestReprocessCircleFromPost:
         assert result["circle_patch"]["items"] == [{"name": "New Book", "price": 500}]
         assert result["updated_circle"]["catalog_status"] == "confirmed"
 
+    def test_direct_post_review_memo_reaches_patch(self, tmp_path, monkeypatch):
+        event_json = tmp_path / "event.json"
+        original = {"event": {"name": "Event"}, "circles": [{"name": "Circle A", "memo": "手編集", "items": []}]}
+        event_json.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+        import src.processors.twitter_post_processor as tpp
+
+        class FakeProcessor:
+            def __init__(self, _config):
+                pass
+
+            async def process_circle_from_post_url(self, circle, *_args, **_kwargs):
+                circle.memo += "\n要確認: 商品名未確定: 判読不能"
+                circle.catalog_status = "needs_recheck"
+                return True
+
+        monkeypatch.setattr(tpp, "TwitterPostProcessor", FakeProcessor)
+        result = _job_reprocess_circle_from_post({"event_json": str(event_json), "circle_index": 0,
+            "post_url": "https://x.com/user/status/1234567890", "output_dir": str(tmp_path), "project_root": str(tmp_path)})
+        assert "手編集\n要確認: 商品名未確定: 判読不能" in result["circle_patch"]["memo"]
+        assert result["circle_patch"]["catalog_status"] == "needs_recheck"
+        assert json.loads(event_json.read_text(encoding="utf-8")) == original
+
     def test_direct_post_absence_is_returned_without_losing_goods(self, tmp_path, monkeypatch):
         event_json = tmp_path / "event.json"
         original = {"event": {"name": "Event"}, "circles": [{"name": "Circle A", "items": [{"name": "old", "checked": 1}], "absence_status": None}]}

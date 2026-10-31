@@ -13,7 +13,7 @@ import {
 } from "./single-event-sync";
 import type { ImportData } from "./types";
 
-const base = "http://192.168.1.25:43123/upload?token=secret&mode=single-event-sync&target_uid=event-a&target_name=Test&target_date=2026-10-31";
+const base = "http://192.168.1.25:43123/upload?token=secret&mode=single-event-sync&target_uid=event-a&target_name=Test&target_date=2026-10-31&direction=receive";
 
 export function runSingleEventSyncTests(): void {
   const upload = parseSingleEventSyncUploadUrl(base);
@@ -52,6 +52,9 @@ export function runSingleEventSyncTests(): void {
     base.replace("&mode=single-event-sync", ""),
     base.replace("&target_uid=event-a", ""),
     `${base}&unexpected=1`,
+    base.replace("&direction=receive", ""),
+    base.replace("direction=receive", "direction=sideways"),
+    `${base}&direction=send`,
   ];
   for (const [index, rejected] of rejectedUrls.entries()) {
     let accepted = false;

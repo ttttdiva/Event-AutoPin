@@ -257,6 +257,32 @@ async function runDatabaseSingleEventSyncTests() {
       eventArchive("Target from PC", "maps/pc-map.png", 0),
       { "maps/pc-map.png": "new-image-bytes" },
     );
+    // Synthetic desktop QR and authenticated session share the real mobile parser
+    // and the SQLite/ZIP fixture below. The desktop adds direction to its URL.
+    const contract = require("./single-event-sync");
+    const sessionToken = "contract-token";
+    const sessionId = crypto.createHash("sha256").update(sessionToken).digest("hex");
+    const serverUrl = `http://192.168.1.25:43123/upload?token=${sessionToken}&mode=single-event-sync&target_uid=uid-target&target_name=Target&target_date=2026-10-31`;
+    const makeDesktopQr = (direction) => {
+      const pairingUrl = new URL(serverUrl);
+      pairingUrl.searchParams.set("direction", direction);
+      return pairingUrl.toString();
+    };
+    for (const direction of ["send", "receive"]) {
+      const qr = contract.parseSingleEventSyncUploadUrl(makeDesktopQr(direction));
+      assert.equal(qr.direction, direction);
+      const pending = JSON.stringify({ state: "pending", target_uid: qr.targetUid, sessionId });
+      assert.equal(contract.validateSingleEventSyncSession(pending, qr.targetUid, qr.token).state, "pending");
+      assert.throws(() => contract.validateSingleEventSyncSession(pending, qr.targetUid, "wrong"));
+      if (direction === "receive") {
+        const terminal = JSON.stringify({ state: "mobile-applied", target_uid: qr.targetUid, sessionId });
+        assert.equal(contract.validateSingleEventSyncSession(terminal, qr.targetUid, qr.token).state, "mobile-applied");
+      } else {
+        const download = `http://192.168.1.25:43124/mobile_export.zip?token=outbound&mode=single-event-sync&target_uid=${qr.targetUid}`;
+        const ready = JSON.stringify({ state: "pc-ready", target_uid: qr.targetUid, sessionId, download_url: download });
+        assert.equal(contract.validateSingleEventSyncSession(ready, qr.targetUid, qr.token).downloadUrl, download);
+      }
+    }
     const firstPreview = await db.previewSingleEventSyncZip(firstZip, 1, "uid-target");
     const firstResult = await db.applySingleEventSyncZip(
       firstZip,
@@ -264,6 +290,10 @@ async function runDatabaseSingleEventSyncTests() {
       "uid-target",
       firstPreview.revision,
     );
+    // Model the completion acknowledgement only after the actual SQLite apply.
+    const ack = { mode: "single-event-sync", target_uid: firstResult.eventUid, state: "mobile-applied" };
+    assert.deepEqual(ack, { mode: "single-event-sync", target_uid: "uid-target", state: "mobile-applied" });
+    assert.equal(contract.validateSingleEventSyncSession(JSON.stringify({ ...ack, sessionId }), ack.target_uid, sessionToken).state, "mobile-applied");
     assert.equal(firstResult.eventId, 1);
     assert.deepEqual(firstResult.diff.changedEventIds, [1]);
     assert.equal((await database.getFirstAsync("SELECT name FROM events WHERE id = 1")).name, "Target from PC");

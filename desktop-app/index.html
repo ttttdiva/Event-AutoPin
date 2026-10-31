@@ -649,7 +649,7 @@
                 aria-labelledby="mobileTransferHelpTrigger"
                 hidden
               >
-                ①両端末で同じイベントを選び、「モバイルと同期」でQRを1回読み取ります。モバイル→PC反映はPC側で採用を確定し、PC→モバイル反映はモバイル側で最終確認します（再読取不要）。②全イベント同期は既存のPCデータをモバイルへ送ります。③ZIPエクスポートは選択イベントを書き出します。④ZIPインポートは単一イベントだけを取り込み、共有設定は除外します（全イベントbundleは対象外）。通信はHTTPで暗号化されないため、同一の信頼できるLAN・private IPv4の同一/24内でのみ使用してください。QRの有効期限は約20分で、同期用UIDの登録は中止後も残ります。
+                ①モバイルに送信は選択イベントのZIPをPCから配信します。モバイル側で受信を選びQRを読み取ってください。②モバイルから受信はPCに表示したQRをモバイル側の送信で読み取ります。③全イベント同期はPCの全イベントをモバイルへ送ります。④ZIPエクスポート・インポートは選択イベントのファイル操作です。通信は暗号化されないHTTPのため、同一の信頼できるLAN・private IPv4の同一/24内で使用してください。
               </span>
             </span>
           </h2>
@@ -662,8 +662,11 @@
             <div class="event-sync-default">
               <span id="eventSyncTarget" class="event-sync-target" hidden></span>
               <div class="event-sync-actions" role="group" aria-label="モバイル連携操作">
-                <button id="startEventSyncBtn" type="button" class="btn-primary event-sync-action event-sync-action-primary" disabled>
-                  モバイルと同期
+                <button id="sendToMobileBtn" type="button" class="btn-primary event-sync-action event-sync-action-primary">
+                  モバイルに送信
+                </button>
+                <button id="importResultBtn" type="button" class="btn-secondary event-sync-action">
+                  モバイルから受信
                 </button>
                 <button id="sendFullSyncToMobileBtn" type="button" class="btn-secondary event-sync-action font-semibold">
                   全イベント同期
@@ -675,7 +678,15 @@
                   ZIPインポート
                 </button>
               </div>
+              <p class="event-sync-warning">通信は暗号化されません。同一の信頼できるLAN・private IPv4の同一/24内で使用してください。</p>
               <span id="eventSyncStatus" class="event-sync-status" role="status" aria-live="polite" hidden></span>
+            </div>
+            <div id="eventSyncDirection" class="event-sync-stage hidden">
+              <h4>送信・受信を選択</h4>
+              <p class="event-sync-warning">選択した側の対象イベントを受信側に反映します。受信側の対象イベントはバックアップされます。</p>
+              <button id="eventSyncSendBtn" type="button" class="btn-primary px-4 py-2 rounded">送信（PC → モバイル）</button>
+              <button id="eventSyncReceiveBtn" type="button" class="btn-secondary px-4 py-2 rounded">受信（モバイル → PC）</button>
+              <button id="eventSyncDirectionCancelBtn" type="button" class="btn-secondary px-3 py-2 rounded">戻る</button>
             </div>
             <div id="eventSyncPairing" class="event-sync-stage hidden">
               <h4>1. QRでモバイルとペアリング</h4>
@@ -685,7 +696,7 @@
                 <div id="eventSyncQrUrl" class="text-xs break-all"></div>
                 <p id="eventSyncQrExpiry" class="form-hint" role="note"></p>
               </div>
-              <p class="form-hint">モバイルアプリでこのQRを読み取り、対象イベントのZIPを送信してください。通信中はこの画面を開いたままにしてください。</p>
+              <p class="form-hint">モバイルアプリで対応する方向を選び、このQRを読み取ってください。通信中はこの画面を開いたままにしてください。</p>
               <button id="cancelEventSyncBtn" type="button" class="btn-secondary px-3 py-1.5 rounded">同期を中断</button>
             </div>
             <div id="eventSyncPreview" class="event-sync-stage hidden">
@@ -710,12 +721,8 @@
             </div>
             <div id="eventSyncPcFollowup" class="event-sync-stage hidden" role="status" aria-live="polite">
               <h4>PC側のデータをモバイルへ適用</h4>
-              <p id="eventSyncPcFollowupStatus">同じ同期接続でPC側のZIPをモバイルへ送信します。モバイル側で差分を確認し、明示的に適用してください。</p>
+              <p id="eventSyncPcFollowupStatus">同じ同期接続でPC側のデータをモバイルへ送信しています。</p>
             </div>
-          </div>
-          <div id="mobileTransferLegacyControls" hidden aria-hidden="true">
-            <button id="sendToMobileBtn" type="button">旧方式: PCからモバイルへ送る</button>
-            <button id="importResultBtn" type="button">バックアップZIPを受信</button>
           </div>
           <div id="qrCodeArea" class="hidden text-center mt-4">
             <canvas id="qrCanvas" class="mx-auto"></canvas>

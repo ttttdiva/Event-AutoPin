@@ -183,6 +183,7 @@ shopping-app/lib/performance-core.ts
 shopping-app/lib/performance.ts
 shopping-app/lib/priority-color-context.tsx
 shopping-app/lib/priority-colors.ts
+shopping-app/lib/qr-auto-sync.test.js
 shopping-app/lib/settings-store.ts
 shopping-app/lib/settings-store-model.test.ts
 shopping-app/lib/model-catalog.ts

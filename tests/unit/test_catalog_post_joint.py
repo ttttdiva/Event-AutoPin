@@ -714,3 +714,78 @@ def test_openai_429_falls_back_to_grok_build_with_all_images(monkeypatch, tmp_pa
     assert parsed["model"] == "grok-4.7"
     assert len(sent) == 1 and sent[0][1]["image_paths"] == images
     assert "image_index=2" in sent[0][0]
+
+def test_manual_partial_review_preserves_existing_and_cache_per_circle(tmp_path, monkeypatch):
+    raw = result(product(name="確定品"), product(name="不確定品", needs_review=True, review_reason="価格が読めない"))
+    processor, requests, _, _ = prepare_processor(tmp_path, monkeypatch, [raw])
+    first = Circle(name="first", items=[{"name": "不確定品", "type": "新刊(漫画)", "price": 123, "checked": 1, "description": "手編集"}, {"name": "追加品", "price": 9}])
+    second = Circle(name="second", items=[{"name": "不確定品", "type": "新刊(漫画)", "price": 456, "checked": 2}])
+    for circle in (first, second):
+        assert asyncio.run(processor.process_circle_from_post_url(circle, URL, "event"))
+        assert circle.catalog_status == "needs_recheck"
+        assert "価格が読めない" in circle.memo
+        assert any(item["name"] == "確定品" and item["price"] == 500 for item in circle.items)
+    assert first.items[0]["price"] == 123 and first.items[0]["description"] == "手編集" and first.items[0]["checked"] == 1
+    assert first.items[1]["name"] == "追加品"
+    assert second.items[0]["price"] == 456 and second.items[0]["checked"] == 2
+    assert len(requests) == 1
+
+
+def test_manual_all_review_and_missing_price_are_not_free(tmp_path, monkeypatch):
+    raw = result(product(needs_review=True, review_reason="500か5000か不明", price_text="¥500/¥5000"),
+                 product(name="価格なし", price=0, price_basis="not_shown", price_text="", price_image_index=None),
+                 product(name="無料", price=0, price_basis="free_explicit", price_text="無料"))
+    processor, _, _, _ = prepare_processor(tmp_path, monkeypatch, [raw])
+    circle = Circle(name="circle")
+    assert asyncio.run(processor.process_circle_from_post_url(circle, URL))
+    assert circle.catalog_status == "needs_recheck"
+    assert {i["name"]: i["price"] for i in circle.items} == {"新刊A": None, "価格なし": None, "無料": 0}
+    assert "500か5000か不明" in circle.memo and "価格未記載" in circle.memo
+
+
+def test_manual_unrepresentable_review_is_visible(tmp_path, monkeypatch):
+    raw = result(product(name="", needs_review=True, review_reason="判読不能"))
+    processor, _, _, _ = prepare_processor(tmp_path, monkeypatch, [raw])
+    circle = Circle(name="circle", items=[{"name": "既存", "price": 100}])
+    assert asyncio.run(processor.process_circle_from_post_url(circle, URL))
+    assert circle.items == [{"name": "既存", "price": 100}]
+    assert circle.catalog_status == "needs_recheck" and "判読不能" in circle.memo
+
+def test_partial_review_failed_staging_keeps_original_lists(tmp_path, monkeypatch):
+    raw = result(product(needs_review=True, review_reason="価格不明"))
+    processor, _, _, _ = prepare_processor(tmp_path, monkeypatch, [raw])
+    circle = Circle(name="circle", items=[{"name": "既存", "price": 100}], item_images=[ItemImage(path="old.png")])
+    before = copy.deepcopy(circle.__dict__)
+    original_apply = catalog_post._apply
+
+    def fail_after_staging(processor, target, state, post_url):
+        original_apply(processor, target, state, post_url)
+        if state.get("_partial_review"):
+            raise RuntimeError("stage failure")
+
+    monkeypatch.setattr(catalog_post, "_apply", fail_after_staging)
+    with pytest.raises(RuntimeError, match="stage failure"):
+        asyncio.run(processor.process_circle_from_post_url(circle, URL))
+    assert circle.__dict__ == before
+    assert processor._joint_post_cache == {}
+
+
+@pytest.mark.parametrize("review_first", [True, False])
+def test_manual_review_duplicate_keeps_confirmed_and_reason(review_first):
+    confirmed = product()
+    uncertain = product(needs_review=True, review_reason="価格が不明")
+    items = [uncertain, confirmed] if review_first else [confirmed, uncertain]
+    parsed = CatalogPostAnalyzer.parse(json.dumps(result(*items), ensure_ascii=False), 2, POST, manual=True)
+    assert len(parsed["items"]) == 1 and parsed["items"][0]["price"] == 500
+    assert "価格が不明" in parsed["review_notes"][0]
+
+
+def test_manual_review_price_evidence_and_schema():
+    items = [product(name="仮題", needs_review=True, review_reason="題名不明"),
+             product(name="対応不明", needs_review=True, review_reason="対応不明", price_text="¥500/¥1000")]
+    parsed = CatalogPostAnalyzer.parse(json.dumps(result(*items), ensure_ascii=False), 2, POST, manual=True)
+    assert [item["price"] for item in parsed["items"]] == [500, None]
+    for changes in ({"price_text": None}, {"price_image_index": 99}, {"price_basis": "invalid"}, {"price": "500"}):
+        bad = product(needs_review=True, review_reason="要確認", **changes)
+        with pytest.raises(ValueError):
+            CatalogPostAnalyzer.parse(json.dumps(result(bad), ensure_ascii=False), 2, POST, manual=True)

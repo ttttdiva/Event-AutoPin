@@ -452,16 +452,29 @@ not_shownの場合だけprice_text=""かつprice_image_index=null。本文由来
             raise ValueError("商品と分類が矛盾しています")
         normalized = []
         by_key = {}
+        review_by_key = {}
+        review_notes = []
         for item in items:
             if not isinstance(item, dict):
                 raise ValueError("商品はobjectが必要です")
             name = item.get("name")
-            if not isinstance(name, str) or not name.strip():
+            review = item.get("needs_review")
+            if type(review) is not bool:
+                raise ValueError("needs_reviewには真偽値が必要です")
+            reason = item.get("review_reason", "")
+            if review and manual:
+                if not isinstance(reason, str):
+                    raise ValueError("要確認理由が不正です")
+                review_notes.append(f"要確認: {name if isinstance(name, str) and name.strip() else '商品名未確定'}: {reason.strip() or '詳細未確定'}")
+            unrepresentable = (not isinstance(name, str) or not name.strip()
+                               or not isinstance(item.get("type"), str) or item.get("type") not in cls.ITEM_TAGS
+                               or not isinstance(item.get("sale_kind"), str) or item.get("sale_kind") not in {"single", "set"})
+            if not (review and manual) and (not isinstance(name, str) or not name.strip()):
                 raise ValueError("商品名が未確定です")
-            if (not isinstance(item.get("type"), str) or item["type"] not in cls.ITEM_TAGS
+            if not (review and manual) and (not isinstance(item.get("type"), str) or item["type"] not in cls.ITEM_TAGS
                     or not isinstance(item.get("sale_kind"), str) or item["sale_kind"] not in {"single", "set"}):
                 raise ValueError("商品種別またはセット区分が不正です")
-            if type(item.get("needs_review")) is not bool or item["needs_review"]:
+            if review and not manual:
                 raise ValueError(f"要再確認の商品: {name}: {item.get('review_reason', '')}")
             refs = indices(item.get("source_image_indices"))
             evidence = item.get("text_evidence")
@@ -473,10 +486,10 @@ not_shownの場合だけprice_text=""かつprice_image_index=null。本文由来
                 raise ValueError(f"商品根拠画像がcatalog_image_indicesにありません: {name}")
             price, basis, quote = item.get("price"), item.get("price_basis"), item.get("price_text")
             price_index = item.get("price_image_index")
-            if type(price) is not int or price < 0 or not isinstance(quote, str):
+            if not isinstance(quote, str) or (price is not None and (type(price) is not int or price < 0)):
                 raise ValueError(f"価格の形式が不正です: {name}")
             if basis == "not_shown":
-                if price != 0 or quote != "" or price_index is not None:
+                if (price != 0 and not (manual and price is None)) or quote != "" or price_index is not None:
                     raise ValueError(f"価格未記載の根拠が不正です: {name}")
             else:
                 if type(price_index) is not int or not 0 <= price_index <= image_count or not quote.strip():
@@ -499,16 +512,27 @@ not_shownの場合だけprice_text=""かつprice_image_index=null。本文由来
                         amount = Decimal(first or second) * {"万": 10000, "千": 1000}.get(first_unit or second_unit, 1)
                         if amount == amount.to_integral_value():
                             amounts.add(int(amount))
-                    if price <= 0 or amounts != {price}:
-                        raise ValueError(f"価格と原文の数字が一致しません: {name}")
+                    if type(price) is not int or price <= 0 or amounts != {price}:
+                        if review and manual and len(amounts) > 1 and price in amounts:
+                            price = None
+                        else:
+                            raise ValueError(f"価格と原文の数字が一致しません: {name}")
                 elif basis == "free_explicit":
                     if price != 0 or not re.search(r"無料|無配|無償|\bfree\b|(?<!\d)0\s*円", canonical, re.I):
                         raise ValueError(f"無料の明記がありません: {name}")
                 else:
                     raise ValueError(f"price_basisが不正です: {name}")
+            if review and manual and re.search(r"価格|値段|料金", reason) and re.search(r"不明|未確定|読めない|判読|わからない|分からない|対応.*(?:ない|不明)", reason):
+                price = None
+            if manual and basis == "not_shown":
+                price = None
+                if not review:
+                    review_notes.append(f"要確認: {name}: 価格未記載")
             description = item.get("description", "")
             if not isinstance(description, str):
                 raise ValueError(f"商品説明の形式が不正です: {name}")
+            if unrepresentable:
+                continue
             normalized_item = {"name": name.strip(), "type": item["type"], "price": price,
                                "description": description, "sale_kind": item["sale_kind"],
                                "catalog_evidence": {"image_indices": refs, "text": evidence,
@@ -516,6 +540,13 @@ not_shownの場合だけprice_text=""かつprice_image_index=null。本文由来
             key = (re.sub(r"\s+", "", unicodedata.normalize("NFKC", name)).lower(), item["type"], item["sale_kind"])
             if key in by_key:
                 previous = by_key[key]
+                if manual and (review or review_by_key[key]):
+                    # 要確認の重複は矛盾の確定根拠にせず、理由をメモに残す。
+                    if review_by_key[key] and not review:
+                        normalized[normalized.index(previous)] = normalized_item
+                        by_key[key] = normalized_item
+                        review_by_key[key] = False
+                    continue
                 if previous["price"] != price or previous["catalog_evidence"]["price_basis"] != basis:
                     raise ValueError(f"重複商品の価格が矛盾しています: {name}")
                 previous["catalog_evidence"]["image_indices"] = sorted(set(previous["catalog_evidence"]["image_indices"] + refs))
@@ -525,9 +556,12 @@ not_shownの場合だけprice_text=""かつprice_image_index=null。本文由来
                     previous["catalog_evidence"].update(price_text=quote, price_image_index=0)
             else:
                 by_key[key] = normalized_item
+                review_by_key[key] = review
                 normalized.append(normalized_item)
         result = {"classification": classification, "is_existing_only": raw["is_existing_only"], "catalog_image_indices": catalog_indices,
                   "items": normalized}
+        if manual and review_notes:
+            result["review_notes"] = review_notes
         if not manual:
             result.update(classification=classification, event_match=raw["event_match"])
         return result

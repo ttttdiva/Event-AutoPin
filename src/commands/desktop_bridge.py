@@ -2312,8 +2312,11 @@ def _job_reprocess_circle_from_post_impl(
 
     # memoにポストURLを追記（成功したrunだけ。失敗runはpatchを返さない）
     existing_memo = circle_dict.get("memo", "") or ""
-    if post_url not in existing_memo:
-        circle_patch["memo"] = (existing_memo + "\n" + post_url) if existing_memo else post_url
+    result_memo = circle_obj.memo or existing_memo
+    if post_url not in result_memo:
+        result_memo = (result_memo + "\n" + post_url) if result_memo else post_url
+    if result_memo != existing_memo:
+        circle_patch["memo"] = result_memo
 
     if deadline is not None:
         deadline.require_time(stage="python.return")

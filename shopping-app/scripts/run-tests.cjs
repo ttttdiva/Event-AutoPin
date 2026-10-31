@@ -36,6 +36,7 @@ const testCases = [
   ["lib/priority-row-theme.test.ts", "runPriorityRowThemeTests"],
   ["lib/statusbar-appearance.test.js", "runStatusBarAppearanceTests"],
   ["lib/single-event-sync.test.ts", "runSingleEventSyncTests"],
+  ["lib/qr-auto-sync.test.js", "runQrAutoSyncTests"],
   ["lib/theme-appearance.test.ts", "runThemeAppearanceTests"],
   ["lib/text-collation.test.ts", "runTextCollationTests"],
   ["lib/update-service.test.js"],
