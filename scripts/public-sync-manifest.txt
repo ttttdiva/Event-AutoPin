@@ -34,6 +34,8 @@ desktop-app/src/state/cookie-drop.ts
 desktop-app/src/state/event-document.ts
 desktop-app/src/state/event-document-ownership.test.ts
 desktop-app/src/state/event-document-save-flow.test.ts
+desktop-app/src/state/event-sync-preview.test.ts
+desktop-app/src/state/event-sync-preview.ts
 desktop-app/src/state/event-meta-merge.test.ts
 desktop-app/src/state/event-meta-merge.ts
 desktop-app/src/state/event-reload-ownership.test.ts
@@ -149,6 +151,7 @@ shopping-app/lib/crawl/vision-analyzer.ts
 shopping-app/lib/database-core.test.ts
 shopping-app/lib/database-filesystem.test.ts
 shopping-app/lib/database-instrumentation.test.ts
+shopping-app/lib/database-single-event-sync.test.js
 shopping-app/lib/database-lifetime.test.ts
 shopping-app/lib/database-shared-settings.test.ts
 shopping-app/lib/database-core.ts
@@ -162,6 +165,8 @@ shopping-app/lib/map-pin-layout.test.ts
 shopping-app/lib/map-pin-layout.ts
 shopping-app/lib/map-viewport-transform.test.ts
 shopping-app/lib/map-viewport-transform.ts
+shopping-app/lib/single-event-sync.test.ts
+shopping-app/lib/single-event-sync.ts
 shopping-app/lib/mutation-epoch.test.ts
 shopping-app/lib/mutation-epoch.ts
 shopping-app/lib/import-helpers.ts
@@ -287,6 +292,7 @@ tests/unit/test_circle_master.py
 tests/unit/test_date_utils.py
 tests/unit/test_desktop_release_gate.py
 tests/unit/test_desktop_bridge.py
+tests/unit/test_desktop_mobile_zip_security.py
 tests/unit/test_grok_build.py
 tests/unit/test_grok_rescue.py
 tests/unit/test_generic_adapter.py

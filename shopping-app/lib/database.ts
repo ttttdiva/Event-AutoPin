@@ -1,7 +1,7 @@
 import * as SQLite from "expo-sqlite";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
-import { unzip, zip as zipDirectory } from "react-native-zip-archive";
+import { getUncompressedSize, unzip, zip as zipDirectory } from "react-native-zip-archive";
 import type {
   Event,
   EventMap,
@@ -42,6 +42,12 @@ import {
   shouldRollbackPublishedFiles,
   type ImportPublishPhase,
 } from "./database-core";
+import {
+  buildSingleEventSyncDiff,
+  singleEventSyncImageRefs,
+  type SingleEventSyncDiff,
+  type SyncImageFingerprints,
+} from "./single-event-sync";
 
 const DB_NAME = "doujin_shopping.db";
 const LATEST_SCHEMA_VERSION = 7;
@@ -588,6 +594,7 @@ async function initDatabase(database: SQLite.SQLiteDatabase, options?: { recover
 /** イベント一覧専用の軽量 projection。raw_json/metadata_json は返さない。 */
 export interface EventSummary {
   id: number;
+  syncUid: string | null;
   name: string;
   url: string;
   date: string | null;
@@ -641,7 +648,7 @@ export async function getEventSummaries(eventId?: number): Promise<EventSummary[
       FROM circles c LEFT JOIN items i ON i.circle_id = c.id${itemScope}
       GROUP BY c.event_id
     )
-    SELECT e.id, e.name, e.url, e.date, e.venue, e.organizer, e.memo,
+    SELECT e.id, e.sync_uid, e.name, e.url, e.date, e.venue, e.organizer, e.memo,
       e.completed, e.imported_at, e.shopping_started_at, e.shopping_ended_at,
       e.event_image_filename,
       COALESCE(cs.total_circles, 0) AS total_circles,
@@ -661,6 +668,7 @@ export async function getEventSummaries(eventId?: number): Promise<EventSummary[
   );
   return rows.map((row) => ({
     id: Number(row.id),
+    syncUid: row.sync_uid ?? null,
     name: String(row.name ?? ""),
     url: String(row.url ?? ""),
     date: row.date ?? null,
@@ -709,6 +717,57 @@ export async function getEvent(id: number): Promise<Event | null> {
     id,
   );
   return row ? mapEvent(row) : null;
+}
+
+/** Link one explicitly selected legacy event to the UID advertised by the PC QR.
+ * This writes only `events.sync_uid`; event contents remain untouched. */
+export async function linkEventSyncUidForPairing(
+  eventId: number,
+  targetUid: string,
+  targetName: string,
+  targetDate: string,
+): Promise<void> {
+  if (!Number.isSafeInteger(eventId) || eventId <= 0 || !targetUid || targetUid.length > 256 || /[\s\u0000-\u001f\u007f]/.test(targetUid)) {
+    throw new Error("PC対象UIDまたはイベントIDが不正です");
+  }
+  const database = await getDatabase();
+  try {
+    await database.withExclusiveTransactionAsync(async (transaction) => {
+      const txDb = transaction as unknown as SQLite.SQLiteDatabase;
+      const event = await txDb.getFirstAsync<{ id: number; sync_uid: string | null; name: string; date: string | null }>(
+        "SELECT id, sync_uid, name, date FROM events WHERE id = ?",
+        eventId,
+      );
+      if (!event) throw new Error("選択したイベントが見つかりません");
+      if (event.name !== targetName || (event.date ?? "") !== targetDate) {
+        throw new Error("QRのPC対象名・開催日と選択イベントが一致しません。イベント内容は変更されていません");
+      }
+      if (event.sync_uid && event.sync_uid !== targetUid) {
+        throw new Error("選択イベントは別のUIDに紐づいています");
+      }
+      const duplicates = await txDb.getFirstAsync<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM events WHERE sync_uid = ?",
+        targetUid,
+      );
+      if (Number(duplicates?.count ?? 0) > (event.sync_uid === targetUid ? 1 : 0)) {
+        throw new Error("PC対象UIDが複数のイベントに紐づいているため中止しました");
+      }
+      if (event.sync_uid === targetUid) return;
+      const result = await txDb.runAsync(
+        "UPDATE events SET sync_uid = ? WHERE id = ? AND sync_uid IS NULL AND name = ? AND COALESCE(date, '') = ?",
+        targetUid,
+        eventId,
+        targetName,
+        targetDate,
+      );
+      if (result.changes !== 1) throw new Error("イベントが更新されました。再度ペアリングしてください");
+    });
+  } catch (error: any) {
+    if (/UNIQUE constraint failed/i.test(String(error?.message ?? error))) {
+      throw new Error("PC対象UIDは別のイベントで使用されています");
+    }
+    throw error;
+  }
 }
 
 /** イベントを手動作成 */
@@ -2870,6 +2929,7 @@ async function reconcileChangedEventState(
   stageRoot: string,
   stagedEventId: number,
   previousEventId: number,
+  preserveMobileState = true,
 ): Promise<ChangedEventIdentityMap> {
   const previousEvent = await database.getFirstAsync<any>(
     `SELECT memo, completed, shopping_started_at, shopping_ended_at,
@@ -2942,48 +3002,117 @@ async function reconcileChangedEventState(
     for (const [stagedItemId, previousItemId] of matches) itemIds.set(stagedItemId, previousItemId);
   }
 
-  await database.withExclusiveTransactionAsync(async (txn) => {
-    const txDb = txn as unknown as SQLite.SQLiteDatabase;
-    await txDb.runAsync(
-      `UPDATE events SET memo = ?, completed = ?, shopping_started_at = ?,
-         shopping_ended_at = ?, event_image_filename = ? WHERE id = ?`,
-      previousEvent.memo ?? "",
-      Number(previousEvent.completed ?? 0),
-      previousEvent.shopping_started_at ?? null,
-      previousEvent.shopping_ended_at ?? null,
-      localEventImage,
-      stagedEventId,
-    );
-    for (const [stagedCircleId, previousCircleId] of circleIds) {
-      const previous = previousCircles.find((row) => Number(row.id) === previousCircleId);
-      if (!previous) continue;
+  if (preserveMobileState) {
+    await database.withExclusiveTransactionAsync(async (txn) => {
+      const txDb = txn as unknown as SQLite.SQLiteDatabase;
       await txDb.runAsync(
-        `UPDATE circles SET memo = ?, checked = ?, pin_x = ?, pin_y = ?,
-           map_number = ?, priority_color = ? WHERE id = ?`,
-        previous.memo ?? "",
-        Number(previous.checked ?? 0),
-        previous.pin_x ?? null,
-        previous.pin_y ?? null,
-        previous.map_number ?? null,
-        Number(previous.priority_color ?? 5),
-        stagedCircleId,
+        `UPDATE events SET memo = ?, completed = ?, shopping_started_at = ?,
+           shopping_ended_at = ?, event_image_filename = ? WHERE id = ?`,
+        previousEvent.memo ?? "",
+        Number(previousEvent.completed ?? 0),
+        previousEvent.shopping_started_at ?? null,
+        previousEvent.shopping_ended_at ?? null,
+        localEventImage,
+        stagedEventId,
       );
-    }
-    for (const [stagedItemId, previousItemId] of itemIds) {
-      const previous = await txDb.getFirstAsync<any>(
-        "SELECT purchase_status, purchase_status_source FROM items WHERE id = ?",
-        previousItemId,
-      );
-      if (!previous) continue;
-      await txDb.runAsync(
-        "UPDATE items SET purchase_status = ?, purchase_status_source = ? WHERE id = ?",
-        Number(previous.purchase_status ?? 0),
-        previous.purchase_status_source ?? null,
-        stagedItemId,
-      );
-    }
-  });
+      for (const [stagedCircleId, previousCircleId] of circleIds) {
+        const previous = previousCircles.find((row) => Number(row.id) === previousCircleId);
+        if (!previous) continue;
+        await txDb.runAsync(
+          `UPDATE circles SET memo = ?, checked = ?, pin_x = ?, pin_y = ?,
+             map_number = ?, priority_color = ? WHERE id = ?`,
+          previous.memo ?? "",
+          Number(previous.checked ?? 0),
+          previous.pin_x ?? null,
+          previous.pin_y ?? null,
+          previous.map_number ?? null,
+          Number(previous.priority_color ?? 5),
+          stagedCircleId,
+        );
+      }
+      for (const [stagedItemId, previousItemId] of itemIds) {
+        const previous = await txDb.getFirstAsync<any>(
+          "SELECT purchase_status, purchase_status_source FROM items WHERE id = ?",
+          previousItemId,
+        );
+        if (!previous) continue;
+        await txDb.runAsync(
+          "UPDATE items SET purchase_status = ?, purchase_status_source = ? WHERE id = ?",
+          Number(previous.purchase_status ?? 0),
+          previous.purchase_status_source ?? null,
+          stagedItemId,
+        );
+      }
+    });
+  }
   return { stagedEventId, liveEventId: previousEventId, circleIds, itemIds };
+}
+
+interface EventSyncRevisionDigests {
+  revision: string;
+  databaseRevision: string;
+}
+
+interface SerializedEventSyncRevision extends EventSyncRevisionDigests {
+  version: 1;
+}
+
+function serializeEventSyncRevision(revision: EventSyncRevisionDigests): string {
+  return JSON.stringify({ version: 1, ...revision } satisfies SerializedEventSyncRevision);
+}
+
+function parseEventSyncRevision(value: string): SerializedEventSyncRevision {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("イベント同期revisionの形式が不正です");
+  }
+  if (
+    !parsed || parsed.version !== 1 ||
+    typeof parsed.revision !== "string" || !/^[0-9a-f]{64}$/i.test(parsed.revision) ||
+    typeof parsed.databaseRevision !== "string" || !/^[0-9a-f]{64}$/i.test(parsed.databaseRevision)
+  ) {
+    throw new Error("イベント同期revisionの形式が不正です");
+  }
+  return parsed as SerializedEventSyncRevision;
+}
+
+async function computeEventSyncRevisions(
+  database: SQLite.SQLiteDatabase,
+  eventId: number,
+  includeImageTree = true,
+): Promise<EventSyncRevisionDigests> {
+  const event = await database.getFirstAsync<any>("SELECT * FROM events WHERE id = ?", eventId);
+  if (!event) throw new Error("同期対象イベントがありません");
+  const maps = await database.getAllAsync<any>("SELECT * FROM event_maps WHERE event_id = ? ORDER BY id", eventId);
+  const circles = await database.getAllAsync<any>("SELECT * FROM circles WHERE event_id = ? ORDER BY id", eventId);
+  const items = await database.getAllAsync<any>(
+    "SELECT i.* FROM items i JOIN circles c ON c.id = i.circle_id WHERE c.event_id = ? ORDER BY i.id",
+    eventId,
+  );
+  const images = await database.getAllAsync<any>(
+    "SELECT ii.* FROM item_images ii JOIN circles c ON c.id = ii.circle_id WHERE c.event_id = ? ORDER BY ii.id",
+    eventId,
+  );
+  const assetMappings = await database.getAllAsync<any>(
+    "SELECT * FROM asset_local_map WHERE event_id = ? ORDER BY logical_path, local_path",
+    eventId,
+  );
+  const databasePayload = JSON.stringify({ event, maps, circles, items, images, assetMappings });
+  const databaseRevision = sha256Hex(new TextEncoder().encode(databasePayload));
+  if (!includeImageTree) return { revision: databaseRevision, databaseRevision };
+  const imageDir = `${IMAGES_DIR}${eventId}/`;
+  const dirInfo = await FileSystem.getInfoAsync(imageDir);
+  const files = dirInfo.exists ? await listDirectoryFiles(imageDir) : [];
+  const revision = sha256Hex(new TextEncoder().encode(JSON.stringify({ databaseRevision, files })));
+  return { revision, databaseRevision };
+}
+
+interface SingleEventRevisionGuard {
+  eventId: number;
+  uid: string;
+  databaseRevision: string;
 }
 
 async function finalizeIncrementalDb(
@@ -2993,9 +3122,23 @@ async function finalizeIncrementalDb(
   deleteIds: number[],
   stableUidByEventId: Map<number, string>,
   changedIdentityByStagedId: Map<number, ChangedEventIdentityMap>,
+  revisionGuard?: SingleEventRevisionGuard,
 ): Promise<void> {
   await database.withExclusiveTransactionAsync(async (txn) => {
     const txDb = txn as unknown as SQLite.SQLiteDatabase;
+    if (revisionGuard) {
+      const current = await txDb.getFirstAsync<{ id: number; sync_uid: string | null }>(
+        "SELECT id, sync_uid FROM events WHERE id = ?",
+        revisionGuard.eventId,
+      );
+      if (!current || current.sync_uid !== revisionGuard.uid) {
+        throw new Error("同期対象イベントのUIDが変更されました。プレビューをやり直してください");
+      }
+      const revision = await computeEventSyncRevisions(txDb, revisionGuard.eventId, false);
+      if (revision.databaseRevision !== revisionGuard.databaseRevision) {
+        throw new Error("プレビュー後に対象イベントが変更されました。反映を中止しました");
+      }
+    }
     // Primary/FK identities are moved as one graph. SQLite checks the final
     // state at COMMIT, so no route can observe a half-renamed event graph.
     await txDb.execAsync("PRAGMA defer_foreign_keys = ON");
@@ -5100,21 +5243,48 @@ async function hasHealthyLocalAssets(
   }
 }
 
+interface IncrementalImportOptions {
+  singleEvent?: {
+    uid: string;
+    targetEventId: number;
+    expectedRevision: string;
+    preserveMobileState: boolean;
+    shouldCancel?: () => boolean;
+  };
+}
+
 async function importIncrementalBundle(
   extractDir: string,
   events: SyncManifestEvent[],
   onProgress?: (progress: ImportProgress) => void,
   rootAssetManifest?: AssetManifest | null,
+  options: IncrementalImportOptions = {},
 ): Promise<number> {
   const database = await getDatabase();
-  const stageRoot = createImageStageRoot();
-  await ensureDirectory(stageRoot);
   const existing = await measuredGetAll<{
     id: number;
     sync_uid: string | null;
     content_hash: string | null;
     asset_set_hash: string | null;
   }>(database, "SELECT id, sync_uid, content_hash, asset_set_hash FROM events WHERE sync_uid IS NOT NULL");
+  const singleEvent = options.singleEvent;
+  const singleEventRevision = singleEvent ? parseEventSyncRevision(singleEvent.expectedRevision) : null;
+  if (singleEvent) {
+    if (events.length !== 1 || manifestUid(events[0]) !== singleEvent.uid) {
+      throw new Error("single-event同期ZIPに別イベントまたは複数イベントが含まれています");
+    }
+    const matches = existing.filter((row) => row.sync_uid === singleEvent.uid);
+    if (matches.length !== 1 || Number(matches[0].id) !== singleEvent.targetEventId) {
+      throw new Error("UIDに一致するmobileイベントが一意に見つかりません");
+    }
+    const currentRevision = await computeEventSyncRevisions(database, singleEvent.targetEventId);
+    if (currentRevision.revision !== singleEventRevision?.revision) {
+      throw new Error("プレビュー後に対象イベントが変更されました。反映を中止しました");
+    }
+  }
+  if (singleEvent?.shouldCancel?.()) throw new Error("single-event同期を中断しました");
+  const stageRoot = createImageStageRoot();
+  await ensureDirectory(stageRoot);
   const byUid = new Map(existing.map((row) => [row.sync_uid as string, row]));
   const seen = new Set<string>();
   const importedEventIds: number[] = [];
@@ -5131,6 +5301,10 @@ async function importIncrementalBundle(
   let cleanupCompleted = false;
   let cleanupEventIds: number[] = [];
   let sharedSettingsJournal: ImportStageJournal | null = null;
+  const emitProgress = (progress: ImportProgress) => {
+    if (singleEvent?.shouldCancel?.()) throw new Error("single-event同期を中断しました");
+    onProgress?.(progress);
+  };
     await writeImportStageJournal(stageRoot, {
       version: 1,
       phase,
@@ -5140,6 +5314,7 @@ async function importIncrementalBundle(
     });
   try {
     for (let i = 0; i < events.length; i++) {
+      if (singleEvent?.shouldCancel?.()) throw new Error("single-event同期を中断しました");
       const manifestEvent = events[i];
       const uid = manifestUid(manifestEvent);
       const hash = manifestContentHash(manifestEvent);
@@ -5155,15 +5330,15 @@ async function importIncrementalBundle(
         && await hasHealthyLocalAssets(database, extractDir, manifestEvent, Number(previous.id), rootAssetManifest)) {
         unchangedEventIds.push(Number(previous.id));
         lastEventId = Number(previous.id);
-        onProgress?.({ current: i + 1, total: events.length, phase: "events" });
+        emitProgress({ current: i + 1, total: events.length, phase: "events" });
         continue;
       }
 
-      onProgress?.({ current: i + 1, total: events.length, phase: "events" });
+      emitProgress({ current: i + 1, total: events.length, phase: "events" });
       const stagingUid = `__staging__${uid}__${Date.now()}_${i}`;
       const newEventId = await importEventFromExtractDir(
         eventDirFromManifestPath(extractDir, manifestEvent.path),
-        onProgress,
+        emitProgress,
         manifestEvent,
         stageRoot,
         stagingUid,
@@ -5186,12 +5361,18 @@ async function importIncrementalBundle(
         changedEventIds.push(previousId);
         changedIdentityByStagedId.set(
           newEventId,
-          await reconcileChangedEventState(database, stageRoot, newEventId, previousId),
+          await reconcileChangedEventState(
+            database,
+            stageRoot,
+            newEventId,
+            previousId,
+            singleEvent ? singleEvent.preserveMobileState : true,
+          ),
         );
       }
     }
 
-    const removedEventIds = existing
+    const removedEventIds = singleEvent ? [] : existing
       .filter((row) => !!row.sync_uid && !seen.has(row.sync_uid))
       .map((row) => Number(row.id));
     const plan = buildImportPublishPlan(importedEventIds, previousChangedIds, removedEventIds);
@@ -5212,9 +5393,9 @@ async function importIncrementalBundle(
       published,
       cleanupEventIds,
     });
-    const sharedInspection = await inspectSharedBundleSettings(extractDir);
-    const sharedFingerprint = await getSetting(SHARED_BUNDLE_FINGERPRINT_KEY);
-    if (sharedFingerprint !== sharedInspection.fingerprint) {
+    const sharedInspection = singleEvent ? null : await inspectSharedBundleSettings(extractDir);
+    const sharedFingerprint = singleEvent ? null : await getSetting(SHARED_BUNDLE_FINGERPRINT_KEY);
+    if (sharedInspection && sharedFingerprint !== sharedInspection.fingerprint) {
       // Capture only changed default-cut files.  Equal files are hash-compared
       // before this point and never staged, backed up, or copied.
       sharedSettingsJournal = await prepareSharedSettingsSnapshot(stageRoot, sharedInspection);
@@ -5256,8 +5437,25 @@ async function importIncrementalBundle(
 
     // すべての changed event が staging DB/画像へ成功した後にだけ画像を publish。
     // 新しい event ID の live dir が存在しても backup を stageRoot 内に保持する。
+    if (singleEvent && singleEventRevision) {
+      const prePublishRevision = await computeEventSyncRevisions(database, singleEvent.targetEventId);
+      if (prePublishRevision.revision !== singleEventRevision.revision) {
+        throw new Error("画像を公開する前に対象イベントが変更されました。プレビューをやり直してください");
+      }
+    }
     phase = advanceImportPublishPhase(phase, "publishing");
     for (const eventId of plan.publishEventIds) {
+      if (singleEvent?.shouldCancel?.()) throw new Error("single-event同期を中断しました");
+      if (singleEvent && singleEventRevision) {
+        // publishStagedImageDir replaces the live directory after preserving a
+        // rollback backup. Compare the original DB + image tree immediately
+        // before this boundary; the final SQL CAS below intentionally ignores
+        // files because the event's new images are live by then.
+        const prePublishRevision = await computeEventSyncRevisions(database, singleEvent.targetEventId);
+        if (prePublishRevision.revision !== singleEventRevision.revision) {
+          throw new Error("画像を公開する直前に対象イベントが変更されました。反映を中止しました");
+        }
+      }
       published.push(await publishStagedImageDir(
         stageRoot,
         eventId,
@@ -5274,6 +5472,7 @@ async function importIncrementalBundle(
     }
     // 画像 publish 後、DB path rewrite と旧 changed/missing row delete を同一
     // transaction にする。ここで失敗すれば旧 live DB はまだ保持される。
+    if (singleEvent?.shouldCancel?.()) throw new Error("single-event同期を中断しました");
     await finalizeIncrementalDb(
       database,
       stageRoot,
@@ -5281,6 +5480,13 @@ async function importIncrementalBundle(
       plan.deleteEventIds,
       stableUidByEventId,
       changedIdentityByStagedId,
+      singleEvent
+        ? {
+            eventId: singleEvent.targetEventId,
+            uid: singleEvent.uid,
+            databaseRevision: singleEventRevision?.databaseRevision ?? "",
+          }
+        : undefined,
     );
     finalized = true;
     phase = advanceImportPublishPhase(phase, "finalized");
@@ -5309,7 +5515,7 @@ async function importIncrementalBundle(
       ...unchangedEventIds,
     ])];
     lastImportDiff = {
-      kind: "full",
+      kind: singleEvent ? "single" : "full",
       incremental: true,
       importedEventIds: liveImportedEventIds,
       addedEventIds,
@@ -5516,6 +5722,294 @@ export async function importFromZip(
   }
 }
 
+export interface SingleEventSyncPreview {
+  eventId: number;
+  eventUid: string;
+  eventName: string;
+  revision: string;
+  diff: SingleEventSyncDiff;
+}
+
+export interface SingleEventSyncApplyResult {
+  eventId: number;
+  eventUid: string;
+  backupPath: string;
+  diff: ImportDiffResult;
+}
+
+interface ExtractedSingleEventSyncZip {
+  extractDir: string;
+  data: ImportData;
+  eventUid: string;
+  assetManifest: AssetManifest | null;
+  files: DirectoryFileFingerprint[];
+}
+
+function validSingleEventUid(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && !/[\s\u0000-\u001f\u007f]/.test(value);
+}
+
+async function assertSafeExtractedTree(
+  root: string,
+  prefix = "",
+  state: { files: number } = { files: 0 },
+): Promise<void> {
+  for (const name of await FileSystem.readDirectoryAsync(root)) {
+    const relative = prefix ? `${prefix}/${name}` : name;
+    if (relative.length > 1024) throw new Error("ZIP内パスが長すぎます");
+    if (!isSafeArchivePath(relative)) throw new Error("ZIPに不正な相対パスが含まれています");
+    const path = `${normalizeDir(root)}${name}`;
+    const info = await FileSystem.getInfoAsync(path);
+    if (!info.exists) throw new Error("ZIP展開中にファイルが消失しました");
+    if ((info as any).isDirectory) {
+      await assertSafeExtractedTree(`${normalizeDir(path)}`, relative, state);
+    } else {
+      state.files += 1;
+      if (state.files > 25000) throw new Error("PC同期ZIPのファイル数が上限25,000件を超えています");
+    }
+  }
+}
+
+async function extractSingleEventSyncZip(zipFilePath: string): Promise<ExtractedSingleEventSyncZip> {
+  const zipInfo = await FileSystem.getInfoAsync(zipFilePath);
+  if (!zipInfo.exists || (zipInfo as any).isDirectory || typeof (zipInfo as any).size !== "number") {
+    throw new Error("PC同期ZIPがありません");
+  }
+  if (Number((zipInfo as any).size) > 512 * 1024 * 1024) {
+    throw new Error("PC同期ZIPが大きすぎます（上限512MB）");
+  }
+  const extractDir = `${FileSystem.cacheDirectory}single_event_sync_${Date.now()}_${Math.random().toString(36).slice(2)}/`;
+  await ensureDirectory(extractDir);
+  try {
+    const sourcePath = zipFilePath.replace(/^file:\/\/\//, "/").replace(/^file:\/\//, "");
+    const extractPath = extractDir.replace(/^file:\/\/\//, "/").replace(/^file:\/\//, "").replace(/[\\/]+$/, "");
+    const uncompressedSize = await getUncompressedSize(sourcePath);
+    if (!Number.isFinite(uncompressedSize) || uncompressedSize < 0 || uncompressedSize > 1024 * 1024 * 1024) {
+      throw new Error("PC同期ZIPの展開サイズが上限1GBを超えています");
+    }
+    await unzip(sourcePath, extractPath);
+    await assertSafeExtractedTree(extractDir);
+    if ((await FileSystem.getInfoAsync(`${extractDir}sync_bundle.json`)).exists) {
+      throw new Error("全イベント同期ZIPは単一イベント比較では使用できません");
+    }
+    const eventPath = `${extractDir}event.json`;
+    const eventInfo = await FileSystem.getInfoAsync(eventPath);
+    if (!eventInfo.exists) {
+      throw new Error("PC同期ZIPのルートにevent.jsonがありません");
+    }
+    if (Number((eventInfo as any).size ?? 0) > 64 * 1024 * 1024) {
+      throw new Error("PC同期ZIPのevent.jsonが大きすぎます（上限64MB）");
+    }
+    const parsed = JSON.parse(await FileSystem.readAsStringAsync(eventPath)) as ImportData & { event_uid?: unknown };
+    if (!parsed || typeof parsed !== "object" || !parsed.event || typeof parsed.event !== "object" || !Array.isArray(parsed.circles)) {
+      throw new Error("PC同期ZIPのevent.json形式が不正です");
+    }
+    const eventUid = parsed.event_uid;
+    if (!validSingleEventUid(eventUid)) throw new Error("PC同期ZIPに有効なroot event_uidがありません");
+    for (const image of singleEventSyncImageRefs(parsed)) {
+      const externalItemImage = image.key.startsWith("item-image-ref:") && /^https?:\/\//i.test(image.path);
+      if (!isSafeArchivePath(image.path) && !externalItemImage) {
+        throw new Error(`ZIP内画像パスが不正です: ${image.label}`);
+      }
+    }
+    const files = await listDirectoryFiles(extractDir);
+    return {
+      extractDir,
+      data: parsed,
+      eventUid,
+      assetManifest: await readAssetManifest(extractDir),
+      files,
+    };
+  } catch (error) {
+    await FileSystem.deleteAsync(extractDir, { idempotent: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function requireUniqueSingleSyncTarget(eventId: number, uid: string): Promise<any> {
+  if (!Number.isSafeInteger(eventId) || eventId <= 0 || !validSingleEventUid(uid)) {
+    throw new Error("同期イベントIDまたはUIDが不正です");
+  }
+  const database = await getDatabase();
+  const rows = await measuredGetAll<any>(
+    database,
+    "SELECT id, sync_uid, name, date, event_image_filename FROM events WHERE sync_uid = ? ORDER BY id",
+    uid,
+  );
+  if (rows.length !== 1 || Number(rows[0].id) !== eventId || rows[0].sync_uid !== uid) {
+    throw new Error("PC対象UIDに一致するmobileイベントが一意に見つかりません");
+  }
+  return rows[0];
+}
+
+async function getSingleEventImageFingerprints(
+  data: ImportData,
+  eventId: number,
+  extractDir?: string,
+  assetManifest?: AssetManifest | null,
+): Promise<SyncImageFingerprints> {
+  const result: SyncImageFingerprints = {};
+  for (const image of singleEventSyncImageRefs(data)) {
+    let path: string | null = null;
+    if (extractDir) {
+      if (!isSafeArchivePath(image.path)) {
+        result[image.key] = null;
+        continue;
+      }
+      const logical = image.key === "event-image" ? canonicalEventImageLogical(image.path) : image.path;
+      const resolved = await resolveImportedAsset(extractDir, assetManifest ?? null, [logical, image.path]);
+      path = resolved?.path ?? null;
+    } else {
+      path = image.path.startsWith("file://") || image.path.startsWith("/")
+        ? image.path
+        : `${IMAGES_DIR}${eventId}/${image.path}`;
+    }
+    if (!path) {
+      result[image.key] = null;
+      continue;
+    }
+    const info = (await FileSystem.getInfoAsync(path, { md5: true } as any).catch(() => ({ exists: false } as any))) as any;
+    result[image.key] = info.exists && typeof info.md5 === "string" ? info.md5.toLowerCase() : null;
+  }
+  return result;
+}
+
+/** Read and compare one UID-bound event without changing the live database. */
+export async function previewSingleEventSyncZip(
+  zipFilePath: string,
+  eventId: number,
+  expectedUid: string,
+): Promise<SingleEventSyncPreview> {
+  const extracted = await extractSingleEventSyncZip(zipFilePath);
+  try {
+    if (extracted.eventUid !== expectedUid) throw new Error("PC ZIPのUIDと選択イベントUIDが一致しません");
+    const target = await requireUniqueSingleSyncTarget(eventId, expectedUid);
+    const local = await exportEventData(eventId);
+    if (!local) throw new Error("選択イベントが見つかりません");
+    local.event.event_image_filename = target.event_image_filename ?? "";
+    local.event.event_image = target.event_image_filename ?? "";
+    const [localFingerprints, incomingFingerprints] = await Promise.all([
+      getSingleEventImageFingerprints(local, eventId),
+      getSingleEventImageFingerprints(extracted.data, eventId, extracted.extractDir, extracted.assetManifest),
+    ]);
+    const revision = serializeEventSyncRevision(
+      await computeEventSyncRevisions(await getDatabase(), eventId),
+    );
+    return {
+      eventId,
+      eventUid: expectedUid,
+      eventName: String(extracted.data.event.name ?? "不明なイベント"),
+      revision,
+      diff: buildSingleEventSyncDiff(local, extracted.data, {
+        local: localFingerprints,
+        incoming: incomingFingerprints,
+      }),
+    };
+  } finally {
+    await FileSystem.deleteAsync(extracted.extractDir, { idempotent: true });
+  }
+}
+
+/** Back up and apply only the one confirmed UID target. */
+export async function applySingleEventSyncZip(
+  zipFilePath: string,
+  eventId: number,
+  expectedUid: string,
+  expectedRevision: string,
+  onProgress?: (progress: ImportProgress) => void,
+  shouldCancel: () => boolean = () => false,
+): Promise<SingleEventSyncApplyResult> {
+  const extracted = await extractSingleEventSyncZip(zipFilePath);
+  const expectedRevisionData = parseEventSyncRevision(expectedRevision);
+  let temporaryBackup: string | null = null;
+  try {
+    if (shouldCancel()) throw new Error("single-event同期を中断しました");
+    if (extracted.eventUid !== expectedUid) throw new Error("確認後にPC ZIPのUIDが変わりました");
+    const target = await requireUniqueSingleSyncTarget(eventId, expectedUid);
+    const database = await getDatabase();
+    const currentRevision = await computeEventSyncRevisions(database, eventId);
+    if (currentRevision.revision !== expectedRevisionData.revision) {
+      throw new Error("プレビュー後に対象イベントが変更されました。反映を中止しました");
+    }
+
+    // A persistent event-only backup must be verified before starting publish.
+    temporaryBackup = await exportEventAsZip(
+      eventId,
+      (progress) => {
+        onProgress?.({ ...progress, phase: "events" });
+        if (progress.phase === "images" && shouldCancel()) throw new Error("single-event同期を中断しました");
+      },
+      { includeSharedSettings: false },
+    );
+    if (shouldCancel()) {
+      await FileSystem.deleteAsync(temporaryBackup, { idempotent: true }).catch(() => undefined);
+      temporaryBackup = null;
+      throw new Error("single-event同期を中断しました");
+    }
+    const backupDir = `${FileSystem.documentDirectory}event_sync_backups/`;
+    await ensureDirectory(backupDir);
+    const safeUid = expectedUid.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 48) || "event";
+    const backupPath = `${backupDir}event_${eventId}_${Date.now()}_${safeUid}.zip`;
+    const sourceInfo = (await FileSystem.getInfoAsync(temporaryBackup, { md5: true } as any)) as any;
+    if (!sourceInfo.exists || typeof sourceInfo.size !== "number" || typeof sourceInfo.md5 !== "string") {
+      throw new Error("イベントバックアップの検証情報を取得できません");
+    }
+    await FileSystem.copyAsync({ from: temporaryBackup, to: backupPath });
+    const savedInfo = (await FileSystem.getInfoAsync(backupPath, { md5: true } as any)) as any;
+    if (!savedInfo.exists || savedInfo.size !== sourceInfo.size ||
+        typeof savedInfo.md5 !== "string" || savedInfo.md5.toLowerCase() !== sourceInfo.md5.toLowerCase()) {
+      await FileSystem.deleteAsync(backupPath, { idempotent: true }).catch(() => undefined);
+      throw new Error("イベントバックアップの保存検証に失敗しました。反映を中止しました");
+    }
+
+    if (shouldCancel()) throw new Error(`single-event同期を中断しました。バックアップ: ${backupPath}`);
+    const postBackupRevision = await computeEventSyncRevisions(database, eventId);
+    if (postBackupRevision.revision !== expectedRevisionData.revision) {
+      throw new Error(`バックアップ作成中に対象イベントが変更されました。反映を中止しました。バックアップ: ${backupPath}`);
+    }
+    const contentHash = sha256Hex(new TextEncoder().encode(JSON.stringify(extracted.data)));
+    const assetEntries = extracted.files.filter((file) => file.relative !== "event.json" && file.relative !== "asset_manifest.json");
+    const assetSetHash = sha256Hex(new TextEncoder().encode(JSON.stringify(assetEntries)));
+    const manifestEvent: SyncManifestEvent = {
+      path: "event.json",
+      event_uid: expectedUid,
+      uid: expectedUid,
+      hash: contentHash,
+      content_hash: contentHash,
+      asset_hash: assetSetHash,
+      asset_set_hash: assetSetHash,
+    };
+    try {
+      await importIncrementalBundle(
+        extracted.extractDir,
+        [manifestEvent],
+        onProgress,
+        extracted.assetManifest,
+        {
+          singleEvent: {
+            uid: expectedUid,
+            targetEventId: eventId,
+            expectedRevision,
+            preserveMobileState: false,
+            shouldCancel,
+          },
+        },
+      );
+    } catch (error: any) {
+      throw new Error(`${String(error?.message ?? error)}. バックアップ: ${backupPath}`);
+    }
+    return {
+      eventId,
+      eventUid: expectedUid,
+      backupPath,
+      diff: getLastImportDiff(),
+    };
+  } finally {
+    if (temporaryBackup) await FileSystem.deleteAsync(temporaryBackup, { idempotent: true }).catch(() => undefined);
+    await FileSystem.deleteAsync(extracted.extractDir, { idempotent: true });
+  }
+}
+
 /** イベント削除時に画像ディレクトリも削除 */
 export async function deleteEventWithImages(eventId: number): Promise<void> {
   const database = await getDatabase();
@@ -5640,9 +6134,9 @@ export async function exportEventData(
   const database = await getDatabase();
   const event = await getEventForExport(eventId);
   if (!event) return null;
-  const rootRow = await measuredGetFirst<{ sync_root_json: string | null }>(
+  const rootRow = await measuredGetFirst<{ sync_root_json: string | null; sync_uid: string | null }>(
     database,
-    "SELECT sync_root_json FROM events WHERE id = ?",
+    "SELECT sync_root_json, sync_uid FROM events WHERE id = ?",
     eventId,
   );
 
@@ -5695,9 +6189,12 @@ export async function exportEventData(
   const baseMetadata = parseJsonObject<ImportData["metadata"]>(event.metadataJson);
 
   const preservedRoot = parseJsonObject<Record<string, unknown>>(rootRow?.sync_root_json);
+  const exportRoot = { ...preservedRoot };
+  if (rootRow?.sync_uid) exportRoot.event_uid = rootRow.sync_uid;
+  else delete exportRoot.event_uid;
   const preservedMetadata = parseJsonObject<ImportData["metadata"]>(String((preservedRoot as any).metadata ?? ""));
   return {
-    ...preservedRoot,
+    ...exportRoot,
     event: {
       ...baseEvent,
       name: event.name,
@@ -5748,6 +6245,7 @@ export interface ExportProgress {
 export async function exportEventAsZip(
   eventId: number,
   onProgress?: (progress: ExportProgress) => void,
+  options: { includeSharedSettings?: boolean } = {},
 ): Promise<string> {
   const data = await exportEventData(eventId);
   if (!data) throw new Error("Event not found");
@@ -5789,7 +6287,9 @@ export async function exportEventAsZip(
     /[^a-zA-Z0-9\u3000-\u9FFF\uF900-\uFAFF]/g,
     "_",
   );
-  const filePath = `${FileSystem.cacheDirectory}${safeName}_result.zip`;
+  const filePath = options.includeSharedSettings === false
+    ? `${FileSystem.cacheDirectory}${safeName}_single_sync_${Date.now()}.zip`
+    : `${FileSystem.cacheDirectory}${safeName}_result.zip`;
 
   try {
     await FileSystem.deleteAsync(exportDir, { idempotent: true });
@@ -5885,46 +6385,48 @@ export async function exportEventAsZip(
       }
     }
 
-    try {
-      const favorites = await getFavoriteCircles();
-      const cmData = await readStoredCircleMasterData();
-      for (const fav of favorites) {
-        const key = fav.name || fav.tag;
-        if (key) {
-          const existing = cmData.circles[key] ?? {
-            penname: fav.tag,
-            favorite: true,
-            genre: "",
-            default_cut: null,
-          };
-          cmData.circles[key] = {
-            ...existing,
-            penname: existing.penname || fav.tag,
-            favorite: true,
-          };
+    if (options.includeSharedSettings !== false) {
+      try {
+        const favorites = await getFavoriteCircles();
+        const cmData = await readStoredCircleMasterData();
+        for (const fav of favorites) {
+          const key = fav.name || fav.tag;
+          if (key) {
+            const existing = cmData.circles[key] ?? {
+              penname: fav.tag,
+              favorite: true,
+              genre: "",
+              default_cut: null,
+            };
+            cmData.circles[key] = {
+              ...existing,
+              penname: existing.penname || fav.tag,
+              favorite: true,
+            };
+          }
         }
-      }
-      await FileSystem.writeAsStringAsync(
-        `${exportDir}circle_master.json`,
-        JSON.stringify(cmData, null, 2),
-      );
-      const cutsInfo = await FileSystem.getInfoAsync(DEFAULT_CUTS_DIR);
-      if (cutsInfo.exists) {
-        const cutNames = await FileSystem.readDirectoryAsync(DEFAULT_CUTS_DIR);
-        for (const cutName of cutNames) {
-          const source = `${DEFAULT_CUTS_DIR}${cutName}`;
-          const info = await FileSystem.getInfoAsync(source);
-          if (!info.exists || (info as any).isDirectory) continue;
-          await copyExportAsset(
-            source,
-            `default_cuts/${cutName}`,
-            exportDir,
-            assetManifest,
-          );
+        await FileSystem.writeAsStringAsync(
+          `${exportDir}circle_master.json`,
+          JSON.stringify(cmData, null, 2),
+        );
+        const cutsInfo = await FileSystem.getInfoAsync(DEFAULT_CUTS_DIR);
+        if (cutsInfo.exists) {
+          const cutNames = await FileSystem.readDirectoryAsync(DEFAULT_CUTS_DIR);
+          for (const cutName of cutNames) {
+            const source = `${DEFAULT_CUTS_DIR}${cutName}`;
+            const info = await FileSystem.getInfoAsync(source);
+            if (!info.exists || (info as any).isDirectory) continue;
+            await copyExportAsset(
+              source,
+              `default_cuts/${cutName}`,
+              exportDir,
+              assetManifest,
+            );
+          }
         }
+      } catch (e) {
+        console.warn("circle_master.json export skipped:", e);
       }
-    } catch (e) {
-      console.warn("circle_master.json export skipped:", e);
     }
 
     await FileSystem.writeAsStringAsync(

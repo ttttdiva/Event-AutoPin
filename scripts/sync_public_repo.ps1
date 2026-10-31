@@ -13,9 +13,20 @@ $TransactionPrefix = '.event-autopin-sync.'
 $DependencyChecker = 'scripts/check_public_dependency_closure.py'
 
 function Run([string]$Exe, [string[]]$Arguments) {
-    $value = @(& $Exe @Arguments 2>&1)
-    if ($LASTEXITCODE -ne 0) { throw "$Exe failed: $($value -join ' ')" }
-    return @($value)
+    # Git writes path names as UTF-8 when core.quotepath=false. Windows
+    # PowerShell 5.1 otherwise decodes native stdout using the active console
+    # code page, corrupting Unicode manifest paths before they reach archive
+    # pathspecs. Scope the decoder change to this invocation and restore it so
+    # the script does not alter the host's encoding settings.
+    $previousOutputEncoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+        $value = @(& $Exe @Arguments 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "$Exe failed: $($value -join ' ')" }
+        return @($value)
+    } finally {
+        [Console]::OutputEncoding = $previousOutputEncoding
+    }
 }
 
 # `git archive` currently does not expose the --pathspec-from-file options that

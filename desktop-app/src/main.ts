@@ -118,6 +118,12 @@ import {
 } from "./history-search-ui";
 import { mergeCommittedEventMetaPreservingUnknown } from "./state/event-meta-merge";
 import {
+  buildEventSyncPreview,
+  eventSyncFingerprintsMatch,
+  type EventSyncChangeKind,
+  type EventSyncPreview,
+} from "./state/event-sync-preview";
+import {
   prepareFullSyncEventDocument,
   reconcileSessionEventDocument,
 } from "./state/event-session";
@@ -8479,9 +8485,968 @@ async function flushActiveEventForLifecycle(): Promise<void> {
   if (status.error) throw new Error(`イベント保存キューに失敗しました: ${String(status.error)}`);
 }
 
+type EventSyncChoice = "mobile" | "desktop" | "cancel";
+type EventSyncPhase = "starting" | "pairing" | "preview" | "staging" | "revalidating" | "publishing" | "acknowledging" | "outbound";
+type EventSyncTerminalState = "mobile-applied" | "cancelled" | "error";
+type EventSyncSessionStatePayload = {
+  state?: string;
+  status?: string;
+  sessionId?: string;
+  targetEventUid?: string;
+  target_uid?: string;
+  downloadUrl?: string | null;
+  download_url?: string | null;
+  source?: string;
+  error?: string;
+  message?: string;
+  terminal?: boolean;
+  terminalDelivered?: boolean;
+  delivered?: boolean;
+  delivery?: string;
+  origin?: string;
+  expired?: boolean;
+};
+type DesktopEventSyncSession = {
+  phase: EventSyncPhase;
+  targetSlug: string;
+  targetDir: string;
+  targetUid: string | null;
+  sessionId?: string;
+  targetName: string;
+  sessionUrl?: string;
+  pairingExpiresInSeconds?: number;
+  pairingExpiresAt?: number;
+  uploadId?: string;
+  fingerprint?: unknown;
+  outboundZipPath?: string;
+  outboundServerStarted: boolean;
+  terminalState?: EventSyncTerminalState;
+  expired?: boolean;
+  awaitingMobilePollTerminal: boolean;
+  resolveTerminal?: (state: EventSyncTerminalState) => void;
+  receiveServerAttempted: boolean;
+  cancelRequested: boolean;
+  resolveChoice?: (choice: EventSyncChoice) => void;
+};
+
+class EventSyncUidRegistrationDeclined extends Error {
+  constructor() {
+    super("同期用UIDの登録がキャンセルされました");
+    this.name = "EventSyncUidRegistrationDeclined";
+  }
+}
+
+let activeEventSyncSession: DesktopEventSyncSession | null = null;
+type MobileTransferBusyKind = "import" | "export" | "full-sync" | "legacy-send";
+let mobileTransferBusyKind: MobileTransferBusyKind | null = null;
+
+function mobileTransferBusyLabel(kind: MobileTransferBusyKind): string {
+  switch (kind) {
+    case "import": return "ZIP取り込み";
+    case "export": return "ZIPエクスポート";
+    case "full-sync": return "全イベント同期";
+    case "legacy-send": return "旧方式の転送";
+  }
+}
+
+function rejectBusyMobileTransfer(action: string): boolean {
+  if (activeEventSyncSession) {
+    setEventSyncStatus(`比較同期が進行中です。現在の同期を完了または中断してから${action}してください。`, "error");
+    return true;
+  }
+  if (mobileTransferBusyKind) {
+    setEventSyncStatus(
+      `${mobileTransferBusyLabel(mobileTransferBusyKind)}を処理中です。完了または停止してから${action}してください。`,
+      "error",
+    );
+    return true;
+  }
+  if (isOperationBusy(operationState)) {
+    setEventSyncStatus(`別のイベント処理中です。完了してから${action}してください。`, "error");
+    return true;
+  }
+  return false;
+}
+
+function normalizedEventSyncState(payload: EventSyncSessionStatePayload): string {
+  return String(payload.state ?? payload.status ?? "")
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/_/g, "-");
+}
+
+function handleEventSyncSessionState(payload: EventSyncSessionStatePayload): void {
+  const session = activeEventSyncSession;
+  if (!session || !session.targetUid) return;
+  if (!session.sessionId || !payload.sessionId || payload.sessionId !== session.sessionId) {
+    logToFile("比較同期: session ID未確定または不一致のsession stateを無視");
+    return;
+  }
+  const receivedUid = payload.targetEventUid ?? payload.target_uid;
+  if (receivedUid && receivedUid !== session.targetUid) {
+    logToFile(`比較同期: session event UID不一致 expected=${session.targetUid} received=${receivedUid}`);
+    return;
+  }
+  const state = normalizedEventSyncState(payload);
+  if (state === "pc-ready") {
+    setEventSyncStage("eventSyncPcFollowup", true);
+    const followupStatus = document.getElementById("eventSyncPcFollowupStatus");
+    if (followupStatus) {
+      followupStatus.textContent = "PCのZIPを同じ同期接続で送信しました。モバイル側の差分確認と適用を待っています。";
+    }
+    setEventSyncStatus("PC側のデータを送信しました。モバイル側の確認・適用を待っています…");
+    return;
+  }
+  if (state !== "mobile-applied" && state !== "cancelled" && state !== "error") return;
+  const delivery = String(payload.delivery ?? payload.origin ?? "").toLocaleLowerCase();
+  const terminalDelivered = payload.expired === true ||
+    payload.terminal === true ||
+    payload.terminalDelivered === true ||
+    payload.delivered === true ||
+    /poll|terminal|get/.test(delivery);
+  // The desktop waiter/JSON notification can update the state before the
+  // mobile GET receives its terminal response. Keep the receiver alive until
+  // the marked GET delivery arrives for every terminal state.
+  if (session.awaitingMobilePollTerminal && !terminalDelivered) {
+    setEventSyncStatus(
+      state === "mobile-applied"
+        ? "PC側への反映を確定しました。モバイル側の完了確認を待っています…"
+        : "モバイル側の同期結果を同じ接続で確認しています…",
+    );
+    return;
+  }
+  const terminalState = state as EventSyncTerminalState;
+  session.terminalState = terminalState;
+  if (payload.expired === true) session.expired = true;
+  if (terminalState !== "mobile-applied") {
+    session.cancelRequested = true;
+    const resolveChoice = session.resolveChoice;
+    session.resolveChoice = undefined;
+    if (resolveChoice) {
+      resolveChoice("cancel");
+      return;
+    }
+  }
+  const resolve = session.resolveTerminal;
+  session.resolveTerminal = undefined;
+  if (resolve) {
+    resolve(terminalState);
+    return;
+  }
+  void cleanupUnexpectedEventSyncTerminal(session, terminalState, payload);
+}
+
+async function cleanupUnexpectedEventSyncTerminal(
+  syncSession: DesktopEventSyncSession,
+  state: EventSyncTerminalState,
+  payload: EventSyncSessionStatePayload,
+): Promise<void> {
+  if (activeEventSyncSession !== syncSession) return;
+  try { await invoke("stop_receive_server"); } catch (error) { logToFile(`比較同期: terminal受信server stop失敗 ${String(error)}`); }
+  if (syncSession.outboundServerStarted) {
+    try { await invoke("stop_file_server"); } catch (error) { logToFile(`比較同期: terminal file server stop失敗 ${String(error)}`); }
+    syncSession.outboundServerStarted = false;
+  }
+  await cleanupEventSyncOutboundFile(syncSession);
+  setEventSyncStage("eventSyncPairing", false);
+  setEventSyncStage("eventSyncPreview", false);
+  setEventSyncStage("eventSyncPcFollowup", false);
+  const qrArea = document.getElementById("qrCodeArea");
+  if (qrArea) qrArea.style.display = "none";
+  if (activeEventSyncSession === syncSession) activeEventSyncSession = null;
+  if (payload.expired === true) {
+    const message = payload.error ?? payload.message ?? "QRの有効期限が切れました";
+    setEventSyncStatus(`QRの有効期限が切れました。${message}`, "error");
+  } else if (state === "cancelled") {
+    setEventSyncStatus("比較同期を中断しました。イベントデータは変更していません。");
+  } else if (state === "error") {
+    const message = payload.error ?? payload.message ?? "同期sessionが終了しました";
+    setEventSyncStatus(`比較同期に失敗しました。イベントデータは未反映です: ${message}`, "error");
+  } else {
+    setEventSyncStatus(`比較同期が完了しました: ${syncSession.targetName}`, "success");
+  }
+  logToFile(`比較同期: terminal cleanup state=${state} slug=${syncSession.targetSlug}`);
+  refreshEventSyncTargetDisplay();
+}
+
+void listen<EventSyncSessionStatePayload>("event-sync-session-state", (event) => {
+  handleEventSyncSessionState(event.payload);
+}).catch((error) => {
+  logToFile(`比較同期: session state listener登録失敗 ${String(error)}`);
+});
+
+function eventSyncElement<T extends HTMLElement>(id: string): T {
+  const element = document.getElementById(id) as T | null;
+  if (!element) throw new Error(`同期UI要素がありません: ${id}`);
+  return element;
+}
+
+function setEventSyncStatus(message: string, state: "normal" | "error" | "success" = "normal"): void {
+  const status = document.getElementById("eventSyncStatus");
+  if (!status) return;
+  status.textContent = message;
+  status.hidden = !message;
+  status.setAttribute("data-state", state);
+}
+
+function updateEventSyncCancelButtons(): void {
+  const session = activeEventSyncSession;
+  const disabled = !session ||
+    session.phase === "publishing" ||
+    session.phase === "acknowledging" ||
+    session.phase === "outbound";
+  for (const id of ["cancelEventSyncBtn", "cancelEventSyncPreviewBtn"]) {
+    const button = document.getElementById(id) as HTMLButtonElement | null;
+    if (button) button.disabled = disabled;
+  }
+}
+
+function refreshEventSyncTargetDisplay(): void {
+  const target = document.getElementById("eventSyncTarget");
+  const start = document.getElementById("startEventSyncBtn") as HTMLButtonElement | null;
+  updateEventSyncCancelButtons();
+  if (!target || !start) return;
+  const owner = activeEventSlug
+    ? eventList.find((event) => event.slug === activeEventSlug)
+    : null;
+  const session = activeEventSyncSession;
+  if (session) {
+    target.hidden = false;
+    target.textContent = `同期対象: ${session.targetName}（${session.targetSlug}）`;
+  } else if (owner) {
+    target.hidden = true;
+    target.textContent = `選択中: ${owner.meta.name || owner.slug}`;
+  } else {
+    target.hidden = true;
+    target.textContent = "イベント未選択";
+  }
+  start.disabled = !owner || Boolean(session);
+}
+
+function setEventSyncStage(stageId: string, visible: boolean): void {
+  const stage = document.getElementById(stageId);
+  if (!stage) return;
+  stage.classList.toggle("hidden", !visible);
+}
+
+function resetEventSyncSourceChoice(): void {
+  document.querySelectorAll<HTMLInputElement>('input[name="eventSyncSource"]').forEach((radio) => {
+    radio.checked = false;
+  });
+  const confirm = document.getElementById("eventSyncConfirm") as HTMLInputElement | null;
+  if (confirm) confirm.checked = false;
+  updateEventSyncConfirmButton();
+}
+
+function selectedEventSyncSource(): "mobile" | "desktop" | null {
+  return document.querySelector<HTMLInputElement>('input[name="eventSyncSource"]:checked')?.value === "mobile"
+    ? "mobile"
+    : document.querySelector<HTMLInputElement>('input[name="eventSyncSource"]:checked')?.value === "desktop"
+      ? "desktop"
+      : null;
+}
+
+function updateEventSyncConfirmButton(): void {
+  const button = document.getElementById("eventSyncApplyBtn") as HTMLButtonElement | null;
+  const confirm = document.getElementById("eventSyncConfirm") as HTMLInputElement | null;
+  if (!button || !confirm) return;
+  const source = selectedEventSyncSource();
+  button.disabled = !source || !confirm.checked || activeEventSyncSession?.phase !== "preview";
+  button.textContent = source === "mobile"
+    ? "モバイルを正としてPCへ反映"
+    : source === "desktop"
+      ? "PCを正として同じ接続でモバイルへ送信"
+      : "同期元を確定して続行";
+}
+
+function renderEventSyncPreview(preview: EventSyncPreview): void {
+  const summary = eventSyncElement<HTMLDivElement>("eventSyncDiffSummary");
+  const diff = eventSyncElement<HTMLDivElement>("eventSyncDiff");
+  summary.replaceChildren();
+  diff.replaceChildren();
+  const countLabels: Array<[EventSyncChangeKind, string]> = [
+    ["added", "追加"], ["changed", "変更"], ["deleted", "削除"],
+  ];
+  for (const [kind, label] of countLabels) {
+    const badge = document.createElement("span");
+    badge.className = "event-sync-count";
+    badge.textContent = `${label} ${preview.counts[kind]}件`;
+    summary.appendChild(badge);
+  }
+  const total = document.createElement("span");
+  total.className = "event-sync-count";
+  total.textContent = `差分合計 ${preview.total}件`;
+  summary.appendChild(total);
+
+  if (preview.total === 0) {
+    const empty = document.createElement("p");
+    empty.className = "form-hint";
+    empty.textContent = "event.jsonと画像hashに差分はありません。同期元を選び、続行を確認してください。";
+    diff.appendChild(empty);
+    return;
+  }
+
+  const kindLabels: Record<EventSyncChangeKind, string> = {
+    added: "追加",
+    changed: "変更",
+    deleted: "削除",
+  };
+  for (const section of preview.sections) {
+    const container = document.createElement("section");
+    container.className = "event-sync-diff-section";
+    const heading = document.createElement("h5");
+    heading.textContent = `${section.title}（${section.entries.length}件）`;
+    container.appendChild(heading);
+    const list = document.createElement("ul");
+    list.className = "event-sync-diff-list";
+    for (const entry of section.entries) {
+      const row = document.createElement("li");
+      row.dataset.kind = entry.kind;
+      const label = document.createElement("span");
+      label.className = "event-sync-diff-label";
+      label.textContent = `[${kindLabels[entry.kind]}] ${entry.label}`;
+      const detail = document.createElement("div");
+      detail.textContent = entry.details;
+      row.append(label, detail);
+      list.appendChild(row);
+    }
+    container.appendChild(list);
+    diff.appendChild(container);
+  }
+}
+
+async function ensureSelectedEventSyncUid(expectedSlug: string, expectedDir: string): Promise<string> {
+  return runManagedEventDocumentMutation(async () => {
+    if (activeEventSlug !== expectedSlug) {
+      throw new Error("同期開始前に選択イベントが切り替わりました。選び直してください。");
+    }
+    const owner = eventList.find((entry) => entry.slug === expectedSlug);
+    if (!owner || !eventPathsEqual(owner.dir, expectedDir)) {
+      throw new Error("同期対象イベントの保存先が変わりました。");
+    }
+    const pendingMeta = captureCrawlMetaSnapshot();
+    await flushCrawlMetaSnapshot(pendingMeta, INTERNAL_OPERATION_SAVE);
+    const saved = await saveNow(INTERNAL_OPERATION_SAVE);
+    if (!saved.ok) throw new Error(`同期開始前の保存に失敗しました: ${String(saved.error)}`);
+
+    const ownerDir = normalizeEventPath(owner.dir);
+    const ownerKey = eventMetaOwnerKey(owner.slug, ownerDir);
+    await eventSaveQueue.flushKey(ownerKey);
+    const queueStatus = eventSaveQueue.getStatus(ownerKey);
+    if (queueStatus.error) throw new Error(`同期対象イベントの保存キューに失敗しました: ${String(queueStatus.error)}`);
+
+    const lifecycleLease = eventLifecycleGate.acquire(ownerKey);
+    if (!lifecycleLease) throw new Error("同期対象イベントは削除または名前変更処理中です。");
+    try {
+      let uid = "";
+      await eventMetaWriteCoordinator.runExclusiveAccepted(ownerKey, async () => {
+        const eventJsonPath = eventJsonPathForDir(ownerDir);
+        const bundle = await invoke<{
+          data?: EventJsonData;
+          modified_ms?: number;
+          file_size?: number;
+        }>("load_event_bundle", { eventJson: eventJsonPath, eventDir: ownerDir, includeMaps: false });
+        if (!bundle?.data || typeof bundle.data !== "object" || Array.isArray(bundle.data)) {
+          throw new Error("同期対象のevent.jsonを読み込めません。");
+        }
+        const prepared = prepareFullSyncEventDocument(bundle.data, createDesktopEventUid);
+        uid = prepared.eventUid;
+        if (!prepared.changed) return;
+        const confirmed = window.confirm(
+          `同期用UIDの登録を確認してください。\n\n` +
+            `対象: ${owner.meta.name || owner.slug}\n` +
+            "このイベントに端末間の同定用UIDだけを登録します。登録したUIDは、あとで同期を中断しても残ります。\n" +
+            "登録処理で既存のイベント内容を置き換えることはありません。\n\n" +
+            "UIDを登録して比較同期を開始しますか？",
+        );
+        if (!confirmed) throw new EventSyncUidRegistrationDeclined();
+        const beforeSave = await invoke<{ modified_ms?: number; file_size?: number }>(
+          "event_file_fingerprint",
+          { eventJson: eventJsonPath },
+        );
+        if (beforeSave?.modified_ms !== bundle.modified_ms || beforeSave?.file_size !== bundle.file_size) {
+          throw new Error("UID保存の直前に同期対象event.jsonが変更されました。もう一度開始してください。");
+        }
+        const disk = await invoke<{ modified_ms?: number; file_size?: number }>("save_event_json_native", {
+          eventJson: eventJsonPath,
+          data: prepared.data,
+        });
+        const fingerprint: EventSourceFingerprint = {
+          modifiedMs: disk?.modified_ms,
+          fileSize: disk?.file_size,
+        };
+        purchaseHistoryIndexService.replace(owner.slug, prepared.data, fingerprint);
+        if (activeEventSlug === owner.slug && eventPathsEqual(editorJsonPathValue(), eventJsonPath)) {
+          eventJsonData = recordDeepClone(prepared.data);
+          persistedEventJsonData = recordDeepClone(prepared.data);
+          if (committedEventSession?.slug === owner.slug) {
+            committedEventSession = reconcileSessionEventDocument(
+              committedEventSession,
+              prepared.data,
+              fingerprint,
+            );
+          }
+          markEventDocumentMutated();
+        }
+      });
+      if (!uid) throw new Error("同期対象イベントのUIDを確定できませんでした。");
+      return uid;
+    } finally {
+      lifecycleLease.release();
+    }
+  });
+}
+
+async function cancelEventSyncUpload(uploadId: string, reason: string): Promise<void> {
+  try {
+    await invoke("cancel_received_upload", { uploadId, error: reason });
+  } catch (error) {
+    logToFile(`比較同期: upload cancel失敗 upload=${uploadId} error=${String(error)}`);
+  }
+}
+
+function waitForEventSyncChoice(syncSession: DesktopEventSyncSession): Promise<EventSyncChoice> {
+  return new Promise((resolve) => {
+    syncSession.resolveChoice = resolve;
+  });
+}
+
+function waitForEventSyncTerminal(
+  syncSession: DesktopEventSyncSession,
+): Promise<EventSyncTerminalState> {
+  if (syncSession.terminalState) return Promise.resolve(syncSession.terminalState);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (state: EventSyncTerminalState) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      resolve(state);
+    };
+    syncSession.resolveTerminal = finish;
+    const timeout = window.setTimeout(() => {
+      if (syncSession.resolveTerminal === finish) syncSession.resolveTerminal = undefined;
+      finish("error");
+    }, (() => {
+      const remainingMs = Number.isFinite(syncSession.pairingExpiresAt)
+        ? Math.max(0, syncSession.pairingExpiresAt! - Date.now())
+        : ((Number.isFinite(syncSession.pairingExpiresInSeconds) && (syncSession.pairingExpiresInSeconds ?? 0) > 0
+          ? syncSession.pairingExpiresInSeconds!
+          : 20 * 60) * 1000);
+      return remainingMs + 30_000;
+    })());
+  });
+}
+
+function eventSyncOutboundZipPath(syncSession: DesktopEventSyncSession): string {
+  const projectRoot = projectRootEl.value.trim().replace(/[\\/]+$/, "");
+  if (!projectRoot) throw new Error("プロジェクトルートが未設定です。");
+  const uploadKey = (syncSession.uploadId || `${Date.now()}`).replace(/[^A-Za-z0-9_-]/g, "_");
+  return `${projectRoot}/temp/event_sync_${uploadKey}_${Date.now()}.zip`;
+}
+
+async function cleanupEventSyncOutboundFile(syncSession: DesktopEventSyncSession): Promise<void> {
+  const zipPath = syncSession.outboundZipPath;
+  if (!zipPath) return;
+  syncSession.outboundZipPath = undefined;
+  try {
+    await invoke("delete_file", { filePath: zipPath });
+  } catch (error) {
+    logToFile(`比較同期: outbound ZIP cleanup失敗 path=${zipPath} error=${String(error)}`);
+  }
+}
+
+async function startDesktopEventSync(): Promise<void> {
+  if (activeEventSyncSession) return;
+  if (mobileTransferBusyKind) {
+    setEventSyncStatus(
+      `${mobileTransferBusyLabel(mobileTransferBusyKind)}を処理中です。完了または停止してから比較同期を開始してください。`,
+      "error",
+    );
+    return;
+  }
+  if (isOperationBusy(operationState)) {
+    setEventSyncStatus("別のイベント処理中です。完了してから比較同期を開始してください。", "error");
+    return;
+  }
+  const slug = activeEventSlug;
+  const owner = slug ? eventList.find((event) => event.slug === slug) : null;
+  if (!slug || !owner || !eventJsonData) {
+    setEventSyncStatus("サイドバーで同期対象イベントを選択してください。", "error");
+    return;
+  }
+  const session: DesktopEventSyncSession = {
+    phase: "starting",
+    targetSlug: owner.slug,
+    targetDir: normalizeEventPath(owner.dir),
+    targetUid: null,
+    targetName: owner.meta.name || owner.slug,
+    outboundServerStarted: false,
+    awaitingMobilePollTerminal: false,
+    receiveServerAttempted: false,
+    cancelRequested: false,
+  };
+  activeEventSyncSession = session;
+  refreshEventSyncTargetDisplay();
+  resetEventSyncSourceChoice();
+  setEventSyncStage("eventSyncPairing", false);
+  setEventSyncStage("eventSyncPreview", false);
+  setEventSyncStatus("選択イベントを保存し、UIDを確認しています…");
+  logToFile(`比較同期: 開始 slug=${session.targetSlug}`);
+  try {
+    session.targetUid = await ensureSelectedEventSyncUid(session.targetSlug, session.targetDir);
+    if (activeEventSyncSession !== session || session.cancelRequested) return;
+    setEventSyncStage("eventSyncPcFollowup", false);
+    const oldQrArea = document.getElementById("qrCodeArea");
+    if (oldQrArea) oldQrArea.style.display = "none";
+    await invoke("stop_file_server");
+    await invoke("stop_receive_server");
+    if (activeEventSyncSession !== session || session.cancelRequested) return;
+    session.receiveServerAttempted = true;
+    const response = await invoke<{
+      status: string;
+      url: string;
+      sessionId?: string;
+      ip?: string;
+      port?: number;
+      expiresInSeconds?: number;
+    }>(
+      "start_receive_server",
+      { projectRoot: projectRootEl.value, targetEventUid: session.targetUid },
+    );
+    if (activeEventSyncSession !== session || session.cancelRequested) {
+      await invoke("stop_receive_server");
+      return;
+    }
+    if (response.status !== "ok" || !response.url) throw new Error("比較同期の受信サーバーを起動できませんでした。");
+    const sessionId = typeof response.sessionId === "string" ? response.sessionId.trim() : "";
+    if (!sessionId) throw new Error("比較同期のsession IDを受け取れませんでした。");
+    session.sessionId = sessionId;
+    session.sessionUrl = response.url;
+    const responseExpirySeconds = Number(response.expiresInSeconds);
+    if (Number.isFinite(responseExpirySeconds) && responseExpirySeconds > 0) {
+      session.pairingExpiresInSeconds = responseExpirySeconds;
+      session.pairingExpiresAt = Date.now() + responseExpirySeconds * 1000;
+    }
+    session.phase = "pairing";
+    const expirySeconds = Number(response.expiresInSeconds);
+    const expiryLabel = Number.isFinite(expirySeconds) && expirySeconds > 0
+      ? `QRの有効期限: 約${Math.ceil(expirySeconds / 60)}分`
+      : "QRの有効期限: サーバー側の期限管理中";
+    eventSyncElement<HTMLElement>("eventSyncPairingTarget").textContent =
+      `対象: ${session.targetName}（UID ${session.targetUid}）。別イベントのZIPはこの比較に使われません。${expiryLabel}`;
+    eventSyncElement<HTMLElement>("eventSyncQrUrl").textContent = response.url;
+    eventSyncElement<HTMLElement>("eventSyncQrExpiry").textContent = expiryLabel;
+    const QRCode = (await import("qrcode")).default;
+    await QRCode.toCanvas(eventSyncElement<HTMLCanvasElement>("eventSyncQrCanvas"), response.url, { width: 256, margin: 2 });
+    setEventSyncStage("eventSyncPairing", true);
+    setEventSyncStatus(`QRを読み取り、モバイル側からこのイベントのデータを送信してください。（${expiryLabel}）`);
+    logToFile(`比較同期: QR待機開始 slug=${session.targetSlug} uid=${session.targetUid}`);
+  } catch (error) {
+    if (activeEventSyncSession === session) activeEventSyncSession = null;
+    if (session.receiveServerAttempted) {
+      try { await invoke("stop_receive_server"); } catch { /* already stopped */ }
+    }
+    setEventSyncStage("eventSyncPairing", false);
+    if (error instanceof EventSyncUidRegistrationDeclined) {
+      setEventSyncStatus("同期用UIDの登録をキャンセルしました。受信サーバーは起動していません。イベント内容は変更していません。");
+    } else {
+      setEventSyncStatus(`比較同期を開始できませんでした: ${String(error)}`, "error");
+    }
+    logToFile(`比較同期: 起動エラー ${String(error)}`);
+  } finally {
+    refreshEventSyncTargetDisplay();
+  }
+}
+
+async function requestCancelDesktopEventSync(): Promise<void> {
+  const session = activeEventSyncSession;
+  if (!session) return;
+  if (session.phase === "publishing" || session.phase === "acknowledging") {
+    setEventSyncStatus("反映を確定しています。完了表示までお待ちください。");
+    return;
+  }
+  if (session.phase === "outbound") {
+    setEventSyncStatus("モバイル側の確認・適用を待っています。完了または中断の通知を受け取るまで接続を維持します。");
+    return;
+  }
+  session.cancelRequested = true;
+  if (session.resolveChoice) {
+    const resolve = session.resolveChoice;
+    session.resolveChoice = undefined;
+    resolve("cancel");
+    setEventSyncStatus("中断しています。対象イベントは変更しません。");
+    return;
+  }
+  if (session.uploadId) {
+    await cancelEventSyncUpload(session.uploadId, "ユーザーが比較同期を中断しました");
+    setEventSyncStatus("受信処理を中断しています。対象イベントは変更しません。");
+    return;
+  }
+  try {
+    await invoke("stop_receive_server");
+  } catch (error) {
+    logToFile(`比較同期: 受信サーバー停止失敗 ${String(error)}`);
+  }
+  // stop中にresult-receivedが届いた場合は、そのuploadのhandlerにcleanupを
+  // 引き継ぐ。ここでsessionを解放すると、遅れて別同期のserverまで停止し得る。
+  if (session.uploadId) return;
+  if (activeEventSyncSession === session) activeEventSyncSession = null;
+  setEventSyncStage("eventSyncPairing", false);
+  setEventSyncStage("eventSyncPreview", false);
+  setEventSyncStatus("比較同期を中断しました。イベントデータに変更はありません。");
+  logToFile(`比較同期: 中断 slug=${session.targetSlug}`);
+  refreshEventSyncTargetDisplay();
+}
+
+async function handleReceivedEventSyncUpload(payload: {
+  uploadId: string;
+  zipPath: string;
+  size: number;
+  targetEventUid?: string | null;
+}): Promise<void> {
+  const { uploadId, zipPath, size, targetEventUid } = payload;
+  const session = activeEventSyncSession;
+  if (!session || session.phase !== "pairing" || !session.targetUid || targetEventUid !== session.targetUid) {
+    await cancelEventSyncUpload(uploadId, "比較同期の対象イベントUIDが一致しません");
+    if (session && activeEventSyncSession === session) {
+      setEventSyncStatus("別のイベントUIDのZIPを受信しました。そのZIPは破棄し、対象イベントの受信待機を続けます。", "error");
+    }
+    logToFile(`比較同期: UID不一致 upload=${uploadId} expected=${session?.targetUid ?? "none"} received=${targetEventUid ?? "none"}`);
+    return;
+  }
+
+  session.uploadId = uploadId;
+  if (session.cancelRequested) {
+    await cancelEventSyncUpload(uploadId, "比較同期の中断中に受信したZIPです");
+    try { await invoke("stop_receive_server"); } catch { /* already stopped */ }
+    if (activeEventSyncSession === session) activeEventSyncSession = null;
+    setEventSyncStage("eventSyncPairing", false);
+    setEventSyncStatus("比較同期を中断しました。イベントデータに変更はありません。");
+    refreshEventSyncTargetDisplay();
+    return;
+  }
+  session.phase = "preview";
+  eventSyncElement<HTMLElement>("eventSyncPairingTarget").textContent =
+    "ZIPを受信しました。キャンセルするまでイベントデータは変更せず、対象と内容を検査しています…";
+  eventSyncElement<HTMLElement>("eventSyncPreviewTarget").textContent =
+    `対象: ${session.targetName}（${session.targetSlug} / UID ${session.targetUid}）。ZIP ${(size / 1024 / 1024).toFixed(1)} MB。`;
+  eventSyncElement<HTMLDivElement>("eventSyncDiff").replaceChildren();
+  setEventSyncStatus("受信ZIPを安全に検査し、PC側との差分を計算しています…");
+  let successAckSent = false;
+  let outboundServerStarted = false;
+  let heartbeatTimer: number | null = null;
+  let heartbeatFailure: unknown = null;
+  const heartbeat = () => invoke("heartbeat_received_upload", { uploadId });
+  const assertLease = async () => {
+    if (heartbeatFailure) throw heartbeatFailure;
+    if (session.cancelRequested) throw new Error("比較同期は中断されました");
+    await heartbeat();
+    if (heartbeatFailure) throw heartbeatFailure;
+  };
+  try {
+    await invoke("claim_received_upload", { uploadId });
+    heartbeatTimer = window.setInterval(() => {
+      void heartbeat().catch((error) => {
+        heartbeatFailure = error;
+        if (heartbeatTimer !== null) clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      });
+    }, 20_000);
+    await waitForOperationIdle();
+    await assertLease();
+    if (activeEventSlug === session.targetSlug) {
+      await flushCrawlMetaSnapshot(captureCrawlMetaSnapshot(), INTERNAL_OPERATION_SAVE);
+      await flushActiveEventForLifecycle();
+    }
+    else {
+      const targetKey = eventMetaOwnerKey(session.targetSlug, session.targetDir);
+      await eventSaveQueue.flushKey(targetKey);
+      if (eventSaveQueue.getStatus(targetKey).error) throw new Error("同期対象イベントの保存キューに失敗しました。");
+    }
+    await assertLease();
+    const preview = await invoke<{
+      targetSlug: string;
+      targetEventUid: string;
+      desktopData: unknown;
+      mobileData: unknown;
+      fingerprint: unknown;
+      assetDiff?: unknown;
+    }>("preview_received_event_sync", {
+      uploadId,
+      projectRoot: projectRootEl.value,
+      targetEventUid: session.targetUid,
+    });
+    await assertLease();
+    if (preview.targetEventUid !== session.targetUid) throw new Error("差分プレビューの対象UIDが一致しません。");
+    session.targetSlug = preview.targetSlug;
+    session.fingerprint = preview.fingerprint;
+    session.phase = "preview";
+    const diff = buildEventSyncPreview(preview.desktopData, preview.mobileData, preview.assetDiff);
+    eventSyncElement<HTMLElement>("eventSyncPreviewTarget").textContent =
+      `対象: ${session.targetName}（${preview.targetSlug} / UID ${session.targetUid}）。PCとモバイルの差分を確認してください。`;
+    renderEventSyncPreview(diff);
+    resetEventSyncSourceChoice();
+    setEventSyncStage("eventSyncPairing", false);
+    setEventSyncStage("eventSyncPreview", true);
+    setEventSyncStatus(`差分 ${diff.total}件を表示しています。同期元を選び、確認欄にチェックしてください。`);
+    logToFile(`比較同期: preview slug=${preview.targetSlug} diff=${diff.total} upload=${uploadId}`);
+
+    const choice = await waitForEventSyncChoice(session);
+    session.resolveChoice = undefined;
+    if (choice === "cancel" || session.cancelRequested) {
+      await cancelEventSyncUpload(uploadId, "ユーザーが差分確認後に比較同期を中断しました");
+      try { await invoke("stop_receive_server"); } catch { /* best effort */ }
+      if (activeEventSyncSession === session) activeEventSyncSession = null;
+      setEventSyncStage("eventSyncPreview", false);
+      setEventSyncStatus("中断しました。対象イベントは変更していません。");
+      refreshEventSyncTargetDisplay();
+      return;
+    }
+
+    await assertLease();
+    if (choice === "mobile") {
+      session.phase = "staging";
+      setEventSyncStatus("モバイル側を正として反映準備中です。まだイベントデータは公開されていません。");
+      const staged = await invoke<{ status?: string }>("stage_received_event_sync", {
+        uploadId,
+        projectRoot: projectRootEl.value,
+        targetEventUid: session.targetUid,
+        expectedFingerprint: preview.fingerprint,
+      });
+      if (staged?.status && !["ok", "staged", "ready"].includes(staged.status)) {
+        throw new Error(`同期ステージを準備できませんでした: ${staged.status}`);
+      }
+      await assertLease();
+      if (session.cancelRequested) throw new Error("公開前に比較同期が中断されました");
+      session.phase = "publishing";
+      session.awaitingMobilePollTerminal = true;
+      updateEventSyncCancelButtons();
+      setEventSyncStatus("確認済みのモバイルデータを対象イベントへ反映しています。完了までお待ちください。");
+      const publishResult = await invoke<{ backupPath?: string }>(
+        "publish_received_event_sync",
+        { uploadId },
+      );
+      const backupPath = typeof publishResult?.backupPath === "string" && publishResult.backupPath.trim()
+        ? publishResult.backupPath.trim()
+        : null;
+      successAckSent = true;
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      setEventSyncStatus("PC側への反映結果を同じ同期接続で通知しています。モバイル側の完了確認を待っています…");
+      const terminalState = await waitForEventSyncTerminal(session);
+      if (terminalState !== "mobile-applied") {
+        throw new Error(
+          terminalState === "cancelled"
+            ? "モバイル側で同期がキャンセルされました。"
+            : "モバイル側の完了通知を受け取れませんでした。",
+        );
+      }
+      try { await invoke("stop_receive_server"); } catch (error) { logToFile(`比較同期: 反映後server stop失敗 ${String(error)}`); }
+      let reloadWarning = "";
+      try {
+        await loadEventList();
+        if (activeEventSlug === preview.targetSlug) {
+          const reloaded = await selectEvent(preview.targetSlug);
+          if (!reloaded) reloadWarning = "（画面の再読み込みに失敗しました。イベント一覧は更新済みです）";
+        }
+      } catch (error) {
+        reloadWarning = `（画面更新警告: ${String(error)}）`;
+      }
+      setEventSyncStage("eventSyncPreview", false);
+      const backupNotice = backupPath ? ` / バックアップ: ${backupPath}` : "";
+      setEventSyncStatus(`モバイル側のデータを反映しました: ${session.targetName}${backupNotice}${reloadWarning}`, reloadWarning ? "error" : "success");
+      resultEl.textContent =
+        `比較同期: モバイル側をPCへ反映完了\n対象: ${session.targetName}\n` +
+        (backupPath ? `バックアップ: ${backupPath}` : "バックアップパス: 返却なし");
+      logToFile(`比較同期: mobileをPCへ反映完了 slug=${preview.targetSlug} upload=${uploadId} backup=${backupPath ?? "none"}`);
+    } else {
+      session.phase = "revalidating";
+      setEventSyncStatus("PC側の保存を完了し、プレビュー後に変更がないか再確認しています…");
+      await waitForOperationIdle();
+      await assertLease();
+      const pendingTargetMeta = activeEventSlug === preview.targetSlug
+        ? captureCrawlMetaSnapshot()
+        : null;
+      const desktopTransfer = await runManagedEventDocumentMutation(async () => {
+        const target = eventList.find((entry) => entry.slug === preview.targetSlug);
+        if (!target || !eventPathsEqual(target.dir, session.targetDir)) {
+          throw new Error("同期対象がプレビュー後に変更されました。再比較が必要です（stale target）。");
+        }
+        const targetKey = eventMetaOwnerKey(target.slug, target.dir);
+        if (activeEventSlug === target.slug) {
+          await flushCrawlMetaSnapshot(pendingTargetMeta ?? captureCrawlMetaSnapshot(), INTERNAL_OPERATION_SAVE);
+          const activeSave = await saveNow(INTERNAL_OPERATION_SAVE);
+          if (!activeSave.ok) {
+            throw new Error(`PC側対象イベントの保存に失敗しました: ${String(activeSave.error)}`);
+          }
+        }
+        await eventSaveQueue.flushKey(targetKey);
+        const queueStatus = eventSaveQueue.getStatus(targetKey);
+        if (queueStatus.error) {
+          throw new Error(`PC側対象イベントの保存キューに失敗しました: ${String(queueStatus.error)}`);
+        }
+        await assertLease();
+
+        let currentPreview: {
+          targetSlug: string;
+          targetEventUid: string;
+          desktopData: unknown;
+          mobileData: unknown;
+          fingerprint: unknown;
+          assetDiff?: unknown;
+        };
+        try {
+          currentPreview = await invoke("preview_received_event_sync", {
+            uploadId,
+            projectRoot: projectRootEl.value,
+            targetEventUid: session.targetUid,
+          });
+        } catch (error) {
+          throw new Error(`PC側データを再検証できませんでした。差分比較からやり直してください: ${String(error)}`);
+        }
+        await assertLease();
+        if (
+          currentPreview.targetSlug !== preview.targetSlug ||
+          currentPreview.targetEventUid !== session.targetUid ||
+          !eventSyncFingerprintsMatch(preview.fingerprint, currentPreview.fingerprint)
+        ) {
+          throw new Error("PC側対象イベントがプレビュー後に変更されました。今回の同期を中断しました（stale fingerprint）。差分比較からやり直してください。");
+        }
+
+        session.phase = "acknowledging";
+        updateEventSyncCancelButtons();
+        setEventSyncStatus("再検証済みのPCデータを確定し、同じ同期接続用のZIPを作成しています…");
+        await assertLease();
+        const eventJsonPath = eventJsonPathForDir(target.dir);
+        const zipPath = eventSyncOutboundZipPath(session);
+        session.outboundZipPath = zipPath;
+        const zipRes = await runJob("create_mobile_zip", {
+          event_json: eventJsonPath,
+          output_dir: target.dir,
+          zip_output_path: zipPath,
+          include_shared_settings: false,
+        });
+        if (!zipRes?.ok) throw new Error("PC側のイベントZIPを作成できませんでした。");
+        await invoke("stop_file_server");
+        const serverRes = await invoke<{ status: string; url?: string }>(
+          "start_event_sync_file_server",
+          { filePath: zipPath, targetEventUid: session.targetUid },
+        );
+        if (serverRes.status !== "ok" || typeof serverRes.url !== "string") {
+          throw new Error("PC側ZIPを配信するHTTPサーバーを起動できませんでした。");
+        }
+        session.outboundServerStarted = true;
+        outboundServerStarted = true;
+        session.awaitingMobilePollTerminal = true;
+        await assertLease();
+        await invoke("ack_received_upload_with_download", {
+          uploadId,
+          downloadUrl: serverRes.url,
+        });
+        successAckSent = true;
+        if (heartbeatTimer !== null) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
+        session.phase = "outbound";
+        updateEventSyncCancelButtons();
+        return { target };
+      });
+      const { target } = desktopTransfer;
+      setEventSyncStage("eventSyncPcFollowup", true);
+      setEventSyncStage("eventSyncPreview", false);
+      eventSyncElement<HTMLElement>("eventSyncPcFollowupStatus").textContent =
+        "PC側のZIPを同じ同期接続で送信しました。モバイル側の差分確認と適用を待っています。";
+      setEventSyncStatus("PC側のデータを送信しました。モバイル側の確認・適用を待っています…", "success");
+      resultEl.textContent = `比較同期: PC側を正として同じ接続で送信中\n対象: ${target.meta.name || target.slug}`;
+      logToFile(`比較同期: desktopを正として同一session送信 slug=${target.slug} upload=${uploadId}`);
+      const terminalState = await waitForEventSyncTerminal(session);
+      if (terminalState !== "mobile-applied") {
+        throw new Error(
+          terminalState === "cancelled"
+            ? "モバイル側で同期がキャンセルされました。"
+            : "モバイル側の完了通知を受け取れませんでした。",
+        );
+      }
+      setEventSyncStatus("モバイル側でPCデータの適用が完了しました。", "success");
+      resultEl.textContent = `比較同期: PC側を正としてモバイルへ反映完了\n対象: ${target.meta.name || target.slug}`;
+    }
+    try { await invoke("stop_receive_server"); } catch { /* already stopped */ }
+    if (session.outboundServerStarted) {
+      try { await invoke("stop_file_server"); } catch (error) { logToFile(`比較同期: outbound server stop失敗 ${String(error)}`); }
+      session.outboundServerStarted = false;
+    }
+    await cleanupEventSyncOutboundFile(session);
+    if (activeEventSyncSession === session) activeEventSyncSession = null;
+    refreshEventSyncTargetDisplay();
+  } catch (error) {
+    if (!successAckSent) await cancelEventSyncUpload(uploadId, String(error));
+    if (activeEventSyncSession === session) {
+      try { await invoke("stop_receive_server"); } catch { /* already stopped */ }
+    }
+    if (outboundServerStarted) {
+      try { await invoke("stop_file_server"); } catch { /* already stopped */ }
+      session.outboundServerStarted = false;
+      const qrArea = document.getElementById("qrCodeArea");
+      if (qrArea) qrArea.style.display = "none";
+      setEventSyncStage("eventSyncPcFollowup", false);
+    }
+    await cleanupEventSyncOutboundFile(session);
+    if (activeEventSyncSession === session) activeEventSyncSession = null;
+    if (session.expired) {
+      setEventSyncStage("eventSyncPairing", false);
+      setEventSyncStage("eventSyncPreview", false);
+      setEventSyncStage("eventSyncPcFollowup", false);
+      setEventSyncStatus("QRの有効期限が切れました。もう一度「モバイルと同期」を開始してください。", "error");
+    } else if (session.cancelRequested) {
+      setEventSyncStage("eventSyncPairing", false);
+      setEventSyncStage("eventSyncPreview", false);
+      setEventSyncStatus("比較同期を中断しました。対象イベントは変更していません。");
+    } else {
+      setEventSyncStatus(`比較同期に失敗しました。イベントデータは未反映です: ${String(error)}`, "error");
+    }
+    logToFile(`比較同期: upload処理失敗 upload=${uploadId} zip=${zipPath} error=${String(error)}`);
+    refreshEventSyncTargetDisplay();
+  } finally {
+    if (heartbeatTimer !== null) clearInterval(heartbeatTimer);
+  }
+}
+
+document.getElementById("startEventSyncBtn")?.addEventListener("click", () => {
+  void startDesktopEventSync();
+});
+document.getElementById("cancelEventSyncBtn")?.addEventListener("click", () => {
+  void requestCancelDesktopEventSync();
+});
+document.getElementById("cancelEventSyncPreviewBtn")?.addEventListener("click", () => {
+  void requestCancelDesktopEventSync();
+});
+document.querySelectorAll<HTMLInputElement>('input[name="eventSyncSource"]').forEach((radio) => {
+  radio.addEventListener("change", updateEventSyncConfirmButton);
+});
+document.getElementById("eventSyncConfirm")?.addEventListener("change", updateEventSyncConfirmButton);
+document.getElementById("eventSyncApplyBtn")?.addEventListener("click", () => {
+  const session = activeEventSyncSession;
+  const source = selectedEventSyncSource();
+  const confirm = document.getElementById("eventSyncConfirm") as HTMLInputElement | null;
+  if (!session || session.phase !== "preview" || !source || !confirm?.checked) return;
+  const resolve = session.resolveChoice;
+  if (!resolve) return;
+  session.phase = source === "mobile" ? "staging" : "revalidating";
+  resolve(source);
+  session.resolveChoice = undefined;
+  updateEventSyncConfirmButton();
+});
+
 (document.getElementById("exportZipBtn") as HTMLButtonElement).addEventListener(
   "click",
   async () => {
+    if (rejectBusyMobileTransfer("ZIPエクスポートを開始")) return;
+    mobileTransferBusyKind = "export";
+    try {
     const eventDir = getActiveEventDir();
     if (!eventDir) {
       resultEl.textContent = "サイドバーでイベントを選択してください";
@@ -8508,12 +9473,19 @@ async function flushActiveEventForLifecycle(): Promise<void> {
       const b = res.bridge as any;
       resultEl.textContent = `ZIPエクスポート完了\n保存先: ${b.zip_path}\nサイズ: ${((b.total_size || 0) / 1024 / 1024).toFixed(1)} MB\nサークル画像: ${b.circle_images ?? 0}件\nアイテム画像: ${b.item_images ?? 0}件\nマップ画像: ${b.map_images ?? 0}件`;
     }
+    } finally {
+      if (mobileTransferBusyKind === "export") mobileTransferBusyKind = null;
+    }
   },
 );
 
 (
   document.getElementById("sendToMobileBtn") as HTMLButtonElement
 ).addEventListener("click", async () => {
+  if (rejectBusyMobileTransfer("旧方式の転送を開始")) return;
+  mobileTransferBusyKind = "legacy-send";
+  let transferServerStarted = false;
+  try {
   const eventDir = getActiveEventDir();
   if (!eventDir) {
     resultEl.textContent = "サイドバーでイベントを選択してください";
@@ -8542,6 +9514,7 @@ async function flushActiveEventForLifecycle(): Promise<void> {
   try {
     const serverRes = await startMobileZipServer(zipPath);
     if (serverRes.status === "ok") {
+      transferServerStarted = true;
       const url = serverRes.url as string;
       const qrArea = document.getElementById("qrCodeArea")!;
       qrArea.style.display = "block";
@@ -8557,11 +9530,20 @@ async function flushActiveEventForLifecycle(): Promise<void> {
   } catch (e) {
     resultEl.textContent = `サーバー起動エラー: ${String(e)}`;
   }
+  } finally {
+    if (!transferServerStarted && mobileTransferBusyKind === "legacy-send") {
+      mobileTransferBusyKind = null;
+    }
+  }
 });
 
 (
   document.getElementById("sendFullSyncToMobileBtn") as HTMLButtonElement
 ).addEventListener("click", async () => {
+  if (rejectBusyMobileTransfer("全イベント同期を開始")) return;
+  mobileTransferBusyKind = "full-sync";
+  let transferServerStarted = false;
+  try {
   if (eventList.length === 0) {
     resultEl.textContent = "同期できるイベントがありません";
     return;
@@ -8610,6 +9592,7 @@ async function flushActiveEventForLifecycle(): Promise<void> {
   try {
     const serverRes = await startMobileZipServer(zipPath);
     if (serverRes.status === "ok") {
+      transferServerStarted = true;
       const url = serverRes.url as string;
       const qrArea = document.getElementById("qrCodeArea")!;
       qrArea.style.display = "block";
@@ -8629,6 +9612,11 @@ async function flushActiveEventForLifecycle(): Promise<void> {
   } catch (e) {
     resultEl.textContent = `サーバー起動エラー: ${String(e)}`;
   }
+  } finally {
+    if (!transferServerStarted && mobileTransferBusyKind === "full-sync") {
+      mobileTransferBusyKind = null;
+    }
+  }
 });
 
 (
@@ -8638,6 +9626,11 @@ async function flushActiveEventForLifecycle(): Promise<void> {
     await invoke("stop_file_server");
     const qrArea = document.getElementById("qrCodeArea")!;
     qrArea.style.display = "none";
+    setEventSyncStage("eventSyncPcFollowup", false);
+    if (mobileTransferBusyKind === "full-sync" || mobileTransferBusyKind === "legacy-send") {
+      mobileTransferBusyKind = null;
+    }
+    setEventSyncStatus("サーバーを停止しました。");
     resultEl.textContent = "サーバーを停止しました";
   } catch (e) {
     resultEl.textContent = `サーバー停止エラー: ${String(e)}`;
@@ -12045,6 +13038,7 @@ function updateActiveEventDisplay(meta: EventMeta, pending = false) {
   const mobileEl = document.getElementById("mobileActiveEvent");
   if (mobileEl)
     mobileEl.innerHTML = `<strong>対象イベント:</strong> ${escapeHtml(info)}${pendingLabel}${shoppingHtml}`;
+  refreshEventSyncTargetDisplay();
 }
 
 /** イベント選択ではカードDOMを再生成せずclass差分だけを更新する。 */
@@ -13522,6 +14516,7 @@ async function deleteEvent(slug: string) {
         eventDocumentStateRevision += 1;
         renderCircleEditorAndMap();
         updateEventMemoUI();
+        refreshEventSyncTargetDisplay();
       }
       await loadEventList();
       // 一覧更新が完了するまで削除ownerを不可視に保つ。finallyで必ず
@@ -13701,9 +14696,38 @@ document.getElementById("catalogPostModelProvider")?.addEventListener("change", 
   });
 });
 
-// 逆QRインポート
+// 逆QRインポート / ローカルZIP取り込み
+type ResultImportPayload = {
+  uploadId: string;
+  zipPath: string;
+  size: number;
+  targetEventUid?: string | null;
+};
+type ResultImportPlan = {
+  status?: string;
+  slug?: string;
+  dir?: string;
+  meta?: EventMeta;
+  eventName?: string;
+  eventDate?: string | null;
+  targetExists?: boolean;
+  localOnly?: boolean;
+  affectedEvents?: Array<{ slug: string; dir: string; survives: boolean }>;
+};
+type ResultImportOutcome = {
+  status?: string;
+  slug: string;
+  dir?: string;
+  meta?: EventMeta;
+  postPublishWarnings?: string[];
+};
+const handledResultImportUploadIds = new Set<string>();
+
 const importResultBtn = document.getElementById(
   "importResultBtn",
+) as HTMLButtonElement;
+const importLocalZipBtn = document.getElementById(
+  "importLocalZipBtn",
 ) as HTMLButtonElement;
 const importModalOverlay = document.getElementById("importModalOverlay")!;
 const importCancelBtn = document.getElementById(
@@ -13711,7 +14735,63 @@ const importCancelBtn = document.getElementById(
 ) as HTMLButtonElement;
 const importStatusEl = document.getElementById("importStatus")!;
 
+async function startLocalZipImport(): Promise<void> {
+  if (rejectBusyMobileTransfer("ローカルZIP取り込みを開始")) return;
+  let selected: string | string[] | null;
+  try {
+    selected = await dialogOpen({
+      multiple: false,
+      filters: [{ name: "ZIP", extensions: ["zip"] }],
+    });
+  } catch (error) {
+    setEventSyncStatus(`ローカルZIPの選択に失敗しました: ${String(error)}`, "error");
+    return;
+  }
+  if (!selected || Array.isArray(selected)) return;
+  if (rejectBusyMobileTransfer("ローカルZIP取り込みを開始")) return;
+
+  mobileTransferBusyKind = "import";
+  setEventSyncStatus("ローカルZIPを登録し、安全性を検証しています…");
+  resultEl.textContent = "ローカルZIPを登録中...";
+  try {
+    const registered = await invoke<{
+      status?: string;
+      uploadId?: string;
+      zipPath?: string;
+      size?: number;
+      localOnly?: boolean;
+    }>("register_local_zip_import", { zipPath: selected });
+    if (
+      registered?.status !== "ok" ||
+      typeof registered.uploadId !== "string" ||
+      typeof registered.zipPath !== "string" ||
+      registered.localOnly !== true
+    ) {
+      throw new Error("ローカルZIPを登録できませんでした。");
+    }
+    await handleReceivedResultImport(
+      {
+        uploadId: registered.uploadId,
+        zipPath: registered.zipPath,
+        size: Number(registered.size ?? 0),
+      },
+      true,
+    );
+  } catch (error) {
+    if (mobileTransferBusyKind === "import") mobileTransferBusyKind = null;
+    setEventSyncStatus(`ローカルZIPの取り込みに失敗しました: ${String(error)}`, "error");
+    resultEl.textContent = `ローカルZIP取り込みエラー: ${String(error)}`;
+    logToFile(`ローカルZIP取り込みエラー: ${String(error)}`);
+  }
+}
+
+importLocalZipBtn.addEventListener("click", () => {
+  void startLocalZipImport();
+});
+
 importResultBtn.addEventListener("click", async () => {
+  if (rejectBusyMobileTransfer("QR受信を開始")) return;
+  mobileTransferBusyKind = "import";
   try {
     importStatusEl.textContent = "受信サーバー起動中...";
     importModalOverlay.classList.remove("hidden");
@@ -13740,9 +14820,13 @@ importResultBtn.addEventListener("click", async () => {
 
       importStatusEl.textContent = "スマホからのデータ受信を待機中...";
       logToFile(`モバイル同期: 待機開始 url=${url}`);
+    } else {
+      throw new Error(`受信サーバーを起動できませんでした: ${res.status}`);
     }
   } catch (e) {
+    if (mobileTransferBusyKind === "import") mobileTransferBusyKind = null;
     importStatusEl.textContent = `エラー: ${String(e)}`;
+    setEventSyncStatus(`QR受信を開始できませんでした: ${String(e)}`, "error");
     logToFile(`モバイル同期: 受信サーバー起動エラー ${String(e)}`);
   }
 });
@@ -13753,28 +14837,39 @@ importCancelBtn.addEventListener("click", async () => {
   try {
     await invoke("stop_receive_server");
     logToFile("モバイル同期: 受信キャンセル");
+    if (mobileTransferBusyKind === "import") mobileTransferBusyKind = null;
+    setEventSyncStatus("QR受信を中断しました。");
   } catch {
     /* ignore */
   }
 });
 
-listen<{ zipPath: string; size: number }>("result-uploaded", async (event) => {
-  const { zipPath, size } = event.payload;
-  importStatusEl.textContent = `データ受信完了 (${(size / 1024 / 1024).toFixed(1)} MB)。PCに取り込み中...`;
-  resultEl.textContent = `データ受信完了 (${(size / 1024 / 1024).toFixed(1)} MB)\nPCに取り込み中...\n${zipPath}`;
-  logToFile(`モバイル同期: 受信完了 size=${size} zip=${zipPath}`);
-});
-
-// 受信完了イベントのリスナー
-listen<{
-  uploadId: string;
-  zipPath: string;
-  size: number;
-}>("result-received", async (event) => {
-  importModalOverlay.classList.remove("active");
-  importModalOverlay.classList.add("hidden");
-  const { uploadId, zipPath, size } = event.payload;
+async function handleReceivedResultImport(
+  payload: ResultImportPayload,
+  localOnly = false,
+): Promise<void> {
+  if (!payload?.uploadId || handledResultImportUploadIds.has(payload.uploadId)) return;
+  handledResultImportUploadIds.add(payload.uploadId);
+  if (handledResultImportUploadIds.size > 32) {
+    const oldest = handledResultImportUploadIds.values().next().value as string | undefined;
+    if (oldest) handledResultImportUploadIds.delete(oldest);
+  }
+  if (activeEventSyncSession) {
+    await cancelEventSyncUpload(payload.uploadId, "比較同期が進行中のため結果ZIPを取り込みません");
+    setEventSyncStatus("比較同期が進行中です。結果ZIPは取り込みませんでした。", "error");
+    return;
+  }
+  if (mobileTransferBusyKind && mobileTransferBusyKind !== "import") {
+    await cancelEventSyncUpload(payload.uploadId, "別のモバイル連携処理が進行中です");
+    setEventSyncStatus("別のモバイル連携処理が進行中です。結果ZIPは取り込みませんでした。", "error");
+    return;
+  }
+  mobileTransferBusyKind = "import";
+  const { uploadId, zipPath, size } = payload;
   let successAckSent = false;
+  let localImportCancelled = false;
+  let cancelError: unknown = null;
+  const postPublishWarnings: string[] = [];
   let leaseHeartbeatTimer: number | null = null;
   let leaseHeartbeatFailure: unknown = null;
   const heartbeatUploadLease = () =>
@@ -13794,7 +14889,17 @@ listen<{
     }, 20_000);
   };
 
-  resultEl.textContent = `データ受信完了 (${(size / 1024 / 1024).toFixed(1)} MB)\nインポート完了処理中...`;
+  if (!localOnly) {
+    importModalOverlay.classList.remove("active");
+    importModalOverlay.classList.add("hidden");
+  }
+  const sizeLabel = `${(Number(size || 0) / 1024 / 1024).toFixed(1)} MB`;
+  const progressMessage = localOnly
+    ? `ローカルZIP受信完了 (${sizeLabel})。安全性を検証し、取り込み内容を確認しています…`
+    : `データ受信完了 (${sizeLabel})。インポート完了処理中...`;
+  importStatusEl.textContent = progressMessage;
+  setEventSyncStatus(progressMessage);
+  resultEl.textContent = progressMessage;
 
   try {
     await invoke("claim_received_upload", { uploadId });
@@ -13802,7 +14907,7 @@ listen<{
     await waitForOperationIdle();
     await assertUploadLeaseCurrent();
     const pendingCrawlMeta = captureCrawlMetaSnapshot();
-    const res = await runManagedEventDocumentMutation(async () => {
+    const res = await runManagedEventDocumentMutation<ResultImportOutcome>(async () => {
       await assertUploadLeaseCurrent();
       await flushCrawlMetaSnapshot(
         pendingCrawlMeta,
@@ -13815,63 +14920,99 @@ listen<{
       }
       await assertUploadLeaseCurrent();
       await flushAllEventSavesOrThrow();
-      await flushCircleMasterSaves();
+      if (!localOnly) await flushCircleMasterSaves();
       await assertUploadLeaseCurrent();
-      return circleMasterWriteSerial.run(CIRCLE_MASTER_WRITE_KEY, async () => {
-        const plan = await invoke<{
-        status: string;
-        slug: string;
-        dir: string;
-        affectedEvents: Array<{ slug: string; dir: string; survives: boolean }>;
-        }>("plan_received_result_import", {
+      const loadPlan = () => invoke<ResultImportPlan>("plan_received_result_import", {
+        uploadId,
+        projectRoot: projectRootEl.value,
+      });
+      const plan = localOnly
+        ? await loadPlan()
+        : await circleMasterWriteSerial.run(CIRCLE_MASTER_WRITE_KEY, loadPlan);
+      await assertUploadLeaseCurrent();
+      if (
+        !plan ||
+        typeof plan.slug !== "string" ||
+        !plan.slug.trim() ||
+        typeof plan.dir !== "string" ||
+        !plan.dir.trim() ||
+        !Array.isArray(plan.affectedEvents)
+      ) {
+        throw new Error("インポート計画の応答が不正です。");
+      }
+      if (localOnly && plan.affectedEvents.length !== 1) {
+        throw new Error("ローカルZIPは単一イベントだけ取り込めます。");
+      }
+      if (localOnly && plan.localOnly !== true) {
+        throw new Error("ローカルZIP専用の取り込み計画を確認できませんでした。");
+      }
+      if (localOnly) {
+        const eventName = String(plan.eventName || plan.meta?.name || plan.slug);
+        const eventDate = String(plan.eventDate || plan.meta?.date || "未設定");
+        const overwriteLabel = plan.targetExists === true
+          ? "既存イベントを上書きします"
+          : "新規イベントとして取り込みます";
+        const confirmed = window.confirm(
+          `ローカルZIPの取り込み内容を確認してください。\n\n` +
+          `イベント: ${eventName}\n` +
+          `開催日: ${eventDate}\n` +
+          `対象フォルダ: ${plan.dir}\n` +
+          `${overwriteLabel}。上書き時は永続バックアップを作成します。\n` +
+          "共有設定（circle_master/default_cuts）は取り込みません。\n\n" +
+          "この内容で取り込みますか？",
+        );
+        if (!confirmed) {
+          localImportCancelled = true;
+          throw new Error("ローカルZIPの取り込みをキャンセルしました");
+        }
+      }
+      const lifecycleKeys = Array.from(
+        new Set(
+          plan.affectedEvents.map((affected) =>
+            eventMetaOwnerKey(affected.slug, affected.dir),
+          ),
+        ),
+      );
+      await Promise.all(
+        lifecycleKeys.map((key) => eventLifecycleGate.closeAndDrain(key)),
+      );
+      let published = false;
+      const cacheReadyLifecycleKeys = new Set<string>();
+      try {
+        const staged = await invoke<{
+          status: string;
+          slug: string;
+          dir: string;
+          meta?: EventMeta;
+        }>("stage_received_result_import", {
           uploadId,
           projectRoot: projectRootEl.value,
+          expectedSlug: plan.slug,
         });
         await assertUploadLeaseCurrent();
-        const lifecycleKeys = Array.from(
-          new Set(
-            plan.affectedEvents.map((affected) =>
-              eventMetaOwnerKey(affected.slug, affected.dir),
-            ),
-          ),
-        );
-        await Promise.all(
-          lifecycleKeys.map((key) => eventLifecycleGate.closeAndDrain(key)),
-        );
-        let published = false;
-        const cacheReadyLifecycleKeys = new Set<string>();
-        try {
-          const staged = await invoke<{
-            status: string;
-            slug: string;
-            dir: string;
-            meta: EventMeta;
-          }>("stage_received_result_import", {
-            uploadId,
-            projectRoot: projectRootEl.value,
-            expectedSlug: plan.slug,
-          });
-          await assertUploadLeaseCurrent();
-          const imported = await invoke<{
-            status: string;
-            slug: string;
-            dir: string;
-          }>("publish_received_result_import", { uploadId });
-          published = true;
-          // publish commandがmobile successをatomicに確定する。以後のUI復旧失敗は
-          // committed uploadをfailure/retryへ戻してはいけない。
-          successAckSent = true;
-          for (const affected of plan.affectedEvents) {
-            const key = eventMetaOwnerKey(affected.slug, affected.dir);
-            eventMetaWriteCoordinator.invalidate(key);
-            eventMetaWriteCoordinator.forgetCommitted(key);
-          }
-          // publishはevent directoryを外部置換するため、survivorを再openする前に
-          // fresh documentのevent metadataをcacheへ戻す。古いUI snapshotが直後に
-          // 保存されてもmobile import metadataを巻き戻さない。
-          for (const affected of plan.affectedEvents) {
-            if (!affected.survives) continue;
-            const key = eventMetaOwnerKey(affected.slug, affected.dir);
+        const imported = await invoke<{
+          status: string;
+          slug: string;
+          dir: string;
+        }>("publish_received_result_import", { uploadId });
+        published = true;
+        // publish commandがmobile/local successをatomicに確定する。以後のUI復旧失敗は
+        // committed uploadをfailure/retryへ戻してはいけない。
+        successAckSent = true;
+        for (const affected of plan.affectedEvents) {
+          const key = eventMetaOwnerKey(affected.slug, affected.dir);
+          eventMetaWriteCoordinator.invalidate(key);
+          eventMetaWriteCoordinator.forgetCommitted(key);
+        }
+        // publishはevent directoryを外部置換するため、survivorを再openする前に
+        // fresh documentのevent metadataをcacheへ戻す。古いUI snapshotが直後に
+        // 保存されてもmobile/local import metadataを巻き戻さない。fresh読込だけの
+        // 失敗は反映済みpublishを失敗扱いに戻さず、該当lifecycle gateを閉じたまま
+        // 再読込warningへ渡す（staleなUI保存による巻き戻しを防ぐ）。
+        for (const affected of plan.affectedEvents) {
+          if (!affected.survives) continue;
+          const key = eventMetaOwnerKey(affected.slug, affected.dir);
+          try {
             const freshBundle = await invoke<{ data?: EventJsonData }>(
               "load_event_bundle",
               {
@@ -13885,9 +15026,7 @@ listen<{
               typeof freshBundle.data !== "object" ||
               Array.isArray(freshBundle.data)
             ) {
-              throw new Error(
-                `インポート後のevent.json再読込に失敗しました: ${affected.slug}`,
-              );
+              throw new Error("event.json再読込結果が不正です");
             }
             const freshMeta = freshBundle.data.event;
             if (
@@ -13896,75 +15035,146 @@ listen<{
                 typeof freshMeta !== "object" ||
                 Array.isArray(freshMeta))
             ) {
-              throw new Error(
-                `インポート後のevent metadataが不正です: ${affected.slug}`,
-              );
+              throw new Error("event metadataが不正です");
             }
             eventMetaWriteCoordinator.recordCommitted(key, freshMeta ?? {});
             cacheReadyLifecycleKeys.add(key);
-          }
-          return { ...staged, ...imported };
-        } finally {
-          for (const affected of plan.affectedEvents) {
-            const key = eventMetaOwnerKey(affected.slug, affected.dir);
-            if (!published || cacheReadyLifecycleKeys.has(key)) {
-              eventLifecycleGate.open(key);
-            }
+          } catch (error) {
+            postPublishWarnings.push(
+              `インポート後の${affected.slug}再読込に失敗しました。stale保存を防ぐため再選択・保存を保留します: ${String(error)}`,
+            );
           }
         }
-      });
+        return {
+          ...staged,
+          ...imported,
+          slug: plan.slug,
+          dir: plan.dir,
+          meta: staged.meta ?? plan.meta,
+          postPublishWarnings,
+        };
+      } finally {
+        for (const affected of plan.affectedEvents) {
+          const key = eventMetaOwnerKey(affected.slug, affected.dir);
+          if (!published || cacheReadyLifecycleKeys.has(key)) {
+            eventLifecycleGate.open(key);
+          }
+        }
+      }
     });
 
-    if (res.status === "ok") {
-      const recoveryWarnings: string[] = [];
+    if (res.status !== "ok") throw new Error("インポート結果が成功ではありません");
+    const recoveryWarnings: string[] = [...(res.postPublishWarnings ?? [])];
+    if (!localOnly) {
       try {
         await loadCircleMasterStrict();
       } catch (error) {
         recoveryWarnings.push(`circle_master再読込失敗: ${String(error)}`);
       }
-      try {
-        await loadEventList();
-      } catch (error) {
-        recoveryWarnings.push(`イベント一覧再読込失敗: ${String(error)}`);
-      }
-      try {
-        const selected = await selectEvent(res.slug);
-        if (!selected) recoveryWarnings.push("インポート後のイベント選択に失敗しました");
-      } catch (error) {
-        recoveryWarnings.push(`イベント選択エラー: ${String(error)}`);
-      }
-      const warningText = recoveryWarnings.length
-        ? `\nUI再読込警告: ${recoveryWarnings.join(" / ")}`
-        : "";
-      resultEl.textContent = `インポート完了: ${res.meta.name || res.slug}${warningText}`;
-      logToFile(`モバイル同期: インポート完了 slug=${res.slug} zip=${zipPath}`);
-    } else {
-      throw new Error("インポート結果が成功ではありません");
     }
-  } catch (e) {
+    try {
+      await loadEventList();
+    } catch (error) {
+      recoveryWarnings.push(`イベント一覧再読込失敗: ${String(error)}`);
+    }
+    try {
+      const selected = await selectEvent(res.slug);
+      if (!selected) recoveryWarnings.push("インポート後のイベント選択に失敗しました");
+    } catch (error) {
+      recoveryWarnings.push(`イベント選択エラー: ${String(error)}`);
+    }
+    const warningText = recoveryWarnings.length
+      ? `\nUI再読込警告: ${recoveryWarnings.join(" / ")}`
+      : "";
+    const completeMessage = `${localOnly ? "ローカルZIP取り込み完了" : "インポート完了"}: ${res.meta?.name || res.slug}${warningText}`;
+    setEventSyncStatus(completeMessage, recoveryWarnings.length ? "error" : "success");
+    resultEl.textContent = completeMessage;
+    logToFile(`${localOnly ? "ローカルZIP取り込み" : "モバイル同期"}: 完了 slug=${res.slug} zip=${zipPath}`);
+  } catch (error) {
     if (!successAckSent) {
       try {
         await invoke("cancel_received_upload", {
           uploadId,
-          error: String(e),
+          error: String(error),
         });
       } catch (ackError) {
+        cancelError = ackError;
         logToFile(`モバイル同期: failure ackエラー ${String(ackError)}`);
       }
     }
-    resultEl.textContent = `インポートエラー: ${String(e)}`;
-    logToFile(`モバイル同期: インポートエラー ${String(e)} zip=${zipPath}`);
+    if (localImportCancelled) {
+      const cleanupWarning = cancelError ? ` cleanup失敗: ${String(cancelError)}` : "";
+      const cancelledMessage = `ローカルZIPの取り込みをキャンセルしました。イベントデータは変更していません。${cleanupWarning}`;
+      setEventSyncStatus(cancelledMessage, cancelError ? "error" : "normal");
+      resultEl.textContent = cancelledMessage;
+      return;
+    }
+    const failureMessage = `${localOnly ? "ローカルZIP取り込み" : "インポート"}に失敗しました: ${String(error)}`;
+    setEventSyncStatus(failureMessage, "error");
+    resultEl.textContent = failureMessage;
+    logToFile(`${localOnly ? "ローカルZIP取り込み" : "モバイル同期"}: インポートエラー ${String(error)} zip=${zipPath}`);
   } finally {
     if (leaseHeartbeatTimer !== null) clearInterval(leaseHeartbeatTimer);
+    if (mobileTransferBusyKind === "import") mobileTransferBusyKind = null;
   }
+}
+
+listen<{ zipPath: string; size: number }>("result-uploaded", async (event) => {
+  const { zipPath, size } = event.payload;
+  if (activeEventSyncSession) {
+    setEventSyncStatus(`ZIP受信完了 (${(size / 1024 / 1024).toFixed(1)} MB)。対象イベントの検査と差分比較中です。`);
+    logToFile(`比較同期: ZIP受信完了 size=${size} zip=${zipPath}`);
+    return;
+  }
+  importStatusEl.textContent = `データ受信完了 (${(size / 1024 / 1024).toFixed(1)} MB)。PCに取り込み中...`;
+  if (mobileTransferBusyKind === "import") {
+    setEventSyncStatus(`ZIP受信完了 (${(size / 1024 / 1024).toFixed(1)} MB)。PCに取り込み中…`);
+  }
+  resultEl.textContent = `データ受信完了 (${(size / 1024 / 1024).toFixed(1)} MB)\nPCに取り込み中...\n${zipPath}`;
+  logToFile(`モバイル同期: 受信完了 size=${size} zip=${zipPath}`);
 });
 
+// 受信完了イベントのリスナー
+listen<ResultImportPayload>("result-received", async (event) => {
+  if (event.payload.targetEventUid || activeEventSyncSession) {
+    await handleReceivedEventSyncUpload(event.payload);
+    return;
+  }
+  await handleReceivedResultImport(event.payload, false);
+});
 listen<{ zipPath?: string; size?: number; error: string }>(
   "result-receive-error",
   async (event) => {
+    if (activeEventSyncSession) {
+      const session = activeEventSyncSession;
+      if (session.uploadId) {
+        session.cancelRequested = true;
+        if (session.resolveChoice) {
+          const resolve = session.resolveChoice;
+          session.resolveChoice = undefined;
+          resolve("cancel");
+        } else {
+          await cancelEventSyncUpload(session.uploadId, event.payload.error);
+        }
+        setEventSyncStatus(`受信エラーのため比較同期を中断しています: ${event.payload.error}`, "error");
+        return;
+      }
+      session.cancelRequested = true;
+      try { await invoke("stop_receive_server"); } catch { /* already stopped */ }
+      if (session.uploadId) return;
+      if (activeEventSyncSession === session) activeEventSyncSession = null;
+      setEventSyncStage("eventSyncPairing", false);
+      setEventSyncStage("eventSyncPreview", false);
+      setEventSyncStatus(`比較同期の受信に失敗しました。データは反映していません: ${event.payload.error}`, "error");
+      logToFile(`比較同期: 受信エラー slug=${session.targetSlug} error=${event.payload.error}`);
+      refreshEventSyncTargetDisplay();
+      return;
+    }
     importModalOverlay.classList.remove("active");
     importModalOverlay.classList.add("hidden");
     const { zipPath, size, error } = event.payload;
+    if (mobileTransferBusyKind === "import") mobileTransferBusyKind = null;
+    setEventSyncStatus(`ZIP受信に失敗しました: ${error}`, "error");
     resultEl.textContent = `同期エラー: ${error}`;
     logToFile(
       `モバイル同期: 同期エラー error=${error} size=${size ?? "?"} zip=${zipPath ?? "?"}`,

@@ -598,7 +598,7 @@
 
         <section id="tab-mobile" class="tab-pane">
           <h2 class="help-heading-row">
-            <span>モバイル連携</span>
+            <span>モバイルと同期</span>
             <span class="help-popover-anchor">
               <button
                 id="mobileTransferHelpTrigger"
@@ -615,7 +615,7 @@
                 aria-labelledby="mobileTransferHelpTrigger"
                 hidden
               >
-                サイドバーで選択中のイベントのデータと画像をZIPにまとめてモバイルへ転送します。
+                ①両端末で同じイベントを選び、「モバイルと同期」でQRを1回読み取ります。モバイル→PC反映はPC側で採用を確定し、PC→モバイル反映はモバイル側で最終確認します（再読取不要）。②全イベント同期は既存のPCデータをモバイルへ送ります。③ZIPエクスポートは選択イベントを書き出します。④ZIPインポートは単一イベントだけを取り込み、共有設定は除外します（全イベントbundleは対象外）。通信はHTTPで暗号化されないため、同一の信頼できるLAN・private IPv4の同一/24内でのみ使用してください。QRの有効期限は約20分で、同期用UIDの登録は中止後も残ります。
               </span>
             </span>
           </h2>
@@ -624,28 +624,64 @@
               >サイドバーでイベントを選択してください</span
             >
           </div>
-          <div class="flex gap-2 mt-3">
-            <button id="exportZipBtn" class="btn-secondary px-4 py-2 rounded">
-              ZIPエクスポート
-            </button>
-            <button
-              id="sendToMobileBtn"
-              class="btn-primary px-4 py-2 rounded font-semibold"
-            >
-              モバイルに送る
-            </button>
-            <button
-              id="sendFullSyncToMobileBtn"
-              class="btn-secondary px-4 py-2 rounded font-semibold"
-            >
-              全イベント同期
-            </button>
-            <button
-              id="importResultBtn"
-              class="btn-secondary px-4 py-2 rounded"
-            >
-              モバイルから受信
-            </button>
+          <div id="eventSyncPanel" class="event-sync-panel mt-4">
+            <div class="event-sync-default">
+              <span id="eventSyncTarget" class="event-sync-target" hidden></span>
+              <div class="event-sync-actions" role="group" aria-label="モバイル連携操作">
+                <button id="startEventSyncBtn" type="button" class="btn-primary event-sync-action event-sync-action-primary" disabled>
+                  モバイルと同期
+                </button>
+                <button id="sendFullSyncToMobileBtn" type="button" class="btn-secondary event-sync-action font-semibold">
+                  全イベント同期
+                </button>
+                <button id="exportZipBtn" type="button" class="btn-secondary event-sync-action">
+                  ZIPエクスポート
+                </button>
+                <button id="importLocalZipBtn" type="button" class="btn-secondary event-sync-action">
+                  ZIPインポート
+                </button>
+              </div>
+              <span id="eventSyncStatus" class="event-sync-status" role="status" aria-live="polite" hidden></span>
+            </div>
+            <div id="eventSyncPairing" class="event-sync-stage hidden">
+              <h4>1. QRでモバイルとペアリング</h4>
+              <p id="eventSyncPairingTarget" class="event-sync-warning"></p>
+              <div class="event-sync-qr">
+                <canvas id="eventSyncQrCanvas" aria-label="イベント比較同期用QRコード"></canvas>
+                <div id="eventSyncQrUrl" class="text-xs break-all"></div>
+                <p id="eventSyncQrExpiry" class="form-hint" role="note"></p>
+              </div>
+              <p class="form-hint">モバイルアプリでこのQRを読み取り、対象イベントのZIPを送信してください。通信中はこの画面を開いたままにしてください。</p>
+              <button id="cancelEventSyncBtn" type="button" class="btn-secondary px-3 py-1.5 rounded">同期を中断</button>
+            </div>
+            <div id="eventSyncPreview" class="event-sync-stage hidden">
+              <h4>2. 差分を確認して同期元を選択</h4>
+              <p id="eventSyncPreviewTarget" class="event-sync-warning"></p>
+              <div id="eventSyncDiffSummary" class="event-sync-summary"></div>
+              <div id="eventSyncDiff" class="event-sync-diff"></div>
+              <fieldset class="event-sync-source">
+                <legend>正とするデータを選択してください</legend>
+                <label><input type="radio" name="eventSyncSource" value="mobile" /> モバイル側を正として、このPCの対象イベントへ反映</label>
+                <label><input type="radio" name="eventSyncSource" value="desktop" /> PC側を正として、同じ同期接続でモバイルへ適用</label>
+              </fieldset>
+              <label class="event-sync-confirm">
+                <input id="eventSyncConfirm" type="checkbox" />
+                差分と対象イベントを確認し、選択した側を正として続行します。
+              </label>
+              <div class="flex gap-2 mt-3 flex-wrap">
+                <button id="eventSyncApplyBtn" type="button" class="btn-primary px-4 py-2 rounded font-semibold" disabled>同期元を確定して続行</button>
+                <button id="cancelEventSyncPreviewBtn" type="button" class="btn-secondary px-3 py-2 rounded">中断して変更しない</button>
+              </div>
+              <p class="form-hint">画像差分はファイルhashで比較します。反映前に対象イベントのバックアップを作成します。対象ファイルが比較後に変化した場合は反映を中止します。</p>
+            </div>
+            <div id="eventSyncPcFollowup" class="event-sync-stage hidden" role="status" aria-live="polite">
+              <h4>PC側のデータをモバイルへ適用</h4>
+              <p id="eventSyncPcFollowupStatus">同じ同期接続でPC側のZIPをモバイルへ送信します。モバイル側で差分を確認し、明示的に適用してください。</p>
+            </div>
+          </div>
+          <div id="mobileTransferLegacyControls" hidden aria-hidden="true">
+            <button id="sendToMobileBtn" type="button">旧方式: PCからモバイルへ送る</button>
+            <button id="importResultBtn" type="button">バックアップZIPを受信</button>
           </div>
           <div id="qrCodeArea" class="hidden text-center mt-4">
             <canvas id="qrCanvas" class="mx-auto"></canvas>

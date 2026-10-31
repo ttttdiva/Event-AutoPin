@@ -26,6 +26,9 @@ import {
   deleteEventWithImages,
   resetAllPurchaseStatus,
   exportEventAsZip,
+  linkEventSyncUidForPairing,
+  previewSingleEventSyncZip,
+  applySingleEventSyncZip,
   updateEventMemo,
   toggleEventCompleted,
   createEvent,
@@ -45,7 +48,7 @@ import {
   getFileSize,
   shareSyncLog,
 } from "@/lib/sync-logger";
-import type { ImportProgress, ExportProgress } from "@/lib/database";
+import type { ImportProgress, ExportProgress, SingleEventSyncPreview } from "@/lib/database";
 import type { EventSummary } from "@/lib/database";
 import { getColors } from "@/constants/Colors";
 import * as FileSystem from "expo-file-system/legacy";
@@ -61,6 +64,16 @@ import {
 } from "@/lib/performance";
 import { createLoadEpochGuard } from "@/lib/event-load-epoch";
 import { compareJaText } from "@/lib/text-collation";
+import {
+  parseSingleEventSyncDownloadUrl,
+  parseSingleEventSyncUploadUrl,
+  parseSingleEventSyncSessionResponse,
+  redactSyncUrl,
+  redactSyncText,
+  resolveSingleEventSyncIdentity,
+  resolveSingleEventSyncUid,
+  shouldRetrySingleEventSyncCancellation,
+} from "../../lib/single-event-sync";
 
 type EventWithStats = EventSummary;
 
@@ -75,7 +88,10 @@ const EVENT_SORT_OPTIONS: Array<{ key: EventSortKey; label: string }> = [
 
 const EVENT_SORT_KEY_SETTING = "event_list_sort_key";
 const EVENT_SORT_DIRECTION_SETTING = "event_list_sort_direction";
-const PC_SYNC_TIMEOUT_MS = 5 * 60 * 1000;
+const PC_SYNC_TIMEOUT_MS = 15 * 60 * 1000;
+const PC_SYNC_POLL_INTERVAL_MS = 1500;
+const PC_SYNC_POLL_REQUEST_TIMEOUT_MS = 15 * 1000;
+const PC_SYNC_NETWORK_WARNING = "Bearerトークンは20分で失効します。HTTP通信は暗号化されません。同じプライベートIPv4の/24（同一LAN）で実行してください。";
 
 function normalizeEventSortKey(value: string | null): EventSortKey {
   return EVENT_SORT_OPTIONS.some((option) => option.key === value)
@@ -146,6 +162,168 @@ async function fetchWithTimeout(
   }
 }
 
+function waitForSyncPollInterval(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, PC_SYNC_POLL_INTERVAL_MS));
+}
+
+async function pollSingleEventSyncSession(
+  sessionUrl: string,
+  expectedUid: string,
+  shouldCancel: () => boolean,
+  onWaiting: () => void,
+): Promise<ReturnType<typeof parseSingleEventSyncSessionResponse>> {
+  const deadline = Date.now() + PC_SYNC_TIMEOUT_MS;
+  let firstRequest = true;
+  while (Date.now() < deadline) {
+    if (shouldCancel()) throw new Error("イベント同期を中断しました");
+    if (!firstRequest) {
+      onWaiting();
+      await waitForSyncPollInterval();
+      if (shouldCancel()) throw new Error("イベント同期を中断しました");
+    }
+    firstRequest = false;
+    const response = await fetchWithTimeout(
+      sessionUrl,
+      { method: "GET", headers: { Accept: "application/json" } },
+      PC_SYNC_POLL_REQUEST_TIMEOUT_MS,
+    );
+    const body = await response.text();
+    // A pending session is intentionally represented by 202.  A 404/405
+    // means that the server does not implement same-session polling, so do
+    // not retry forever or ask the user to scan a second QR.
+    if (response.status === 404 || response.status === 405) {
+      throw new Error("PC側がこの同期セッションの継続に対応していません。PCアプリを更新してから再試行してください");
+    }
+    if (!response.ok && response.status !== 202) {
+      let message = `同期セッションの確認に失敗しました: HTTP ${response.status}`;
+      if (body.trim()) {
+        try {
+          const parsed = parseSingleEventSyncSessionResponse(body, expectedUid);
+          if (parsed.message) message = parsed.message;
+        } catch {
+          // Keep the status based error and avoid exposing an untrusted body.
+        }
+      }
+      throw new Error(message);
+    }
+    if (!body.trim()) continue;
+    const parsed = parseSingleEventSyncSessionResponse(body, expectedUid);
+    if (parsed.state !== "pending") return parsed;
+  }
+  throw new Error("PC側の選択待ちがタイムアウトしました。PC側の同期画面を確認してください");
+}
+
+async function postSingleEventSyncSession(
+  sessionUrl: string,
+  expectedUid: string,
+  state: "mobile-applied" | "cancelled",
+): Promise<void> {
+  const response = await fetchWithTimeout(
+    sessionUrl,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        mode: "single-event-sync",
+        target_uid: expectedUid,
+        state,
+        result: state,
+      }),
+    },
+    PC_SYNC_POLL_REQUEST_TIMEOUT_MS,
+  );
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`PC側への同期完了通知に失敗しました: HTTP ${response.status}`);
+  }
+  if (body.trim()) {
+    const result = parseSingleEventSyncSessionResponse(body, expectedUid);
+    if (result.state === "error") {
+      throw new Error(result.message ?? "PC側が同期完了通知を受け付けませんでした");
+    }
+  }
+}
+
+async function getSingleEventSyncSessionOnce(
+  sessionUrl: string,
+  expectedUid: string,
+): Promise<ReturnType<typeof parseSingleEventSyncSessionResponse>> {
+  // POST only acknowledges receipt. The backend publishes the terminal state
+  // and then delivers event-sync-session-state (delivered:true) to the
+  // desktop when this one-shot GET arrives, so require that GET confirmation
+  // before showing completion.
+  const terminalResponse = await fetchWithTimeout(
+    sessionUrl,
+    { method: "GET", headers: { Accept: "application/json" } },
+    PC_SYNC_POLL_REQUEST_TIMEOUT_MS,
+  );
+  const terminalBody = await terminalResponse.text();
+  if (!terminalResponse.ok) {
+    throw new Error(`PC側の同期完了確認に失敗しました: HTTP ${terminalResponse.status}`);
+  }
+  if (!terminalBody.trim()) {
+    throw new Error("PC側の同期完了確認が空の応答でした");
+  }
+  const terminal = parseSingleEventSyncSessionResponse(terminalBody, expectedUid);
+  if (terminal.targetUid !== expectedUid) throw new Error("PC側の同期完了確認のUIDが一致しません");
+  return terminal;
+}
+
+async function notifySingleEventSyncSession(
+  sessionUrl: string,
+  expectedUid: string,
+  state: "mobile-applied" | "cancelled",
+): Promise<void> {
+  await postSingleEventSyncSession(sessionUrl, expectedUid, state);
+  const terminal = await getSingleEventSyncSessionOnce(sessionUrl, expectedUid);
+  if (terminal.state !== state) {
+    throw new Error("PC側の同期完了通知が同UIDの終端状態として確認できませんでした");
+  }
+}
+
+/** Best effort terminalization after an upload/transport failure. */
+async function cancelSingleEventSyncSessionBestEffort(
+  sessionUrl: string,
+  expectedUid: string,
+): Promise<string | null> {
+  const warnings: string[] = [];
+  try {
+    await postSingleEventSyncSession(sessionUrl, expectedUid, "cancelled");
+  } catch (error: any) {
+    warnings.push(`同期終了通知: ${redactSyncText(error?.message ?? String(error))}`);
+  }
+  let terminal: ReturnType<typeof parseSingleEventSyncSessionResponse> | null = null;
+  try {
+    terminal = await getSingleEventSyncSessionOnce(sessionUrl, expectedUid);
+  } catch (error: any) {
+    warnings.push(`同期終端確認: ${redactSyncText(error?.message ?? String(error))}`);
+    return warnings.length ? warnings.join(" / ") : null;
+  }
+
+  // A transient POST failure can leave the session pending. Retry cancellation
+  // exactly once in that state; terminal states are never overwritten.
+  if (shouldRetrySingleEventSyncCancellation(terminal.state)) {
+    try {
+      await postSingleEventSyncSession(sessionUrl, expectedUid, "cancelled");
+    } catch (error: any) {
+      warnings.push(`再試行の同期終了通知: ${redactSyncText(error?.message ?? String(error))}`);
+    }
+    try {
+      terminal = await getSingleEventSyncSessionOnce(sessionUrl, expectedUid);
+    } catch (error: any) {
+      warnings.push(`再試行の同期終端確認: ${redactSyncText(error?.message ?? String(error))}`);
+      return warnings.length ? warnings.join(" / ") : null;
+    }
+  }
+  if (terminal.state !== "cancelled" && terminal.state !== "error" && terminal.state !== "mobile-applied") {
+    warnings.push(`同期終端state: ${terminal.state}`);
+  }
+  return warnings.length ? warnings.join(" / ") : null;
+}
+
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
@@ -166,6 +344,31 @@ function formatImportProgress(progress: ImportProgress): string {
     return `サークル ${progress.current}/${progress.total}`;
   }
   return "マップ読み込み中...";
+}
+
+function compactDiffLines(values: string[], limit = 8): string {
+  if (!values.length) return "なし";
+  const shown = values.slice(0, limit).map((value) => `・${value}`).join("\n");
+  return values.length > limit ? `${shown}\nほか ${values.length - limit}件` : shown;
+}
+
+function formatSingleEventSyncDiff(preview: SingleEventSyncPreview): string {
+  const { diff } = preview;
+  const lines = [
+    `イベント情報: ${diff.metadata.length}件`,
+    compactDiffLines(diff.metadata),
+    `サークル: 追加 ${diff.circles.added.length} / 変更 ${diff.circles.changed.length} / 削除 ${diff.circles.removed.length}`,
+    compactDiffLines([...diff.circles.added.map((name) => `追加 ${name}`), ...diff.circles.changed.map((name) => `変更 ${name}`), ...diff.circles.removed.map((name) => `削除 ${name}`)]),
+    `頒布物: 追加 ${diff.items.added.length} / 変更 ${diff.items.changed.length} / 削除 ${diff.items.removed.length}`,
+    compactDiffLines([...diff.items.added.map((name) => `追加 ${name}`), ...diff.items.changed.map((name) => `変更 ${name}`), ...diff.items.removed.map((name) => `削除 ${name}`)]),
+    `購入状態: ${diff.purchase.length}件`,
+    compactDiffLines(diff.purchase),
+    `マップピン: ${diff.mapPins.length}件`,
+    compactDiffLines(diff.mapPins),
+    `画像: 追加 ${diff.images.added.length} / 変更 ${diff.images.changed.length} / 削除 ${diff.images.removed.length}`,
+    compactDiffLines([...diff.images.added.map((name) => `追加 ${name}`), ...diff.images.changed.map((name) => `変更 ${name}`), ...diff.images.removed.map((name) => `削除 ${name}`)]),
+  ];
+  return lines.join("\n");
 }
 
 export default function EventListScreen() {
@@ -225,6 +428,7 @@ export default function EventListScreen() {
 
   // インポート方法選択モーダル
   const [showImportModal, setShowImportModal] = useState(false);
+  const [showAdvancedImportOptions, setShowAdvancedImportOptions] = useState(false);
 
   // 長押しアクションモーダル
   const [actionTarget, setActionTarget] = useState<EventWithStats | null>(null);
@@ -237,12 +441,22 @@ export default function EventListScreen() {
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [lastSyncLogPath, setLastSyncLogPath] = useState<string | null>(null);
 
-  // PCに送信（逆QR）
+  // PCと同期（初回QRでセッションを開始）
   const [sendToPCTarget, setSendToPCTarget] = useState<EventWithStats | null>(
     null,
   );
   const [showSendQRScanner, setShowSendQRScanner] = useState(false);
   const sendQrScannedRef = useRef(false);
+  const [pendingSingleEventSync, setPendingSingleEventSync] = useState<{
+    event: EventWithStats;
+    zipPath: string;
+    preview: SingleEventSyncPreview;
+    sessionUrl: string;
+  } | null>(null);
+  const [singleSyncSourceSelected, setSingleSyncSourceSelected] = useState(false);
+  const [singleSyncBusy, setSingleSyncBusy] = useState(false);
+  const syncCancelledRef = useRef(false);
+  const activeSyncNetworkTaskRef = useRef<{ cancelAsync: () => Promise<void> } | null>(null);
 
   // イベントメモ編集
   const [memoTarget, setMemoTarget] = useState<EventWithStats | null>(null);
@@ -391,7 +605,7 @@ export default function EventListScreen() {
           setExportProgress(null);
         }
         break;
-      case "sendToPC":
+      case "syncWithPC":
         setSendToPCTarget(ev);
         sendQrScannedRef.current = false;
         if (!cameraPermission?.granted) {
@@ -569,8 +783,13 @@ export default function EventListScreen() {
     setShowImportModal(true);
   }
 
-  async function doImportZip() {
+  function closeImportModal() {
     setShowImportModal(false);
+    setShowAdvancedImportOptions(false);
+  }
+
+  async function doImportZip() {
+    closeImportModal();
     try {
       invalidateListLoad();
       setImporting(true);
@@ -585,7 +804,7 @@ export default function EventListScreen() {
   }
 
   async function doImportQR() {
-    setShowImportModal(false);
+    closeImportModal();
     if (!cameraPermission?.granted) {
       const perm = await requestCameraPermission();
       if (!perm.granted) {
@@ -622,6 +841,186 @@ export default function EventListScreen() {
     }
   }
 
+  async function onPCSourceQRCode(
+    data: string,
+    event: EventWithStats,
+    sessionUrl: string,
+    sessionUid: string,
+  ) {
+    if (!sessionUid) {
+      await notifySingleEventSyncSession(sessionUrl, sessionUid, "cancelled").catch(() => undefined);
+      Alert.alert("PCイベント比較", "同期対象UIDがありません。同期を中断しました");
+      return;
+    }
+    let zipPath: string | null = null;
+    syncCancelledRef.current = false;
+    setSingleSyncBusy(true);
+    setImporting(true);
+    setSyncMessage("PCの比較ZIPを確認中...");
+    setImportProgress({ current: 0, total: 0, phase: "download" });
+    try {
+      const target = parseSingleEventSyncDownloadUrl(data);
+      if (target.targetUid !== sessionUid) {
+        throw new Error("QRのPC対象UIDと選択イベントUIDが一致しません");
+      }
+      zipPath = `${FileSystem.cacheDirectory}pc_single_event_${event.id}_${Date.now()}.zip`;
+      let lastProgressAt = Date.now();
+      let downloadTooLarge = false;
+      let task: ReturnType<typeof FileSystem.createDownloadResumable> | null = null;
+      task = FileSystem.createDownloadResumable(
+        target.url.toString(),
+        zipPath,
+        {},
+        (progress) => {
+          lastProgressAt = Date.now();
+          if (progress.totalBytesWritten > 512 * 1024 * 1024) {
+            downloadTooLarge = true;
+            syncCancelledRef.current = true;
+            void task?.cancelAsync().catch(() => undefined);
+          }
+          setImportProgress({
+            current: progress.totalBytesWritten,
+            total: Math.max(progress.totalBytesExpectedToWrite, 0),
+            phase: "download",
+          });
+        },
+      );
+      activeSyncNetworkTaskRef.current = task;
+      const timeout = setTimeout(() => {
+        syncCancelledRef.current = true;
+        void task?.cancelAsync().catch(() => undefined);
+      }, PC_SYNC_TIMEOUT_MS);
+      let result;
+      try {
+        result = await task.downloadAsync();
+      } finally {
+        clearTimeout(timeout);
+        if (activeSyncNetworkTaskRef.current === task) activeSyncNetworkTaskRef.current = null;
+      }
+      if (downloadTooLarge) throw new Error("PC同期ZIPのサイズが上限512MBを超えています");
+      if (syncCancelledRef.current) {
+        throw new Error(`PC ZIPの受信を中断しました${Date.now() - lastProgressAt > PC_SYNC_TIMEOUT_MS ? "（タイムアウト）" : ""}`);
+      }
+      if (!result || result.status !== 200) {
+        throw new Error(`PC ZIPのダウンロードに失敗しました: HTTP ${result?.status ?? "応答なし"}`);
+      }
+      setSyncMessage("イベント差分を確認中...");
+      setImportProgress({ current: 0, total: 1, phase: "events" });
+      const preview = await previewSingleEventSyncZip(zipPath, event.id, sessionUid);
+      if (syncCancelledRef.current) throw new Error("PCイベント比較を中断しました");
+      setPendingSingleEventSync({ event, zipPath, preview, sessionUrl });
+      setSingleSyncSourceSelected(false);
+      zipPath = null;
+    } catch (error: any) {
+      if (zipPath) await FileSystem.deleteAsync(zipPath, { idempotent: true }).catch(() => undefined);
+      const originalMessage = redactSyncText(error?.message ?? String(error));
+      let cancelMessage = "";
+      try {
+        await notifySingleEventSyncSession(sessionUrl, sessionUid, "cancelled");
+      } catch (cancelError: any) {
+        cancelMessage = `\n同期終了通知にも失敗しました: ${redactSyncText(cancelError?.message ?? String(cancelError))}`;
+        console.warn("PCイベント同期のcancel通知に失敗しました", redactSyncText(cancelError?.message ?? String(cancelError)));
+      }
+      Alert.alert(
+        syncCancelledRef.current ? "比較を中断しました" : "PCイベント比較エラー",
+        `${originalMessage}${cancelMessage}`,
+      );
+    } finally {
+      activeSyncNetworkTaskRef.current = null;
+      setSingleSyncBusy(false);
+      setImporting(false);
+      setImportProgress(null);
+      setSyncMessage(null);
+      syncCancelledRef.current = false;
+    }
+  }
+
+  function cancelSingleSyncOperation() {
+    if (!singleSyncBusy) return;
+    syncCancelledRef.current = true;
+    const task = activeSyncNetworkTaskRef.current;
+    if (task) void task.cancelAsync().catch(() => undefined);
+  }
+
+  async function cancelPendingSingleEventSync() {
+    const pending = pendingSingleEventSync;
+    setPendingSingleEventSync(null);
+    setSingleSyncSourceSelected(false);
+    if (pending) {
+      await notifySingleEventSyncSession(pending.sessionUrl, pending.preview.eventUid, "cancelled")
+        .catch(() => undefined);
+      await FileSystem.deleteAsync(pending.zipPath, { idempotent: true }).catch(() => undefined);
+    }
+  }
+
+  async function applyPendingSingleEventSync() {
+    const pending = pendingSingleEventSync;
+    if (!pending || !singleSyncSourceSelected) return;
+    const { event, zipPath, preview, sessionUrl } = pending;
+    const confirmed = await new Promise<boolean>((resolve) => {
+      Alert.alert(
+        "PCデータを反映",
+        `「${event.name}」のmobile内容をバックアップし、PCの内容で置き換えます。差分は対象イベントUIDの1件に限られます。反映を開始しますか？`,
+        [
+          { text: "戻る", style: "cancel", onPress: () => resolve(false) },
+          { text: "バックアップ後に反映", style: "destructive", onPress: () => resolve(true) },
+        ],
+      );
+    });
+    if (!confirmed) return;
+
+    setPendingSingleEventSync(null);
+    syncCancelledRef.current = false;
+    setSingleSyncBusy(true);
+    setImporting(true);
+    setSyncMessage("イベントバックアップを作成中...");
+    setImportProgress({ current: 0, total: 1, phase: "events" });
+    invalidateListLoad();
+    try {
+      const result = await applySingleEventSyncZip(
+        zipPath,
+        event.id,
+        preview.eventUid,
+        preview.revision,
+        (progress) => {
+          if (syncCancelledRef.current) throw new Error("イベント同期を中断しました");
+          setImportProgress({ ...progress });
+          setSyncMessage(progress.phase === "circles" ? "サークル・頒布物を反映中..." : "イベントを安全に反映中...");
+        },
+        () => syncCancelledRef.current,
+      );
+      if (syncCancelledRef.current) throw new Error("イベント同期を中断しました");
+      setCurrentEventId(result.eventId);
+      invalidateListLoad();
+      await loadData();
+      const diff = result.diff;
+      let completionNotice = "";
+      try {
+        await notifySingleEventSyncSession(sessionUrl, preview.eventUid, "mobile-applied");
+      } catch (notifyError: any) {
+        completionNotice = `\nPC側への完了通知に失敗しました: ${redactSyncText(notifyError?.message ?? String(notifyError))}`;
+      }
+      Alert.alert(
+        completionNotice ? "PCイベントを反映しました（通知要確認）" : "PCイベントを反映しました",
+        `${event.name}\nイベントバックアップ: ${result.backupPath}\n追加 ${diff.addedEventIds.length} / 更新 ${diff.changedEventIds.length} / 変更なし ${diff.unchangedEventIds.length}${completionNotice}`,
+      );
+    } catch (error: any) {
+      await notifySingleEventSyncSession(sessionUrl, preview.eventUid, "cancelled").catch(() => undefined);
+      invalidateListLoad();
+      await loadData();
+      Alert.alert(syncCancelledRef.current ? "同期を中断しました" : "同期エラー", error?.message ?? String(error));
+    } finally {
+      activeSyncNetworkTaskRef.current = null;
+      await FileSystem.deleteAsync(zipPath, { idempotent: true }).catch(() => undefined);
+      syncCancelledRef.current = false;
+      setSingleSyncBusy(false);
+      setImporting(false);
+      setImportProgress(null);
+      setSyncMessage(null);
+      setSingleSyncSourceSelected(false);
+    }
+  }
+
   async function finishImport(result: ImportRunResult) {
     // Full-sync changed rows keep their live IDs and unchanged rows add no
     // rows, so focus the actual diff target rather than relying on the
@@ -653,29 +1052,90 @@ export default function EventListScreen() {
     );
   }
 
-  // PCに送信: QRスキャン→ZIPアップロード
+  // PCと同期: 初回QRスキャン→ZIPアップロード→同一セッション継続
   async function onSendQRCodeScanned({ data }: { data: string }) {
     if (sendQrScannedRef.current) return;
     sendQrScannedRef.current = true;
     setShowSendQRScanner(false);
-
-    if (!data.startsWith("http")) {
-      Alert.alert("エラー", "QRコードにURLが含まれていません");
-      return;
-    }
 
     const ev = sendToPCTarget;
     if (!ev) return;
     setSendToPCTarget(null);
 
     let syncLogPath: string | null = null;
+    let zipPath: string | null = null;
+    let syncSessionUrl: string | null = null;
+    let syncSessionUid: string | null = null;
+    let terminalSessionConsumed = false;
+    let userCancelled = false;
+    syncCancelledRef.current = false;
+    setSingleSyncBusy(true);
     try {
+      const target = parseSingleEventSyncUploadUrl(data);
+      syncSessionUrl = target.url.toString();
+      syncSessionUid = target.targetUid;
+      const identityAction = resolveSingleEventSyncIdentity({
+        selectedUid: ev.syncUid,
+        targetUid: target.targetUid,
+        selectedName: ev.name,
+        selectedDate: ev.date,
+        targetName: target.targetName,
+        targetDate: target.targetDate,
+      });
+      const pairedUid = resolveSingleEventSyncUid({
+        selectedUid: ev.syncUid,
+        targetUid: target.targetUid,
+        identityAction,
+      });
+      if (identityAction === "link-required") {
+        const confirmed = await new Promise<boolean>((resolve) => {
+          Alert.alert(
+            "PCイベントとのペアリング",
+            `選択イベント「${ev.name}」をPCの「${target.targetName}」に紐づけます。イベント内容はまだ送信・上書きされません。UIDを登録して続けますか？\n\n${PC_SYNC_NETWORK_WARNING}`,
+            [
+              { text: "キャンセル", style: "cancel", onPress: () => resolve(false) },
+              { text: "UIDを紐づける", onPress: () => resolve(true) },
+            ],
+          );
+        });
+        if (!confirmed) {
+          userCancelled = true;
+          syncCancelledRef.current = true;
+          throw new Error("PCイベント同期を中断しました");
+        }
+        await linkEventSyncUidForPairing(
+          ev.id,
+          target.targetUid,
+          target.targetName as string,
+          target.targetDate as string,
+        );
+        // Pairing is now committed in SQLite. Keep the in-flight event
+        // snapshot aligned so the same session can continue into the PC ZIP
+        // preview without treating the legacy null UID as a mismatch.
+        ev.syncUid = pairedUid;
+        patchEventSummary(ev.id, { syncUid: pairedUid });
+      }
+      const sendConfirmed = await new Promise<boolean>((resolve) => {
+        Alert.alert(
+          "比較データをPCへ送信",
+          `「${ev.name}」のデータをUID ${target.targetUid} のPCへ送ります。PC側のプレビューで確認し、mobileを正として確定するまでPCのデータは変更されません。\n\n${PC_SYNC_NETWORK_WARNING}`,
+          [
+            { text: "キャンセル", style: "cancel", onPress: () => resolve(false) },
+            { text: "送信", onPress: () => resolve(true) },
+          ],
+        );
+      });
+      if (!sendConfirmed) {
+        userCancelled = true;
+        syncCancelledRef.current = true;
+        throw new Error("PCイベント同期を中断しました");
+      }
       setExporting(true);
       setSyncMessage("同期ログを作成中...");
       syncLogPath = await createSyncLog("send-to-pc", {
         eventId: ev.id,
         eventName: ev.name,
-        targetUrl: data,
+        targetUrl: redactSyncUrl(data),
         platform: Platform.OS,
       });
       setLastSyncLogPath(syncLogPath);
@@ -683,48 +1143,115 @@ export default function EventListScreen() {
 
       setSyncMessage("ZIPを作成中...");
       setExportProgress({ current: 0, total: 1, phase: "images" });
-      const zipPath = await exportEventAsZip(ev.id, (p) =>
-        setExportProgress({ ...p }),
+      zipPath = await exportEventAsZip(
+        ev.id,
+        (p) => {
+          if (syncCancelledRef.current) throw new Error("イベント送信を中断しました");
+          setExportProgress({ ...p });
+        },
+        { includeSharedSettings: false },
       );
+      if (syncCancelledRef.current) throw new Error("イベント送信を中断しました");
       const zipSize = await getFileSize(zipPath);
       await appendSyncLog(syncLogPath, "ZIP created", { zipPath, zipSize });
 
-      setSyncMessage("Uploading ZIP to PC...");
+      setSyncMessage("PCへZIPを送信中...");
       setExportProgress({ current: 0, total: 1, phase: "zip" });
 
-      setSyncMessage("Uploading to PC...");
-      const uploadResult = await FileSystem.uploadAsync(data, zipPath, {
+      setSyncMessage("PCへ送信中...");
+      const uploadTask = FileSystem.createUploadTask(target.url.toString(), zipPath, {
         httpMethod: "POST",
         uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
         headers: { "Content-Type": "application/octet-stream" },
       });
+      activeSyncNetworkTaskRef.current = uploadTask;
+      const uploadTimeout = setTimeout(() => {
+        syncCancelledRef.current = true;
+        void uploadTask.cancelAsync().catch(() => undefined);
+      }, PC_SYNC_TIMEOUT_MS);
+      let uploadResult;
+      try {
+        uploadResult = await uploadTask.uploadAsync();
+      } finally {
+        clearTimeout(uploadTimeout);
+        if (activeSyncNetworkTaskRef.current === uploadTask) activeSyncNetworkTaskRef.current = null;
+      }
+      if (syncCancelledRef.current || !uploadResult) throw new Error("PCへの送信を中断しました");
 
       const responseText = uploadResult.body;
       const responseOk = uploadResult.status >= 200 && uploadResult.status < 300;
       await appendSyncLog(syncLogPath, "PC response received", {
         status: uploadResult.status,
         ok: responseOk,
-        body: responseText.slice(0, 2000),
+        body: redactSyncText(responseText).slice(0, 2000),
       });
 
       if (!responseOk) {
-        throw new Error(`Upload failed: HTTP ${uploadResult.status}`);
+        throw new Error(`PCへの送信に失敗しました: HTTP ${uploadResult.status}`);
       }
-
-      let importedName = "";
-      try {
-        const responseJson = JSON.parse(responseText);
-        importedName = responseJson?.importResult?.meta?.name ?? "";
-      } catch {
-        /* 古いPC側アプリはJSONを返さないため無視 */
+      const sessionResponse = parseSingleEventSyncSessionResponse(responseText, target.targetUid);
+      if (sessionResponse.state === "pending") {
+        setExporting(false);
+        setExportProgress(null);
+        setImporting(true);
+        setImportProgress({ current: 0, total: 0, phase: "download" });
+        setSyncMessage("PC側の差分確認と採用結果を待っています...");
+        const decision = await pollSingleEventSyncSession(
+          target.url.toString(),
+          target.targetUid,
+          () => syncCancelledRef.current,
+          () => setSyncMessage("PC側の差分確認と採用結果を待っています..."),
+        );
+        terminalSessionConsumed = decision.state === "cancelled" ||
+          decision.state === "error" || decision.state === "mobile-applied";
+        if (decision.state === "pc-ready" && decision.downloadUrl) {
+          await appendSyncLog(syncLogPath, "PC selected; receiving same-session ZIP", {
+            targetUid: target.targetUid,
+          });
+          await onPCSourceQRCode(decision.downloadUrl, ev, target.url.toString(), target.targetUid);
+          return;
+        }
+        if (decision.state === "mobile-applied") {
+          setSyncMessage("mobile側を正としてPCへ反映しました");
+          Alert.alert("PCへ反映しました", `「${ev.name}」のmobileデータをPC側へ反映しました。`);
+          return;
+        }
+        if (decision.state === "cancelled") {
+          throw new Error(decision.message ?? "PC側で同期がキャンセルされました");
+        }
+        throw new Error(decision.message ?? "PC側から同期結果を受け取れませんでした");
       }
-      setSyncMessage("同期完了");
-      await appendSyncLog(syncLogPath, "sync completed", { importedName });
+      if (sessionResponse.state === "pc-ready") {
+        if (!sessionResponse.downloadUrl) {
+          throw new Error("PC側を正とするZIPの受信URLがありません");
+        }
+        setExporting(false);
+        setExportProgress(null);
+        await appendSyncLog(syncLogPath, "PC selected; receiving same-session ZIP", {
+          targetUid: target.targetUid,
+        });
+        await onPCSourceQRCode(sessionResponse.downloadUrl, ev, target.url.toString(), target.targetUid);
+        return;
+      }
+      if (sessionResponse.state === "mobile-applied") {
+        setSyncMessage("mobile側を正としてPCへ反映しました");
+        Alert.alert("PCへ反映しました", `「${ev.name}」のmobileデータをPC側へ反映しました。`);
+        return;
+      }
+      if (sessionResponse.state === "cancelled" || sessionResponse.state === "error") {
+        throw new Error(sessionResponse.message ?? "PC側で同期が中断されました");
+      }
+      // Older desktop versions return only {status:"ok"} after they finish
+      // the upload. Keep that path informational, while newer versions use
+      // the same session response above to deliver the PC ZIP automatically.
+      setSyncMessage("PCへ比較データを送信しました");
+      await appendSyncLog(syncLogPath, "single-event data staged for desktop preview", {
+        targetUid: target.targetUid,
+        status: uploadResult.status,
+      });
       Alert.alert(
-        "同期完了",
-        importedName
-          ? `PC側の取り込みまで完了しました。\n${importedName}`
-          : "PC側の取り込みまで完了しました。",
+        "PCへ送信しました",
+        "PC側で差分を確認し、採用結果がこの接続へ返るまでお待ちください。",
         [
           { text: "OK" },
           {
@@ -736,20 +1263,41 @@ export default function EventListScreen() {
         ],
       );
     } catch (e: any) {
-      await appendSyncLog(syncLogPath, "sync failed", {
-        message: e?.message ?? String(e),
-        stack: e?.stack,
+      let terminalWarning = "";
+      if (!terminalSessionConsumed && syncSessionUrl && syncSessionUid) {
+        terminalWarning = await cancelSingleEventSyncSessionBestEffort(
+          syncSessionUrl,
+          syncSessionUid,
+        ).then((warning) => warning ? `\n${warning}` : "");
+        terminalSessionConsumed = true;
+      }
+      const originalMessage = redactSyncText(e?.message ?? String(e));
+      await appendSyncLog(syncLogPath, userCancelled ? "sync cancelled" : "sync failed", {
+        message: `${originalMessage}${terminalWarning}`,
+        stack: redactSyncText(e?.stack ?? ""),
       });
-      Alert.alert("送信エラー", e.message, [
-        { text: "OK" },
-        {
-          text: "ログ共有",
-          onPress: () => {
-            shareSyncLog(syncLogPath);
+      if (!userCancelled) {
+        Alert.alert(syncCancelledRef.current ? "送信を中断しました" : "送信エラー", `${originalMessage}${terminalWarning}`, [
+          { text: "OK" },
+          {
+            text: "ログ共有",
+            onPress: () => {
+              shareSyncLog(syncLogPath);
+            },
           },
-        },
-      ]);
+        ]);
+      } else if (terminalWarning) {
+        Alert.alert(
+          "送信を中断しました",
+          `PC側へのキャンセル通知を確認できませんでした。PC側の状態を確認してから再試行してください。${terminalWarning}`,
+          [{ text: "OK" }],
+        );
+      }
     } finally {
+      activeSyncNetworkTaskRef.current = null;
+      if (zipPath) await FileSystem.deleteAsync(zipPath, { idempotent: true }).catch(() => undefined);
+      syncCancelledRef.current = false;
+      setSingleSyncBusy(false);
       setExporting(false);
       setExportProgress(null);
       setSyncMessage(null);
@@ -948,11 +1496,11 @@ export default function EventListScreen() {
         visible={showImportModal}
         transparent
         animationType="fade"
-        onRequestClose={() => setShowImportModal(false)}
+        onRequestClose={closeImportModal}
       >
         <Pressable
           style={styles.modalOverlay}
-          onPress={() => setShowImportModal(false)}
+          onPress={closeImportModal}
         >
           <View
             style={[styles.modalCard, { backgroundColor: colors.card }]}
@@ -962,30 +1510,55 @@ export default function EventListScreen() {
               データインポート
             </Text>
             <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="高度な操作・バックアップ"
+              accessibilityState={{ expanded: showAdvancedImportOptions }}
               style={[styles.modalOption, { borderBottomColor: colors.border }]}
-              onPress={doImportZip}
+              onPress={() => setShowAdvancedImportOptions((expanded) => !expanded)}
             >
               <FontAwesome
-                name="file-archive-o"
-                size={18}
+                name={showAdvancedImportOptions ? "chevron-down" : "chevron-right"}
+                size={14}
                 color={colors.tint}
               />
               <Text style={[styles.modalOptionText, { color: colors.text }]}>
-                ZIPファイル
+                高度な操作・バックアップ
               </Text>
             </Pressable>
-            <Pressable
-              style={[styles.modalOption, { borderBottomColor: "transparent" }]}
-              onPress={doImportQR}
-            >
-              <FontAwesome name="qrcode" size={18} color={colors.tint} />
-              <Text style={[styles.modalOptionText, { color: colors.text }]}>
-                QRコード
-              </Text>
-            </Pressable>
+            {showAdvancedImportOptions && (
+              <View style={styles.advancedImportOptions}>
+                <Text style={[styles.advancedImportHint, { color: colors.textSecondary }]}>
+                  旧形式のQR取り込みと手動バックアップZIPを使います。
+                </Text>
+                <Pressable
+                  accessibilityRole="button"
+                  style={[styles.modalOption, { borderBottomColor: colors.border }]}
+                  onPress={doImportZip}
+                >
+                  <FontAwesome
+                    name="file-archive-o"
+                    size={18}
+                    color={colors.tint}
+                  />
+                  <Text style={[styles.modalOptionText, { color: colors.text }]}>
+                    手動ZIPを取り込む
+                  </Text>
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  style={[styles.modalOption, { borderBottomColor: "transparent" }]}
+                  onPress={doImportQR}
+                >
+                  <FontAwesome name="qrcode" size={18} color={colors.tint} />
+                  <Text style={[styles.modalOptionText, { color: colors.text }]}>
+                    旧QRから取り込む
+                  </Text>
+                </Pressable>
+              </View>
+            )}
             <Pressable
               style={styles.modalCancel}
-              onPress={() => setShowImportModal(false)}
+              onPress={closeImportModal}
             >
               <Text
                 style={[
@@ -1068,11 +1641,11 @@ export default function EventListScreen() {
             </Pressable>
             <Pressable
               style={[styles.modalOption, { borderBottomColor: colors.border }]}
-              onPress={() => handleAction("sendToPC")}
+              onPress={() => handleAction("syncWithPC")}
             >
               <FontAwesome name="desktop" size={18} color={colors.tint} />
               <Text style={[styles.modalOptionText, { color: colors.text }]}>
-                PCに送信
+                PCと同期
               </Text>
             </Pressable>
             <Pressable
@@ -1142,6 +1715,90 @@ export default function EventListScreen() {
               </Text>
             </Pressable>
           </View>
+        </Pressable>
+      </Modal>
+
+      {/* PC ZIP差分の確認とソース選択 */}
+      <Modal
+        visible={pendingSingleEventSync !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => void cancelPendingSingleEventSync()}
+      >
+        <Pressable
+          style={styles.modalOverlay}
+          onPress={() => void cancelPendingSingleEventSync()}
+        >
+          <InputScrollView
+            style={{ width: "100%", flexGrow: 0, maxHeight: "100%" }}
+            contentContainerStyle={{ alignItems: "center" }}
+          >
+            <View
+              style={[styles.syncPreviewCard, { backgroundColor: colors.card }]}
+              onStartShouldSetResponder={() => true}
+            >
+              <Text style={[styles.modalTitle, { color: colors.text }]}>
+                イベント差分プレビュー
+              </Text>
+              {pendingSingleEventSync && (
+                <>
+                  <Text style={[styles.syncPreviewEvent, { color: colors.text }]}>
+                    {pendingSingleEventSync.event.name}
+                  </Text>
+                  <Text style={[styles.syncPreviewUid, { color: colors.textSecondary }]}>
+                    UID: {pendingSingleEventSync.preview.eventUid}
+                  </Text>
+                  <Text style={[styles.syncPreviewWarning, { color: colors.text }]}>
+                    反映先はこのイベント1件だけです。ほかのイベントと共有設定は変更しません。
+                    {"\n"}{PC_SYNC_NETWORK_WARNING}
+                  </Text>
+                  <Pressable
+                    style={[
+                      styles.syncSourceOption,
+                      {
+                        borderColor: singleSyncSourceSelected ? colors.tint : colors.border,
+                        backgroundColor: singleSyncSourceSelected ? `${colors.tint}18` : colors.background,
+                      },
+                    ]}
+                    onPress={() => setSingleSyncSourceSelected(true)}
+                  >
+                    <FontAwesome
+                      name={singleSyncSourceSelected ? "check-circle" : "circle-o"}
+                      size={20}
+                      color={singleSyncSourceSelected ? colors.tint : colors.textSecondary}
+                    />
+                    <Text style={[styles.syncSourceText, { color: colors.text }]}>
+                      PC側を正として反映する
+                    </Text>
+                  </Pressable>
+                  <Text
+                    selectable
+                    style={[styles.syncDiffText, { color: colors.textSecondary }]}
+                  >
+                    {formatSingleEventSyncDiff(pendingSingleEventSync.preview)}
+                  </Text>
+                  <View style={styles.memoButtons}>
+                    <Pressable
+                      style={[styles.memoBtn, { borderColor: colors.border }]}
+                      onPress={() => void cancelPendingSingleEventSync()}
+                    >
+                      <Text style={{ color: colors.textSecondary }}>キャンセル</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[
+                        styles.memoBtn,
+                        { backgroundColor: singleSyncSourceSelected ? colors.tint : colors.border },
+                      ]}
+                      disabled={!singleSyncSourceSelected}
+                      onPress={() => void applyPendingSingleEventSync()}
+                    >
+                      <Text style={{ color: "#fff", fontWeight: "600" }}>確認して適用</Text>
+                    </Pressable>
+                  </View>
+                </>
+              )}
+            </View>
+          </InputScrollView>
         </Pressable>
       </Modal>
 
@@ -1305,7 +1962,9 @@ export default function EventListScreen() {
       <Modal
         visible={showQRScanner}
         animationType="slide"
-        onRequestClose={() => setShowQRScanner(false)}
+        onRequestClose={() => {
+          setShowQRScanner(false);
+        }}
       >
         <View style={styles.qrContainer}>
           <CameraView
@@ -1314,10 +1973,14 @@ export default function EventListScreen() {
             onBarcodeScanned={onQRCodeScanned}
           />
           <View style={styles.qrOverlay}>
-            <Text style={styles.qrText}>QRコードをスキャンしてください</Text>
+            <Text style={styles.qrText}>
+              QRコードをスキャンしてください
+            </Text>
             <Pressable
               style={styles.qrCloseBtn}
-              onPress={() => setShowQRScanner(false)}
+              onPress={() => {
+                setShowQRScanner(false);
+              }}
             >
               <Text style={styles.qrCloseBtnText}>閉じる</Text>
             </Pressable>
@@ -1325,7 +1988,7 @@ export default function EventListScreen() {
         </View>
       </Modal>
 
-      {/* PCに送信用QRスキャナーモーダル */}
+      {/* PCと同期するための初回QRスキャナーモーダル */}
       <Modal
         visible={showSendQRScanner}
         animationType="slide"
@@ -1338,10 +2001,16 @@ export default function EventListScreen() {
             onBarcodeScanned={onSendQRCodeScanned}
           />
           <View style={styles.qrOverlay}>
-            <Text style={styles.qrText}>PCに表示されたQRコードをスキャン</Text>
+            <Text style={styles.qrText}>PCの「モバイルと同期」QRをスキャン</Text>
+            <Text style={styles.qrWarningText}>
+              {PC_SYNC_NETWORK_WARNING}
+            </Text>
             <Pressable
               style={styles.qrCloseBtn}
-              onPress={() => setShowSendQRScanner(false)}
+              onPress={() => {
+                setShowSendQRScanner(false);
+                setSendToPCTarget(null);
+              }}
             >
               <Text style={styles.qrCloseBtnText}>閉じる</Text>
             </Pressable>
@@ -1355,7 +2024,7 @@ export default function EventListScreen() {
           <View style={[styles.importCard, { backgroundColor: colors.card }]}>
             <ActivityIndicator size="large" color={colors.tint} />
             <Text style={[styles.importText, { color: colors.text }]}>
-              インポート中...
+              {syncMessage ?? "インポート中..."}
             </Text>
             {importProgress && (
               <Text
@@ -1366,6 +2035,11 @@ export default function EventListScreen() {
               >
                 {formatImportProgress(importProgress)}
               </Text>
+            )}
+            {singleSyncBusy && (
+              <Pressable style={styles.syncCancelBtn} onPress={cancelSingleSyncOperation}>
+                <Text style={styles.syncCancelBtnText}>中断</Text>
+              </Pressable>
             )}
           </View>
         </View>
@@ -1391,6 +2065,11 @@ export default function EventListScreen() {
               >
                 画像 {exportProgress.current}/{exportProgress.total}
               </Text>
+            )}
+            {singleSyncBusy && (
+              <Pressable style={styles.syncCancelBtn} onPress={cancelSingleSyncOperation}>
+                <Text style={styles.syncCancelBtnText}>中断</Text>
+              </Pressable>
             )}
             {lastSyncLogPath && syncMessage && (
               <Pressable
@@ -1653,6 +2332,59 @@ const styles = StyleSheet.create({
     paddingTop: 20,
     paddingBottom: 10,
   },
+  syncPreviewCard: {
+    width: "92%",
+    borderRadius: 14,
+    padding: 18,
+    marginVertical: 24,
+  },
+  syncPreviewEvent: {
+    fontSize: 17,
+    fontWeight: "700",
+    textAlign: "center",
+    marginBottom: 4,
+  },
+  syncPreviewUid: {
+    fontSize: 11,
+    textAlign: "center",
+    marginBottom: 12,
+  },
+  syncPreviewWarning: {
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 12,
+  },
+  syncSourceOption: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    borderWidth: 1.5,
+    borderRadius: 9,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 12,
+  },
+  syncSourceText: {
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  syncDiffText: {
+    fontSize: 12,
+    lineHeight: 18,
+    marginBottom: 14,
+  },
+  syncCancelBtn: {
+    marginTop: 4,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#c62828",
+    paddingHorizontal: 18,
+    paddingVertical: 8,
+  },
+  syncCancelBtnText: {
+    color: "#c62828",
+    fontWeight: "700",
+  },
   modalTitle: {
     fontSize: 17,
     fontWeight: "700",
@@ -1709,6 +2441,16 @@ const styles = StyleSheet.create({
   modalCancelText: {
     fontSize: 15,
   },
+  advancedImportOptions: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  advancedImportHint: {
+    fontSize: 12,
+    lineHeight: 17,
+    paddingHorizontal: 20,
+    paddingTop: 10,
+    paddingBottom: 2,
+  },
   // QRスキャナー
   qrContainer: { flex: 1, backgroundColor: "#000" },
   qrCamera: { flex: 1 },
@@ -1723,6 +2465,14 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(0,0,0,0.6)",
   },
   qrText: { color: "#fff", fontSize: 16, fontWeight: "600", marginBottom: 16 },
+  qrWarningText: {
+    color: "#fff",
+    fontSize: 12,
+    lineHeight: 17,
+    textAlign: "center",
+    marginHorizontal: 20,
+    marginBottom: 14,
+  },
   qrCloseBtn: {
     backgroundColor: "#fff",
     paddingHorizontal: 32,

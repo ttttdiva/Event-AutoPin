@@ -3849,6 +3849,10 @@ def _job_merge_circle_master(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _job_create_mobile_zip(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # The comparison flow opts out of shared desktop settings.  Default to
+    # the legacy behavior for existing callers/importers.
+    include_shared_settings = payload.get("include_shared_settings", True) is not False
+    single_event_sync = not include_shared_settings
     event_json_file = payload.get("event_json")
     output_dir = payload.get("output_dir")
     zip_output_path = payload.get("zip_output_path")
@@ -3912,9 +3916,11 @@ def _job_create_mobile_zip(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Resolve every referenced asset before opening the ZIP.  Absolute paths,
     # traversal segments, and symlinks escaping the owning root are rejected
     # instead of being silently skipped or copied from outside the event.
-    from ..utils.circle_master import CircleMasterManager
+    cm = None
+    if not single_event_sync:
+        from ..utils.circle_master import CircleMasterManager
 
-    cm = CircleMasterManager()
+        cm = CircleMasterManager()
 
     def prepare_asset(root: Path, ref: Any, archive_name: str, label: str) -> tuple[Path, str, Path]:
         if not isinstance(ref, str) or not ref.strip():
@@ -3947,7 +3953,7 @@ def _job_create_mobile_zip(payload: Dict[str, Any]) -> Dict[str, Any]:
         prepared_map_assets.append((_source, logical_ref, out_dir))
 
     prepared_default_assets: List[tuple[Path, str, Path]] = []
-    if cm.cuts_dir.exists():
+    if not single_event_sync and cm is not None and cm.cuts_dir.exists():
         cuts_root = cm.cuts_dir.resolve()
         for cut_path in cm.cuts_dir.iterdir():
             if not cut_path.is_file():
@@ -3994,6 +4000,10 @@ def _job_create_mobile_zip(payload: Dict[str, Any]) -> Dict[str, Any]:
             source_root, relative_ref, label="asset"
         )
         logical_name = _safe_archive_path(archive_name)
+        if single_event_sync and logical_name.casefold().startswith("default_cuts/"):
+            # A circle may still point at a shared default cut.  It is not an
+            # event-owned asset and must not create a sync manifest alias.
+            return False
         if not source_path.exists() or not source_path.is_file():
             return False
         digest = hashlib.sha256()
@@ -4025,10 +4035,11 @@ def _job_create_mobile_zip(payload: Dict[str, Any]) -> Dict[str, Any]:
         # event.json
         zf.writestr("event.json", json.dumps(data, ensure_ascii=False, indent=2))
 
-        # circle_master.json（サークルマスターデータ）
-        zf.writestr(
-            "circle_master.json", json.dumps(cm.to_dict(), ensure_ascii=False, indent=2)
-        )
+        if not single_event_sync and cm is not None:
+            # circle_master.json（サークルマスターデータ）
+            zf.writestr(
+                "circle_master.json", json.dumps(cm.to_dict(), ensure_ascii=False, indent=2)
+            )
 
         for source_path, archive_name, source_root in prepared_default_assets:
             if add_asset(zf, source_path, archive_name, source_root):

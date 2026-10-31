@@ -8,6 +8,7 @@ __pycache__/
 /output/
 /events/
 /temp/
+/.eventtrail-import-stage/event-sync-backups/
 .env
 twitter_tokens.json
 logs/

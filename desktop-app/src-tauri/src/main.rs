@@ -17,7 +17,38 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn is_usable_advertised_ipv4(ip: std::net::Ipv4Addr) -> bool {
-    !ip.is_unspecified() && !ip.is_loopback() && !ip.is_link_local()
+    ip.is_private() && !ip.is_unspecified() && !ip.is_loopback() && !ip.is_link_local()
+}
+
+/// Restrict sync HTTP peers to the advertised RFC1918 /24.  The QR advertises
+/// one interface, so a conservative /24 avoids accepting a routed private
+/// network or VPN peer while still working on the common home LAN.  Loopback
+/// is accepted only when both ends explicitly use loopback (unit tests and
+/// local development); production QR addresses are never loopback.
+fn peer_is_on_advertised_subnet(
+    remote: Option<&std::net::SocketAddr>,
+    advertised: std::net::Ipv4Addr,
+) -> bool {
+    let Some(std::net::SocketAddr::V4(remote)) = remote else {
+        return false;
+    };
+    let peer = *remote.ip();
+    if peer.is_loopback() || advertised.is_loopback() {
+        return peer.is_loopback() && advertised.is_loopback();
+    }
+    if !peer.is_private() || !advertised.is_private() {
+        return false;
+    }
+    let peer_octets = peer.octets();
+    let advertised_octets = advertised.octets();
+    peer_octets[..3] == advertised_octets[..3]
+}
+
+fn peer_is_loopback(remote: Option<&std::net::SocketAddr>) -> bool {
+    match remote {
+        Some(std::net::SocketAddr::V4(address)) => address.ip().is_loopback(),
+        _ => false,
+    }
 }
 
 /// Resolve the IPv4 address that a phone on the local network should use.
@@ -51,10 +82,8 @@ fn resolve_advertised_ipv4() -> Result<std::net::Ipv4Addr, String> {
     route_ip
         .filter(|ip| ip.is_private())
         .or_else(|| local_ip.filter(|ip| ip.is_private()))
-        .or(route_ip)
-        .or(local_ip)
         .ok_or_else(|| {
-            "LAN IPv4アドレスを取得できません（loopback/link-localを除外しました）".to_string()
+            "LAN IPv4アドレスを取得できません（private IPv4以外を除外しました）".to_string()
         })
 }
 
@@ -4760,6 +4789,23 @@ async def parse_anim_idx(text: str, clt: HttpClient) -> list[int]:
         assert!(is_usable_advertised_ipv4(std::net::Ipv4Addr::new(
             192, 168, 0, 1
         )));
+        let advertised = std::net::Ipv4Addr::new(192, 168, 1, 20);
+        assert!(peer_is_on_advertised_subnet(
+            Some(&std::net::SocketAddr::from(([192, 168, 1, 42], 18722))),
+            advertised,
+        ));
+        assert!(!peer_is_on_advertised_subnet(
+            Some(&std::net::SocketAddr::from(([192, 168, 2, 42], 18722))),
+            advertised,
+        ));
+        assert!(!peer_is_on_advertised_subnet(
+            Some(&std::net::SocketAddr::from(([8, 8, 8, 8], 18722))),
+            advertised,
+        ));
+        assert!(peer_is_on_advertised_subnet(
+            Some(&std::net::SocketAddr::from(([127, 0, 0, 1], 18722))),
+            std::net::Ipv4Addr::LOCALHOST,
+        ));
     }
 
     #[test]
@@ -4829,6 +4875,62 @@ async def parse_anim_idx(text: str, clt: HttpClient) -> list[int]:
             );
         }
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn protected_event_sync_file_server_serves_only_authorized_url() {
+        let _test_guard = file_server_test_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "eventtrail-protected-file-server-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("mobile sync.zip");
+        {
+            let mut zip = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
+            let options = zip::write::FileOptions::default();
+            let event = json!({
+                "event_uid": "sync-file-event",
+                "event": {"name": "Single Event", "date": "2026-06-01"},
+                "circles": [],
+                "metadata": {}
+            });
+            zip.start_file("event.json", options).unwrap();
+            zip.write_all(&serde_json::to_vec(&event).unwrap()).unwrap();
+            zip.start_file("event_image/event.png", options).unwrap();
+            zip.write_all(b"zip image").unwrap();
+            zip.finish().unwrap();
+        }
+        stop_file_server().unwrap();
+        let result = start_event_sync_file_server(
+            zip_path.to_string_lossy().to_string(),
+            "sync-file-event".to_string(),
+        )
+        .unwrap();
+        let url = result["url"].as_str().unwrap();
+        let route = url.split_once("://").unwrap().1.split_once('/').unwrap().1;
+        assert!(http_get_file(route).starts_with("HTTP/1.1 200"));
+        let token = url.split("token=").nth(1).unwrap();
+        assert!(http_get_file(&route.replace(token, "wrong-token")).starts_with("HTTP/1.1 401"));
+        assert!(http_get_file(&route.replace("&token=", "&")).starts_with("HTTP/1.1 401"));
+        assert!(
+            http_get_file(&route.replace("sync-file-event", "wrong-event"))
+                .starts_with("HTTP/1.1 401")
+        );
+        assert!(
+            http_get_file(&route.replace("mobile_export.zip", "other.zip"))
+                .starts_with("HTTP/1.1 404")
+        );
+        stop_file_server().unwrap();
+        assert!(
+            !zip_path.exists(),
+            "protected sync ZIPがstop時にcleanupされませんでした"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -5520,11 +5622,12 @@ async def parse_anim_idx(text: str, clt: HttpClient) -> list[int]:
 
     #[test]
     fn received_upload_payload_defers_import_to_frontend() {
-        let payload = received_upload_payload("upload-1", "C:/temp/result.zip", 42);
+        let payload = received_upload_payload("upload-1", "C:/temp/result.zip", 42, None);
         assert_eq!(payload["status"], "ok");
         assert_eq!(payload["uploadId"], "upload-1");
         assert_eq!(payload["zipPath"], "C:/temp/result.zip");
         assert_eq!(payload["size"], 42);
+        assert!(payload["targetEventUid"].is_null());
         assert!(payload.get("importResult").is_none());
         assert!(payload.get("projectRoot").is_none());
     }
@@ -5736,8 +5839,11 @@ async def parse_anim_idx(text: str, clt: HttpClient) -> list[int]:
                 event_dir: root.join("events/fixture"),
                 event_name: "fixture".to_string(),
                 event_date: None,
+                target_exists: false,
+                local_only: false,
                 redundant_events: Vec::new(),
             },
+            local_only: false,
             live_preimages: Vec::new(),
         });
         assert!(ack_received_upload(id.clone(), true, None).is_err());
@@ -6279,6 +6385,69 @@ fn strict_archive_relative_path(name: &str) -> Option<PathBuf> {
     (!output.as_os_str().is_empty()).then_some(output)
 }
 
+fn strict_sync_archive_relative_path(name: &str) -> Option<PathBuf> {
+    let relative = strict_archive_relative_path(name)?;
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return None;
+        };
+        let text = part.to_str()?;
+        if text.is_empty()
+            || text.chars().any(char::is_control)
+            || text.ends_with('.')
+            || text.ends_with(' ')
+        {
+            return None;
+        }
+        let device_stem = text
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(device_stem.as_str(), "con" | "prn" | "aux" | "nul")
+            || ["com", "lpt"].iter().any(|prefix| {
+                device_stem.strip_prefix(prefix).is_some_and(|suffix| {
+                    suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9')
+                })
+            })
+        {
+            return None;
+        }
+    }
+    Some(relative)
+}
+
+fn is_allowed_sync_asset_path(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let mut components = normalized.split('/');
+    let prefix = components.next().unwrap_or_default().to_ascii_lowercase();
+    let has_child = components.next().is_some();
+    has_child
+        && matches!(
+            prefix.as_str(),
+            "maps" | "event_image" | "circles" | "items"
+        )
+}
+
+fn is_allowed_sync_archive_path(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let folded = normalized.to_ascii_lowercase();
+    folded == "event.json"
+        || folded == "asset_manifest.json"
+        || (folded.starts_with("assets/") && folded.len() > "assets/".len())
+        || is_allowed_sync_asset_path(path)
+}
+
+fn is_allowed_sync_directory_path(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let folded = normalized.to_ascii_lowercase();
+    matches!(
+        folded.as_str(),
+        "assets" | "maps" | "event_image" | "circles" | "items"
+    ) || folded.starts_with("assets/")
+        || is_allowed_sync_asset_path(path)
+}
+
 fn read_asset_manifest_aliases(archive: &mut zip::ZipArchive<fs::File>) -> HashMap<String, String> {
     let Ok(mut file) = archive.by_name("asset_manifest.json") else {
         return HashMap::new();
@@ -6312,6 +6481,8 @@ struct ReceivedImportPlan {
     event_dir: PathBuf,
     event_name: String,
     event_date: Option<String>,
+    target_exists: bool,
+    local_only: bool,
     redundant_events: Vec<(String, PathBuf)>,
 }
 
@@ -6327,17 +6498,37 @@ fn read_import_event_data(zip_path: &Path) -> Result<Value, String> {
     serde_json::from_str(&buf).map_err(|e| format!("event.json解析失敗: {e}"))
 }
 
-fn plan_received_import(
+fn plan_received_import_with_scope(
     zip_path: &Path,
     project_root: &Path,
+    local_only: bool,
 ) -> Result<ReceivedImportPlan, String> {
+    if local_only {
+        validate_local_import_zip(zip_path)?;
+    }
     let event_data = read_import_event_data(zip_path)?;
     let event_obj = event_data.get("event").unwrap_or(&Value::Null);
     let event_name = event_field_string(event_obj, "name").unwrap_or_else(|| "unknown".to_string());
     let event_date = normalized_event_date(event_obj);
-    let (slug, event_dir) = if let Some((slug, dir)) =
-        find_existing_event_dir(project_root, &event_name, event_date.as_deref())
-    {
+    let existing = find_existing_event_dir(project_root, &event_name, event_date.as_deref());
+    let target_exists = existing.is_some();
+    let (slug, event_dir) = if let Some((slug, dir)) = existing {
+        if local_only {
+            if let Some(incoming_uid) = event_uid_from_data(&event_data) {
+                let existing_data = fs::read_to_string(dir.join("event.json"))
+                    .map_err(|e| format!("local対象event.json読み込み失敗: {e}"))?;
+                let existing_data: Value = serde_json::from_str(&existing_data)
+                    .map_err(|e| format!("local対象event.json解析失敗: {e}"))?;
+                if let Some(existing_uid) = event_uid_from_data(&existing_data) {
+                    if existing_uid != incoming_uid {
+                        return Err(
+                            "local ZIPのUIDが既存name/date対象と異なるため上書きを拒否しました"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
         (slug, dir)
     } else {
         let now = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
@@ -6346,13 +6537,18 @@ fn plan_received_import(
         let dir = project_root.join("events").join(&slug);
         (slug, dir)
     };
-    let redundant_events =
-        redundant_mobile_import_dirs(project_root, &event_name, event_date.as_deref(), &slug);
+    let redundant_events = if local_only {
+        Vec::new()
+    } else {
+        redundant_mobile_import_dirs(project_root, &event_name, event_date.as_deref(), &slug)
+    };
     Ok(ReceivedImportPlan {
         slug,
         event_dir,
         event_name,
         event_date,
+        target_exists,
+        local_only,
         redundant_events,
     })
 }
@@ -6803,18 +6999,68 @@ fn receive_server_running() -> &'static Mutex<Option<Arc<AtomicBool>>> {
     FLAG.get_or_init(|| Mutex::new(None))
 }
 
+fn receive_server_auth() -> &'static Mutex<Option<ReceiveServerAuth>> {
+    static AUTH: OnceLock<Mutex<Option<ReceiveServerAuth>>> = OnceLock::new();
+    AUTH.get_or_init(|| Mutex::new(None))
+}
+
+fn receive_sync_session() -> &'static Mutex<Option<ReceiveSyncSession>> {
+    static SESSION: OnceLock<Mutex<Option<ReceiveSyncSession>>> = OnceLock::new();
+    SESSION.get_or_init(|| Mutex::new(None))
+}
+
+fn receive_generation_is_current(
+    running: &Option<Arc<AtomicBool>>,
+    worker: &Arc<AtomicBool>,
+) -> bool {
+    running
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, worker) && worker.load(Ordering::Relaxed))
+}
+
+fn clear_receive_state_if_current(worker: &Arc<AtomicBool>) {
+    let running = match receive_server_running().lock() {
+        Ok(running) => running,
+        Err(_) => return,
+    };
+    if !running
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, worker))
+    {
+        return;
+    }
+    // Keep the running generation guard until auth/session cleanup finishes;
+    // start/stop cannot install a new generation in the gap.
+    if let Ok(mut auth) = receive_server_auth().lock() {
+        *auth = None;
+    }
+    if let Ok(mut session) = receive_sync_session().lock() {
+        *session = None;
+    }
+}
+
+const RECEIVE_BEARER_TOKEN_LIFETIME: Duration = Duration::from_secs(1200);
+const MAX_RECEIVED_ZIP_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SYNC_ZIP_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_SYNC_ZIP_EXPANDED_BYTES: u64 = 768 * 1024 * 1024;
+const MAX_SYNC_ZIP_ENTRIES: usize = 10_000;
+
 #[derive(Debug)]
 enum ReceivedUploadAck {
-    Success,
+    Success(Option<String>),
     Failure(String),
 }
 
 struct PendingReceivedUpload {
     sender: std::sync::mpsc::SyncSender<ReceivedUploadAck>,
     zip_path: PathBuf,
+    target_event_uid: Option<String>,
+    receive_generation: Option<Arc<AtomicBool>>,
+    local_only: bool,
     claimed: bool,
     lease_deadline: Instant,
     import_stage: Option<ReceivedImportStage>,
+    event_sync_stage: Option<ReceivedEventSyncStage>,
     recovery_required: bool,
     published: bool,
 }
@@ -6824,7 +7070,81 @@ struct ReceivedImportStage {
     stage_root: PathBuf,
     project_root: PathBuf,
     plan: ReceivedImportPlan,
+    local_only: bool,
     live_preimages: Vec<(PathBuf, Option<u64>)>,
+}
+
+#[derive(Clone, Debug)]
+struct ReceivedEventSyncStage {
+    stage_root: PathBuf,
+    project_root: PathBuf,
+    event_dir: PathBuf,
+    slug: String,
+    target_event_uid: String,
+    fingerprint: String,
+    live_preimage: Option<u64>,
+    zip_preimage: Option<u64>,
+}
+
+struct ReceiveServerAuth {
+    bearer_token: String,
+    target_event_uid: String,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+enum ReceiveSyncSessionState {
+    Waiting,
+    Pending { upload_id: String },
+    PcReady { download_url: String },
+    MobileApplied,
+    Cancelled { message: String },
+    Error { message: String },
+}
+
+#[derive(Clone, Debug)]
+struct ReceiveSyncSession {
+    target_event_uid: String,
+    state: ReceiveSyncSessionState,
+}
+
+fn receive_sync_session_is_terminal(session: Option<&ReceiveSyncSession>) -> bool {
+    session.is_some_and(|session| {
+        matches!(
+            &session.state,
+            ReceiveSyncSessionState::MobileApplied
+                | ReceiveSyncSessionState::Cancelled { .. }
+                | ReceiveSyncSessionState::Error { .. }
+        )
+    })
+}
+
+/// Retire a terminal receive-server generation while the running registry is
+/// locked. A cancelled/failed/completed session no longer owns mutable import
+/// work, so a subsequent start may replace its listener immediately. Keeping
+/// the registry lock across auth/session cleanup is important: an old worker
+/// can only clear state when its Arc is still the current generation.
+fn retire_terminal_receive_generation_locked(
+    running: &mut Option<Arc<AtomicBool>>,
+) -> Result<bool, String> {
+    let terminal = receive_sync_session()
+        .lock()
+        .map_err(|e| format!("receive sync session lock取得失敗: {e}"))
+        .map(|session| receive_sync_session_is_terminal(session.as_ref()))?;
+    if !terminal {
+        return Ok(false);
+    }
+
+    if let Some(worker) = running.take() {
+        worker.store(false, Ordering::Relaxed);
+    }
+    *receive_server_auth()
+        .lock()
+        .map_err(|e| format!("receive auth lock取得失敗: {e}"))? = None;
+    *receive_sync_session()
+        .lock()
+        .map_err(|e| format!("receive sync session lock取得失敗: {e}"))? = None;
+    Ok(true)
 }
 
 struct RemoveDirOnDrop {
@@ -6857,10 +7177,13 @@ fn circle_master_write_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn register_received_upload_with_timeout(
+fn register_received_upload_with_timeout_and_target_scope(
     upload_id: &str,
     zip_path: PathBuf,
     timeout: Duration,
+    target_event_uid: Option<String>,
+    local_only: bool,
+    receive_generation: Option<Arc<AtomicBool>>,
 ) -> Result<std::sync::mpsc::Receiver<ReceivedUploadAck>, String> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let mut pending = pending_received_uploads()
@@ -6874,9 +7197,13 @@ fn register_received_upload_with_timeout(
         PendingReceivedUpload {
             sender,
             zip_path,
+            target_event_uid,
+            receive_generation,
+            local_only,
             claimed: false,
             lease_deadline: Instant::now() + timeout,
             import_stage: None,
+            event_sync_stage: None,
             recovery_required: false,
             published: false,
         },
@@ -6884,11 +7211,88 @@ fn register_received_upload_with_timeout(
     Ok(receiver)
 }
 
+#[cfg(test)]
+fn register_received_upload_with_timeout_and_target(
+    upload_id: &str,
+    zip_path: PathBuf,
+    timeout: Duration,
+    target_event_uid: Option<String>,
+) -> Result<std::sync::mpsc::Receiver<ReceivedUploadAck>, String> {
+    register_received_upload_with_timeout_and_target_scope(
+        upload_id,
+        zip_path,
+        timeout,
+        target_event_uid,
+        false,
+        None,
+    )
+}
+
+fn register_local_received_upload(
+    upload_id: &str,
+    zip_path: PathBuf,
+) -> Result<std::sync::mpsc::Receiver<ReceivedUploadAck>, String> {
+    register_received_upload_with_timeout_and_target_scope(
+        upload_id,
+        zip_path,
+        RECEIVED_UPLOAD_LEASE_DURATION,
+        None,
+        true,
+        Some(Arc::new(AtomicBool::new(true))),
+    )
+}
+
+#[cfg(test)]
+fn register_received_upload_with_timeout(
+    upload_id: &str,
+    zip_path: PathBuf,
+    timeout: Duration,
+) -> Result<std::sync::mpsc::Receiver<ReceivedUploadAck>, String> {
+    register_received_upload_with_timeout_and_target(upload_id, zip_path, timeout, None)
+}
+
+#[cfg(test)]
 fn register_received_upload(
     upload_id: &str,
     zip_path: PathBuf,
 ) -> Result<std::sync::mpsc::Receiver<ReceivedUploadAck>, String> {
     register_received_upload_with_timeout(upload_id, zip_path, RECEIVED_UPLOAD_LEASE_DURATION)
+}
+
+#[cfg(test)]
+fn register_received_sync_upload(
+    upload_id: &str,
+    zip_path: PathBuf,
+    target_event_uid: String,
+) -> Result<std::sync::mpsc::Receiver<ReceivedUploadAck>, String> {
+    register_received_upload_with_timeout_and_target(
+        upload_id,
+        zip_path,
+        RECEIVED_UPLOAD_LEASE_DURATION,
+        Some(target_event_uid),
+    )
+}
+
+fn register_received_upload_for_generation(
+    worker: &Arc<AtomicBool>,
+    upload_id: &str,
+    zip_path: PathBuf,
+    target_event_uid: Option<String>,
+) -> Result<std::sync::mpsc::Receiver<ReceivedUploadAck>, String> {
+    let running = receive_server_running()
+        .lock()
+        .map_err(|error| format!("receive running lock error: {error}"))?;
+    if !receive_generation_is_current(&running, worker) {
+        return Err("receive server generation is no longer active".to_string());
+    }
+    register_received_upload_with_timeout_and_target_scope(
+        upload_id,
+        zip_path,
+        RECEIVED_UPLOAD_LEASE_DURATION,
+        target_event_uid,
+        false,
+        Some(worker.clone()),
+    )
 }
 
 #[tauri::command]
@@ -6938,14 +7342,1452 @@ fn current_received_upload_zip(upload_id: &str) -> Result<PathBuf, String> {
     Ok(upload.zip_path.clone())
 }
 
+fn received_upload_is_local_only(upload_id: &str) -> Result<bool, String> {
+    let pending = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("受信scopeロック取得失敗: {e}"))?;
+    let upload = pending
+        .get(upload_id)
+        .ok_or_else(|| "upload leaseは期限切れまたは取消済みです".to_string())?;
+    if !upload.claimed || Instant::now() >= upload.lease_deadline {
+        return Err("upload leaseはcurrentではありません".to_string());
+    }
+    Ok(upload.local_only)
+}
+
+fn ensure_received_upload_generation_current(
+    upload_id: &str,
+    running: &Option<Arc<AtomicBool>>,
+) -> Result<(), String> {
+    let pending = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("受信generationロック取得失敗: {e}"))?;
+    let upload = pending
+        .get(upload_id)
+        .ok_or_else(|| "upload leaseは期限切れまたは取消済みです".to_string())?;
+    if let Some(worker) = upload.receive_generation.as_ref() {
+        if !receive_generation_is_current(running, worker) {
+            return Err("receive server generation is no longer active".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn received_upload_target_uid(upload_id: &str) -> Result<String, String> {
+    let pending = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("受信target UIDロック取得失敗: {e}"))?;
+    let upload = pending
+        .get(upload_id)
+        .ok_or_else(|| "upload leaseは期限切れまたは取消済みです".to_string())?;
+    if !upload.claimed || Instant::now() >= upload.lease_deadline {
+        return Err("upload leaseはcurrentではありません".to_string());
+    }
+    upload
+        .target_event_uid
+        .clone()
+        .ok_or_else(|| "単一イベント同期QRから受信したZIPではありません".to_string())
+}
+
+fn valid_event_uid(uid: &str) -> bool {
+    !uid.is_empty()
+        && uid.len() <= 256
+        && uid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn valid_received_upload_id(upload_id: &str) -> bool {
+    !upload_id.is_empty()
+        && upload_id.len() <= 128
+        && upload_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn secure_random_bytes(bytes: &mut [u8]) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn SystemFunction036(buffer: *mut u8, length: u32) -> u8;
+        }
+        if bytes.len() > u32::MAX as usize {
+            return Err("乱数要求サイズが大きすぎます".to_string());
+        }
+        let ok = unsafe { SystemFunction036(bytes.as_mut_ptr(), bytes.len() as u32) };
+        if ok == 0 {
+            return Err("暗号学的乱数の取得に失敗しました".to_string());
+        }
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        let mut random = fs::File::open("/dev/urandom")
+            .map_err(|e| format!("暗号学的乱数sourceを開けません: {e}"))?;
+        random
+            .read_exact(bytes)
+            .map_err(|e| format!("暗号学的乱数を取得できません: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = bytes;
+        Err("このplatformでは暗号学的乱数を取得できません".to_string())
+    }
+}
+
+fn random_bearer_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    secure_random_bytes(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn constant_time_token_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
+fn decode_query_value(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let source = value.as_bytes();
+    let mut index = 0;
+    while index < source.len() {
+        match source[index] {
+            b'+' => {
+                bytes.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                let hex = source.get(index + 1..index + 3)?;
+                let digits = std::str::from_utf8(hex).ok()?;
+                bytes.push(u8::from_str_radix(digits, 16).ok()?);
+                index += 3;
+            }
+            byte => {
+                bytes.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn parse_query(query: Option<&str>) -> HashMap<String, String> {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            Some((decode_query_value(key)?, decode_query_value(value)?))
+        })
+        .collect()
+}
+
+fn receive_request_target_uid_with_auth(
+    url: &str,
+    auth: &mut Option<ReceiveServerAuth>,
+    clear_expired_auth: bool,
+) -> Result<Option<String>, (u16, String)> {
+    let query = parse_query(url.split_once('?').map(|(_, query)| query));
+    let is_sync_url = query.get("mode").is_some()
+        || query.get("target_uid").is_some()
+        || query.get("token").is_some();
+    let Some(current) = auth.as_ref() else {
+        return if is_sync_url {
+            Err((401, "pairing token is not active".to_string()))
+        } else {
+            Ok(None)
+        };
+    };
+    if Instant::now() >= current.expires_at {
+        if clear_expired_auth {
+            *auth = None;
+        }
+        return Err((410, "pairing token expired".to_string()));
+    }
+    let token = query.get("token").map(String::as_str).unwrap_or("");
+    let mode = query.get("mode").map(String::as_str).unwrap_or("");
+    let target_uid = query.get("target_uid").map(String::as_str).unwrap_or("");
+    if mode != "single-event-sync"
+        || target_uid != current.target_event_uid
+        || !constant_time_token_eq(token, &current.bearer_token)
+    {
+        return Err((401, "pairing token or target event is invalid".to_string()));
+    }
+    Ok(Some(current.target_event_uid.clone()))
+}
+
+#[cfg(test)]
+fn receive_request_target_uid(url: &str) -> Result<Option<String>, (u16, String)> {
+    let mut auth = receive_server_auth()
+        .lock()
+        .map_err(|error| (500, format!("receive auth lock error: {error}")))?;
+    receive_request_target_uid_with_auth(url, &mut auth, true)
+}
+
+fn receive_request_target_uid_for_generation(
+    url: &str,
+    worker: &Arc<AtomicBool>,
+) -> Result<Option<String>, (u16, String)> {
+    let running = receive_server_running()
+        .lock()
+        .map_err(|error| (500, format!("receive running lock error: {error}")))?;
+    if !receive_generation_is_current(&running, worker) {
+        return Err((409, "receive server generation is no longer active".to_string()));
+    }
+    let mut auth = receive_server_auth()
+        .lock()
+        .map_err(|error| (500, format!("receive auth lock error: {error}")))?;
+    receive_request_target_uid_with_auth(url, &mut auth, false)
+}
+
+fn begin_receive_sync_upload(target_event_uid: &str, upload_id: &str) -> Result<(), String> {
+    let mut session = receive_sync_session()
+        .lock()
+        .map_err(|error| format!("receive sync session lock error: {error}"))?;
+    let current = session
+        .as_mut()
+        .ok_or_else(|| "single-event sync session is not active".to_string())?;
+    if current.target_event_uid != target_event_uid {
+        return Err("single-event sync session target UID is invalid".to_string());
+    }
+    if !matches!(current.state, ReceiveSyncSessionState::Waiting) {
+        return Err("single-event sync upload is already active or terminal".to_string());
+    }
+    current.state = ReceiveSyncSessionState::Pending {
+        upload_id: upload_id.to_string(),
+    };
+    Ok(())
+}
+
+fn begin_receive_sync_upload_for_generation(
+    worker: &Arc<AtomicBool>,
+    target_event_uid: &str,
+    upload_id: &str,
+) -> Result<(), String> {
+    let running = receive_server_running()
+        .lock()
+        .map_err(|error| format!("receive running lock error: {error}"))?;
+    if !receive_generation_is_current(&running, worker) {
+        return Err("receive server generation is no longer active".to_string());
+    }
+    begin_receive_sync_upload(target_event_uid, upload_id)
+}
+
+fn receive_sync_upload_ack_state(
+    target_event_uid: &str,
+    upload_id: &str,
+    state: ReceiveSyncSessionState,
+) -> Result<bool, String> {
+    let mut session = receive_sync_session()
+        .lock()
+        .map_err(|error| format!("receive sync session lock error: {error}"))?;
+    let current = session
+        .as_mut()
+        .ok_or_else(|| "single-event sync session is not active".to_string())?;
+    if current.target_event_uid != target_event_uid {
+        return Err("single-event sync session target UID is invalid".to_string());
+    }
+    let ReceiveSyncSessionState::Pending {
+        upload_id: current_upload_id,
+    } = &current.state
+    else {
+        return Ok(false);
+    };
+    if current_upload_id != upload_id {
+        return Ok(false);
+    }
+    current.state = state;
+    Ok(true)
+}
+
+fn receive_sync_upload_ack_state_for_generation(
+    worker: &Arc<AtomicBool>,
+    target_event_uid: &str,
+    upload_id: &str,
+    state: ReceiveSyncSessionState,
+) -> Result<bool, String> {
+    let running = receive_server_running()
+        .lock()
+        .map_err(|error| format!("receive running lock error: {error}"))?;
+    if !receive_generation_is_current(&running, worker) {
+        return Ok(false);
+    }
+    receive_sync_upload_ack_state(target_event_uid, upload_id, state)
+}
+
+fn cancel_receive_sync_session(target_event_uid: &str, message: String) -> Result<bool, String> {
+    let mut session = receive_sync_session()
+        .lock()
+        .map_err(|error| format!("receive sync session lock error: {error}"))?;
+    let current = session
+        .as_mut()
+        .ok_or_else(|| "single-event sync session is not active".to_string())?;
+    if current.target_event_uid != target_event_uid {
+        return Err("single-event sync session target UID is invalid".to_string());
+    }
+    if matches!(
+        current.state,
+        ReceiveSyncSessionState::Waiting
+            | ReceiveSyncSessionState::Pending { .. }
+    ) {
+        current.state = ReceiveSyncSessionState::Cancelled { message };
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn expire_receive_sync_session(target_event_uid: &str, message: String) -> Result<bool, String> {
+    let mut session = receive_sync_session()
+        .lock()
+        .map_err(|error| format!("receive sync session lock error: {error}"))?;
+    let current = session
+        .as_mut()
+        .ok_or_else(|| "single-event sync session is not active".to_string())?;
+    if current.target_event_uid != target_event_uid {
+        return Err("single-event sync session target UID is invalid".to_string());
+    }
+    if matches!(
+        current.state,
+        ReceiveSyncSessionState::Waiting
+            | ReceiveSyncSessionState::Pending { .. }
+            | ReceiveSyncSessionState::PcReady { .. }
+    ) {
+        current.state = ReceiveSyncSessionState::Cancelled { message };
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+fn apply_receive_sync_notification(
+    target_event_uid: &str,
+    state: ReceiveSyncSessionState,
+) -> Result<(), String> {
+    let mut session = receive_sync_session()
+        .lock()
+        .map_err(|error| format!("receive sync session lock error: {error}"))?;
+    apply_receive_sync_notification_locked(&mut *session, target_event_uid, state)
+}
+
+fn apply_receive_sync_notification_locked(
+    session: &mut Option<ReceiveSyncSession>,
+    target_event_uid: &str,
+    state: ReceiveSyncSessionState,
+) -> Result<(), String> {
+    let current = session
+        .as_mut()
+        .ok_or_else(|| "single-event sync session is not active".to_string())?;
+    if current.target_event_uid != target_event_uid {
+        return Err("single-event sync session target UID is invalid".to_string());
+    }
+    let allowed = match (&current.state, &state) {
+        (ReceiveSyncSessionState::PcReady { .. }, ReceiveSyncSessionState::MobileApplied)
+        | (ReceiveSyncSessionState::MobileApplied, ReceiveSyncSessionState::MobileApplied)
+        | (
+            ReceiveSyncSessionState::Waiting | ReceiveSyncSessionState::Pending { .. },
+            ReceiveSyncSessionState::Cancelled { .. },
+        )
+        | (ReceiveSyncSessionState::PcReady { .. }, ReceiveSyncSessionState::Cancelled { .. })
+        | (ReceiveSyncSessionState::Cancelled { .. }, ReceiveSyncSessionState::Cancelled { .. }) => true,
+        _ => false,
+    };
+    if !allowed {
+        return Err("mobile完了通知はPC-ready後にのみ受け付けます".to_string());
+    }
+    current.state = state;
+    Ok(())
+}
+
+fn apply_receive_sync_notification_for_generation(
+    worker: &Arc<AtomicBool>,
+    target_event_uid: &str,
+    state: ReceiveSyncSessionState,
+) -> Result<(), String> {
+    let running = receive_server_running()
+        .lock()
+        .map_err(|error| format!("receive running lock error: {error}"))?;
+    if !receive_generation_is_current(&running, worker) {
+        return Err("receive server generation is no longer active".to_string());
+    }
+    let mut session = receive_sync_session()
+        .lock()
+        .map_err(|error| format!("receive sync session lock error: {error}"))?;
+    if session
+        .as_ref()
+        .is_none_or(|current| current.target_event_uid != target_event_uid)
+    {
+        return Err("single-event sync session target UID is invalid".to_string());
+    }
+    let pending_upload_id = match (&session.as_ref().map(|current| &current.state), &state) {
+        (Some(ReceiveSyncSessionState::Pending { upload_id }), ReceiveSyncSessionState::Cancelled { .. }) => {
+            Some(upload_id.clone())
+        }
+        _ => None,
+    };
+    if let Some(upload_id) = pending_upload_id {
+        let cancelled = pending_received_uploads()
+            .lock()
+            .map_err(|error| format!("受信cancelロック取得失敗: {error}"))?
+            .get(&upload_id)
+            .map(|upload| upload.published || upload.recovery_required)
+            .unwrap_or(false);
+        if cancelled {
+            return Err("反映確定済みの同期はキャンセルできません".to_string());
+        }
+        let committed_without_pending = pending_received_uploads()
+            .lock()
+            .map_err(|error| format!("受信cancelロック取得失敗: {error}"))?
+            .get(&upload_id)
+            .is_none()
+            && published_received_uploads()
+                .lock()
+                .map_err(|error| format!("published uploadロック取得失敗: {error}"))?
+                .contains(&upload_id);
+        if committed_without_pending {
+            return Err("反映確定済みの同期はキャンセルできません".to_string());
+        }
+        let removed = pending_received_uploads()
+            .lock()
+            .map_err(|error| format!("受信cancelロック取得失敗: {error}"))?
+            .remove(&upload_id);
+        if let Some(upload) = removed {
+            if let Some(stage) = upload.import_stage {
+                let _ = fs::remove_dir_all(stage.stage_root);
+            }
+            if let Some(stage) = upload.event_sync_stage {
+                let _ = fs::remove_dir_all(stage.stage_root);
+            }
+            let _ = upload.sender.try_send(ReceivedUploadAck::Failure(
+                "モバイル側で同期がキャンセルされました".to_string(),
+            ));
+        }
+    }
+    apply_receive_sync_notification_locked(&mut *session, target_event_uid, state)
+}
+
+fn receive_sync_session_response(
+    target_event_uid: &str,
+) -> Result<(u16, Value, bool), String> {
+    let session_id = receive_server_auth()
+        .lock()
+        .ok()
+        .and_then(|auth| {
+            auth.as_ref()
+                .filter(|auth| auth.target_event_uid == target_event_uid)
+                .map(|auth| sha256_hex(auth.bearer_token.as_bytes()))
+        });
+    let session = receive_sync_session()
+        .lock()
+        .map_err(|error| format!("receive sync session lock error: {error}"))?
+        .clone()
+        .ok_or_else(|| "single-event sync session is not active".to_string())?;
+    if session.target_event_uid != target_event_uid {
+        return Err("single-event sync session target UID is invalid".to_string());
+    }
+    let mut payload = json!({
+        "targetEventUid": target_event_uid,
+        "target_uid": target_event_uid,
+    });
+    if let Some(session_id) = session_id {
+        payload["sessionId"] = json!(session_id);
+    }
+    let (status, terminal) = match session.state {
+        ReceiveSyncSessionState::Waiting => {
+            payload["state"] = json!("pending");
+            payload["status"] = json!("pending");
+            (202, false)
+        }
+        ReceiveSyncSessionState::Pending { upload_id } => {
+            payload["state"] = json!("pending");
+            payload["status"] = json!("pending");
+            payload["uploadId"] = json!(upload_id);
+            (202, false)
+        }
+        ReceiveSyncSessionState::PcReady { download_url } => {
+            payload["state"] = json!("pc-ready");
+            payload["status"] = json!("pc-ready");
+            payload["source"] = json!("pc");
+            payload["downloadUrl"] = json!(download_url);
+            payload["download_url"] = payload["downloadUrl"].clone();
+            // Keep the receive listener alive until mobile posts its final
+            // apply acknowledgement on the same URL.
+            (200, false)
+        }
+        ReceiveSyncSessionState::MobileApplied => {
+            payload["state"] = json!("mobile-applied");
+            payload["status"] = json!("mobile-applied");
+            payload["source"] = json!("mobile");
+            (200, true)
+        }
+        ReceiveSyncSessionState::Cancelled { message } => {
+            payload["state"] = json!("cancelled");
+            payload["status"] = json!("cancelled");
+            payload["error"] = json!(message);
+            (200, true)
+        }
+        ReceiveSyncSessionState::Error { message } => {
+            payload["state"] = json!("error");
+            payload["status"] = json!("error");
+            payload["error"] = json!(message);
+            (200, true)
+        }
+    };
+    Ok((status, payload, terminal))
+}
+
+fn receive_sync_session_response_for_generation(
+    worker: &Arc<AtomicBool>,
+    target_event_uid: &str,
+) -> Result<(u16, Value, bool), String> {
+    let running = receive_server_running()
+        .lock()
+        .map_err(|error| format!("receive running lock error: {error}"))?;
+    if !receive_generation_is_current(&running, worker) {
+        return Err("receive server generation is no longer active".to_string());
+    }
+    receive_sync_session_response(target_event_uid)
+}
+
+fn receive_sync_error_is_cancelled(error: &str) -> bool {
+    ["中断", "停止", "期限切れ", "キャンセル", "cancel", "canceled", "cancelled"]
+        .iter()
+        .any(|marker| error.to_ascii_lowercase().contains(marker))
+}
+
+fn receive_sync_session_event_payload(
+    target_event_uid: &str,
+    delivered: bool,
+) -> Result<Value, String> {
+    let (_, mut payload, _) = receive_sync_session_response(target_event_uid)?;
+    payload["delivered"] = json!(delivered);
+    Ok(payload)
+}
+
+const RECEIVE_SYNC_EXPIRED_MESSAGE: &str = "QRの有効期限が切れました。もう一度QRを表示して同期を開始してください";
+
+fn receive_sync_session_expired_payload(target_event_uid: &str) -> Result<Value, String> {
+    let mut payload = receive_sync_session_event_payload(target_event_uid, false)?;
+    payload["expired"] = json!(true);
+    payload["message"] = json!(RECEIVE_SYNC_EXPIRED_MESSAGE);
+    payload["error"] = json!(RECEIVE_SYNC_EXPIRED_MESSAGE);
+    Ok(payload)
+}
+
+fn emit_receive_event_for_generation(
+    window: &tauri::Window,
+    worker: &Arc<AtomicBool>,
+    event: &str,
+    payload: Value,
+) -> bool {
+    let Ok(running) = receive_server_running().lock() else {
+        return false;
+    };
+    if !receive_generation_is_current(&running, worker) {
+        return false;
+    }
+    window.emit(event, payload).is_ok()
+}
+
+fn expire_receive_generation_if_needed(
+    window: &tauri::Window,
+    worker: &Arc<AtomicBool>,
+) -> Result<bool, String> {
+    let running = receive_server_running()
+        .lock()
+        .map_err(|error| format!("receive running lock error: {error}"))?;
+    if !receive_generation_is_current(&running, worker) {
+        return Ok(false);
+    }
+    let expired = receive_server_auth()
+        .lock()
+        .map_err(|error| format!("receive auth lock error: {error}"))?
+        .as_ref()
+        .is_some_and(|auth| Instant::now() >= auth.expires_at);
+    if !expired {
+        return Ok(true);
+    }
+
+    let target_event_uid = receive_sync_session()
+        .lock()
+        .map_err(|error| format!("receive sync session lock error: {error}"))?
+        .as_ref()
+        .map(|session| session.target_event_uid.clone());
+    if let Some(target_event_uid) = target_event_uid {
+        let transitioned = expire_receive_sync_session(
+            &target_event_uid,
+            RECEIVE_SYNC_EXPIRED_MESSAGE.to_string(),
+        )
+        .unwrap_or(false);
+        if transitioned {
+            if let Ok(payload) = receive_sync_session_expired_payload(&target_event_uid) {
+                let _ = window.emit("event-sync-session-state", payload);
+            }
+        }
+    }
+    // Keep this cleanup under the same generation lock as the expiry
+    // transition. A replacement generation cannot lose its upload here.
+    terminal_cancel_all_received_uploads_for_generation(
+        "QR pairingが期限切れです",
+        Some(worker),
+    );
+    worker.store(false, Ordering::Relaxed);
+    Ok(false)
+}
+
+fn emit_receive_sync_session_state_for_generation(
+    window: &tauri::Window,
+    worker: &Arc<AtomicBool>,
+    target_event_uid: &str,
+    delivered: bool,
+) -> bool {
+    let Ok(running) = receive_server_running().lock() else {
+        return false;
+    };
+    if !receive_generation_is_current(&running, worker) {
+        return false;
+    }
+    let Ok(payload) = receive_sync_session_event_payload(target_event_uid, delivered) else {
+        return false;
+    };
+    window.emit("event-sync-session-state", payload).is_ok()
+}
+
+fn query_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
+fn receive_sync_target_metadata(
+    project_root: &Path,
+    target_event_uid: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let (_, _, event_data) = find_unique_event_dir_by_uid(project_root, target_event_uid)?;
+    let event = event_data.get("event").unwrap_or(&Value::Null);
+    let name = event_field_string(event, "name");
+    let date = normalized_event_date(event);
+    Ok((name, date))
+}
+
+fn single_event_sync_receive_url(
+    upload_url: &str,
+    target_event_uid: &str,
+    target_name: Option<&str>,
+    target_date: Option<&str>,
+    bearer_token: &str,
+) -> String {
+    let mut url = format!(
+        "{upload_url}?mode=single-event-sync&target_uid={}",
+        query_encode(target_event_uid)
+    );
+    if let Some(target_name) = target_name {
+        url.push_str("&target_name=");
+        url.push_str(&query_encode(target_name));
+    }
+    if let Some(target_date) = target_date {
+        url.push_str("&target_date=");
+        url.push_str(&query_encode(target_date));
+    }
+    url.push_str("&token=");
+    url.push_str(bearer_token);
+    url
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut message = input.to_vec();
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+    let mut state = [
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    for chunk in message.chunks_exact(64) {
+        let mut words = [0u32; 64];
+        for (index, bytes) in chunk.chunks_exact(4).take(16).enumerate() {
+            words[index] = u32::from_be_bytes(bytes.try_into().expect("4 byte word"));
+        }
+        for index in 16..64 {
+            let s0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(choose)
+                .wrapping_add(K[index])
+                .wrapping_add(words[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+    state.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+#[derive(Clone, Debug)]
+struct SyncZipAsset {
+    key: String,
+    archive_name: String,
+    digest: String,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedSyncZip {
+    event_data: Value,
+    assets: Vec<SyncZipAsset>,
+}
+
+fn is_shared_import_archive_path(path: &Path) -> bool {
+    let folded = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    folded == "circle_master.json"
+        || folded == "default_cuts"
+        || folded.starts_with("default_cuts/")
+}
+
+fn parse_sync_zip_aliases_with_scope(
+    archive: &mut zip::ZipArchive<fs::File>,
+    allow_shared: bool,
+) -> Result<HashMap<String, String>, String> {
+    let mut file = match archive.by_name("asset_manifest.json") {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(HashMap::new()),
+        Err(error) => return Err(format!("asset_manifest.jsonを読めません: {error}")),
+    };
+    if file.size() > 2 * 1024 * 1024 {
+        return Err("asset_manifest.jsonが大きすぎます".to_string());
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| format!("asset_manifest.json読み込み失敗: {error}"))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("asset_manifest.json解析失敗: {error}"))?;
+    if let Some(assets) = value.get("assets") {
+        let assets = assets
+            .as_object()
+            .ok_or_else(|| "asset_manifest.json assetsが不正です".to_string())?;
+        for entry in assets.values() {
+            let entry = entry
+                .as_object()
+                .ok_or_else(|| "asset_manifest.json asset entryが不正です".to_string())?;
+            for field in ["path", "paths", "original_names"] {
+                let Some(paths) = entry.get(field) else {
+                    continue;
+                };
+                let values: Vec<&str> = if let Some(single) = paths.as_str() {
+                    vec![single]
+                } else if let Some(array) = paths.as_array() {
+                    array
+                        .iter()
+                        .map(|path| {
+                            path.as_str().ok_or_else(|| {
+                                format!("asset_manifest.json {field}に文字列以外があります")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    return Err(format!("asset_manifest.json {field}が不正です"));
+                };
+                for path in values {
+                    let path = strict_sync_archive_relative_path(path).ok_or_else(|| {
+                        format!("asset_manifest.json {field} pathがunsafeです: {path}")
+                    })?;
+                    let normalized_path = path
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .to_ascii_lowercase();
+                    let content_asset = normalized_path.starts_with("assets/");
+                    let shared_path = is_shared_import_archive_path(&path);
+                    if !(is_allowed_sync_asset_path(&path)
+                        || (content_asset && field != "original_names")
+                        || (allow_shared && shared_path))
+                    {
+                        return Err(format!(
+                            "asset_manifest.json {field} pathが許可root外です: {}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let Some(aliases) = value.get("aliases") else {
+        return Ok(HashMap::new());
+    };
+    let aliases = aliases
+        .as_object()
+        .ok_or_else(|| "asset_manifest.json aliasesが不正です".to_string())?;
+    let mut result = HashMap::new();
+    let mut destinations = HashSet::new();
+    for (logical, source) in aliases {
+        let source = source
+            .as_str()
+            .ok_or_else(|| "asset_manifest.json asset pathが文字列ではありません".to_string())?;
+        let logical_path = strict_sync_archive_relative_path(logical)
+            .ok_or_else(|| format!("asset manifest logical pathがunsafeです: {logical}"))?;
+        let source_path = strict_sync_archive_relative_path(source)
+            .ok_or_else(|| format!("asset manifest source pathがunsafeです: {source}"))?;
+        let source_folded = source_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase();
+        let source_is_content_asset =
+            source_folded.starts_with("assets/") && source_folded.len() > "assets/".len();
+        let logical_is_shared = is_shared_import_archive_path(&logical_path);
+        let source_is_shared = is_shared_import_archive_path(&source_path);
+        if !(is_allowed_sync_asset_path(&logical_path) || (allow_shared && logical_is_shared))
+            || !(source_is_content_asset
+                || is_allowed_sync_asset_path(&source_path)
+                || (allow_shared && source_is_shared))
+        {
+            return Err(format!(
+                "asset manifest pathが単一イベント同期の許可root外です: {logical} -> {source}"
+            ));
+        }
+        let logical = logical_path.to_string_lossy().replace('\\', "/");
+        let folded = logical.to_lowercase();
+        if !destinations.insert(folded) {
+            return Err(format!(
+                "asset manifest logical pathが重複しています: {logical}"
+            ));
+        }
+        result.insert(logical, source_path.to_string_lossy().replace('\\', "/"));
+    }
+    Ok(result)
+}
+
+fn is_image_asset_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "webp" | "gif" | "avif" | "bmp" | "tif" | "tiff"
+            )
+        })
+}
+
+fn read_validated_sync_zip(
+    zip_path: &Path,
+    expected_uid: &str,
+) -> Result<ValidatedSyncZip, String> {
+    read_validated_sync_zip_with_scope(zip_path, Some(expected_uid), false)
+}
+
+fn read_validated_sync_zip_with_scope(
+    zip_path: &Path,
+    expected_uid: Option<&str>,
+    allow_shared: bool,
+) -> Result<ValidatedSyncZip, String> {
+    let metadata = fs::metadata(zip_path).map_err(|e| format!("ZIP metadata取得失敗: {e}"))?;
+    if !metadata.is_file() || metadata.len() > MAX_RECEIVED_ZIP_BYTES {
+        return Err("受信ZIPのサイズまたは種別が不正です".to_string());
+    }
+    let zip_file = fs::File::open(zip_path).map_err(|e| format!("ZIPを開けません: {e}"))?;
+    let mut archive = zip::ZipArchive::new(zip_file).map_err(|e| format!("ZIP展開失敗: {e}"))?;
+    if archive.len() == 0 || archive.len() > MAX_SYNC_ZIP_ENTRIES {
+        return Err("ZIP entry数が許容範囲外です".to_string());
+    }
+    let mut members: HashMap<String, (String, u64)> = HashMap::new();
+    let mut all_names = HashSet::new();
+    let mut expanded_size = 0u64;
+    for index in 0..archive.len() {
+        let file = archive
+            .by_index(index)
+            .map_err(|e| format!("ZIP entry読み込み失敗: {e}"))?;
+        let raw_name = file.name().to_string();
+        let directory = raw_name.ends_with('/');
+        let normalized_input = if directory {
+            raw_name.trim_end_matches('/')
+        } else {
+            raw_name.as_str()
+        };
+        let relative = strict_sync_archive_relative_path(normalized_input)
+            .ok_or_else(|| format!("unsafe ZIP entry pathです: {raw_name}"))?;
+        let name = relative.to_string_lossy().replace('\\', "/");
+        if !all_names.insert(name.to_lowercase()) {
+            return Err(format!(
+                "ZIP entry pathがcase-insensitiveで重複しています: {name}"
+            ));
+        }
+        if let Some(mode) = file.unix_mode() {
+            let kind = mode & 0o170000;
+            let allowed_kind = if directory { 0o040000 } else { 0o100000 };
+            if kind == 0o120000 || (kind != 0 && kind != allowed_kind) {
+                return Err(format!("ZIP entry typeがsymlinkまたは特殊fileです: {name}"));
+            }
+        }
+        let name_folded = name.to_ascii_lowercase();
+        let shared_path = is_shared_import_archive_path(&relative);
+        if shared_path && !allow_shared {
+            return Err(
+                "単一イベント同期ZIPにcircle_master/default_cutsが含まれています".to_string(),
+            );
+        }
+        if directory {
+            if shared_path && allow_shared {
+                continue;
+            }
+            if !is_allowed_sync_directory_path(&relative) {
+                return Err(format!("ZIP directory pathが許可root外です: {name}"));
+            }
+            continue;
+        }
+        if (name_folded == "event.json" && name != "event.json")
+            || (name_folded == "asset_manifest.json" && name != "asset_manifest.json")
+        {
+            return Err(format!(
+                "reserved ZIP pathはcanonical表記が必要です: {name}"
+            ));
+        }
+        if !is_allowed_sync_archive_path(&relative) && !(allow_shared && shared_path) {
+            return Err(format!("ZIP file pathが許可root外です: {name}"));
+        }
+        if file.size() > MAX_SYNC_ZIP_ENTRY_BYTES {
+            return Err(format!("ZIP entryが大きすぎます: {name}"));
+        }
+        expanded_size = expanded_size.saturating_add(file.size());
+        if expanded_size > MAX_SYNC_ZIP_EXPANDED_BYTES {
+            return Err("ZIP展開後サイズが許容上限を超えています".to_string());
+        }
+        if file.size() > 1_048_576
+            && file.compressed_size() > 0
+            && file.size() / file.compressed_size() > 1000
+        {
+            return Err(format!("ZIP entry圧縮率が許容範囲外です: {name}"));
+        }
+        members.insert(name.to_lowercase(), (name, file.size()));
+    }
+    let event_member = members
+        .get("event.json")
+        .ok_or_else(|| "ZIP rootにevent.jsonがありません".to_string())?;
+    if event_member.1 > 20 * 1024 * 1024 {
+        return Err("event.jsonが大きすぎます".to_string());
+    }
+    let mut event_file = archive
+        .by_name("event.json")
+        .map_err(|e| format!("event.jsonを読めません: {e}"))?;
+    let mut event_text = String::new();
+    event_file
+        .read_to_string(&mut event_text)
+        .map_err(|e| format!("event.json読み込み失敗: {e}"))?;
+    drop(event_file);
+    let event_data: Value =
+        serde_json::from_str(&event_text).map_err(|e| format!("event.json解析失敗: {e}"))?;
+    let mobile_uid = event_uid_from_data(&event_data);
+    if let Some(expected_uid) = expected_uid {
+        let mobile_uid = mobile_uid
+            .ok_or_else(|| "mobile event.jsonにstable event_uidがありません".to_string())?;
+        if mobile_uid != expected_uid {
+            return Err("mobile event UIDが選択したdesktop eventと一致しません".to_string());
+        }
+    } else if let Some(raw_uid) = event_data.get("event_uid") {
+        let uid = raw_uid
+            .as_str()
+            .map(str::trim)
+            .filter(|uid| valid_event_uid(uid))
+            .ok_or_else(|| "local event.jsonのevent_uid形式が不正です".to_string())?;
+        let _ = uid;
+    }
+
+    let aliases = parse_sync_zip_aliases_with_scope(&mut archive, allow_shared)?;
+    let mut logical_assets: HashMap<String, String> = HashMap::new();
+    for (logical, source) in aliases {
+        if !members.contains_key(&source.to_lowercase()) {
+            return Err(format!(
+                "asset manifest sourceがZIP内にありません: {source}"
+            ));
+        }
+        logical_assets.insert(logical, source);
+    }
+    for (folded, (name, _)) in &members {
+        if name == "event.json"
+            || name == "asset_manifest.json"
+            || name.starts_with("assets/")
+            || (allow_shared && is_shared_import_archive_path(Path::new(name)))
+        {
+            continue;
+        }
+        logical_assets
+            .entry(name.clone())
+            .or_insert_with(|| name.clone());
+        let _ = folded;
+    }
+    let mut assets = Vec::new();
+    let mut logical_paths = HashSet::new();
+    for (key, archive_name) in logical_assets {
+        let relative = strict_sync_archive_relative_path(&key)
+            .ok_or_else(|| format!("mobile asset pathがunsafeです: {key}"))?;
+        let normalized = relative.to_string_lossy().replace('\\', "/");
+        let normalized_folded = normalized.to_lowercase();
+        if normalized_folded == "event.json"
+            || normalized_folded == "asset_manifest.json"
+            || (!allow_shared && is_shared_import_archive_path(&relative))
+        {
+            return Err(format!("mobile asset pathが許可対象外です: {normalized}"));
+        }
+        if !logical_paths.insert(normalized.to_lowercase()) {
+            return Err(format!(
+                "mobile asset destinationが重複しています: {normalized}"
+            ));
+        }
+        let mut file = archive
+            .by_name(&archive_name)
+            .map_err(|e| format!("mobile asset読み込み失敗 {archive_name}: {e}"))?;
+        let mut bytes = Vec::with_capacity(file.size().min(8 * 1024 * 1024) as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|e| format!("mobile asset読み込み失敗 {archive_name}: {e}"))?;
+        if bytes.len() as u64 != file.size() {
+            return Err(format!("mobile asset size不一致: {archive_name}"));
+        }
+        assets.push(SyncZipAsset {
+            key: normalized,
+            archive_name,
+            digest: sha256_hex(&bytes),
+        });
+    }
+    Ok(ValidatedSyncZip { event_data, assets })
+}
+
+fn validate_local_import_zip(zip_path: &Path) -> Result<(), String> {
+    let zip_file = fs::File::open(zip_path).map_err(|e| format!("local ZIPを開けません: {e}"))?;
+    let mut archive = zip::ZipArchive::new(zip_file)
+        .map_err(|e| format!("local ZIP展開失敗: {e}"))?;
+    for index in 0..archive.len() {
+        let file = archive
+            .by_index(index)
+            .map_err(|e| format!("local ZIP entry読み込み失敗: {e}"))?;
+        let folded = file.name().replace('\\', "/").to_ascii_lowercase();
+        if folded == "sync_bundle.json" || folded.starts_with("events/") {
+            return Err("全イベントbundle ZIPはlocal importに対応していません".to_string());
+        }
+    }
+    read_validated_sync_zip_with_scope(zip_path, None, true).map(|_| ())
+}
+
+fn sanitize_local_asset_manifest(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|e| format!("local asset_manifest.json解析失敗: {e}"))?;
+    let mut aliases = serde_json::Map::new();
+    if let Some(entries) = value.get("aliases") {
+        let entries = entries
+            .as_object()
+            .ok_or_else(|| "local asset_manifest.json aliasesが不正です".to_string())?;
+        for (logical, source) in entries {
+            let source = source
+                .as_str()
+                .ok_or_else(|| "local asset_manifest.json alias sourceが不正です".to_string())?;
+            let logical_path = strict_sync_archive_relative_path(logical)
+                .ok_or_else(|| format!("local alias pathがunsafeです: {logical}"))?;
+            let source_path = strict_sync_archive_relative_path(source)
+                .ok_or_else(|| format!("local alias sourceがunsafeです: {source}"))?;
+            if is_shared_import_archive_path(&logical_path)
+                || is_shared_import_archive_path(&source_path)
+            {
+                continue;
+            }
+            aliases.insert(logical.clone(), json!(source));
+        }
+    }
+    serde_json::to_vec_pretty(&json!({
+        "format": "eventtrail_asset_manifest",
+        "format_version": 1,
+        "aliases": aliases,
+    }))
+    .map_err(|e| format!("local asset_manifest.json生成失敗: {e}"))
+}
+
+fn sanitize_local_import_zip(source: &Path, destination: &Path) -> Result<(), String> {
+    validate_local_import_zip(source)?;
+    let source_file = fs::File::open(source).map_err(|e| format!("local ZIP再読込失敗: {e}"))?;
+    let mut archive = zip::ZipArchive::new(source_file)
+        .map_err(|e| format!("local ZIP再展開失敗: {e}"))?;
+    let output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|e| format!("sanitized local ZIP作成失敗: {e}"))?;
+    let mut writer = zip::ZipWriter::new(output);
+    let options = zip::write::FileOptions::default();
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|e| format!("local ZIP entry再読込失敗: {e}"))?;
+        let raw_name = file.name().to_string();
+        let directory = raw_name.ends_with('/');
+        if directory {
+            continue;
+        }
+        let relative = strict_sync_archive_relative_path(raw_name.trim_end_matches('/'))
+            .ok_or_else(|| format!("local ZIP entry pathがunsafeです: {raw_name}"))?;
+        if is_shared_import_archive_path(&relative) {
+            continue;
+        }
+        let normalized = relative.to_string_lossy().replace('\\', "/");
+        let mut bytes = Vec::with_capacity(file.size().min(8 * 1024 * 1024) as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|e| format!("local ZIP entry読み込み失敗: {raw_name}: {e}"))?;
+        if bytes.len() as u64 != file.size() {
+            return Err(format!("local ZIP entry size不一致: {raw_name}"));
+        }
+        if normalized.eq_ignore_ascii_case("asset_manifest.json") {
+            bytes = sanitize_local_asset_manifest(&bytes)?;
+        }
+        writer
+            .start_file(normalized, options)
+            .map_err(|e| format!("sanitized ZIP entry作成失敗: {e}"))?;
+        writer
+            .write_all(&bytes)
+            .map_err(|e| format!("sanitized ZIP entry書込失敗: {e}"))?;
+    }
+    writer
+        .finish()
+        .map_err(|e| format!("sanitized local ZIP完了失敗: {e}"))?;
+    read_validated_sync_zip_with_scope(destination, None, false)
+        .map(|_| ())
+        .map_err(|error| format!("sanitized local ZIP再検証失敗: {error}"))
+}
+
+fn event_uid_from_data(value: &Value) -> Option<String> {
+    let uid = value.get("event_uid")?.as_str()?.trim();
+    valid_event_uid(uid).then(|| uid.to_string())
+}
+
+fn find_unique_event_dir_by_uid(
+    project_root: &Path,
+    target_uid: &str,
+) -> Result<(String, PathBuf, Value), String> {
+    if !valid_event_uid(target_uid) {
+        return Err("target event UIDの形式が不正です".to_string());
+    }
+    let events_dir = project_root.join("events");
+    let events_meta = fs::symlink_metadata(&events_dir)
+        .map_err(|e| format!("events directoryを確認できません: {e}"))?;
+    if !events_meta.is_dir() || metadata_is_link_or_reparse(&events_meta) {
+        return Err("events directoryが通常のdirectoryではありません".to_string());
+    }
+    let mut found: Vec<(String, PathBuf, Value)> = Vec::new();
+    for entry in fs::read_dir(&events_dir).map_err(|e| format!("events directory読込失敗: {e}"))?
+    {
+        let entry = entry.map_err(|e| format!("events entry読込失敗: {e}"))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|e| format!("event directory metadata失敗: {e}"))?;
+        if metadata_is_link_or_reparse(&metadata) {
+            return Err(format!(
+                "events directory内にsymlink/reparseがあります: {}",
+                entry.path().display()
+            ));
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        let event_path = entry.path().join("event.json");
+        let event_metadata = match fs::symlink_metadata(&event_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("event.json metadata取得失敗: {error}")),
+        };
+        if metadata_is_link_or_reparse(&event_metadata) || !event_metadata.is_file() {
+            return Err(format!(
+                "event.jsonが通常fileではありません: {}",
+                event_path.display()
+            ));
+        }
+        let text = fs::read_to_string(&event_path)
+            .map_err(|e| format!("event.json読み込み失敗 {}: {e}", event_path.display()))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("event.json解析失敗 {}: {e}", event_path.display()))?;
+        if event_uid_from_data(&value).as_deref() == Some(target_uid) {
+            found.push((
+                entry.file_name().to_string_lossy().to_string(),
+                entry.path(),
+                value,
+            ));
+        }
+    }
+    match found.len() {
+        0 => Err("選択UIDのdesktop eventが見つかりません".to_string()),
+        1 => Ok(found.remove(0)),
+        _ => Err("選択UIDに一致するdesktop eventが複数あります".to_string()),
+    }
+}
+
+fn collect_local_image_digests(root: &Path) -> Result<HashMap<String, (String, String)>, String> {
+    fn collect(
+        root: &Path,
+        current: &Path,
+        output: &mut HashMap<String, (String, String)>,
+    ) -> Result<(), String> {
+        for entry in
+            fs::read_dir(current).map_err(|e| format!("event asset directory読込失敗: {e}"))?
+        {
+            let entry = entry.map_err(|e| format!("event asset entry読込失敗: {e}"))?;
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("event asset種別取得失敗: {e}"))?;
+            if kind.is_symlink() {
+                return Err(format!(
+                    "event assetにsymlinkを含められません: {}",
+                    entry.path().display()
+                ));
+            }
+            if kind.is_dir() {
+                collect(root, &entry.path(), output)?;
+            } else if kind.is_file() {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|_| "event asset pathがroot外です".to_string())?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if is_image_asset_path(&relative) {
+                    let bytes = fs::read(entry.path())
+                        .map_err(|e| format!("event image読み込み失敗: {e}"))?;
+                    let folded = relative.to_lowercase();
+                    if output
+                        .insert(folded, (relative.clone(), sha256_hex(&bytes)))
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "local eventにcase-insensitive重複image pathがあります: {relative}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut output = HashMap::new();
+    collect(root, root, &mut output)?;
+    Ok(output)
+}
+
+fn sync_asset_diff(event_dir: &Path, mobile_assets: &[SyncZipAsset]) -> Result<Value, String> {
+    let desktop = collect_local_image_digests(event_dir)?;
+    let mobile: HashMap<String, &SyncZipAsset> = mobile_assets
+        .iter()
+        .filter(|asset| is_image_asset_path(&asset.key))
+        .map(|asset| (asset.key.to_lowercase(), asset))
+        .collect();
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    let mut deleted = Vec::new();
+    for (folded, asset) in &mobile {
+        match desktop.get(folded) {
+            None => added
+                .push(json!({"key": asset.key, "path": asset.key, "mobileDigest": asset.digest})),
+            Some((desktop_path, digest)) if digest != &asset.digest => changed.push(json!({
+                "key": asset.key,
+                "path": asset.key,
+                "desktopPath": desktop_path,
+                "desktopDigest": digest,
+                "mobileDigest": asset.digest
+            })),
+            Some(_) => {}
+        }
+    }
+    for (folded, (desktop_path, digest)) in &desktop {
+        if !mobile.contains_key(folded) {
+            deleted.push(json!({
+                "key": desktop_path,
+                "path": desktop_path,
+                "desktopDigest": digest
+            }));
+        }
+    }
+    added.sort_by_key(|asset| asset["key"].as_str().unwrap_or_default().to_string());
+    changed.sort_by_key(|asset| asset["key"].as_str().unwrap_or_default().to_string());
+    deleted.sort_by_key(|asset| asset["key"].as_str().unwrap_or_default().to_string());
+    Ok(json!({"added": added, "changed": changed, "deleted": deleted}))
+}
+
+fn received_sync_fingerprint(
+    zip_path: &Path,
+    event_dir: &Path,
+) -> Result<(String, Option<u64>, Option<u64>), String> {
+    let zip_preimage = path_content_fingerprint(zip_path)?;
+    let live_preimage = path_content_fingerprint(event_dir)?;
+    let zip = zip_preimage.ok_or_else(|| "受信ZIPが存在しません".to_string())?;
+    let live = live_preimage.ok_or_else(|| "対象event directoryが存在しません".to_string())?;
+    Ok((
+        format!("event:{live:016x};zip:{zip:016x}"),
+        live_preimage,
+        zip_preimage,
+    ))
+}
+
+fn preview_received_event_sync_value(
+    upload_id: &str,
+    project_root: &Path,
+    target_event_uid: &str,
+) -> Result<(Value, ReceivedEventSyncStage), String> {
+    if received_upload_target_uid(upload_id)? != target_event_uid {
+        return Err("target UIDがQR pairingのtargetと一致しません".to_string());
+    }
+    let zip_path = current_received_upload_zip(upload_id)?;
+    let (slug, event_dir, _) = find_unique_event_dir_by_uid(project_root, target_event_uid)?;
+    let (before_fingerprint, _, _) = received_sync_fingerprint(&zip_path, &event_dir)?;
+    let desktop_event_path = event_dir.join("event.json");
+    let desktop_event_metadata = fs::symlink_metadata(&desktop_event_path)
+        .map_err(|e| format!("desktop event.json metadata取得失敗: {e}"))?;
+    if !desktop_event_metadata.is_file() || metadata_is_link_or_reparse(&desktop_event_metadata) {
+        return Err("desktop event.jsonが通常fileではありません".to_string());
+    }
+    let desktop_text = fs::read_to_string(&desktop_event_path)
+        .map_err(|e| format!("desktop event.json読み込み失敗: {e}"))?;
+    let desktop_data: Value = serde_json::from_str(&desktop_text)
+        .map_err(|e| format!("desktop event.json解析失敗: {e}"))?;
+    if event_uid_from_data(&desktop_data).as_deref() != Some(target_event_uid) {
+        return Err("preview中にdesktop event UIDが変更されました".to_string());
+    }
+    let validated_zip = read_validated_sync_zip(&zip_path, target_event_uid)?;
+    let asset_diff = sync_asset_diff(&event_dir, &validated_zip.assets)?;
+    let (fingerprint, live_preimage, zip_preimage) =
+        received_sync_fingerprint(&zip_path, &event_dir)?;
+    if fingerprint != before_fingerprint {
+        return Err(
+            "preview中にdesktop eventまたは受信ZIPが変更されました。再読込してください".to_string(),
+        );
+    }
+    let stage_root = project_root
+        .join(".eventtrail-import-stage")
+        .join(format!("event-sync-stage-{upload_id}"));
+    let stage = ReceivedEventSyncStage {
+        stage_root,
+        project_root: project_root.to_path_buf(),
+        event_dir: event_dir.clone(),
+        slug: slug.clone(),
+        target_event_uid: target_event_uid.to_string(),
+        fingerprint: fingerprint.clone(),
+        live_preimage,
+        zip_preimage,
+    };
+    let value = json!({
+        "targetSlug": slug,
+        "targetEventUid": target_event_uid,
+        "desktopData": desktop_data,
+        "mobileData": validated_zip.event_data,
+        "assetDiff": asset_diff,
+        "fingerprint": fingerprint
+    });
+    Ok((value, stage))
+}
+
+fn extract_sync_zip_to_stage(
+    zip_path: &Path,
+    target_uid: &str,
+    destination: &Path,
+) -> Result<Value, String> {
+    let validated = read_validated_sync_zip(zip_path, target_uid)?;
+    fs::create_dir_all(destination)
+        .map_err(|e| format!("event sync stage directory作成失敗: {e}"))?;
+    let zip_file = fs::File::open(zip_path).map_err(|e| format!("ZIPを開けません: {e}"))?;
+    let mut archive = zip::ZipArchive::new(zip_file).map_err(|e| format!("ZIP再読込失敗: {e}"))?;
+    let event_bytes = serde_json::to_vec_pretty(&validated.event_data)
+        .map_err(|e| format!("mobile event.json serialize失敗: {e}"))?;
+    fs::write(destination.join("event.json"), event_bytes)
+        .map_err(|e| format!("mobile event.json stage書込失敗: {e}"))?;
+    for asset in &validated.assets {
+        let relative = strict_sync_archive_relative_path(&asset.key)
+            .ok_or_else(|| format!("unsafe stage asset path: {}", asset.key))?;
+        let target = destination.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("asset stage directory作成失敗: {e}"))?;
+        }
+        let mut source = archive
+            .by_name(&asset.archive_name)
+            .map_err(|e| format!("ZIP asset再読込失敗 {}: {e}", asset.archive_name))?;
+        let mut output =
+            fs::File::create(&target).map_err(|e| format!("asset stage作成失敗: {e}"))?;
+        std::io::copy(&mut source, &mut output)
+            .map_err(|e| format!("asset stage書込失敗 {}: {e}", target.display()))?;
+        output
+            .sync_all()
+            .map_err(|e| format!("asset stage sync失敗: {e}"))?;
+    }
+    Ok(validated.event_data)
+}
+
 fn copy_directory_without_links(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_metadata =
+        fs::symlink_metadata(source).map_err(|e| format!("stage source metadata取得失敗: {e}"))?;
+    if !source_metadata.is_dir() || metadata_is_link_or_reparse(&source_metadata) {
+        return Err(format!(
+            "stage sourceが通常directoryではありません: {}",
+            source.display()
+        ));
+    }
     fs::create_dir_all(destination).map_err(|e| format!("stage directory作成失敗: {e}"))?;
     for entry in fs::read_dir(source).map_err(|e| format!("stage source読込失敗: {e}"))? {
         let entry = entry.map_err(|e| format!("stage entry読込失敗: {e}"))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("stage entry種別取得失敗: {e}"))?;
-        if file_type.is_symlink() {
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|e| format!("stage entry metadata取得失敗: {e}"))?;
+        let file_type = metadata.file_type();
+        if metadata_is_link_or_reparse(&metadata) {
             return Err(format!(
                 "stage対象にsymlinkを含められません: {}",
                 entry.path().display()
@@ -7022,6 +8864,10 @@ fn received_import_plan_value(plan: &ReceivedImportPlan) -> Value {
         "status": "ok",
         "slug": plan.slug,
         "dir": plan.event_dir.to_string_lossy().to_string().replace("\\", "/"),
+        "eventName": plan.event_name,
+        "eventDate": plan.event_date,
+        "targetExists": plan.target_exists,
+        "localOnly": plan.local_only,
         "affectedEvents": affected,
     })
 }
@@ -7029,8 +8875,9 @@ fn received_import_plan_value(plan: &ReceivedImportPlan) -> Value {
 #[tauri::command]
 fn plan_received_result_import(upload_id: String, project_root: String) -> Result<Value, String> {
     let zip_path = current_received_upload_zip(&upload_id)?;
+    let local_only = received_upload_is_local_only(&upload_id)?;
     let project_root = absolute_project_root(&project_root)?;
-    let plan = plan_received_import(&zip_path, &project_root)?;
+    let plan = plan_received_import_with_scope(&zip_path, &project_root, local_only)?;
     current_received_upload_zip(&upload_id)?;
     Ok(received_import_plan_value(&plan))
 }
@@ -7041,15 +8888,13 @@ fn stage_received_result_import(
     project_root: String,
     expected_slug: String,
 ) -> Result<Value, String> {
-    if !upload_id
-        .chars()
-        .all(|character| character.is_ascii_digit() || character == '_' || character == '-')
-    {
+    if !valid_received_upload_id(&upload_id) {
         return Err("uploadIdが不正です".to_string());
     }
     let zip_path = current_received_upload_zip(&upload_id)?;
+    let local_only = received_upload_is_local_only(&upload_id)?;
     let project_root_path = absolute_project_root(&project_root)?;
-    let plan = plan_received_import(&zip_path, &project_root_path)?;
+    let plan = plan_received_import_with_scope(&zip_path, &project_root_path, local_only)?;
     if plan.slug != expected_slug {
         return Err("import planが変更されました".to_string());
     }
@@ -7068,21 +8913,25 @@ fn stage_received_result_import(
             plan.event_dir.clone(),
             path_content_fingerprint(&plan.event_dir)?,
         ),
-        (
+    ];
+    if !local_only {
+        live_preimages.push((
             project_root_path.join("circle_master.json"),
             path_content_fingerprint(&project_root_path.join("circle_master.json"))?,
-        ),
-    ];
+        ));
+    }
     for (_, redundant) in &plan.redundant_events {
         live_preimages.push((redundant.clone(), path_content_fingerprint(redundant)?));
     }
     if plan.event_dir.is_dir() {
         copy_directory_without_links(&plan.event_dir, &stage_root.join("events").join(&plan.slug))?;
     }
-    let circle_master = project_root_path.join("circle_master.json");
-    if circle_master.is_file() {
-        fs::copy(&circle_master, stage_root.join("circle_master.json"))
-            .map_err(|e| format!("circle_master stage copy失敗: {e}"))?;
+    if !local_only {
+        let circle_master = project_root_path.join("circle_master.json");
+        if circle_master.is_file() {
+            fs::copy(&circle_master, stage_root.join("circle_master.json"))
+                .map_err(|e| format!("circle_master stage copy失敗: {e}"))?;
+        }
     }
     let staged = import_result_zip_into_root(
         zip_path.to_string_lossy().to_string(),
@@ -7090,10 +8939,12 @@ fn stage_received_result_import(
         Some(plan.slug.clone()),
     );
     let result = staged?;
-    let staged_cuts = stage_root.join("default_cuts");
-    for relative in staged_files(&staged_cuts)? {
-        let live = project_root_path.join("default_cuts").join(relative);
-        live_preimages.push((live.clone(), path_content_fingerprint(&live)?));
+    if !local_only {
+        let staged_cuts = stage_root.join("default_cuts");
+        for relative in staged_files(&staged_cuts)? {
+            let live = project_root_path.join("default_cuts").join(relative);
+            live_preimages.push((live.clone(), path_content_fingerprint(&live)?));
+        }
     }
     let mut pending = pending_received_uploads()
         .lock()
@@ -7108,6 +8959,7 @@ fn stage_received_result_import(
         stage_root: stage_root.clone(),
         project_root: project_root_path,
         plan: plan.clone(),
+        local_only,
         live_preimages,
     });
     cleanup.armed = false;
@@ -7118,6 +8970,294 @@ fn stage_received_result_import(
         .cloned()
         .unwrap_or(json!(false));
     Ok(response)
+}
+
+#[tauri::command]
+fn preview_received_event_sync(
+    upload_id: String,
+    project_root: String,
+    target_event_uid: String,
+) -> Result<Value, String> {
+    let project_root = absolute_project_root(&project_root)?;
+    let (preview, _) =
+        preview_received_event_sync_value(&upload_id, &project_root, &target_event_uid)?;
+    current_received_upload_zip(&upload_id)?;
+    Ok(preview)
+}
+
+#[tauri::command]
+fn stage_received_event_sync(
+    upload_id: String,
+    project_root: String,
+    target_event_uid: String,
+    expected_fingerprint: String,
+) -> Result<Value, String> {
+    if !valid_received_upload_id(&upload_id) {
+        return Err("uploadIdが不正です".to_string());
+    }
+    let receive_running = receive_server_running()
+        .lock()
+        .map_err(|e| format!("event sync stage generation lock取得失敗: {e}"))?;
+    ensure_received_upload_generation_current(&upload_id, &receive_running)?;
+    let _publish_guard = circle_master_write_lock()
+        .lock()
+        .map_err(|e| format!("event sync stage lock取得失敗: {e}"))?;
+    let _event_mutation_guard = event_json_mutation_lock()
+        .lock()
+        .map_err(|e| format!("event sync stage mutation lock取得失敗: {e}"))?;
+    let project_root_path = absolute_project_root(&project_root)?;
+    let (preview, mut stage) =
+        preview_received_event_sync_value(&upload_id, &project_root_path, &target_event_uid)?;
+    if preview["fingerprint"].as_str() != Some(expected_fingerprint.as_str()) {
+        return Err(
+            "preview後にdesktop eventまたは受信ZIPが変更されました。差分を再読込してください"
+                .to_string(),
+        );
+    }
+    let zip_path = current_received_upload_zip(&upload_id)?;
+    let _ = fs::remove_dir_all(&stage.stage_root);
+    let mut cleanup = RemoveDirOnDrop {
+        path: stage.stage_root.clone(),
+        armed: true,
+    };
+    let staged_event = stage.stage_root.join("events").join(&stage.slug);
+    extract_sync_zip_to_stage(&zip_path, &target_event_uid, &staged_event)?;
+    let staged_text = fs::read_to_string(staged_event.join("event.json"))
+        .map_err(|e| format!("staged event.json再読込失敗: {e}"))?;
+    let staged_value: Value = serde_json::from_str(&staged_text)
+        .map_err(|e| format!("staged event.json再解析失敗: {e}"))?;
+    if event_uid_from_data(&staged_value).as_deref() != Some(target_event_uid.as_str()) {
+        return Err("staged event UIDがtargetと一致しません".to_string());
+    }
+    let (current_fingerprint, live_preimage, zip_preimage) =
+        received_sync_fingerprint(&zip_path, &stage.event_dir)?;
+    if current_fingerprint != stage.fingerprint
+        || Some(current_fingerprint.as_str()) != preview["fingerprint"].as_str()
+    {
+        return Err("stage作成中にdesktop eventまたは受信ZIPが変更されました".to_string());
+    }
+    stage.live_preimage = live_preimage;
+    stage.zip_preimage = zip_preimage;
+    ensure_received_upload_generation_current(&upload_id, &receive_running)?;
+    let mut pending = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("event sync pending lock取得失敗: {e}"))?;
+    let upload = pending
+        .get_mut(&upload_id)
+        .ok_or_else(|| "upload leaseは期限切れまたは取消済みです".to_string())?;
+    if !upload.claimed
+        || Instant::now() >= upload.lease_deadline
+        || upload.target_event_uid.as_deref() != Some(target_event_uid.as_str())
+    {
+        return Err("upload lease/targetがcurrentではありません".to_string());
+    }
+    if let Some(previous) = upload.event_sync_stage.replace(stage.clone()) {
+        let _ = fs::remove_dir_all(previous.stage_root);
+    }
+    cleanup.armed = false;
+    Ok(json!({
+        "status": "ok",
+        "targetSlug": stage.slug,
+        "targetEventUid": stage.target_event_uid,
+        "fingerprint": stage.fingerprint
+    }))
+}
+
+#[tauri::command]
+fn publish_received_event_sync(upload_id: String) -> Result<Value, String> {
+    if !valid_received_upload_id(&upload_id) {
+        return Err("uploadIdが不正です".to_string());
+    }
+    let receive_running = receive_server_running()
+        .lock()
+        .map_err(|e| format!("event sync publish generation lock取得失敗: {e}"))?;
+    let _circle_master_guard = circle_master_write_lock()
+        .lock()
+        .map_err(|e| format!("event sync publish lock取得失敗: {e}"))?;
+    let _event_mutation_guard = event_json_mutation_lock()
+        .lock()
+        .map_err(|e| format!("event sync mutation lock取得失敗: {e}"))?;
+    let mut pending = pending_received_uploads()
+        .lock()
+        .map_err(|e| format!("event sync publish registry lock取得失敗: {e}"))?;
+    let upload = pending
+        .get_mut(&upload_id)
+        .ok_or_else(|| "upload leaseは期限切れまたは取消済みです".to_string())?;
+    if !upload.claimed || Instant::now() >= upload.lease_deadline {
+        return Err("upload leaseはcurrentではありません".to_string());
+    }
+    if let Some(worker) = upload.receive_generation.as_ref() {
+        if !receive_generation_is_current(&receive_running, worker) {
+            return Err("event sync upload generation is no longer active".to_string());
+        }
+    }
+    if upload.import_stage.is_some() {
+        return Err("通常import stageとevent sync stageが同じuploadにあります".to_string());
+    }
+    let stage = upload
+        .event_sync_stage
+        .clone()
+        .ok_or_else(|| "publish対象のevent sync stageがありません".to_string())?;
+    if upload.target_event_uid.as_deref() != Some(stage.target_event_uid.as_str()) {
+        return Err("sync stageのtarget UIDがupload targetと一致しません".to_string());
+    }
+    let zip_path = upload.zip_path.clone();
+    let mut published = Vec::new();
+    let mut manual_backup_path = None;
+    let manifest_path = stage.stage_root.join("transaction.json");
+    let publish_result = (|| -> Result<(), String> {
+        let (slug, current_event_dir, event_data) =
+            find_unique_event_dir_by_uid(&stage.project_root, &stage.target_event_uid)?;
+        if slug != stage.slug || current_event_dir != stage.event_dir {
+            return Err("stage後にUIDとevent directoryの対応が変更されました".to_string());
+        }
+        let (current_fingerprint, live_preimage, zip_preimage) =
+            received_sync_fingerprint(&zip_path, &stage.event_dir)?;
+        if current_fingerprint != stage.fingerprint
+            || live_preimage != stage.live_preimage
+            || zip_preimage != stage.zip_preimage
+        {
+            return Err(
+                "stage後に対象eventまたは受信ZIPが変更されました。差分を再読込してください"
+                    .to_string(),
+            );
+        }
+        let staged_event = stage.stage_root.join("events").join(&stage.slug);
+        let staged_text = fs::read_to_string(staged_event.join("event.json"))
+            .map_err(|e| format!("staged event.json読込失敗: {e}"))?;
+        let staged_data: Value = serde_json::from_str(&staged_text)
+            .map_err(|e| format!("staged event.json解析失敗: {e}"))?;
+        if event_uid_from_data(&staged_data).as_deref() != Some(stage.target_event_uid.as_str())
+            || event_uid_from_data(&event_data).as_deref() != Some(stage.target_event_uid.as_str())
+        {
+            return Err("publish直前のevent UID確認に失敗しました".to_string());
+        }
+
+        let manual_backup = stage
+            .project_root
+            .join(".eventtrail-import-stage")
+            .join("event-sync-backups")
+            .join(&stage.slug)
+            .join(&upload_id);
+        if manual_backup.exists() {
+            return Err("同じuploadIdのevent sync backupが既に存在します".to_string());
+        }
+        validate_contained_path(
+            &manual_backup,
+            &stage.project_root.join(".eventtrail-import-stage"),
+            "event sync backup",
+        )?;
+        let backup_result = (|| -> Result<(), String> {
+            copy_directory_without_links(&stage.event_dir, &manual_backup)?;
+            sync_path_tree(&manual_backup)?;
+            let backup_fingerprint = path_content_fingerprint(&manual_backup)?;
+            if backup_fingerprint != stage.live_preimage {
+                return Err("publish用event backupが対象eventと一致しません".to_string());
+            }
+            Ok(())
+        })();
+        if let Err(error) = backup_result {
+            let _ = fs::remove_dir_all(&manual_backup);
+            return Err(error);
+        }
+        manual_backup_path = Some(manual_backup.clone());
+
+        let (_, final_event_dir, final_event_data) =
+            find_unique_event_dir_by_uid(&stage.project_root, &stage.target_event_uid)?;
+        let (_, final_live_preimage, final_zip_preimage) =
+            received_sync_fingerprint(&zip_path, &stage.event_dir)?;
+        if final_event_dir != stage.event_dir
+            || event_uid_from_data(&final_event_data).as_deref()
+                != Some(stage.target_event_uid.as_str())
+            || final_live_preimage != stage.live_preimage
+            || final_zip_preimage != stage.zip_preimage
+        {
+            return Err(
+                "backup作成中に対象eventまたはZIPが変更されました。同期を再読込してください"
+                    .to_string(),
+            );
+        }
+
+        let source = staged_event
+            .strip_prefix(&stage.stage_root)
+            .map_err(|_| "staged event pathがtransaction root外です".to_string())?
+            .to_path_buf();
+        let destination = stage
+            .event_dir
+            .strip_prefix(&stage.project_root)
+            .map_err(|_| "event destinationがproject root外です".to_string())?
+            .to_path_buf();
+        let mut manifest = PersistentPublishManifest {
+            version: 1,
+            phase: "publishing".to_string(),
+            completed_operations: 0,
+            operations: vec![PersistentPublishOperation {
+                source: Some(source),
+                destination,
+                backup: PathBuf::from("publish-backup/target-event"),
+                had_destination: true,
+            }],
+        };
+        persist_publish_manifest(&manifest_path, &manifest)?;
+        let operation = &manifest.operations[0];
+        let (source, destination, backup) =
+            resolve_manifest_operation(&stage.project_root, &stage.stage_root, operation)?;
+        install_staged_path(source.as_deref(), &destination, &backup, &mut published)?;
+        manifest.completed_operations = 1;
+        persist_publish_manifest(&manifest_path, &manifest)?;
+        manifest.phase = "committed".to_string();
+        persist_publish_manifest(&manifest_path, &manifest)?;
+        Ok(())
+    })();
+    if let Err(error) = publish_result {
+        let rollback = rollback_published_paths(&mut published);
+        if let Err(rollback_error) = rollback {
+            upload.recovery_required = true;
+            let recovery_root = stage
+                .project_root
+                .join(".eventtrail-import-recovery")
+                .join(format!("event-sync-{upload_id}"));
+            let (preserved_root, preserve_error) = preserve_failed_transaction_with(
+                &stage.stage_root,
+                &recovery_root,
+                persist_publish_manifest,
+                durable_rename,
+            );
+            upload.event_sync_stage = Some(ReceivedEventSyncStage {
+                stage_root: preserved_root.clone(),
+                ..stage
+            });
+            return Err(format!(
+                "event sync publish失敗: {error}; rollback失敗: {rollback_error}; recovery={}; recovery-mark={}",
+                preserved_root.display(),
+                preserve_error.unwrap_or_else(|| "ok".to_string())
+            ));
+        }
+        upload.event_sync_stage = Some(stage);
+        return Err(error);
+    }
+    upload.lease_deadline = Instant::now() + RECEIVED_UPLOAD_LEASE_DURATION;
+    let _ = fs::remove_dir_all(&stage.stage_root);
+    upload.event_sync_stage = None;
+    upload.published = true;
+    published_received_uploads()
+        .lock()
+        .map_err(|e| format!("published uploadロック取得失敗: {e}"))?
+        .insert(upload_id.clone());
+    let _ = fs::remove_file(&upload.zip_path);
+    let _ = upload.sender.try_send(ReceivedUploadAck::Success(None));
+    let backup_path = manual_backup_path
+        .map(|path| path.to_string_lossy().to_string().replace('\\', "/"))
+        .ok_or_else(|| "event backup pathを確定できません".to_string())?;
+    Ok(json!({
+        "status": "ok",
+        "slug": stage.slug,
+        "targetSlug": stage.slug,
+        "targetEventUid": stage.target_event_uid,
+        "dir": stage.event_dir.to_string_lossy().to_string().replace('\\', "/"),
+        "backupPath": backup_path,
+        "fingerprint": stage.fingerprint
+    }))
 }
 
 #[derive(Debug)]
@@ -7634,6 +9774,7 @@ fn publish_received_result_import(upload_id: String) -> Result<Value, String> {
         .ok_or_else(|| "publish対象のimport stageがありません".to_string())?;
     let manifest_path = stage.stage_root.join("transaction.json");
     let mut published = Vec::new();
+    let mut manual_backup_path = None;
     let publish_result = (|| -> Result<(), String> {
         for (path, expected) in &stage.live_preimages {
             let current = path_content_fingerprint(path)?;
@@ -7643,6 +9784,33 @@ fn publish_received_result_import(upload_id: String) -> Result<Value, String> {
                     path.display()
                 ));
             }
+        }
+        if stage.local_only && stage.plan.target_exists {
+            let manual_backup = stage
+                .project_root
+                .join(".eventtrail-import-stage")
+                .join("local-import-backups")
+                .join(&stage.plan.slug)
+                .join(&upload_id);
+            if manual_backup.exists() {
+                return Err("同じuploadIdのlocal import backupが既に存在します".to_string());
+            }
+            validate_contained_path(
+                &manual_backup,
+                &stage.project_root.join(".eventtrail-import-stage"),
+                "local import backup",
+            )?;
+            copy_directory_without_links(&stage.plan.event_dir, &manual_backup)?;
+            sync_path_tree(&manual_backup)?;
+            let expected = stage
+                .live_preimages
+                .first()
+                .and_then(|(_, fingerprint)| *fingerprint);
+            if path_content_fingerprint(&manual_backup)? != expected {
+                let _ = fs::remove_dir_all(&manual_backup);
+                return Err("local import backupが対象eventと一致しません".to_string());
+            }
+            manual_backup_path = Some(manual_backup);
         }
         let staged_event = stage.stage_root.join("events").join(&stage.plan.slug);
         let mut operations = vec![PersistentPublishOperation {
@@ -7661,21 +9829,23 @@ fn publish_received_result_import(upload_id: String) -> Result<Value, String> {
             backup: PathBuf::from("publish-backup/target-event"),
             had_destination: stage.plan.event_dir.exists(),
         }];
-        for (slug, redundant) in &stage.plan.redundant_events {
-            if redundant.exists() {
-                operations.push(PersistentPublishOperation {
-                    source: None,
-                    destination: redundant
-                        .strip_prefix(&stage.project_root)
-                        .map_err(|_| "redundant destinationがproject root外です".to_string())?
-                        .to_path_buf(),
-                    backup: PathBuf::from("publish-backup/redundant-events").join(slug),
-                    had_destination: true,
-                });
+        if !stage.local_only {
+            for (slug, redundant) in &stage.plan.redundant_events {
+                if redundant.exists() {
+                    operations.push(PersistentPublishOperation {
+                        source: None,
+                        destination: redundant
+                            .strip_prefix(&stage.project_root)
+                            .map_err(|_| "redundant destinationがproject root外です".to_string())?
+                            .to_path_buf(),
+                        backup: PathBuf::from("publish-backup/redundant-events").join(slug),
+                        had_destination: true,
+                    });
+                }
             }
         }
         let staged_master = stage.stage_root.join("circle_master.json");
-        if staged_master.is_file() {
+        if !stage.local_only && staged_master.is_file() {
             let staged_master_value: Value = serde_json::from_str(
                 &fs::read_to_string(&staged_master)
                     .map_err(|e| format!("staged circle_master読込失敗: {e}"))?,
@@ -7696,15 +9866,17 @@ fn publish_received_result_import(upload_id: String) -> Result<Value, String> {
                 had_destination: destination.exists(),
             });
         }
-        let staged_cuts = stage.stage_root.join("default_cuts");
-        for relative in staged_files(&staged_cuts)? {
-            let destination = stage.project_root.join("default_cuts").join(&relative);
-            operations.push(PersistentPublishOperation {
-                source: Some(PathBuf::from("default_cuts").join(&relative)),
-                destination: PathBuf::from("default_cuts").join(&relative),
-                backup: PathBuf::from("publish-backup/default_cuts").join(&relative),
-                had_destination: destination.exists(),
-            });
+        if !stage.local_only {
+            let staged_cuts = stage.stage_root.join("default_cuts");
+            for relative in staged_files(&staged_cuts)? {
+                let destination = stage.project_root.join("default_cuts").join(&relative);
+                operations.push(PersistentPublishOperation {
+                    source: Some(PathBuf::from("default_cuts").join(&relative)),
+                    destination: PathBuf::from("default_cuts").join(&relative),
+                    backup: PathBuf::from("publish-backup/default_cuts").join(&relative),
+                    had_destination: destination.exists(),
+                });
+            }
         }
         let mut manifest = PersistentPublishManifest {
             version: 1,
@@ -7765,11 +9937,18 @@ fn publish_received_result_import(upload_id: String) -> Result<Value, String> {
     // live mutation commitとmobile成功通知を同じregistry critical sectionで確定する。
     // この後のUI reload/select失敗やserver stopは成功結果を上書きできない。
     let _ = fs::remove_file(&upload.zip_path);
-    let _ = upload.sender.try_send(ReceivedUploadAck::Success);
+    let _ = upload.sender.try_send(ReceivedUploadAck::Success(None));
+    let backup_path = manual_backup_path
+        .map(|path| path.to_string_lossy().to_string().replace('\\', "/"));
     Ok(json!({
         "status": "ok",
         "slug": stage.plan.slug,
         "dir": stage.plan.event_dir.to_string_lossy().to_string().replace("\\", "/"),
+        "eventName": stage.plan.event_name,
+        "eventDate": stage.plan.event_date,
+        "targetExists": stage.plan.target_exists,
+        "localOnly": stage.local_only,
+        "backupPath": backup_path,
         "event_name": stage.plan.event_name,
         "event_date": stage.plan.event_date,
         "duplicate_mobile_imports_removed": stage.plan.redundant_events.len(),
@@ -7790,8 +9969,13 @@ fn remove_pending_received_upload(upload_id: &str) {
             }
             pending.remove(upload_id)
         });
-    if let Some(stage) = removed.and_then(|upload| upload.import_stage) {
-        let _ = fs::remove_dir_all(stage.stage_root);
+    if let Some(upload) = removed {
+        if let Some(stage) = upload.import_stage {
+            let _ = fs::remove_dir_all(stage.stage_root);
+        }
+        if let Some(stage) = upload.event_sync_stage {
+            let _ = fs::remove_dir_all(stage.stage_root);
+        }
     }
 }
 
@@ -7813,20 +9997,34 @@ fn terminal_cancel_received_upload(upload_id: &str, error: &str) {
         if let Some(stage) = &upload.import_stage {
             let _ = fs::remove_dir_all(&stage.stage_root);
         }
+        if let Some(stage) = &upload.event_sync_stage {
+            let _ = fs::remove_dir_all(&stage.stage_root);
+        }
         let _ = upload
             .sender
             .try_send(ReceivedUploadAck::Failure(error.to_string()));
     }
 }
 
-fn terminal_cancel_all_received_uploads(error: &str) {
+fn terminal_cancel_all_received_uploads_for_generation(
+    error: &str,
+    worker: Option<&Arc<AtomicBool>>,
+) {
     let uploads = pending_received_uploads()
         .lock()
         .map(|mut pending| {
             let cancellable = pending
                 .iter()
                 .filter_map(|(id, upload)| {
-                    (!upload.recovery_required && !upload.published).then_some(id.clone())
+                    let same_generation = match worker {
+                        Some(worker) => upload
+                            .receive_generation
+                            .as_ref()
+                            .is_none_or(|generation| Arc::ptr_eq(generation, worker)),
+                        None => upload.receive_generation.is_none(),
+                    };
+                    (same_generation && !upload.recovery_required && !upload.published)
+                        .then_some(id.clone())
                 })
                 .collect::<Vec<_>>();
             cancellable
@@ -7839,10 +10037,18 @@ fn terminal_cancel_all_received_uploads(error: &str) {
         if let Some(stage) = &upload.import_stage {
             let _ = fs::remove_dir_all(&stage.stage_root);
         }
+        if let Some(stage) = &upload.event_sync_stage {
+            let _ = fs::remove_dir_all(&stage.stage_root);
+        }
         let _ = upload
             .sender
             .try_send(ReceivedUploadAck::Failure(error.to_string()));
     }
+}
+
+#[cfg(test)]
+fn terminal_cancel_all_received_uploads(error: &str) {
+    terminal_cancel_all_received_uploads_for_generation(error, None);
 }
 
 fn wait_for_received_upload_ack(
@@ -7850,7 +10056,7 @@ fn wait_for_received_upload_ack(
     receiver: &std::sync::mpsc::Receiver<ReceivedUploadAck>,
     running: &AtomicBool,
     listener_emitted: bool,
-) -> Result<(), (String, bool)> {
+) -> Result<Option<String>, (String, bool)> {
     if !listener_emitted {
         let error = "frontend listenerへ通知できませんでした";
         terminal_cancel_received_upload(upload_id, error);
@@ -7858,7 +10064,7 @@ fn wait_for_received_upload_ack(
     }
     loop {
         match receiver.try_recv() {
-            Ok(ReceivedUploadAck::Success) => return Ok(()),
+            Ok(ReceivedUploadAck::Success(download_url)) => return Ok(download_url),
             Ok(ReceivedUploadAck::Failure(error)) => return Err((error, false)),
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -7890,7 +10096,7 @@ fn wait_for_received_upload_ack(
             deadline.saturating_duration_since(now),
         );
         match receiver.recv_timeout(wait) {
-            Ok(ReceivedUploadAck::Success) => return Ok(()),
+            Ok(ReceivedUploadAck::Success(download_url)) => return Ok(download_url),
             Ok(ReceivedUploadAck::Failure(error)) => return Err((error, false)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -7903,12 +10109,84 @@ fn wait_for_received_upload_ack(
     }
 }
 
-#[tauri::command]
-fn ack_received_upload(
+fn validate_event_sync_download_url(url: &str) -> Result<(), String> {
+    if url.len() > 4096 || url.is_empty() || url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err("PC同期download URLの長さまたは文字が不正です".to_string());
+    }
+    let remainder = url
+        .strip_prefix("http://")
+        .ok_or_else(|| "PC同期download URLはHTTPである必要があります".to_string())?;
+    let (authority, path_query) = remainder
+        .split_once('/')
+        .ok_or_else(|| "PC同期download URLのpathがありません".to_string())?;
+    if authority.is_empty() || authority.contains('@') {
+        return Err("PC同期download URLのhostが不正です".to_string());
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| "PC同期download URLのportがありません".to_string())?;
+    let ip = host
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| "PC同期download URLはIPv4 LANアドレスである必要があります".to_string())?;
+    if !ip.is_private() || port.parse::<u16>().ok() != Some(FILE_SERVER_FIXED_PORT) {
+        return Err("PC同期download URLは同一LANの固定portである必要があります".to_string());
+    }
+    let (path, query) = path_query
+        .split_once('?')
+        .ok_or_else(|| "PC同期download URLに認証queryがありません".to_string())?;
+    if !path.starts_with('/')
+        || path.len() <= 1
+        || path[1..].contains('/')
+        || path.contains("..")
+        || path.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err("PC同期download URLのpathが不正です".to_string());
+    }
+    let query = parse_query(Some(query));
+    if query.get("mode").map(String::as_str) != Some("single-event-sync")
+        || query
+            .get("target_uid")
+            .is_none_or(|uid| !valid_event_uid(uid))
+        || query
+            .get("token")
+            .is_none_or(|token| {
+                token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    {
+        return Err("PC同期download URLのpairing queryが不正です".to_string());
+    }
+
+    let request_url = format!(
+        "{path}?{query}",
+        query = remainder
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or_default()
+    );
+    let active = file_server_runtime()
+        .lock()
+        .map_err(|error| format!("ファイルサーバーruntimeロック取得失敗: {error}"))?
+        .as_ref()
+        .and_then(|runtime| runtime.active.lock().ok().and_then(|slot| slot.clone()));
+    let Some(active) = active else {
+        return Err("PC同期download serverが起動していません".to_string());
+    };
+    authorize_protected_file_request(&active, &tiny_http::Method::Get, &request_url)
+        .map_err(|status| format!("PC同期download URLがactive serverで認証できません ({status})"))
+}
+
+fn ack_received_upload_impl(
     upload_id: String,
     success: bool,
     error: Option<String>,
+    download_url: Option<String>,
 ) -> Result<Value, String> {
+    if let Some(url) = download_url.as_deref() {
+        if !success {
+            return Err("failure ackにdownload URLを指定できません".to_string());
+        }
+        validate_event_sync_download_url(url)?;
+    }
     let mut registry = pending_received_uploads()
         .lock()
         .map_err(|e| format!("受信ackロック取得失敗: {e}"))?;
@@ -7937,8 +10215,11 @@ fn ack_received_upload(
         if !pending.claimed || Instant::now() >= pending.lease_deadline {
             return Err("upload leaseはcurrentではありません".to_string());
         }
-        if success && pending.import_stage.is_some() {
+        if success && (pending.import_stage.is_some() || pending.event_sync_stage.is_some()) {
             return Err("staged importがpublishされていません".to_string());
+        }
+        if download_url.is_some() && pending.target_event_uid.is_none() {
+            return Err("download URLは単一イベント同期uploadでのみ指定できます".to_string());
         }
     }
     let pending = registry
@@ -7953,8 +10234,10 @@ fn ack_received_upload(
 
     let ack = if success {
         match fs::remove_file(&pending.zip_path) {
-            Ok(()) => ReceivedUploadAck::Success,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReceivedUploadAck::Success,
+            Ok(()) => ReceivedUploadAck::Success(download_url.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                ReceivedUploadAck::Success(download_url.clone())
+            }
             Err(e) => ReceivedUploadAck::Failure(format!("受信ZIP削除失敗: {e}")),
         }
     } else {
@@ -7962,8 +10245,17 @@ fn ack_received_upload(
     };
     let failed_message = match &ack {
         ReceivedUploadAck::Failure(message) => Some(message.clone()),
-        ReceivedUploadAck::Success => None,
+        ReceivedUploadAck::Success(_) => None,
     };
+    if failed_message.is_none()
+        && download_url.is_some()
+        && pending.target_event_uid.is_some()
+    {
+        published_received_uploads()
+            .lock()
+            .map_err(|e| format!("published uploadロック取得失敗: {e}"))?
+            .insert(upload_id.clone());
+    }
     pending
         .sender
         .send(ack)
@@ -7975,8 +10267,87 @@ fn ack_received_upload(
 }
 
 #[tauri::command]
+fn ack_received_upload(
+    upload_id: String,
+    success: bool,
+    error: Option<String>,
+) -> Result<Value, String> {
+    ack_received_upload_impl(upload_id, success, error, None)
+}
+
+/// Complete the original mobile POST after the desktop side has prepared its
+/// ZIP.  The response is delivered on the same HTTP connection, so mobile can
+/// download without scanning another QR code.
+#[tauri::command]
+fn ack_received_upload_with_download(
+    upload_id: String,
+    download_url: String,
+) -> Result<Value, String> {
+    ack_received_upload_impl(upload_id, true, None, Some(download_url))
+}
+
+#[tauri::command]
 fn cancel_received_upload(upload_id: String, error: Option<String>) -> Result<Value, String> {
-    ack_received_upload(upload_id, false, error)
+    ack_received_upload_impl(upload_id, false, error, None)
+}
+
+fn local_import_upload_id() -> String {
+    format!(
+        "local_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    )
+}
+
+#[tauri::command]
+fn register_local_zip_import(zip_path: String) -> Result<Value, String> {
+    let source = PathBuf::from(&zip_path);
+    let source_metadata = fs::symlink_metadata(&source)
+        .map_err(|e| format!("local ZIP metadata取得失敗: {e}"))?;
+    if metadata_is_link_or_reparse(&source_metadata) || !source_metadata.is_file() {
+        return Err("local ZIPは通常のfileである必要があります".to_string());
+    }
+    if source_metadata.len() > MAX_RECEIVED_ZIP_BYTES {
+        return Err("local ZIPが256 MiBの上限を超えています".to_string());
+    }
+    let upload_id = local_import_upload_id();
+    let temp_dir = std::env::temp_dir();
+    let raw_path = temp_dir.join(format!("eventtrail_received_{upload_id}_raw.zip"));
+    let sanitized_path = temp_dir.join(format!("eventtrail_received_{upload_id}.zip"));
+    let copy_result = (|| -> Result<(), String> {
+        let mut input = fs::File::open(&source).map_err(|e| format!("local ZIP読込失敗: {e}"))?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&raw_path)
+            .map_err(|e| format!("local ZIP private copy作成失敗: {e}"))?;
+        std::io::copy(&mut input, &mut output)
+            .map_err(|e| format!("local ZIP private copy失敗: {e}"))?;
+        output
+            .sync_all()
+            .map_err(|e| format!("local ZIP private copy fsync失敗: {e}"))?;
+        drop(output);
+        sanitize_local_import_zip(&raw_path, &sanitized_path)
+    })();
+    let _ = fs::remove_file(&raw_path);
+    if let Err(error) = copy_result {
+        let _ = fs::remove_file(&sanitized_path);
+        return Err(error);
+    }
+    let size = fs::metadata(&sanitized_path)
+        .map_err(|e| format!("sanitized local ZIP metadata取得失敗: {e}"))?
+        .len();
+    if let Err(error) = register_local_received_upload(&upload_id, sanitized_path.clone()) {
+        let _ = fs::remove_file(&sanitized_path);
+        return Err(error);
+    }
+    Ok(json!({
+        "status": "ok",
+        "uploadId": upload_id,
+        "zipPath": sanitized_path.to_string_lossy().to_string().replace('\\', "/"),
+        "size": size,
+        "localOnly": true,
+    }))
 }
 
 const RECEIVED_UPLOAD_STALE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -8010,28 +10381,168 @@ fn cleanup_stale_received_uploads(temp_dir: &Path, now: std::time::SystemTime) -
     removed
 }
 
-fn received_upload_payload(upload_id: &str, zip_path: &str, size: usize) -> Value {
+fn received_upload_payload(
+    upload_id: &str,
+    zip_path: &str,
+    size: usize,
+    target_event_uid: Option<&str>,
+) -> Value {
     json!({
         "status": "ok",
         "uploadId": upload_id,
         "zipPath": zip_path,
-        "size": size
+        "size": size,
+        "targetEventUid": target_event_uid
     })
 }
 
+fn stream_request_body_limited(
+    request: &mut tiny_http::Request,
+    path: &Path,
+) -> Result<u64, (u16, String)> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| (500, format!("一時ZIP作成失敗: {error}")))?;
+    let result = (|| -> Result<u64, (u16, String)> {
+        let reader = request.as_reader();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut total = 0u64;
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| (400, format!("request body読み込み失敗: {error}")))?;
+            if count == 0 {
+                break;
+            }
+            total = total.saturating_add(count as u64);
+            if total > MAX_RECEIVED_ZIP_BYTES {
+                return Err((413, "受信ZIPが256 MiBの上限を超えています".to_string()));
+            }
+            file.write_all(&buffer[..count])
+                .map_err(|error| (500, format!("一時ZIP書込失敗: {error}")))?;
+        }
+        file.sync_all()
+            .map_err(|error| (500, format!("一時ZIP fsync失敗: {error}")))?;
+        Ok(total)
+    })();
+    drop(file);
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+const MAX_SYNC_SESSION_NOTIFICATION_BYTES: u64 = 64 * 1024;
+
+fn read_sync_session_notification(
+    request: &mut tiny_http::Request,
+) -> Result<Vec<u8>, (u16, String)> {
+    let mut bytes = Vec::new();
+    let mut reader = request.as_reader().take(MAX_SYNC_SESSION_NOTIFICATION_BYTES + 1);
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|error| (400, format!("同期session通知読み込み失敗: {error}")))?;
+    if bytes.len() as u64 > MAX_SYNC_SESSION_NOTIFICATION_BYTES {
+        return Err((413, "同期session通知が大きすぎます".to_string()));
+    }
+    Ok(bytes)
+}
+
+fn request_content_type_is_json(request: &tiny_http::Request) -> bool {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Content-Type"))
+        .map(|header| {
+            header
+                .value
+                .as_str()
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+        })
+        .unwrap_or(false)
+}
+
+fn parse_sync_session_notification(
+    bytes: &[u8],
+    target_event_uid: &str,
+) -> Result<ReceiveSyncSessionState, (u16, String)> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| (400, format!("同期session通知JSONが不正です: {error}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| (400, "同期session通知JSONはobjectである必要があります".to_string()))?;
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let target_uid = object
+        .get("target_uid")
+        .or_else(|| object.get("targetEventUid"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if mode != "single-event-sync" || target_uid != target_event_uid {
+        return Err((401, "同期session通知のmodeまたはtarget UIDが不正です".to_string()));
+    }
+    let state = object
+        .get("state")
+        .or_else(|| object.get("status"))
+        .or_else(|| object.get("result"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match state.as_str() {
+        "mobile-applied" | "mobile_complete" | "mobile-complete" | "applied" => {
+            Ok(ReceiveSyncSessionState::MobileApplied)
+        }
+        "cancelled" | "canceled" => Ok(ReceiveSyncSessionState::Cancelled {
+            message: object
+                .get("error")
+                .or_else(|| object.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("mobile側で同期がキャンセルされました")
+                .to_string(),
+        }),
+        _ => Err((400, "同期session通知のstateが不正です".to_string())),
+    }
+}
+
 #[tauri::command]
-fn start_receive_server(window: tauri::Window, project_root: String) -> Result<Value, String> {
+fn start_receive_server(
+    window: tauri::Window,
+    project_root: String,
+    target_event_uid: Option<String>,
+) -> Result<Value, String> {
     let project_root = absolute_project_root(&project_root)?;
+    if target_event_uid
+        .as_deref()
+        .is_some_and(|uid| !valid_event_uid(uid))
+    {
+        return Err("targetEventUidの形式が不正です".to_string());
+    }
     {
         let _recovery_guard = circle_master_write_lock()
             .lock()
             .map_err(|e| format!("import recoveryロック取得失敗: {e}"))?;
         recover_incomplete_import_transactions(&project_root)?;
     }
+    let target_event_metadata = target_event_uid
+        .as_deref()
+        .map(|uid| receive_sync_target_metadata(&project_root, uid))
+        .transpose()?;
     cleanup_stale_received_uploads(&std::env::temp_dir(), std::time::SystemTime::now());
     let mut guard = receive_server_running()
         .lock()
         .map_err(|e| format!("ロック取得失敗: {e}"))?;
+    // A previous cancelled/failed/completed single-event session may keep the
+    // listener alive until its terminal GET arrives. Retire only that terminal
+    // generation here so a new sync can start immediately; active
+    // Waiting/Pending/PcReady generations remain protected by the check below.
+    let _retired_terminal_generation =
+        retire_terminal_receive_generation_locked(&mut *guard)?;
     if let Some(ref flag) = *guard {
         if flag.load(Ordering::Relaxed) {
             return Err("受信サーバーは既に起動中です".to_string());
@@ -8050,14 +10561,64 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
 
     let ip = resolve_advertised_ipv4()?;
     let upload_url = format!("http://{}:{}/upload", ip, port);
+    let bearer_token = target_event_uid
+        .as_ref()
+        .map(|_| random_bearer_token())
+        .transpose()?;
+    let qr_url = match (
+        target_event_uid.as_deref(),
+        target_event_metadata.as_ref(),
+        bearer_token.as_deref(),
+    ) {
+        (Some(uid), Some((name, date)), Some(token)) => {
+            single_event_sync_receive_url(
+                &upload_url,
+                uid,
+                name.as_deref(),
+                date.as_deref(),
+                token,
+            )
+        }
+        (None, None, None) => upload_url.clone(),
+        _ => return Err("同期pairing metadataの生成に失敗しました".to_string()),
+    };
+    *receive_server_auth()
+        .lock()
+        .map_err(|e| format!("receive auth lock取得失敗: {e}"))? = target_event_uid
+        .as_ref()
+        .zip(bearer_token.clone())
+        .map(|(target_event_uid, bearer_token)| ReceiveServerAuth {
+            bearer_token,
+            target_event_uid: target_event_uid.clone(),
+            expires_at: Instant::now() + RECEIVE_BEARER_TOKEN_LIFETIME,
+        });
+    *receive_sync_session()
+        .lock()
+        .map_err(|e| format!("receive sync session lock取得失敗: {e}"))? = target_event_uid
+        .as_ref()
+        .map(|target_event_uid| ReceiveSyncSession {
+            target_event_uid: target_event_uid.clone(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
 
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
 
     thread::spawn(move || {
         while running_clone.load(Ordering::Relaxed) {
+            if !expire_receive_generation_if_needed(&window, &running_clone).unwrap_or(false) {
+                break;
+            }
             match server.recv_timeout(Duration::from_millis(500)) {
                 Ok(Some(mut request)) => {
+                    if !(cfg!(test) && peer_is_loopback(request.remote_addr()))
+                        && !peer_is_on_advertised_subnet(request.remote_addr(), ip)
+                    {
+                        let resp = tiny_http::Response::from_string("LAN peer is not allowed")
+                            .with_status_code(tiny_http::StatusCode(403));
+                        let _ = request.respond(resp);
+                        continue;
+                    }
                     // CORSプリフライト対応
                     if request.method().as_str() == "OPTIONS" {
                         let resp = tiny_http::Response::from_string("")
@@ -8071,7 +10632,7 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
                             .with_header(
                                 tiny_http::Header::from_bytes(
                                     &b"Access-Control-Allow-Methods"[..],
-                                    &b"POST, OPTIONS"[..],
+                                    &b"GET, POST, OPTIONS"[..],
                                 )
                                 .unwrap(),
                             )
@@ -8086,44 +10647,330 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
                         continue;
                     }
 
+                    // Single-event sync keeps the original QR URL alive as a
+                    // short-lived GET session.  Mobile polls this endpoint
+                    // after its upload POST and receives the desktop choice
+                    // (including a protected download URL when PC won).
+                    if *request.method() == tiny_http::Method::Get {
+                        if request.url().split('?').next() != Some("/upload") {
+                            let resp = tiny_http::Response::from_string("Not Found")
+                                .with_status_code(tiny_http::StatusCode(404));
+                            let _ = request.respond(resp);
+                            continue;
+                        }
+                        let target_uid = match receive_request_target_uid_for_generation(
+                            request.url(),
+                            &running_clone,
+                        ) {
+                            Ok(Some(target_uid)) => target_uid,
+                            Ok(None) => {
+                                let resp = tiny_http::Response::from_string("Not Found")
+                                    .with_status_code(tiny_http::StatusCode(404));
+                                let _ = request.respond(resp);
+                                continue;
+                            }
+                            Err((status, error)) => {
+                                let resp = tiny_http::Response::from_string(
+                                    json!({"status": "error", "error": error}).to_string(),
+                                )
+                                .with_status_code(tiny_http::StatusCode(status))
+                                .with_header(
+                                    tiny_http::Header::from_bytes(
+                                        &b"Access-Control-Allow-Origin"[..],
+                                        &b"*"[..],
+                                    )
+                                    .unwrap(),
+                                )
+                                .with_header(
+                                    tiny_http::Header::from_bytes(
+                                        &b"Content-Type"[..],
+                                        &b"application/json"[..],
+                                    )
+                                    .unwrap(),
+                                );
+                                let _ = request.respond(resp);
+                                continue;
+                            }
+                        };
+                        let (status, payload, terminal) =
+                            match receive_sync_session_response_for_generation(
+                                &running_clone,
+                                &target_uid,
+                            ) {
+                            Ok(response) => response,
+                            Err(error) => (
+                                409,
+                                json!({"status": "error", "error": error}),
+                                false,
+                            ),
+                        };
+                        let resp = tiny_http::Response::from_string(payload.to_string())
+                            .with_status_code(tiny_http::StatusCode(status))
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Access-Control-Allow-Origin"[..],
+                                    &b"*"[..],
+                                )
+                                .unwrap(),
+                            )
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Content-Type"[..],
+                                    &b"application/json"[..],
+                                )
+                                .unwrap(),
+                            );
+                        let _ = request.respond(resp);
+                        if terminal {
+                            // Notify the renderer before the listener tears
+                            // down the one-shot polling session.  This lets
+                            // the desktop UI clean up its file server after
+                            // mobile has consumed the terminal result.
+                            let _ = emit_receive_sync_session_state_for_generation(
+                                &window,
+                                &running_clone,
+                                &target_uid,
+                                true,
+                            );
+                            running_clone.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        continue;
+                    }
+
                     // POST /upload のみ受け付け
-                    if request.url() != "/upload" || *request.method() != tiny_http::Method::Post {
+                    if request.url().split('?').next() != Some("/upload")
+                        || *request.method() != tiny_http::Method::Post
+                    {
                         let resp = tiny_http::Response::from_string("Not Found")
                             .with_status_code(tiny_http::StatusCode(404));
                         let _ = request.respond(resp);
                         continue;
                     }
 
-                    // ZIPデータを受信
-                    let mut body = Vec::new();
-                    if let Err(e) = request.as_reader().read_to_end(&mut body) {
-                        let resp = tiny_http::Response::from_string(format!("読み込みエラー: {e}"))
-                            .with_status_code(tiny_http::StatusCode(500));
+                    let upload_target_uid = match receive_request_target_uid_for_generation(
+                        request.url(),
+                        &running_clone,
+                    ) {
+                        Ok(target_uid) => target_uid,
+                        Err((status, error)) => {
+                            let resp = tiny_http::Response::from_string(
+                                json!({"status": "error", "error": error}).to_string(),
+                            )
+                            .with_status_code(tiny_http::StatusCode(status))
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Access-Control-Allow-Origin"[..],
+                                    &b"*"[..],
+                                )
+                                .unwrap(),
+                            );
+                            let _ = request.respond(resp);
+                            continue;
+                        }
+                    };
+
+                    // After downloading and applying a PC-selected ZIP,
+                    // mobile posts a small state notification on the same
+                    // authenticated URL.  It completes the session without
+                    // opening another QR or exposing a second endpoint.
+                    if upload_target_uid.is_some() && request_content_type_is_json(&request) {
+                        let bytes = match read_sync_session_notification(&mut request) {
+                            Ok(bytes) => bytes,
+                            Err((status, error)) => {
+                                let resp = tiny_http::Response::from_string(
+                                    json!({"status": "error", "error": error}).to_string(),
+                                )
+                                .with_status_code(tiny_http::StatusCode(status))
+                                .with_header(
+                                    tiny_http::Header::from_bytes(
+                                        &b"Access-Control-Allow-Origin"[..],
+                                        &b"*"[..],
+                                    )
+                                    .unwrap(),
+                                );
+                                let _ = request.respond(resp);
+                                continue;
+                            }
+                        };
+                        // The authenticated URL was checked before reading the
+                        // body. Revalidate after that I/O so a retired worker
+                        // cannot apply its old notification to a replacement
+                        // session with the same event UID.
+                        let target_uid = match receive_request_target_uid_for_generation(
+                            request.url(),
+                            &running_clone,
+                        ) {
+                            Ok(Some(target_uid)) => target_uid,
+                            Ok(None) => {
+                                let resp = tiny_http::Response::from_string(
+                                    json!({"status": "error", "error": "pairing token is not active"}).to_string(),
+                                )
+                                .with_status_code(tiny_http::StatusCode(409));
+                                let _ = request.respond(resp);
+                                continue;
+                            }
+                            Err((status, error)) => {
+                                let resp = tiny_http::Response::from_string(
+                                    json!({"status": "error", "error": error}).to_string(),
+                                )
+                                .with_status_code(tiny_http::StatusCode(status));
+                                let _ = request.respond(resp);
+                                continue;
+                            }
+                        };
+                        let state = match parse_sync_session_notification(&bytes, &target_uid) {
+                            Ok(state) => state,
+                            Err((status, error)) => {
+                                let resp = tiny_http::Response::from_string(
+                                    json!({"status": "error", "error": error}).to_string(),
+                                )
+                                .with_status_code(tiny_http::StatusCode(status))
+                                .with_header(
+                                    tiny_http::Header::from_bytes(
+                                        &b"Access-Control-Allow-Origin"[..],
+                                        &b"*"[..],
+                                    )
+                                    .unwrap(),
+                                );
+                                let _ = request.respond(resp);
+                                continue;
+                            }
+                        };
+                        if let Err(error) = apply_receive_sync_notification_for_generation(
+                            &running_clone,
+                            &target_uid,
+                            state,
+                        ) {
+                            let resp = tiny_http::Response::from_string(
+                                json!({"status": "error", "error": error}).to_string(),
+                            )
+                            .with_status_code(tiny_http::StatusCode(409));
+                            let _ = request.respond(resp);
+                            continue;
+                        }
+                        let (_, response_payload, _) =
+                            receive_sync_session_response_for_generation(
+                                &running_clone,
+                                &target_uid,
+                            )
+                            .unwrap_or((409, json!({"status": "error"}), false));
+                        let resp = tiny_http::Response::from_string(response_payload.to_string())
+                            .with_status_code(tiny_http::StatusCode(200))
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Access-Control-Allow-Origin"[..],
+                                    &b"*"[..],
+                                )
+                                .unwrap(),
+                            )
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Content-Type"[..],
+                                    &b"application/json"[..],
+                                )
+                                .unwrap(),
+                            );
                         let _ = request.respond(resp);
+                        // Keep the listener alive until mobile polls the same
+                        // URL once more.  The GET response emits the terminal
+                        // renderer event with `delivered: true` and performs
+                        // the one-shot cleanup.
                         continue;
                     }
 
-                    // 一時ファイルに保存
+                    // Upload bytes are streamed to disk with a hard cap.
                     let upload_id = format!(
                         "{}_{}",
                         std::process::id(),
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
                     );
+                    if let Some(target_uid) = upload_target_uid.as_deref() {
+                        if let Err(error) = begin_receive_sync_upload_for_generation(
+                            &running_clone,
+                            target_uid,
+                            &upload_id,
+                        ) {
+                            let resp = tiny_http::Response::from_string(
+                                json!({"status": "error", "error": error}).to_string(),
+                            )
+                            .with_status_code(tiny_http::StatusCode(409));
+                            let _ = request.respond(resp);
+                            continue;
+                        }
+                    }
                     let tmp_path =
                         std::env::temp_dir().join(format!("eventtrail_received_{upload_id}.zip"));
-                    if let Err(e) = fs::write(&tmp_path, &body) {
-                        let resp = tiny_http::Response::from_string(format!("保存エラー: {e}"))
-                            .with_status_code(tiny_http::StatusCode(500));
-                        let _ = request.respond(resp);
-                        continue;
+                    let size = match stream_request_body_limited(&mut request, &tmp_path) {
+                        Ok(size) => size,
+                        Err((status, error)) => {
+                            if let Some(target_uid) = upload_target_uid.as_deref() {
+                                let _ = receive_sync_upload_ack_state_for_generation(
+                                    &running_clone,
+                                    target_uid,
+                                    &upload_id,
+                                    ReceiveSyncSessionState::Error {
+                                        message: error.clone(),
+                                    },
+                                );
+                            }
+                            let resp = tiny_http::Response::from_string(
+                                json!({"status": "error", "error": error}).to_string(),
+                            )
+                            .with_status_code(tiny_http::StatusCode(status));
+                            let _ = request.respond(resp);
+                            continue;
+                        }
+                    };
+                    if let Some(uid) = upload_target_uid.as_deref() {
+                        let still_valid = receive_request_target_uid_for_generation(
+                            request.url(),
+                            &running_clone,
+                        )
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            == Some(uid);
+                        if !still_valid {
+                            let _ = fs::remove_file(&tmp_path);
+                            let _ = receive_sync_upload_ack_state_for_generation(
+                                &running_clone,
+                                uid,
+                                &upload_id,
+                                ReceiveSyncSessionState::Cancelled {
+                                    message: "pairing token expired during upload".to_string(),
+                                },
+                            );
+                            let resp = tiny_http::Response::from_string(
+                                json!({"status": "error", "error": "pairing token expired during upload"}).to_string(),
+                            )
+                            .with_status_code(tiny_http::StatusCode(410));
+                            let _ = request.respond(resp);
+                            continue;
+                        }
                     }
 
                     let zip_path = tmp_path.to_string_lossy().to_string().replace("\\", "/");
-                    let size = body.len();
-                    let ack_receiver = match register_received_upload(&upload_id, tmp_path.clone())
-                    {
+                    let receiver_result = register_received_upload_for_generation(
+                        &running_clone,
+                        &upload_id,
+                        tmp_path.clone(),
+                        upload_target_uid.clone(),
+                    );
+                    let ack_receiver = match receiver_result {
                         Ok(receiver) => receiver,
                         Err(e) => {
+                            let _ = fs::remove_file(&tmp_path);
+                            if let Some(target_uid) = upload_target_uid.as_deref() {
+                                let _ = receive_sync_upload_ack_state_for_generation(
+                                    &running_clone,
+                                    target_uid,
+                                    &upload_id,
+                                    ReceiveSyncSessionState::Error {
+                                        message: e.clone(),
+                                    },
+                                );
+                            }
                             let resp = tiny_http::Response::from_string(
                                 json!({"status": "error", "error": e}).to_string(),
                             )
@@ -8132,19 +10979,105 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
                             continue;
                         }
                     };
-                    let _ = window.emit(
+                    let _ = emit_receive_event_for_generation(
+                        &window,
+                        &running_clone,
                         "result-uploaded",
                         json!({
                             "uploadId": upload_id.clone(),
                             "zipPath": zip_path.clone(),
-                            "size": size
+                            "size": size,
+                            "targetEventUid": upload_target_uid
                         }),
                     );
 
                     // receive threadはtemp ZIPの保存と通知だけを担当する。
                     // event.jsonへのimportはfrontendのdocument排他区間で実行する。
-                    let payload = received_upload_payload(&upload_id, &zip_path, size);
-                    let emitted = window.emit("result-received", payload.clone()).is_ok();
+                    let payload = received_upload_payload(
+                        &upload_id,
+                        &zip_path,
+                        size as usize,
+                        upload_target_uid.as_deref(),
+                    );
+                    let emitted = emit_receive_event_for_generation(
+                        &window,
+                        &running_clone,
+                        "result-received",
+                        payload.clone(),
+                    );
+                    if let Some(target_uid) = upload_target_uid.clone() {
+                        let waiter_upload_id = upload_id.clone();
+                        let waiter_target_uid = target_uid.clone();
+                        let waiter_running = running_clone.clone();
+                        let waiter_window = window.clone();
+                        let _ = emit_receive_sync_session_state_for_generation(
+                            &window,
+                            &running_clone,
+                            &target_uid,
+                            false,
+                        );
+                        thread::spawn(move || {
+                            let ack = wait_for_received_upload_ack(
+                                &waiter_upload_id,
+                                &ack_receiver,
+                                &waiter_running,
+                                emitted,
+                            );
+                            let state = match ack {
+                                Ok(Some(download_url)) => {
+                                    ReceiveSyncSessionState::PcReady { download_url }
+                                }
+                                Ok(None) => ReceiveSyncSessionState::MobileApplied,
+                                Err((error, _)) if receive_sync_error_is_cancelled(&error) => {
+                                    ReceiveSyncSessionState::Cancelled { message: error }
+                                }
+                                Err((error, _)) => ReceiveSyncSessionState::Error { message: error },
+                            };
+                            let emit_state = !matches!(&state, ReceiveSyncSessionState::MobileApplied);
+                            let transitioned = receive_sync_upload_ack_state_for_generation(
+                                &waiter_running,
+                                &waiter_target_uid,
+                                &waiter_upload_id,
+                                state,
+                            )
+                            .unwrap_or(false);
+                            if emit_state && transitioned {
+                                let _ = emit_receive_sync_session_state_for_generation(
+                                    &waiter_window,
+                                    &waiter_running,
+                                    &waiter_target_uid,
+                                    false,
+                                );
+                            }
+                            remove_pending_received_upload(&waiter_upload_id);
+                        });
+                        let response_payload = json!({
+                            "status": "pending",
+                            "state": "pending",
+                            "targetEventUid": target_uid.clone(),
+                            "target_uid": target_uid,
+                            "uploadId": upload_id,
+                        });
+                        let resp = tiny_http::Response::from_string(response_payload.to_string())
+                            .with_status_code(tiny_http::StatusCode(202))
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Access-Control-Allow-Origin"[..],
+                                    &b"*"[..],
+                                )
+                                .unwrap(),
+                            )
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Content-Type"[..],
+                                    &b"application/json"[..],
+                                )
+                                .unwrap(),
+                            );
+                        let _ = request.respond(resp);
+                        continue;
+                    }
+
                     let ack = wait_for_received_upload_ack(
                         &upload_id,
                         &ack_receiver,
@@ -8153,7 +11086,14 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
                     );
                     remove_pending_received_upload(&upload_id);
                     let (status, response_payload) = match ack {
-                        Ok(()) => (200, json!({"status": "ok", "uploadId": upload_id})),
+                        Ok(download_url) => (
+                            200,
+                            json!({
+                                "status": "ok",
+                                "uploadId": upload_id,
+                                "downloadUrl": download_url,
+                            }),
+                        ),
                         Err((error, timed_out)) => (
                             if timed_out { 504 } else { 500 },
                             json!({"status": "error", "uploadId": upload_id, "error": error}),
@@ -8179,12 +11119,14 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
 
                     // 受信後サーバー停止
                     running_clone.store(false, Ordering::Relaxed);
+                    clear_receive_state_if_current(&running_clone);
                     break;
                 }
                 Ok(None) => {}
                 Err(_) => break,
             }
         }
+        clear_receive_state_if_current(&running_clone);
     });
 
     *guard = Some(running);
@@ -8193,25 +11135,1185 @@ fn start_receive_server(window: tauri::Window, project_root: String) -> Result<V
         "status": "ok",
         "ip": ip.to_string(),
         "port": port,
-        "url": upload_url
+        "url": qr_url,
+        "uploadUrl": upload_url,
+        "targetEventUid": target_event_uid,
+        "sessionId": bearer_token
+            .as_deref()
+            .map(|token| sha256_hex(token.as_bytes())),
+        "expiresInSeconds": if bearer_token.is_some() { RECEIVE_BEARER_TOKEN_LIFETIME.as_secs() } else { 0 }
     }))
 }
 
 #[tauri::command]
 fn stop_receive_server() -> Result<Value, String> {
+    // Serialize stop's session transition and upload cancellation with a
+    // subsequent start. Otherwise start could retire the newly-cancelled
+    // generation between these two operations and the late cancellation
+    // would remove uploads belonging to the replacement generation.
     let mut guard = receive_server_running()
         .lock()
         .map_err(|e| format!("ロック取得失敗: {e}"))?;
-    if let Some(flag) = guard.take() {
-        flag.store(false, Ordering::Relaxed);
+    // A single-event sync session may still be waiting for mobile to poll the
+    // terminal result (or to post its final apply acknowledgement).  Do not
+    // erase the token/session here; the normal GET/TTL path performs cleanup.
+    let sync_state = receive_sync_session()
+        .lock()
+        .map_err(|e| format!("receive sync session lock取得失敗: {e}"))?
+        .clone();
+    if let Some(session) = sync_state {
+        let pending_publish_in_progress = match &session.state {
+            ReceiveSyncSessionState::Pending { upload_id } => pending_received_uploads()
+                .lock()
+                .ok()
+                .and_then(|pending| pending.get(upload_id).map(|upload| upload.published))
+                .unwrap_or(false),
+            _ => false,
+        };
+        if matches!(session.state, ReceiveSyncSessionState::Waiting)
+            || (matches!(session.state, ReceiveSyncSessionState::Pending { .. })
+                && !pending_publish_in_progress)
+        {
+            let _ = cancel_receive_sync_session(
+                &session.target_event_uid,
+                "デスクトップ側で同期サーバーが停止されました".to_string(),
+            );
+            terminal_cancel_all_received_uploads_for_generation(
+                "受信サーバーが停止されました",
+                guard.as_ref(),
+            );
+        }
+        return Ok(json!({"status": "ok", "deferred": true}));
     }
-    terminal_cancel_all_received_uploads("受信サーバーが停止されました");
+    let current_worker = guard.take();
+    if let Some(flag) = current_worker.as_ref() {
+        // Keep the running registry locked while clearing the matching
+        // auth/session.  A new start cannot install a generation between
+        // stop and cleanup, and an old worker's final cleanup is Arc-guarded.
+        flag.store(false, Ordering::Relaxed);
+        *receive_server_auth()
+            .lock()
+            .map_err(|e| format!("receive auth lock取得失敗: {e}"))? = None;
+        *receive_sync_session()
+            .lock()
+            .map_err(|e| format!("receive sync session lock取得失敗: {e}"))? = None;
+    }
+    terminal_cancel_all_received_uploads_for_generation(
+        "受信サーバーが停止されました",
+        current_worker.as_ref(),
+    );
     Ok(json!({"status": "ok"}))
+}
+
+#[cfg(test)]
+mod received_event_sync_tests {
+    use super::*;
+
+    fn unique_test_root(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "eventtrail-{label}-{}-{suffix}",
+            std::process::id()
+        ))
+    }
+
+    fn unique_upload_id() -> String {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{}_{}", std::process::id(), suffix)
+    }
+
+    fn sync_session_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn stale_receive_worker_cannot_clear_new_session_state() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let old_worker = Arc::new(AtomicBool::new(false));
+        let new_worker = Arc::new(AtomicBool::new(true));
+        *receive_server_running().lock().unwrap() = Some(new_worker.clone());
+        *receive_server_auth().lock().unwrap() = Some(ReceiveServerAuth {
+            bearer_token: "new-token".to_string(),
+            target_event_uid: "event_generation".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: "event_generation".to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+
+        clear_receive_state_if_current(&old_worker);
+        assert!(receive_server_auth().lock().unwrap().is_some());
+        assert!(receive_sync_session().lock().unwrap().is_some());
+
+        clear_receive_state_if_current(&new_worker);
+        assert!(receive_server_auth().lock().unwrap().is_none());
+        assert!(receive_sync_session().lock().unwrap().is_none());
+        *receive_server_running().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn receive_worker_cleanup_holds_generation_lock_until_state_clear() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let old_worker = Arc::new(AtomicBool::new(false));
+        let new_worker = Arc::new(AtomicBool::new(true));
+        let mut running = receive_server_running().lock().unwrap();
+        *running = Some(new_worker.clone());
+        *receive_server_auth().lock().unwrap() = Some(ReceiveServerAuth {
+            bearer_token: "new-token".to_string(),
+            target_event_uid: "event_generation_lock".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: "event_generation_lock".to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let old_for_thread = old_worker.clone();
+        let cleanup_thread = thread::spawn(move || {
+            clear_receive_state_if_current(&old_for_thread);
+            done_sender.send(()).unwrap();
+        });
+        assert!(done_receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(receive_server_auth().lock().unwrap().is_some());
+        assert!(receive_sync_session().lock().unwrap().is_some());
+        drop(running);
+        done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        cleanup_thread.join().unwrap();
+        assert!(receive_server_auth().lock().unwrap().is_some());
+        assert!(receive_sync_session().lock().unwrap().is_some());
+        clear_receive_state_if_current(&new_worker);
+        assert!(receive_server_auth().lock().unwrap().is_none());
+        assert!(receive_sync_session().lock().unwrap().is_none());
+        *receive_server_running().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn terminal_receive_generation_can_be_retired_before_new_start() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        *receive_server_running().lock().unwrap() = None;
+        *receive_server_auth().lock().unwrap() = None;
+        *receive_sync_session().lock().unwrap() = None;
+
+        let old_worker = Arc::new(AtomicBool::new(true));
+        *receive_server_running().lock().unwrap() = Some(old_worker.clone());
+        *receive_server_auth().lock().unwrap() = Some(ReceiveServerAuth {
+            bearer_token: "old-token".to_string(),
+            target_event_uid: "event_retry".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: "event_retry".to_string(),
+            state: ReceiveSyncSessionState::Cancelled {
+                message: "user cancelled".to_string(),
+            },
+        });
+
+        {
+            let mut running = receive_server_running().lock().unwrap();
+            assert!(retire_terminal_receive_generation_locked(&mut *running).unwrap());
+            assert!(running.is_none());
+        }
+        assert!(!old_worker.load(Ordering::Relaxed));
+        assert!(receive_server_auth().lock().unwrap().is_none());
+        assert!(receive_sync_session().lock().unwrap().is_none());
+
+        // Install the replacement generation before the old worker gets its
+        // final cleanup turn. Its Arc guard must keep the new state intact.
+        let new_worker = Arc::new(AtomicBool::new(true));
+        *receive_server_running().lock().unwrap() = Some(new_worker.clone());
+        *receive_server_auth().lock().unwrap() = Some(ReceiveServerAuth {
+            bearer_token: "new-token".to_string(),
+            target_event_uid: "event_retry".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: "event_retry".to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+        clear_receive_state_if_current(&old_worker);
+        assert_eq!(
+            receive_server_auth()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|auth| auth.bearer_token.as_str()),
+            Some("new-token")
+        );
+        assert!(receive_sync_session().lock().unwrap().is_some());
+
+        // Active generations are deliberately not retired by the helper.
+        {
+            let mut running = receive_server_running().lock().unwrap();
+            assert!(!retire_terminal_receive_generation_locked(&mut *running).unwrap());
+            assert!(running
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &new_worker)));
+        }
+        clear_receive_state_if_current(&new_worker);
+        *receive_server_running().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn stale_generation_cannot_update_replacement_same_uid_session() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let target_uid = "event_same_uid";
+        let old_worker = Arc::new(AtomicBool::new(true));
+        *receive_server_running().lock().unwrap() = Some(old_worker.clone());
+        *receive_server_auth().lock().unwrap() = Some(ReceiveServerAuth {
+            bearer_token: "old-token".to_string(),
+            target_event_uid: target_uid.to_string(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: target_uid.to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+        let old_url = format!(
+            "/upload?mode=single-event-sync&target_uid={target_uid}&token=old-token"
+        );
+        assert_eq!(
+            receive_request_target_uid_for_generation(&old_url, &old_worker)
+                .unwrap()
+                .as_deref(),
+            Some(target_uid)
+        );
+
+        // The old request has now entered its body-read/network wait. A new
+        // same-UID generation replaces it before the old request resumes.
+        old_worker.store(false, Ordering::Relaxed);
+        let new_worker = Arc::new(AtomicBool::new(true));
+        *receive_server_running().lock().unwrap() = Some(new_worker.clone());
+        *receive_server_auth().lock().unwrap() = Some(ReceiveServerAuth {
+            bearer_token: "new-token".to_string(),
+            target_event_uid: target_uid.to_string(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: target_uid.to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+
+        assert!(apply_receive_sync_notification_for_generation(
+            &old_worker,
+            target_uid,
+            ReceiveSyncSessionState::MobileApplied,
+        )
+        .is_err());
+        assert!(receive_sync_session_response_for_generation(&old_worker, target_uid).is_err());
+        assert!(receive_request_target_uid_for_generation(&old_url, &old_worker).is_err());
+        assert!(matches!(
+            receive_sync_session()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|session| &session.state),
+            Some(ReceiveSyncSessionState::Waiting)
+        ));
+
+        clear_receive_state_if_current(&new_worker);
+        *receive_server_running().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn expired_sync_session_payload_is_terminal_and_user_actionable() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let target_uid = "event_expired";
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: target_uid.to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+        assert!(cancel_receive_sync_session(
+            target_uid,
+            RECEIVE_SYNC_EXPIRED_MESSAGE.to_string(),
+        )
+        .unwrap());
+        let payload = receive_sync_session_expired_payload(target_uid).unwrap();
+        assert_eq!(payload["state"], "cancelled");
+        assert_eq!(payload["targetEventUid"], target_uid);
+        assert_eq!(payload["expired"], true);
+        assert_eq!(payload["message"], RECEIVE_SYNC_EXPIRED_MESSAGE);
+        *receive_sync_session().lock().unwrap() = None;
+
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: target_uid.to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+        begin_receive_sync_upload(target_uid, "expired-pc-ready").unwrap();
+        assert!(receive_sync_upload_ack_state(
+            target_uid,
+            "expired-pc-ready",
+            ReceiveSyncSessionState::PcReady {
+                download_url: "http://192.168.1.2:18721/mobile_export.zip?mode=single-event-sync&target_uid=event_expired&token=token".to_string(),
+            },
+        )
+        .unwrap());
+        assert!(expire_receive_sync_session(
+            target_uid,
+            RECEIVE_SYNC_EXPIRED_MESSAGE.to_string(),
+        )
+        .unwrap());
+        let pc_ready_expired = receive_sync_session_expired_payload(target_uid).unwrap();
+        assert_eq!(pc_ready_expired["state"], "cancelled");
+        assert_eq!(pc_ready_expired["expired"], true);
+        *receive_sync_session().lock().unwrap() = None;
+    }
+
+    fn write_sync_event(event_dir: &Path, uid: &str, name: &str, circle_name: &str) {
+        fs::create_dir_all(event_dir).unwrap();
+        fs::create_dir_all(event_dir.join("event_image")).unwrap();
+        fs::create_dir_all(event_dir.join("circles")).unwrap();
+        fs::create_dir_all(event_dir.join("maps")).unwrap();
+        fs::write(event_dir.join("event_image/event.png"), b"desktop image").unwrap();
+        fs::write(event_dir.join("circles/cut.png"), b"desktop cut").unwrap();
+        fs::write(event_dir.join("maps/deleted.jpg"), b"desktop map").unwrap();
+        fs::write(
+            event_dir.join("event.json"),
+            serde_json::to_vec_pretty(&json!({
+                "event_uid": uid,
+                "event": {"name": name, "date": "2026-06-01", "event_image_filename": "event_image/event.png"},
+                "circles": [{"name": circle_name, "checked": 0, "circle_cut_filename": "circles/cut.png"}],
+                "metadata": {"source": "desktop"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_sync_zip(path: &Path, uid: &str, image_bytes: &[u8], unsafe_member: Option<&str>) {
+        let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        let options = zip::write::FileOptions::default();
+        let event = json!({
+            "event_uid": uid,
+            "event": {"name": "Mobile Event", "date": "2026-06-01", "event_image_filename": "event_image/event.png"},
+            "circles": [{"name": "Mobile Circle", "checked": 1, "circle_cut_filename": "circles/cut.png"}],
+            "metadata": {"source": "mobile"}
+        });
+        zip.start_file("event.json", options).unwrap();
+        zip.write_all(&serde_json::to_vec(&event).unwrap()).unwrap();
+        zip.start_file("event_image/event.png", options).unwrap();
+        zip.write_all(image_bytes).unwrap();
+        zip.start_file("circles/cut.png", options).unwrap();
+        zip.write_all(b"mobile cut").unwrap();
+        zip.start_file("maps/added.jpg", options).unwrap();
+        zip.write_all(b"mobile map").unwrap();
+        if let Some(name) = unsafe_member {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(b"unsafe").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn write_local_import_zip(path: &Path, uid: &str, include_shared: bool, unsafe_member: Option<&str>) {
+        let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        let options = zip::write::FileOptions::default();
+        let event = json!({
+            "event_uid": uid,
+            "event": {
+                "name": "Mobile Event",
+                "date": "2026-06-01",
+                "event_image_filename": "event_image/event.png"
+            },
+            "circles": [],
+            "metadata": {"source": "local_fixture"}
+        });
+        zip.start_file("event.json", options).unwrap();
+        zip.write_all(&serde_json::to_vec(&event).unwrap()).unwrap();
+        let manifest = json!({
+            "format": "eventtrail_asset_manifest",
+            "format_version": 1,
+            "aliases": {
+                "event_image/event.png": "assets/sha256/aa/event.png",
+                "default_cuts/shared.png": "default_cuts/shared.png"
+            }
+        });
+        zip.start_file("asset_manifest.json", options).unwrap();
+        zip.write_all(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        zip.start_file("assets/sha256/aa/event.png", options).unwrap();
+        zip.write_all(b"local event image").unwrap();
+        if include_shared {
+            zip.start_file("circle_master.json", options).unwrap();
+            zip.write_all(br#"{"circles":{"shared":{"favorite":true}}}"#)
+                .unwrap();
+            zip.start_file("default_cuts/shared.png", options).unwrap();
+            zip.write_all(b"shared cut").unwrap();
+        }
+        if let Some(name) = unsafe_member {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(b"unsafe").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn local_zip_import_sanitizes_shared_settings_and_preserves_other_events() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let root = unique_test_root("local-zip-import");
+        let target_dir = root.join("events/a_target");
+        let other_dir = root.join("events/z_other");
+        write_sync_event(&target_dir, "event_local", "Mobile Event", "Target");
+        write_sync_event(&other_dir, "event_other", "Mobile Event", "Other");
+        fs::write(root.join("circle_master.json"), br#"{"circles":{"keep":{"favorite":true}}}"#)
+            .unwrap();
+        fs::create_dir_all(root.join("default_cuts")).unwrap();
+        fs::write(root.join("default_cuts/live.png"), b"live cut").unwrap();
+        let zip_path = root.join("local.zip");
+        write_local_import_zip(&zip_path, "event_local", true, None);
+
+        let registered = register_local_zip_import(zip_path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(registered["status"], "ok");
+        assert_eq!(registered["localOnly"], true);
+        let upload_id = registered["uploadId"].as_str().unwrap().to_string();
+        claim_received_upload(upload_id.clone()).unwrap();
+        let plan = plan_received_result_import(
+            upload_id.clone(),
+            root.to_string_lossy().to_string(),
+        )
+        .unwrap();
+        assert_eq!(plan["localOnly"], true);
+        assert_eq!(plan["eventName"], "Mobile Event");
+        assert_eq!(plan["eventDate"], "2026-06-01");
+        assert_eq!(plan["targetExists"], true);
+        assert!(plan["affectedEvents"].as_array().unwrap().len() == 1);
+        let slug = plan["slug"].as_str().unwrap().to_string();
+        let staged = stage_received_result_import(
+            upload_id.clone(),
+            root.to_string_lossy().to_string(),
+            slug,
+        )
+        .unwrap();
+        assert_eq!(staged["localOnly"], true);
+        let published = publish_received_result_import(upload_id.clone()).unwrap();
+        assert_eq!(published["localOnly"], true);
+        assert!(published["backupPath"].as_str().unwrap().len() > 0);
+        assert!(Path::new(published["backupPath"].as_str().unwrap()).is_dir());
+
+        let master_after = fs::read(root.join("circle_master.json")).unwrap();
+        assert_eq!(master_after, br#"{"circles":{"keep":{"favorite":true}}}"#);
+        assert_eq!(fs::read(root.join("default_cuts/live.png")).unwrap(), b"live cut");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(other_dir.join("event.json")).unwrap())
+                .unwrap()["event_uid"],
+            "event_other"
+        );
+        assert_eq!(fs::read(target_dir.join("event_image/event.png")).unwrap(), b"local event image");
+        remove_pending_received_upload(&upload_id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_zip_import_rejects_unsafe_member_before_registration() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let root = unique_test_root("local-zip-unsafe");
+        fs::create_dir_all(&root).unwrap();
+        let zip_path = root.join("unsafe.zip");
+        write_local_import_zip(&zip_path, "event_local", true, Some("../escape.txt"));
+        assert!(register_local_zip_import(zip_path.to_string_lossy().to_string()).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_zip_import_accepts_legacy_event_without_uid() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let root = unique_test_root("local-zip-legacy");
+        fs::create_dir_all(root.join("events")).unwrap();
+        let zip_path = root.join("legacy.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
+        let options = zip::write::FileOptions::default();
+        zip.start_file("event.json", options).unwrap();
+        zip.write_all(
+            &serde_json::to_vec(&json!({
+                "event": {"name": "Legacy Event", "date": "2026-06-02"},
+                "circles": [],
+                "metadata": {"source": "legacy"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        let registered = register_local_zip_import(zip_path.to_string_lossy().to_string()).unwrap();
+        let upload_id = registered["uploadId"].as_str().unwrap().to_string();
+        claim_received_upload(upload_id.clone()).unwrap();
+        let plan = plan_received_result_import(upload_id.clone(), root.to_string_lossy().to_string())
+            .unwrap();
+        assert_eq!(plan["eventName"], "Legacy Event");
+        assert_eq!(plan["targetExists"], false);
+        remove_pending_received_upload(&upload_id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mobile_cancel_removes_pending_sync_upload_before_publish() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        *receive_server_running().lock().unwrap() = None;
+        *receive_server_auth().lock().unwrap() = None;
+        *receive_sync_session().lock().unwrap() = None;
+        let root = unique_test_root("sync-cancel-linearization");
+        fs::create_dir_all(&root).unwrap();
+        let upload_id = unique_upload_id();
+        let zip_path = root.join("pending.zip");
+        write_sync_zip(&zip_path, "event_cancel", b"cancel image", None);
+        let receiver = register_received_sync_upload(&upload_id, zip_path, "event_cancel".to_string()).unwrap();
+        claim_received_upload(upload_id.clone()).unwrap();
+        let worker = Arc::new(AtomicBool::new(true));
+        *receive_server_running().lock().unwrap() = Some(worker.clone());
+        *receive_server_auth().lock().unwrap() = Some(ReceiveServerAuth {
+            bearer_token: "cancel-token".to_string(),
+            target_event_uid: "event_cancel".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: "event_cancel".to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+        begin_receive_sync_upload("event_cancel", &upload_id).unwrap();
+        apply_receive_sync_notification_for_generation(
+            &worker,
+            "event_cancel",
+            ReceiveSyncSessionState::Cancelled {
+                message: "mobile cancelled".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(!pending_received_uploads().lock().unwrap().contains_key(&upload_id));
+        let cancel_ack = receiver.try_recv();
+        assert!(
+            matches!(cancel_ack, Ok(ReceivedUploadAck::Failure(_))),
+            "cancel ack={cancel_ack:?}"
+        );
+        assert!(publish_received_event_sync(upload_id.clone()).is_err());
+        *receive_sync_session().lock().unwrap() = None;
+        *receive_server_auth().lock().unwrap() = None;
+        *receive_server_running().lock().unwrap() = None;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_generation_request_keeps_auth_for_worker_terminal_cleanup() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let worker = Arc::new(AtomicBool::new(true));
+        *receive_server_running().lock().unwrap() = Some(worker.clone());
+        *receive_server_auth().lock().unwrap() = Some(ReceiveServerAuth {
+            bearer_token: "expired-token".to_string(),
+            target_event_uid: "event_expired_generation".to_string(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+        });
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: "event_expired_generation".to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+        let url = "/upload?mode=single-event-sync&target_uid=event_expired_generation&token=expired-token";
+        assert_eq!(
+            receive_request_target_uid_for_generation(url, &worker)
+                .unwrap_err()
+                .0,
+            410
+        );
+        assert!(receive_server_auth().lock().unwrap().is_some());
+        *receive_sync_session().lock().unwrap() = None;
+        *receive_server_auth().lock().unwrap() = None;
+        *receive_server_running().lock().unwrap() = None;
+    }
+
+    fn register_sync(
+        root: &Path,
+        upload_id: &str,
+        uid: &str,
+    ) -> std::sync::mpsc::Receiver<ReceivedUploadAck> {
+        let zip_path = root.join(format!("{upload_id}.zip"));
+        write_sync_zip(&zip_path, uid, b"mobile image", None);
+        let receiver = register_received_sync_upload(upload_id, zip_path, uid.to_string()).unwrap();
+        claim_received_upload(upload_id.to_string()).unwrap();
+        receiver
+    }
+
+    #[test]
+    fn same_session_poll_response_exposes_pending_and_pc_download_states() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let target_uid = "event_poll";
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: target_uid.to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+        let (status, waiting, terminal) = receive_sync_session_response(target_uid).unwrap();
+        assert_eq!(status, 202);
+        assert!(!terminal);
+        assert_eq!(waiting["state"], "pending");
+        assert_eq!(waiting["target_uid"], target_uid);
+
+        begin_receive_sync_upload(target_uid, "upload-poll").unwrap();
+        assert!(receive_sync_upload_ack_state(
+            target_uid,
+            "upload-poll",
+            ReceiveSyncSessionState::PcReady {
+                download_url: "http://192.168.1.2:18721/mobile_export.zip?mode=single-event-sync&target_uid=event_poll&token=token".to_string(),
+            },
+        )
+        .unwrap());
+        let (status, ready, terminal) = receive_sync_session_response(target_uid).unwrap();
+        assert_eq!(status, 200);
+        assert!(!terminal, "PC-ready後はmobileの同一session完了通知を待ちます");
+        assert_eq!(ready["state"], "pc-ready");
+        assert_eq!(ready["source"], "pc");
+        assert_eq!(ready["downloadUrl"], ready["download_url"]);
+        assert_eq!(ready["targetEventUid"], target_uid);
+        let ready_event = receive_sync_session_event_payload(target_uid, false).unwrap();
+        assert_eq!(ready_event["delivered"], false);
+
+        apply_receive_sync_notification(target_uid, ReceiveSyncSessionState::MobileApplied)
+            .unwrap();
+        let terminal_event = receive_sync_session_event_payload(target_uid, true).unwrap();
+        assert_eq!(terminal_event["state"], "mobile-applied");
+        assert_eq!(terminal_event["delivered"], true);
+
+        *receive_sync_session().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn sync_download_ack_url_rejects_non_lan_or_unprotected_values() {
+        assert!(validate_event_sync_download_url(
+            "https://192.168.1.2:18721/mobile_export.zip?mode=single-event-sync&target_uid=event_poll&token=abc"
+        )
+        .is_err());
+        assert!(validate_event_sync_download_url(
+            "http://8.8.8.8:18721/mobile_export.zip?mode=single-event-sync&target_uid=event_poll&token=abc"
+        )
+        .is_err());
+        assert!(validate_event_sync_download_url(
+            "http://192.168.1.2:18721/mobile_export.zip?mode=single-event-sync&target_uid=event_poll"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sync_session_cas_rejects_duplicate_uploads_and_stale_waiters() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let target_uid = "event_cas";
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: target_uid.to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+        begin_receive_sync_upload(target_uid, "upload-current").unwrap();
+        assert!(begin_receive_sync_upload(target_uid, "upload-duplicate").is_err());
+        assert!(!receive_sync_upload_ack_state(
+            target_uid,
+            "upload-stale",
+            ReceiveSyncSessionState::PcReady {
+                download_url: "http://192.168.1.2:18721/mobile_export.zip?mode=single-event-sync&target_uid=event_cas&token=token".to_string(),
+            },
+        )
+        .unwrap());
+        assert!(receive_sync_upload_ack_state(
+            target_uid,
+            "upload-current",
+            ReceiveSyncSessionState::PcReady {
+                download_url: "http://192.168.1.2:18721/mobile_export.zip?mode=single-event-sync&target_uid=event_cas&token=token".to_string(),
+            },
+        )
+        .unwrap());
+        assert!(!receive_sync_upload_ack_state(
+            target_uid,
+            "upload-current",
+            ReceiveSyncSessionState::Error {
+                message: "late waiter".to_string(),
+            },
+        )
+        .unwrap());
+        apply_receive_sync_notification(target_uid, ReceiveSyncSessionState::MobileApplied)
+            .unwrap();
+        assert!(!receive_sync_upload_ack_state(
+            target_uid,
+            "upload-current",
+            ReceiveSyncSessionState::PcReady {
+                download_url: "http://192.168.1.2:18721/mobile_export.zip?mode=single-event-sync&target_uid=event_cas&token=token".to_string(),
+            },
+        )
+        .unwrap());
+        *receive_sync_session().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn mobile_completion_notification_is_same_target_and_terminal() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        let target_uid = "event_notify";
+        let notification = br#"{"mode":"single-event-sync","target_uid":"event_notify","state":"mobile-applied","result":"mobile-applied"}"#;
+        assert!(matches!(
+            parse_sync_session_notification(notification, target_uid),
+            Ok(ReceiveSyncSessionState::MobileApplied)
+        ));
+        assert!(parse_sync_session_notification(notification, "other").is_err());
+        let cancelled = br#"{"mode":"single-event-sync","target_uid":"event_notify","state":"cancelled","message":"user cancelled"}"#;
+        assert!(matches!(
+            parse_sync_session_notification(cancelled, target_uid),
+            Ok(ReceiveSyncSessionState::Cancelled { .. })
+        ));
+
+        *receive_sync_session().lock().unwrap() = Some(ReceiveSyncSession {
+            target_event_uid: target_uid.to_string(),
+            state: ReceiveSyncSessionState::Waiting,
+        });
+        assert!(apply_receive_sync_notification(
+            target_uid,
+            ReceiveSyncSessionState::MobileApplied,
+        )
+        .is_err());
+        begin_receive_sync_upload(target_uid, "upload-notify").unwrap();
+        assert!(receive_sync_upload_ack_state(
+            target_uid,
+            "upload-notify",
+            ReceiveSyncSessionState::PcReady {
+                download_url: "http://192.168.1.2:18721/mobile_export.zip?mode=single-event-sync&target_uid=event_notify&token=token".to_string(),
+            },
+        )
+        .unwrap());
+        apply_receive_sync_notification(target_uid, ReceiveSyncSessionState::MobileApplied)
+            .unwrap();
+        assert!(matches!(
+            receive_sync_session_response(target_uid),
+            Ok((200, _, true))
+        ));
+        *receive_sync_session().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn sha256_matches_standard_digest_and_bearer_token_is_one_time_scoped() {
+        let _test_guard = sync_session_test_lock().lock().unwrap();
+        assert_eq!(RECEIVE_BEARER_TOKEN_LIFETIME.as_secs(), 1_200);
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let token = random_bearer_token().unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let root = unique_test_root("single-event-sync-pair-url");
+        let event_dir = root.join("events/selected");
+        write_sync_event(&event_dir, "event_1", "夏コミ 2026", "Desktop Circle");
+        let (target_name, target_date) = receive_sync_target_metadata(&root, "event_1").unwrap();
+        assert_eq!(target_name.as_deref(), Some("夏コミ 2026"));
+        assert_eq!(target_date.as_deref(), Some("2026-06-01"));
+        assert!(receive_sync_target_metadata(&root, "event_2").is_err());
+        let url = single_event_sync_receive_url(
+            "http://192.168.1.2:18722/upload",
+            "event_1",
+            target_name.as_deref(),
+            target_date.as_deref(),
+            &token,
+        );
+        assert!(url.contains("target_name=%E5%A4%8F%E3%82%B3%E3%83%9F%202026"));
+        assert!(url.contains("target_date=2026-06-01"));
+        let parsed_query = parse_query(url.split_once('?').map(|(_, query)| query));
+        assert_eq!(parsed_query.get("target_name").map(String::as_str), Some("夏コミ 2026"));
+        assert_eq!(parsed_query.get("target_date").map(String::as_str), Some("2026-06-01"));
+        *receive_server_auth().lock().unwrap() = Some(ReceiveServerAuth {
+            bearer_token: token.clone(),
+            target_event_uid: "event_1".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        assert_eq!(
+            receive_request_target_uid(&url).unwrap().as_deref(),
+            Some("event_1")
+        );
+        assert!(receive_request_target_uid(
+            &url.replace("target_uid=event_1", "target_uid=event_2")
+        )
+        .is_err());
+        *receive_server_auth().lock().unwrap() = Some(ReceiveServerAuth {
+            bearer_token: token.clone(),
+            target_event_uid: "event_1".to_string(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+        });
+        assert!(receive_request_target_uid(&url).is_err());
+        assert!(receive_server_auth().lock().unwrap().is_none());
+        // Stop invalidation uses the same registry; a stale QR is rejected after clearing it.
+        *receive_server_auth().lock().unwrap() = None;
+        assert!(receive_request_target_uid(&url).is_err());
+
+        let no_date_dir = root.join("events/no_date");
+        fs::create_dir_all(&no_date_dir).unwrap();
+        fs::write(
+            no_date_dir.join("event.json"),
+            serde_json::to_vec(&json!({
+                "event_uid": "event_2",
+                "event": {"name": "日付なしイベント"},
+                "circles": [],
+                "metadata": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (no_date_name, no_date) = receive_sync_target_metadata(&root, "event_2").unwrap();
+        assert_eq!(no_date_name.as_deref(), Some("日付なしイベント"));
+        assert!(no_date.is_none(), "日付なしイベントがpairingを拒否されました");
+        let no_date_url = single_event_sync_receive_url(
+            "http://192.168.1.2:18722/upload",
+            "event_2",
+            no_date_name.as_deref(),
+            no_date.as_deref(),
+            &token,
+        );
+        assert!(!no_date_url.contains("target_date="));
+        *receive_server_auth().lock().unwrap() = Some(ReceiveServerAuth {
+            bearer_token: token.clone(),
+            target_event_uid: "event_2".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        assert_eq!(
+            receive_request_target_uid(&no_date_url).unwrap().as_deref(),
+            Some("event_2")
+        );
+        assert!(receive_request_target_uid(
+            &no_date_url.replace("target_uid=event_2", "target_uid=event_1")
+        )
+        .is_err());
+        *receive_server_auth().lock().unwrap() = None;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn protected_file_download_checks_token_path_uid_and_expiry() {
+        let root = unique_test_root("single-event-sync-file-auth");
+        fs::create_dir_all(&root).unwrap();
+        let zip_path = root.join("mobile export.zip");
+        write_sync_zip(&zip_path, "event_selected", b"image", None);
+        let token = random_bearer_token().unwrap();
+        let mut served = ServedFile::new_event_sync(
+            zip_path.clone(),
+            file_server_generation(),
+            "event_selected".to_string(),
+            token.clone(),
+            None,
+        )
+        .unwrap();
+        let get = tiny_http::Method::Get;
+        let url = format!(
+            "/{}?mode=single-event-sync&target_uid=event_selected&token={token}",
+            query_encode("mobile_export.zip")
+        );
+        assert_eq!(
+            authorize_protected_file_request(&served, &get, &url),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_protected_file_request(&served, &get, &url.replace(&token, "bad")),
+            Err(401)
+        );
+        assert_eq!(
+            authorize_protected_file_request(&served, &get, &url.replace("&token=", "&")),
+            Err(401)
+        );
+        assert_eq!(
+            authorize_protected_file_request(
+                &served,
+                &get,
+                &url.replace("event_selected", "event_other")
+            ),
+            Err(401)
+        );
+        assert_eq!(
+            authorize_protected_file_request(
+                &served,
+                &get,
+                &url.replace("mobile_export.zip", "other.zip")
+            ),
+            Err(404)
+        );
+        served.auth.as_mut().unwrap().expires_at = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            authorize_protected_file_request(&served, &get, &url),
+            Err(410)
+        );
+        drop(served);
+        assert!(
+            !zip_path.exists(),
+            "同期QR cleanup時にsource ZIPが残りました"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_and_stage_are_read_only_and_publish_replaces_only_the_uid_target_with_backup() {
+        let root = unique_test_root("single-event-sync-publish");
+        let target = root.join("events/selected");
+        let other = root.join("events/other");
+        write_sync_event(&target, "event_selected", "Desktop Event", "Desktop Circle");
+        write_sync_event(&other, "event_other", "Other Event", "Other Circle");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("circle_master.json"),
+            b"leave this file unchanged",
+        )
+        .unwrap();
+        let other_before = path_content_fingerprint(&other).unwrap();
+        let master_before = fs::read(root.join("circle_master.json")).unwrap();
+        let target_before = path_content_fingerprint(&target).unwrap();
+        let upload_id = unique_upload_id();
+        let _receiver = register_sync(&root, &upload_id, "event_selected");
+        let preview = preview_received_event_sync(
+            upload_id.clone(),
+            root.to_string_lossy().to_string(),
+            "event_selected".to_string(),
+        )
+        .unwrap();
+        assert_eq!(preview["targetSlug"], "selected");
+        assert_eq!(preview["targetEventUid"], "event_selected");
+        assert_eq!(
+            preview["desktopData"]["circles"][0]["name"],
+            "Desktop Circle"
+        );
+        assert_eq!(preview["mobileData"]["circles"][0]["name"], "Mobile Circle");
+        assert_eq!(preview["assetDiff"]["added"].as_array().unwrap().len(), 1);
+        assert_eq!(preview["assetDiff"]["changed"].as_array().unwrap().len(), 2);
+        assert_eq!(preview["assetDiff"]["deleted"].as_array().unwrap().len(), 1);
+        assert_eq!(path_content_fingerprint(&target).unwrap(), target_before);
+
+        stage_received_event_sync(
+            upload_id.clone(),
+            root.to_string_lossy().to_string(),
+            "event_selected".to_string(),
+            preview["fingerprint"].as_str().unwrap().to_string(),
+        )
+        .unwrap();
+        assert_eq!(path_content_fingerprint(&target).unwrap(), target_before);
+        assert_eq!(path_content_fingerprint(&other).unwrap(), other_before);
+        assert_eq!(
+            fs::read(root.join("circle_master.json")).unwrap(),
+            master_before
+        );
+
+        let result = publish_received_event_sync(upload_id.clone()).unwrap();
+        assert_eq!(result["targetSlug"], "selected");
+        let backup = PathBuf::from(result["backupPath"].as_str().unwrap());
+        assert!(backup.join("event.json").is_file());
+        assert_eq!(
+            path_content_fingerprint(&backup).unwrap(),
+            target_before,
+            "永続backupはpublish前の対象eventそのものを保持します"
+        );
+        assert_eq!(path_content_fingerprint(&other).unwrap(), other_before);
+        assert_eq!(
+            fs::read(root.join("circle_master.json")).unwrap(),
+            master_before
+        );
+        let published: Value =
+            serde_json::from_slice(&fs::read(target.join("event.json")).unwrap()).unwrap();
+        assert_eq!(published["event_uid"], "event_selected");
+        assert_eq!(published["circles"][0]["name"], "Mobile Circle");
+        assert_eq!(
+            fs::read(target.join("event_image/event.png")).unwrap(),
+            b"mobile image"
+        );
+        assert!(target.join("maps/added.jpg").is_file());
+        assert!(!target.join("maps/deleted.jpg").exists());
+        remove_pending_received_upload(&upload_id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_stage_rejects_stale_live_event_or_zip_and_cancel_removes_stage() {
+        let root = unique_test_root("single-event-sync-cas");
+        let target = root.join("events/selected");
+        write_sync_event(&target, "event_selected", "Desktop Event", "Desktop Circle");
+
+        let upload_id = unique_upload_id();
+        let _receiver = register_sync(&root, &upload_id, "event_selected");
+        let preview = preview_received_event_sync(
+            upload_id.clone(),
+            root.to_string_lossy().to_string(),
+            "event_selected".to_string(),
+        )
+        .unwrap();
+        stage_received_event_sync(
+            upload_id.clone(),
+            root.to_string_lossy().to_string(),
+            "event_selected".to_string(),
+            preview["fingerprint"].as_str().unwrap().to_string(),
+        )
+        .unwrap();
+        fs::write(target.join("concurrent-edit.txt"), b"newer desktop edit").unwrap();
+        assert!(publish_received_event_sync(upload_id.clone()).is_err());
+        assert_eq!(
+            fs::read(target.join("concurrent-edit.txt")).unwrap(),
+            b"newer desktop edit"
+        );
+        let stage_path = root
+            .join(".eventtrail-import-stage")
+            .join(format!("event-sync-stage-{upload_id}"));
+        terminal_cancel_received_upload(&upload_id, "cancel after stale conflict");
+        assert!(!stage_path.exists());
+
+        let zip_upload_id = unique_upload_id();
+        let _zip_receiver = register_sync(&root, &zip_upload_id, "event_selected");
+        let zip_preview = preview_received_event_sync(
+            zip_upload_id.clone(),
+            root.to_string_lossy().to_string(),
+            "event_selected".to_string(),
+        )
+        .unwrap();
+        stage_received_event_sync(
+            zip_upload_id.clone(),
+            root.to_string_lossy().to_string(),
+            "event_selected".to_string(),
+            zip_preview["fingerprint"].as_str().unwrap().to_string(),
+        )
+        .unwrap();
+        let zip_path = current_received_upload_zip(&zip_upload_id).unwrap();
+        write_sync_zip(&zip_path, "event_selected", b"changed zip", None);
+        assert!(publish_received_event_sync(zip_upload_id.clone()).is_err());
+        assert_eq!(
+            fs::read(target.join("concurrent-edit.txt")).unwrap(),
+            b"newer desktop edit"
+        );
+        terminal_cancel_received_upload(&zip_upload_id, "cancel after zip conflict");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_uid_mismatch_duplicate_uid_and_unsafe_zip_fail_closed() {
+        let root = unique_test_root("single-event-sync-validation");
+        let target = root.join("events/selected");
+        write_sync_event(&target, "event_selected", "Desktop Event", "Desktop Circle");
+        let other = root.join("events/duplicate");
+        write_sync_event(
+            &other,
+            "event_selected",
+            "Duplicate Event",
+            "Duplicate Circle",
+        );
+        let zip_path = root.join("mismatch.zip");
+        fs::create_dir_all(&root).unwrap();
+        write_sync_zip(&zip_path, "event_other", b"image", None);
+        let nested_uid_zip = root.join("nested-uid.zip");
+        {
+            let mut zip = zip::ZipWriter::new(fs::File::create(&nested_uid_zip).unwrap());
+            let options = zip::write::FileOptions::default();
+            let event = json!({
+                "event": {"event_uid": "event_selected", "name": "Nested UID"},
+                "circles": []
+            });
+            zip.start_file("event.json", options).unwrap();
+            zip.write_all(&serde_json::to_vec(&event).unwrap()).unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(read_validated_sync_zip(&nested_uid_zip, "event_selected").is_err());
+        let mismatch_id = format!("{}_sync_mismatch", std::process::id());
+        let _receiver =
+            register_received_sync_upload(&mismatch_id, zip_path, "event_selected".to_string())
+                .unwrap();
+        claim_received_upload(mismatch_id.clone()).unwrap();
+        assert!(preview_received_event_sync(
+            mismatch_id.clone(),
+            root.to_string_lossy().to_string(),
+            "event_selected".to_string(),
+        )
+        .is_err());
+        terminal_cancel_received_upload(&mismatch_id, "uid mismatch");
+        assert!(find_unique_event_dir_by_uid(&root, "event_selected").is_err());
+
+        let safe_root = unique_test_root("single-event-sync-unsafe");
+        let safe_target = safe_root.join("events/selected");
+        write_sync_event(
+            &safe_target,
+            "event_selected",
+            "Desktop Event",
+            "Desktop Circle",
+        );
+        let unsafe_zip = safe_root.join("unsafe.zip");
+        fs::create_dir_all(&safe_root).unwrap();
+        write_sync_zip(
+            &unsafe_zip,
+            "event_selected",
+            b"image",
+            Some("../circle_master.json"),
+        );
+        assert!(read_validated_sync_zip(&unsafe_zip, "event_selected").is_err());
+        assert!(!safe_root.join("circle_master.json").exists());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(safe_root);
+    }
+
+    #[test]
+    fn sync_zip_accepts_safe_manifest_asset_aliases_and_rejects_unrelated_roots() {
+        let root = unique_test_root("single-event-sync-manifest");
+        fs::create_dir_all(&root).unwrap();
+        let zip_path = root.join("manifest.zip");
+        {
+            let mut zip = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
+            let options = zip::write::FileOptions::default();
+            let event = json!({
+                "event_uid": "event_selected",
+                "event": {"name": "Mobile Event", "date": "2026-06-01"},
+                "circles": [],
+                "metadata": {}
+            });
+            let manifest = json!({
+                "format": "eventtrail_asset_manifest",
+                "format_version": 1,
+                "assets": {
+                    "sample": {
+                        "algorithm": "sha256",
+                        "hash": "placeholder",
+                        "path": "assets/sha256/aa/image.png",
+                        "size": 11,
+                        "original_names": ["event_image/event.png"]
+                    }
+                },
+                "aliases": {"event_image/event.png": "assets/sha256/aa/image.png"}
+            });
+            zip.start_file("event.json", options).unwrap();
+            zip.write_all(&serde_json::to_vec(&event).unwrap()).unwrap();
+            zip.start_file("asset_manifest.json", options).unwrap();
+            zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+                .unwrap();
+            zip.add_directory("assets/", options).unwrap();
+            zip.add_directory("assets/sha256/", options).unwrap();
+            zip.add_directory("assets/sha256/aa/", options).unwrap();
+            zip.start_file("assets/sha256/aa/image.png", options)
+                .unwrap();
+            zip.write_all(b"manifest png").unwrap();
+            zip.finish().unwrap();
+        }
+        let validated = read_validated_sync_zip(&zip_path, "event_selected").unwrap();
+        assert_eq!(validated.assets.len(), 1);
+        assert_eq!(validated.assets[0].key, "event_image/event.png");
+        assert_eq!(validated.assets[0].digest, sha256_hex(b"manifest png"));
+
+        let unrelated_path = root.join("unrelated.zip");
+        {
+            let mut zip = zip::ZipWriter::new(fs::File::create(&unrelated_path).unwrap());
+            let options = zip::write::FileOptions::default();
+            let event = json!({"event_uid": "event_selected", "event": {}, "circles": []});
+            zip.start_file("event.json", options).unwrap();
+            zip.write_all(&serde_json::to_vec(&event).unwrap()).unwrap();
+            zip.start_file("notes.txt", options).unwrap();
+            zip.write_all(b"outside approved event asset roots")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(read_validated_sync_zip(&unrelated_path, "event_selected").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 // ── ファイル配信HTTPサーバー ──
 
 const FILE_SERVER_FIXED_PORT: u16 = 18721;
+
+struct ServedFileAuth {
+    bearer_token: String,
+    target_event_uid: String,
+    advertised_ip: Option<std::net::Ipv4Addr>,
+    expires_at: Instant,
+}
 
 struct ServedFile {
     source_path: PathBuf,
@@ -8219,6 +12321,7 @@ struct ServedFile {
     display_name: String,
     cleanup_source_on_deactivate: bool,
     source_cleanup_done: std::sync::atomic::AtomicBool,
+    auth: Option<ServedFileAuth>,
 }
 
 impl ServedFile {
@@ -8227,11 +12330,29 @@ impl ServedFile {
         generation: u64,
         cleanup_source_on_deactivate: bool,
     ) -> Result<Self, String> {
-        let display_name = source_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        Self::new_with_display_name(
+            source_path,
+            generation,
+            cleanup_source_on_deactivate,
+            None,
+        )
+    }
+
+    fn new_with_display_name(
+        source_path: PathBuf,
+        generation: u64,
+        cleanup_source_on_deactivate: bool,
+        display_name_override: Option<&str>,
+    ) -> Result<Self, String> {
+        let display_name = display_name_override
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                source_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            });
         let internal_name = format!(
             ".eventtrail_mobile_server_{}_{}_{}",
             std::process::id(),
@@ -8256,7 +12377,38 @@ impl ServedFile {
             display_name,
             cleanup_source_on_deactivate,
             source_cleanup_done: std::sync::atomic::AtomicBool::new(false),
+            auth: None,
         })
+    }
+
+    fn new_event_sync(
+        source_path: PathBuf,
+        generation: u64,
+        target_event_uid: String,
+        bearer_token: String,
+        advertised_ip: Option<std::net::Ipv4Addr>,
+    ) -> Result<Self, String> {
+        // Keep the mobile-facing route stable while allowing the actual
+        // source ZIP to live at a unique temporary path per session.
+        let mut served = Self::new_with_display_name(
+            source_path,
+            generation,
+            true,
+            Some("mobile_export.zip"),
+        )?;
+        served.auth = Some(ServedFileAuth {
+            bearer_token,
+            target_event_uid,
+            advertised_ip,
+            expires_at: Instant::now() + RECEIVE_BEARER_TOKEN_LIFETIME,
+        });
+        Ok(served)
+    }
+
+    fn auth_expired(&self) -> bool {
+        self.auth
+            .as_ref()
+            .is_some_and(|auth| Instant::now() >= auth.expires_at)
     }
 
     fn cleanup_source(&self) {
@@ -8329,7 +12481,84 @@ fn bind_file_server_once() -> Result<Arc<tiny_http::Server>, String> {
     }
 }
 
+fn authorize_protected_file_request(
+    served: &ServedFile,
+    method: &tiny_http::Method,
+    url: &str,
+) -> Result<(), u16> {
+    if *method != tiny_http::Method::Get {
+        return Err(404);
+    }
+    let expected_path = format!("/{}", query_encode(&served.display_name));
+    let (path, query) = url
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((url, None));
+    if path != expected_path {
+        return Err(404);
+    }
+    let Some(auth) = served.auth.as_ref() else {
+        return Err(401);
+    };
+    if Instant::now() >= auth.expires_at {
+        return Err(410);
+    }
+    let query = parse_query(query);
+    let mode = query.get("mode").map(String::as_str).unwrap_or("");
+    let target_uid = query.get("target_uid").map(String::as_str).unwrap_or("");
+    let token = query.get("token").map(String::as_str).unwrap_or("");
+    if mode != "single-event-sync"
+        || target_uid != auth.target_event_uid
+        || !constant_time_token_eq(token, &auth.bearer_token)
+    {
+        return Err(401);
+    }
+    Ok(())
+}
+
+fn deactivate_expired_sync_file(active: &Arc<Mutex<Option<Arc<ServedFile>>>>) {
+    let expired = active.lock().ok().and_then(|mut slot| {
+        if slot.as_ref().is_some_and(|served| served.auth_expired()) {
+            slot.take()
+        } else {
+            None
+        }
+    });
+    if let Some(served) = expired {
+        served.deactivate();
+    }
+}
+
 fn respond_file_request(request: tiny_http::Request, served: &ServedFile) {
+    if served.auth.is_some() {
+        if let Err(status) =
+            authorize_protected_file_request(served, request.method(), request.url())
+        {
+            let message = match status {
+                410 => "Pairing expired",
+                404 => "Not found",
+                _ => "Unauthorized",
+            };
+            let response = tiny_http::Response::from_string(message)
+                .with_status_code(tiny_http::StatusCode(status));
+            let _ = request.respond(response);
+            return;
+        }
+        if !cfg!(test)
+            && served
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.advertised_ip)
+            .is_some_and(|advertised| {
+                !peer_is_on_advertised_subnet(request.remote_addr(), advertised)
+            })
+        {
+            let response = tiny_http::Response::from_string("Unauthorized")
+                .with_status_code(tiny_http::StatusCode(401));
+            let _ = request.respond(response);
+            return;
+        }
+    }
     let file = match fs::File::open(&served.serve_path) {
         Ok(file) => file,
         Err(_) => {
@@ -8373,6 +12602,7 @@ fn start_file_server_worker(
     thread::spawn(move || loop {
         match server.recv_timeout(Duration::from_millis(500)) {
             Ok(Some(request)) => {
+                deactivate_expired_sync_file(&active);
                 let served = active.lock().ok().and_then(|guard| guard.clone());
                 if let Some(served) = served {
                     respond_file_request(request, &served);
@@ -8382,7 +12612,7 @@ fn start_file_server_worker(
                     let _ = request.respond(response);
                 }
             }
-            Ok(None) => {}
+            Ok(None) => deactivate_expired_sync_file(&active),
             Err(_) => break,
         }
     });
@@ -8438,6 +12668,73 @@ fn start_file_server(file_path: String, cleanup_on_stop: Option<bool>) -> Result
         "ip": ip.to_string(),
         "port": FILE_SERVER_FIXED_PORT,
         "url": format!("http://{}:{}/{}", ip, FILE_SERVER_FIXED_PORT, file_name)
+    }))
+}
+
+#[tauri::command]
+fn start_event_sync_file_server(
+    file_path: String,
+    target_event_uid: String,
+) -> Result<Value, String> {
+    if !valid_event_uid(&target_event_uid) {
+        return Err("targetEventUidの形式が不正です".to_string());
+    }
+    let source_path = PathBuf::from(&file_path);
+    let source_metadata = fs::symlink_metadata(&source_path)
+        .map_err(|e| format!("event sync ZIP metadata取得失敗: {e}"))?;
+    if !source_metadata.is_file() || metadata_is_link_or_reparse(&source_metadata) {
+        return Err("event sync ZIPは通常fileである必要があります".to_string());
+    }
+    let before = path_content_fingerprint(&source_path)?
+        .ok_or_else(|| "event sync ZIPが存在しません".to_string())?;
+    read_validated_sync_zip(&source_path, &target_event_uid)?;
+    if path_content_fingerprint(&source_path)? != Some(before) {
+        return Err("検証中にevent sync ZIPが変更されました".to_string());
+    }
+
+    let _lifecycle_guard = file_server_lifecycle()
+        .lock()
+        .map_err(|error| format!("ファイルサーバーlifecycleロック取得失敗: {error}"))?;
+    let active = ensure_file_server_runtime()?;
+    let ip = resolve_advertised_ipv4()?;
+    let bearer_token = random_bearer_token()?;
+    let served = Arc::new(ServedFile::new_event_sync(
+        source_path.clone(),
+        file_server_generation(),
+        target_event_uid.clone(),
+        bearer_token.clone(),
+        Some(ip),
+    )?);
+    if path_content_fingerprint(&served.serve_path)? != Some(before) {
+        return Err("配信用event sync ZIP staging後に内容が変わりました".to_string());
+    }
+    let route_path = format!("/{}", query_encode(&served.display_name));
+    let url = format!(
+        "http://{}:{}{}?mode=single-event-sync&target_uid={}&token={}",
+        ip,
+        FILE_SERVER_FIXED_PORT,
+        route_path,
+        query_encode(&target_event_uid),
+        bearer_token
+    );
+    let file_name = served.display_name.clone();
+    let mut slot = active
+        .lock()
+        .map_err(|error| format!("ファイルサーバーactiveロック取得失敗: {error}"))?;
+    let old = slot.replace(served);
+    drop(slot);
+    if let Some(old) = old {
+        old.deactivate_for_replacement(&source_path);
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "ip": ip.to_string(),
+        "port": FILE_SERVER_FIXED_PORT,
+        "url": url,
+        "fileName": file_name,
+        "targetEventUid": target_event_uid,
+        "expiresInSeconds": RECEIVE_BEARER_TOKEN_LIFETIME.as_secs()
     }))
 }
 
@@ -9548,6 +13845,7 @@ fn main() {
             list_map_images,
             list_event_map_images,
             start_file_server,
+            start_event_sync_file_server,
             stop_file_server,
             get_local_ip,
             search_past_participations,
@@ -9565,12 +13863,17 @@ fn main() {
             plan_received_result_import,
             stage_received_result_import,
             publish_received_result_import,
+            preview_received_event_sync,
+            stage_received_event_sync,
+            publish_received_event_sync,
             start_receive_server,
             stop_receive_server,
             ack_received_upload,
+            ack_received_upload_with_download,
             claim_received_upload,
             heartbeat_received_upload,
             cancel_received_upload,
+            register_local_zip_import,
             register_default_cut,
             append_review_entry,
             open_file_default,
