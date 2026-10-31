@@ -6,9 +6,9 @@
     "date": "2026-10-31"
   },
   "mobile": {
-    "version": "1.4.76",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.76/EventAutoPin.apk",
-    "notes": "モバイル1.4.76: 同期キャンセル時の通知とクリーンアップ処理を修正",
+    "version": "1.4.77",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.77/EventAutoPin.apk",
+    "notes": "v1.4.77 リリース",
     "date": "2026-10-31"
   }
 }
