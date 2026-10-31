@@ -1,4 +1,5 @@
 import "./styles.css";
+import { installNumericSelects } from "./numeric-select";
 import {
   effectiveCirclePriority,
   isCircleAbsent,
@@ -167,6 +168,8 @@ import {
   OPENAI_REASONING_EFFORTS,
   openAiEffortsForModel,
 } from "./openai-model-capabilities";
+
+installNumericSelects();
 
 // 画像読み込みエラーのグローバルハンドラ（CSP対策: インラインonerror不使用）
 document.addEventListener(
@@ -5829,7 +5832,7 @@ function renderCircleEditor() {
             const fg = opt ? opt.color : "#666";
             const label = opt ? opt.label : "";
             const absent = isCircleAbsent(eventJsonData.circles[realIdx]);
-            return `<td><div class="color-picker-cell"><div class="color-swatch" data-row="${realIdx}" data-col="${escapeHtml(h)}" style="background:${bg};border-color:${fg};" title="${absent ? "欠席中は優先度「低」に固定" : label}"${absent ? ' aria-disabled="true"' : ""}></div><span class="color-label" style="color:${fg};">${escapeHtml(label)}</span></div></td>`;
+            return `<td><div class="color-picker-cell"><div class="color-swatch" tabindex="-1" data-row="${realIdx}" data-col="${escapeHtml(h)}" style="background:${bg};border-color:${fg};" title="${absent ? "欠席中は優先度「低」に固定" : label}"${absent ? ' aria-disabled="true"' : ""}></div><span class="color-label" style="color:${fg};">${escapeHtml(label)}</span></div></td>`;
           }
           // チェック列: selectで表示
           if (h === "チェック") {
@@ -6058,7 +6061,8 @@ function renderCircleEditor() {
 
         const dropdown = document.createElement("div");
         dropdown.className = "color-dropdown";
-        for (const opt of COLOR_OPTIONS) {
+        for (const value of ["15", "10", "11", "5"]) {
+          const opt = COLOR_OPTIONS.find((option) => option.value === value)!;
           const btn = document.createElement("div");
           btn.className =
             "color-option" + (opt.value === currentVal ? " selected" : "");
@@ -6104,6 +6108,25 @@ function renderCircleEditor() {
         const ddWidth = dropdown.offsetWidth;
         const maxLeft = window.innerWidth - ddWidth - 8;
         dropdown.style.left = `${Math.min(rect.left, maxLeft)}px`;
+
+        dropdown.tabIndex = -1;
+        dropdown.focus();
+        dropdown.addEventListener("keydown", (event) => {
+          if (event.isComposing || event.repeat || event.ctrlKey || event.altKey || event.metaKey) return;
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            dropdown.remove();
+            swatch.focus();
+            return;
+          }
+          const index = Number(event.key) - 1;
+          if (!/^[1-4]$/.test(event.key)) return;
+          event.preventDefault();
+          event.stopPropagation();
+          (dropdown.children[index] as HTMLElement).click();
+          swatch.focus();
+        });
 
         // 外側クリックで閉じる
         const closeHandler = () => {

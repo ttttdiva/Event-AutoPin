@@ -1939,3 +1939,19 @@ html.dark {
   opacity: 0.55;
   cursor: not-allowed;
 }
+
+.numeric-select-popup {
+  position: fixed;
+  z-index: 10000;
+  max-height: 50vh;
+  overflow: auto;
+  background: var(--bg-elevated);
+  color: var(--text-primary, white);
+  border: 1px solid var(--border-default, #777);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px #0005;
+}
+.numeric-select-popup [role="option"] { padding: 4px 8px; cursor: pointer; }
+.numeric-select-popup [role="option"].active,
+.numeric-select-popup [role="option"]:hover { background: #5478a8; color: white; }
+.numeric-select-popup [aria-disabled="true"] { opacity: .5; cursor: default; }

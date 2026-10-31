@@ -21,6 +21,7 @@ desktop-app/src/model-role-capabilities.test.ts
 desktop-app/src/model-execution-plan.ts
 desktop-app/src/model-execution-plan.test.ts
 desktop-app/src/openai-model-capabilities.test.ts
+desktop-app/src/numeric-select.ts
 desktop-app/src/openai-model-capabilities.ts
 desktop-app/src/purchase-status.ts
 desktop-app/src/reprocess-runtime.test.ts
