@@ -46,6 +46,7 @@ def parse_with_high_end_model(
             site_parsing_config.fallback_model,
             site_parsing_config.fallback_effort,
             primary_effort=site_parsing_config.effort,
+            fallback_enabled=getattr(site_parsing_config, "fallback_enabled", True),
         )
         if not attempts:
             raise RuntimeError("サイト構造解析roleに有効なprovider/modelがありません")

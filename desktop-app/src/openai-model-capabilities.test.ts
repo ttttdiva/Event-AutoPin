@@ -52,5 +52,15 @@ assertEqualStrings(
   ["minimal", "low", "medium", "high"],
   "旧GPT-5のminimal互換性が失われています",
 );
+assertEqualStrings(
+  openAiEffortsForModel("gpt-new-live-id"),
+  ["none"],
+  "未知のOpenAI IDへ既知モデルのeffortを推測してはいけません",
+);
+assertEqualStrings(
+  openAiEffortsForModel("gpt-5.6-cyber"),
+  ["none"],
+  "既知のGPT-5.6一般モデルでないIDへmax/mediumを推測してはいけません",
+);
 
 console.log("OpenAI model capability tests passed");

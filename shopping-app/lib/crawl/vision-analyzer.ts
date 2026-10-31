@@ -7,7 +7,7 @@
 import * as FileSystem from "expo-file-system/legacy";
 import { LlmClient } from "./llm-client";
 import {
-  getVisionModel,
+  getVisionModelSelection,
   getVisionReasoningEffort,
   isVisionAnalysisEnabled,
 } from "../settings-store";
@@ -44,10 +44,10 @@ export async function analyzeCircleCut(
       : "image/jpeg";
 
     const [model, reasoningEffort] = await Promise.all([
-      getVisionModel(),
+      getVisionModelSelection(),
       getVisionReasoningEffort(),
     ]);
-    const llm = new LlmClient([model]);
+    const llm = new LlmClient([{ ...model, reasoningEffort }]);
     const text = await llm.analyzeImage(base64, mime, PROMPT, {
       reasoningEffort,
     });

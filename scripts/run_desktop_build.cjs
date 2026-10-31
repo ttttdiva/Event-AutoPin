@@ -15,6 +15,7 @@ function run(exe, args) {
     stdio: "inherit",
     cwd: projectRoot,
     shell: false,
+    windowsHide: true,
   });
   if (result.error) {
     console.error(result.error.message);

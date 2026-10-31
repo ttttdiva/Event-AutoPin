@@ -114,6 +114,20 @@ def test_strict_gate_accepts_matching_source_versions_latest_and_asset(tmp_path:
     assert "PUBLIC_SOURCE_MISMATCH=False" in result.stdout
 
 
+def test_strict_gate_accepts_linked_source_worktree_and_rejects_nonroot_child(tmp_path: Path) -> None:
+    private, public = repositories(tmp_path)
+    linked = tmp_path / "private-linked"
+    git(private, "worktree", "add", "--detach", str(linked), "HEAD")
+    assert (linked / ".git").is_file()
+
+    linked_result = run(linked, public, tmp_path)
+    assert linked_result.returncode == 0, linked_result.stdout + linked_result.stderr
+
+    child_result = run(private / "desktop-app", public, tmp_path)
+    assert child_result.returncode != 0
+    assert "must be the git working-tree root" in child_result.stderr.lower()
+
+
 def test_strict_gate_rejects_source_changed_without_version_or_release_metadata(tmp_path: Path) -> None:
     private, public = repositories(tmp_path)
     write_desktop(private, "1.2.3", "export const value = 2;\n")

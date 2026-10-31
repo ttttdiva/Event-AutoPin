@@ -144,6 +144,14 @@ async def process_candidates(processor: Any, circle: Any, candidates: List[Dict[
         except ReprocessDeadlineExceeded:
             raise
         except Exception as exc:
+            # Grok Buildはprompt送信後に結果不明/キャンセルとなった場合、
+            # 別候補への再送や次のポストへの切替をしてはいけない。
+            from ..utils.grok_build import GrokBuildError
+            if isinstance(exc, GrokBuildError) and exc.code in {
+                "unknown_delivery",
+                "cancelled",
+            }:
+                raise
             last_error = exc
             logger.warning("候補投稿の同時解析に失敗しました。別候補を確認します: %s", type(exc).__name__)
             continue

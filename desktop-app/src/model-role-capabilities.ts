@@ -26,6 +26,7 @@ export type ModelStatus =
 export type RoleModel = {
   id: string;
   provider?: string;
+  source?: string;
   availability?: string;
   stale?: boolean;
   capabilities?: Partial<Record<ModelRole, ModelCapability>>;
@@ -34,6 +35,18 @@ export type RoleModel = {
 export type ProviderStatus = {
   status?: string;
 };
+
+/**
+ * Provider APIのread-onlyモデル一覧で現在利用可能と広告された候補。
+ * 能力metadataが欠けていても、保存設定やstale-cacheを同じ扱いにはしない。
+ */
+export function isLiveApiModel(model: RoleModel): boolean {
+  return (
+    model.source === "provider-api" &&
+    model.stale !== true &&
+    model.availability === "available"
+  );
+}
 
 export function modelPreflightSlotsForOperation(
   operation: ModelPreflightOperation,
@@ -45,13 +58,18 @@ export function modelPreflightSlotsForOperation(
     case "map_auto":
       return visionSlots;
     case "circle_post":
-      return ["oshinagaki_post", ...visionSlots];
+      // URLポスト再処理はpost roleだけを実行する。未使用のvision予備を
+      // 必須検査に含めると、主post開始前に無関係な認証で停止してしまう。
+      return ["oshinagaki_post"];
     case "catalog_reprocess":
-      return ["text", "text_fallback", "oshinagaki_post", ...visionSlots];
+      // 既存event.jsonのおしながき再取得はpost joint roleで完結する。
+      // 未使用のtext/vision roleの認証で再取得を止めない。
+      return ["oshinagaki_post"];
     case "pipeline":
       return [
         "text",
         "text_fallback",
+        "site_structure",
         ...visionSlots,
         ...(twitterEnabled ? ["oshinagaki_post" as const] : []),
       ];
@@ -94,8 +112,24 @@ export function modelsForRole<T extends RoleModel>(
   models: T[],
   role: ModelRole,
   providerStatus?: ProviderStatus,
+  allowUnverifiedText = false,
 ): T[] {
   return models.filter((model) => {
+    if (providerStatus?.status === "permission_denied") return false;
+    if (
+      allowUnverifiedText &&
+      role === "text" &&
+      model.stale !== true &&
+      model.capabilities?.[role] !== "unsupported" &&
+      model.availability !== "retired" &&
+      model.availability !== "scheduled_retirement" &&
+      model.availability !== "deprecated"
+    ) {
+      return true;
+    }
+    if (isLiveApiModel(model) && model.capabilities?.[role] !== "unsupported") {
+      return true;
+    }
     if (
       model.stale &&
       model.availability !== "retired" &&
@@ -104,7 +138,9 @@ export function modelsForRole<T extends RoleModel>(
       return true;
     }
     const status = modelStatusForRole(model, role, providerStatus);
-    return status === "available" || status === "stale" || status === "scheduled_retirement";
+    return (
+      status === "available" || status === "stale" || status === "scheduled_retirement"
+    );
   });
 }
 

@@ -10,9 +10,52 @@ function Get-ProjectRoot {
     return (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 }
 
+function Normalize-ProcessPath {
+    param(
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+    try {
+        return [System.IO.Path]::GetFullPath($Path)
+    }
+    catch {
+        return $null
+    }
+}
+
 function Assert-DesktopExeNotRunning {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$TargetPaths
+    )
+
+    $normalizedTargets = @($TargetPaths | ForEach-Object {
+        $normalized = Normalize-ProcessPath -Path $_
+        if ($null -ne $normalized) { $normalized }
+    })
+    $targetProcessNames = @(
+        @($normalizedTargets | ForEach-Object {
+            [System.IO.Path]::GetFileNameWithoutExtension($_)
+        }) + @('EventAutoPin', 'Event AutoPin', 'event-autopin-desktop')
+    ) | Select-Object -Unique
     $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-        $_.ProcessName -in @('EventAutoPin', 'Event AutoPin')
+        $processNameMatches = $_.ProcessName -in $targetProcessNames
+        $processPath = $null
+        try {
+            $processPath = $_.MainModule.FileName
+        }
+        catch {
+            # 同名プロセスの実体を確認できない場合は安全側で拒否する。
+        }
+        $normalizedProcessPath = Normalize-ProcessPath -Path $processPath
+        # パス不明の同名プロセスは、対象を上書きできない可能性があるため拒否する。
+        if ($null -eq $normalizedProcessPath) {
+            return $processNameMatches
+        }
+        return $normalizedTargets -contains $normalizedProcessPath
     })
     if ($running.Count -gt 0) {
         $pids = ($running | ForEach-Object { $_.Id }) -join ', '
@@ -142,7 +185,21 @@ if (-not (Test-Path -LiteralPath $desktopDir -PathType Container)) {
 }
 
 $desktopVersion = Get-DesktopVersion -DesktopDir $desktopDir
-Assert-DesktopExeNotRunning
+$releaseDir = Join-Path $desktopDir "src-tauri\target\release"
+$buildOutputNames = @(
+    "Event AutoPin.exe",
+    "EventAutoPin.exe",
+    "event-autopin-desktop.exe"
+)
+$existingReleaseExes = @()
+if (Test-Path -LiteralPath $releaseDir -PathType Container) {
+    $existingReleaseExes = @(Get-ChildItem -LiteralPath $releaseDir -Filter *.exe -File |
+        ForEach-Object { $_.FullName })
+}
+$buildTargets = @($destination) + @($buildOutputNames | ForEach-Object {
+    Join-Path $releaseDir $_
+}) + $existingReleaseExes
+Assert-DesktopExeNotRunning -TargetPaths $buildTargets
 
 Push-Location $desktopDir
 try {

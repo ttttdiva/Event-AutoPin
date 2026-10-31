@@ -474,7 +474,10 @@ fn fetch_antigravity_cli_models(dotenv: &HashMap<String, String>) -> (Vec<Value>
     let bin = resolve_agy_bin(dotenv);
     let fallback = || (Vec::new(), "fetch-failed");
 
-    let output = Command::new(&bin).arg("models").output();
+    let mut command = Command::new(&bin);
+    command.arg("models");
+    configure_hidden_command(&mut command);
+    let output = command.output();
     let Ok(output) = output else {
         return fallback();
     };
@@ -659,9 +662,50 @@ fn model_catalog_cache() -> &'static Mutex<HashMap<String, ModelCatalogCacheEntr
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn model_catalog_cache_generations() -> &'static Mutex<HashMap<String, u64>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn model_catalog_cache_generation(project_root: &str) -> u64 {
+    model_catalog_cache_generations()
+        .lock()
+        .ok()
+        .and_then(|generations| generations.get(project_root).copied())
+        .unwrap_or(0)
+}
+
 fn invalidate_model_catalog_cache(project_root: &str) {
+    // generation mutexをcache mutexより先に取得し、fetch完了側も同じ順序で
+    // insertする。これによりinvalidate直後に旧fetchがcacheへ復帰するraceを防ぐ。
+    if let Ok(mut generations) = model_catalog_cache_generations().lock() {
+        let generation = generations.entry(project_root.to_string()).or_insert(0);
+        *generation = generation.wrapping_add(1);
+        if let Ok(mut cache) = model_catalog_cache().lock() {
+            cache.remove(project_root);
+        }
+    }
+}
+
+fn insert_model_catalog_cache_if_current(
+    project_root: String,
+    request_generation: u64,
+    value: Value,
+) {
+    let Ok(generations) = model_catalog_cache_generations().lock() else {
+        return;
+    };
+    if generations.get(&project_root).copied().unwrap_or(0) != request_generation {
+        return;
+    }
     if let Ok(mut cache) = model_catalog_cache().lock() {
-        cache.remove(project_root);
+        cache.insert(
+            project_root,
+            ModelCatalogCacheEntry {
+                stored_at: Instant::now(),
+                value,
+            },
+        );
     }
 }
 
@@ -708,15 +752,20 @@ fn list_model_catalog_sync_with_refresh(
     force_refresh: bool,
 ) -> Result<Value, String> {
     const CACHE_TTL: Duration = Duration::from_secs(300);
+    let request_generation = model_catalog_cache_generation(&project_root);
     if !force_refresh {
-        if let Ok(cache) = model_catalog_cache().lock() {
-            if let Some(entry) = cache.get(&project_root) {
-                if entry.stored_at.elapsed() < CACHE_TTL {
-                    let mut value = entry.value.clone();
-                    if value.get("cache_state").and_then(Value::as_str) == Some("fresh") {
-                        value["cache_state"] = Value::String("fresh".to_string());
+        if let Ok(generations) = model_catalog_cache_generations().lock() {
+            if generations.get(&project_root).copied().unwrap_or(0) == request_generation {
+                if let Ok(cache) = model_catalog_cache().lock() {
+                    if let Some(entry) = cache.get(&project_root) {
+                        if entry.stored_at.elapsed() < CACHE_TTL {
+                            let mut value = entry.value.clone();
+                            if value.get("cache_state").and_then(Value::as_str) == Some("fresh") {
+                                value["cache_state"] = Value::String("fresh".to_string());
+                            }
+                            return Ok(value);
+                        }
                     }
-                    return Ok(value);
                 }
             }
         }
@@ -872,15 +921,7 @@ fn list_model_catalog_sync_with_refresh(
         "cache_state": if stale_count > 0 { "stale" } else if !api_error_providers.is_empty() { "partial" } else { "fresh" },
         "fetched_at": chrono::Utc::now().to_rfc3339()
     });
-    if let Ok(mut cache) = model_catalog_cache().lock() {
-        cache.insert(
-            project_root,
-            ModelCatalogCacheEntry {
-                stored_at: Instant::now(),
-                value: catalog.clone(),
-            },
-        );
-    }
+    insert_model_catalog_cache_if_current(project_root, request_generation, catalog.clone());
     Ok(catalog)
 }
 
@@ -1027,6 +1068,26 @@ fn model_with_capabilities(
 }
 
 fn openai_documented_capabilities(id: &str) -> (&'static str, &'static str, &'static str) {
+    let normalized = id.to_ascii_lowercase();
+    // /v1/modelsはtext/image能力を網羅的に広告しないため、既知の専用モデルだけを
+    // 明示的に除外する。未知の一般モデルをID名からverifiedへ推測してはいけない。
+    let specialized = normalized.contains("embedding")
+        || normalized.contains("moderation")
+        || normalized.contains("transcrib")
+        || normalized.contains("audio")
+        || normalized.contains("tts")
+        || normalized.starts_with("whisper")
+        || normalized.starts_with("dall-e")
+        || normalized.starts_with("gpt-image")
+        || normalized.contains("image-generation")
+        || normalized.contains("imagegen");
+    if specialized {
+        return (
+            "unsupported",
+            "unsupported",
+            "OpenAI model list indicates an embedding/audio/moderation/image-generation model",
+        );
+    }
     let documented_models = [
         "gpt-6-astra",
         "gpt-6.1-sol",
@@ -1070,6 +1131,29 @@ fn openai_documented_capabilities(id: &str) -> (&'static str, &'static str, &'st
         );
     }
     ("unknown", "unknown", "OpenAI models list has no modality metadata")
+}
+
+fn openai_advertised_reasoning_efforts(item: &Value) -> Option<Vec<Value>> {
+    let candidates = [
+        item.get("reasoning_efforts"),
+        item.get("supported_reasoning_efforts"),
+        item.get("reasoning_effort"),
+        item.get("capabilities")
+            .and_then(|capabilities| capabilities.get("reasoning_efforts")),
+        item.get("capabilities")
+            .and_then(|capabilities| capabilities.get("supported_reasoning_efforts")),
+        item.get("capabilities")
+            .and_then(|capabilities| capabilities.get("reasoning_effort")),
+    ];
+    candidates.into_iter().flatten().find_map(|value| {
+        let values = value.as_array()?;
+        let efforts: Vec<Value> = values
+            .iter()
+            .filter(|effort| effort.as_str().is_some_and(|value| !value.trim().is_empty()))
+            .cloned()
+            .collect();
+        (!efforts.is_empty()).then_some(efforts)
+    })
 }
 
 /// Codex CLI自身のモデルcache（`~/.codex/models_cache.json`）から、表示対象のモデルを読む。
@@ -1274,6 +1358,9 @@ fn fetch_openai_models(api_key: &str) -> Result<Vec<Value>, String> {
                 .get("shutdown_date")
                 .cloned()
                 .unwrap_or(Value::Null);
+            if let Some(efforts) = openai_advertised_reasoning_efforts(item) {
+                model["reasoning_efforts"] = Value::Array(efforts);
+            }
             models.push(model_with_capabilities(
                 model,
                 text_capability,
@@ -1576,8 +1663,16 @@ fn fetch_xai_models(api_key: &str) -> Result<Vec<Value>, String> {
         let input_has = |name: &str| {
             inputs.is_some_and(|values| values.iter().any(|value| value.as_str() == Some(name)))
         };
-        let text = if input_has("text") { "verified" } else { "unsupported" };
-        let image = if input_has("image") { "verified" } else { "unsupported" };
+        let text = match inputs {
+            None => "unknown",
+            Some(_) if input_has("text") => "verified",
+            Some(_) => "unsupported",
+        };
+        let image = match inputs {
+            None => "unknown",
+            Some(_) if input_has("image") => "verified",
+            Some(_) => "unsupported",
+        };
         let mut model = model_json(id, id, "xai", "provider-api", "API取得");
         model["input_modalities"] = inputs.cloned().map(Value::Array).unwrap_or(Value::Null);
         model["output_modalities"] = outputs.cloned().map(Value::Array).unwrap_or(Value::Null);
@@ -12814,6 +12909,7 @@ fn get_local_ip() -> Result<Value, String> {
 struct EnvKeys {
     openai_api_key: String,
     gemini_api_key: String,
+    anthropic_api_key: String,
     xai_api_key: String,
 }
 
@@ -12824,6 +12920,7 @@ fn load_env_keys(project_root: String) -> Result<EnvKeys, String> {
     let mut keys = EnvKeys {
         openai_api_key: String::new(),
         gemini_api_key: String::new(),
+        anthropic_api_key: String::new(),
         xai_api_key: String::new(),
     };
     if !path.exists() {
@@ -12842,6 +12939,7 @@ fn load_env_keys(project_root: String) -> Result<EnvKeys, String> {
             match k {
                 "OPENAI_API_KEY" => keys.openai_api_key = v.to_string(),
                 "GEMINI_API_KEY" => keys.gemini_api_key = v.to_string(),
+                "ANTHROPIC_API_KEY" => keys.anthropic_api_key = v.to_string(),
                 "XAI_API_KEY" => keys.xai_api_key = v.to_string(),
                 _ => {}
             }
@@ -12900,11 +12998,17 @@ fn split_env_line_ending(segment: &str) -> (&str, &str) {
 /// 改行形式を保つ。管理対象キーの重複行は最初の1行だけを採用し、空にされたキーは
 /// すべての既存行を削除する。
 fn update_env_contents(existing: &str, keys: &EnvKeys) -> String {
-    const KNOWN: [&str; 3] = ["OPENAI_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY"];
+    const KNOWN: [&str; 4] = [
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "XAI_API_KEY",
+    ];
 
     let values = [
         keys.openai_api_key.as_str(),
         keys.gemini_api_key.as_str(),
+        keys.anthropic_api_key.as_str(),
         keys.xai_api_key.as_str(),
     ];
     let configured = values.map(|value| !value.trim().is_empty());
@@ -12922,7 +13026,7 @@ fn update_env_contents(existing: &str, keys: &EnvKeys) -> String {
     };
 
     let mut output = String::with_capacity(existing.len() + 128);
-    let mut seen = [false; 3];
+    let mut seen = [false; 4];
 
     // 行末のバイト列を含めたまま走査する。これにより未知キー、コメント、空行、
     // CRLF/LF/CRなどを再構成せず、そのまま保存できる。
@@ -13027,30 +13131,31 @@ mod env_key_tests {
         ))
     }
 
-    fn keys(openai: &str, gemini: &str, xai: &str) -> EnvKeys {
+    fn keys(openai: &str, gemini: &str, anthropic: &str, xai: &str) -> EnvKeys {
         EnvKeys {
             openai_api_key: openai.to_string(),
             gemini_api_key: gemini.to_string(),
+            anthropic_api_key: anthropic.to_string(),
             xai_api_key: xai.to_string(),
         }
     }
 
     #[test]
     fn absent_file_with_empty_values_stays_empty() {
-        assert_eq!(update_env_contents("", &keys("", "", "")), "");
+        assert_eq!(update_env_contents("", &keys("", "", "", "")), "");
     }
 
     #[test]
     fn clearing_existing_nonempty_assignment_removes_it() {
         let existing = "# keep this comment\nOPENAI_API_KEY=old-value\nOTHER=value\n";
-        let updated = update_env_contents(existing, &keys("", "", ""));
+        let updated = update_env_contents(existing, &keys("", "", "", ""));
         assert_eq!(updated, "# keep this comment\nOTHER=value\n");
     }
 
     #[test]
     fn whitespace_only_values_are_not_serialized() {
         let existing = "OPENAI_API_KEY=old\nGEMINI_API_KEY=\t\nXAI_API_KEY=   \n";
-        let updated = update_env_contents(existing, &keys(" \t ", "\t", "\n"));
+        let updated = update_env_contents(existing, &keys(" \t ", "\t", "", "\n"));
         assert_eq!(updated, "");
         assert!(!updated.contains("OPENAI_API_KEY="));
         assert!(!updated.contains("GEMINI_API_KEY="));
@@ -13060,7 +13165,7 @@ mod env_key_tests {
     #[test]
     fn nonempty_values_are_written_once_and_keep_input_bytes() {
         let existing = "OPENAI_API_KEY=old\nOPENAI_API_KEY=duplicate\n# marker\n";
-        let updated = update_env_contents(existing, &keys("  new-value  ", "", ""));
+        let updated = update_env_contents(existing, &keys("  new-value  ", "", "", ""));
         assert_eq!(updated.matches("OPENAI_API_KEY=").count(), 1);
         assert!(updated.contains("OPENAI_API_KEY=  new-value  \n"));
         assert!(updated.contains("# marker\n"));
@@ -13069,35 +13174,35 @@ mod env_key_tests {
     #[test]
     fn comments_unknown_lines_and_original_nonempty_bytes_are_preserved() {
         let existing = "# heading\r\nOTHER = keep-me\r\nOPENAI_API_KEY =  old-value  \r\n";
-        let updated = update_env_contents(existing, &keys("  old-value  ", "", ""));
+        let updated = update_env_contents(existing, &keys("  old-value  ", "", "", ""));
         assert_eq!(updated, existing);
     }
 
     #[test]
     fn nonempty_payload_rewrites_when_original_value_bytes_differ() {
         let existing = "OPENAI_API_KEY= old-value \n";
-        let updated = update_env_contents(existing, &keys("old-value", "", ""));
+        let updated = update_env_contents(existing, &keys("old-value", "", "", ""));
         assert_eq!(updated, "OPENAI_API_KEY=old-value\n");
     }
 
     #[test]
     fn lone_cr_update_preserves_unknown_and_comment_bytes() {
         let existing = "# heading\rUNKNOWN=keep\rOPENAI_API_KEY=old\r";
-        let updated = update_env_contents(existing, &keys("new", "", ""));
+        let updated = update_env_contents(existing, &keys("new", "", "", ""));
         assert_eq!(updated, "# heading\rUNKNOWN=keep\rOPENAI_API_KEY=new\r");
     }
 
     #[test]
     fn lone_cr_clear_removes_only_managed_assignment() {
         let existing = "# heading\rOPENAI_API_KEY=old\rUNKNOWN=keep\r";
-        let updated = update_env_contents(existing, &keys("", "", ""));
+        let updated = update_env_contents(existing, &keys("", "", "", ""));
         assert_eq!(updated, "# heading\rUNKNOWN=keep\r");
     }
 
     #[test]
     fn lone_cr_repeated_save_cycles_are_idempotent() {
         let existing = "# heading\rUNKNOWN=keep\r";
-        let configured = keys("new", "new-gemini", "");
+        let configured = keys("new", "new-gemini", "", "");
         let first = update_env_contents(existing, &configured);
         let second = update_env_contents(&first, &configured);
         assert_eq!(second, first);
@@ -13123,13 +13228,13 @@ mod env_key_tests {
             Some("keep")
         );
 
-        save_env_keys(root_text.clone(), keys("new", "", "")).unwrap();
+        save_env_keys(root_text.clone(), keys("new", "", "", "")).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "# heading\rOPENAI_API_KEY=new\rUNKNOWN=keep\r"
         );
         let repeated = fs::read_to_string(&path).unwrap();
-        save_env_keys(root_text, keys("new", "", "")).unwrap();
+        save_env_keys(root_text, keys("new", "", "", "")).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), repeated);
         let _ = fs::remove_dir_all(root);
     }
@@ -13137,12 +13242,34 @@ mod env_key_tests {
     #[test]
     fn repeated_save_cycles_are_idempotent() {
         let existing = "# heading\nOTHER=keep\n";
-        let configured = keys("new-openai", "new-gemini", "");
+        let configured = keys("new-openai", "new-gemini", "", "");
         let first = update_env_contents(existing, &configured);
         let second = update_env_contents(&first, &configured);
         let third = update_env_contents(&second, &configured);
         assert_eq!(second, first);
         assert_eq!(third, second);
+    }
+
+    #[test]
+    fn anthropic_key_is_loaded_and_serialized_without_exposing_other_values() {
+        let existing = "# keep\nANTHROPIC_API_KEY=old-anthropic\nOTHER=value\n";
+        let loaded_root = temp_root("anthropic");
+        fs::create_dir_all(&loaded_root).unwrap();
+        let path = loaded_root.join(".env");
+        fs::write(&path, existing).unwrap();
+        let root_text = loaded_root.to_string_lossy().to_string();
+        let loaded = load_env_keys(root_text.clone()).unwrap();
+        assert_eq!(loaded.anthropic_api_key, "old-anthropic");
+
+        save_env_keys(
+            root_text,
+            keys("new-openai", "", "new-anthropic", ""),
+        )
+        .unwrap();
+        let updated = fs::read_to_string(path).unwrap();
+        assert!(updated.contains("ANTHROPIC_API_KEY=new-anthropic"));
+        assert!(updated.contains("OTHER=value"));
+        let _ = fs::remove_dir_all(loaded_root);
     }
 }
 
@@ -13739,8 +13866,11 @@ claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n";
 mod provider_model_catalog_tests {
     use super::{
         api_catalog_error, append_stale_cached_models, gemini_documented_capabilities,
-        model_catalog_cache, save_env_keys, EnvKeys, ModelCatalogCacheEntry,
-        next_anthropic_page_id, next_gemini_page_token, openai_documented_capabilities,
+        insert_model_catalog_cache_if_current, invalidate_model_catalog_cache,
+        model_catalog_cache, model_catalog_cache_generation, save_env_keys, EnvKeys,
+        ModelCatalogCacheEntry,
+        next_anthropic_page_id, next_gemini_page_token, openai_advertised_reasoning_efforts,
+        openai_documented_capabilities,
     };
     use serde_json::{json, Value};
     use std::collections::HashSet;
@@ -13770,6 +13900,7 @@ mod provider_model_catalog_tests {
             EnvKeys {
                 openai_api_key: "new-fixture".to_string(),
                 gemini_api_key: String::new(),
+                anthropic_api_key: String::new(),
                 xai_api_key: String::new(),
             },
         )
@@ -13783,6 +13914,32 @@ mod provider_model_catalog_tests {
     }
 
     #[test]
+    fn invalidated_catalog_generation_rejects_old_fetch_cache_insert() {
+        let project_root = format!(
+            "cache-generation-test-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        );
+        let request_generation = model_catalog_cache_generation(&project_root);
+        insert_model_catalog_cache_if_current(
+            project_root.clone(),
+            request_generation,
+            json!({"source":"old-fetch"}),
+        );
+        assert!(model_catalog_cache().lock().unwrap().contains_key(&project_root));
+
+        invalidate_model_catalog_cache(&project_root);
+        let current_generation = model_catalog_cache_generation(&project_root);
+        assert_ne!(current_generation, request_generation);
+        insert_model_catalog_cache_if_current(
+            project_root.clone(),
+            request_generation,
+            json!({"source":"late-old-fetch"}),
+        );
+        assert!(!model_catalog_cache().lock().unwrap().contains_key(&project_root));
+    }
+
+    #[test]
     fn documented_provider_capabilities_do_not_guess_unknown_openai_models() {
         assert_eq!(
             openai_documented_capabilities("gpt-5.6-luna"),
@@ -13790,7 +13947,38 @@ mod provider_model_catalog_tests {
         );
         assert_eq!(
             openai_documented_capabilities("gpt-live-transcribe"),
+            (
+                "unsupported",
+                "unsupported",
+                "OpenAI model list indicates an embedding/audio/moderation/image-generation model"
+            )
+        );
+        assert_eq!(
+            openai_documented_capabilities("text-embedding-4"),
+            (
+                "unsupported",
+                "unsupported",
+                "OpenAI model list indicates an embedding/audio/moderation/image-generation model"
+            )
+        );
+        assert_eq!(
+            openai_documented_capabilities("gpt-new-live"),
             ("unknown", "unknown", "OpenAI models list has no modality metadata")
+        );
+    }
+
+    #[test]
+    fn openai_effort_metadata_is_only_copied_when_explicitly_advertised() {
+        assert_eq!(
+            openai_advertised_reasoning_efforts(&json!({
+                "id": "gpt-new-live",
+                "capabilities": {"reasoning_efforts": ["low", "high"]}
+            })),
+            Some(vec![json!("low"), json!("high")])
+        );
+        assert_eq!(
+            openai_advertised_reasoning_efforts(&json!({"id": "gpt-new-live"})),
+            None
         );
     }
 

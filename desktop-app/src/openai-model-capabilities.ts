@@ -37,6 +37,9 @@ export const OPENAI_REASONING_EFFORTS = [
   "xhigh",
 ];
 
+/** APIのeffort metadataがない未知IDは、明示指定なしでプロバイダー既定へ委ねる。 */
+export const OPENAI_API_DEFAULT_REASONING_EFFORTS = ["none"] as const;
+
 const OPENAI_LATEST_REASONING_EFFORTS = [
   "none",
   "low",
@@ -82,17 +85,20 @@ export function openAiEffortsForModel(modelId: string): string[] {
     return ["high"];
   }
 
-  if (normalized.startsWith("gpt-5.2")) {
+  if (normalized === "gpt-5.2") {
     return [...OPENAI_LATEST_REASONING_EFFORTS];
   }
 
-  if (normalized.startsWith("gpt-5.1")) {
+  if (normalized === "gpt-5.1") {
     return [...OPENAI_51_REASONING_EFFORTS];
   }
 
-  if (normalized.startsWith("gpt-5")) {
+  if (normalized === "gpt-5") {
     return [...OPENAI_PRE_51_REASONING_EFFORTS];
   }
 
-  return [...OPENAI_REASONING_EFFORTS];
+  // /v1/modelsがreasoning effortを広告しない未知IDへ、既知モデル由来の
+  // medium/high等を推測して送らない。Python側ではnoneをAPI既定（省略）へ
+  // 解釈するため、UI上も指定なしを唯一の候補として保持する。
+  return [...OPENAI_API_DEFAULT_REASONING_EFFORTS];
 }

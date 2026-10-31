@@ -1,8 +1,11 @@
 /** X (Twitter) の「おしながき」投稿をGrok APIで検索する。 */
-import { getApiKey, isGrokEnabled } from "../settings-store";
+import {
+  getApiKey,
+  getGrokSearchModelSelection,
+  isGrokEnabled,
+} from "../settings-store";
+import { LlmClient } from "./llm-client";
 import { extractXScreenName, normalizeXPostUrl } from "./url-validation";
-
-const GROK_ENDPOINT = "https://api.x.ai/v1/chat/completions";
 
 export interface OshinagakiResult {
   tweetUrl: string | null;
@@ -91,32 +94,15 @@ export async function fetchOshinagaki(
 JSONのみを返してください。`;
 
   try {
-    const res = await fetch(GROK_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "grok-2-latest",
-        messages: [
-          { role: "system", content: "常にJSON形式で回答してください。" },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.2,
-      }),
+    // 設定済みのGrok候補をprovider付きで渡し、同名IDでもOpenAI endpointへ
+    // 誤送信しない。設定値が未選択ならstore側の互換defaultを使う。
+    const model = await getGrokSearchModelSelection();
+    const llm = new LlmClient(model);
+    const content = await llm.extractData(prompt, {
+      temperature: 0.2,
+      reasoningEffort: "none",
     });
-    if (!res.ok) {
-      const detail = (await res.text().catch(() => "")).slice(0, 160).trim();
-      return {
-        status: "error",
-        reason: `Grok API HTTP ${res.status}${detail ? `: ${detail}` : ""}`,
-      };
-    }
-    const data = await res.json();
-    const content = data?.choices?.[0]?.message?.content ?? "";
-    if (!content) return { status: "error", reason: "Grok APIの応答本文が空です" };
-    const parsed = JSON.parse(stripFences(String(content).trim()));
+    const parsed = JSON.parse(stripFences(content));
     if (parsed.tweet_url === null || parsed.tweet_url === undefined || parsed.tweet_url === "") {
       return { status: "not_found" };
     }
@@ -145,10 +131,10 @@ JSONのみを返してください。`;
         rawText: typeof parsed.raw_text === "string" ? parsed.raw_text : null,
       },
     };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    console.warn("Grok検索失敗:", circleName, reason);
-    return { status: "error", reason: `Grok検索失敗: ${reason}` };
+  } catch {
+    // 応答本文・認証情報を理由やログへ流さない。
+    console.warn("Grok検索失敗:", circleName);
+    return { status: "error", reason: "Grok APIでおしながき検索に失敗しました" };
   }
 }
 

@@ -8,6 +8,7 @@ from src.adapters.learned_pattern_adapter import LearnedPatternAdapter
 from src.models import SiteConfig, SiteType
 from src.models.config import SiteParsingConfig
 from src.utils.grok_build import GrokBuildError
+from main import CircleListGenerator
 
 
 class PatternManager:
@@ -142,3 +143,26 @@ def test_unknown_delivery_on_candidate_table_stops_without_text_retry(monkeypatc
 
     assert adapter.extract_circles(BeautifulSoup(html, "html.parser")) == []
     assert calls == ["site_structure"]
+
+
+def test_new_structure_role_without_fallback_does_not_inherit_text_role():
+    generator = object.__new__(CircleListGenerator)
+    generator.config = {
+        "url": "https://example.com/event",
+        "models": ["post-model"],
+        "text_llm_provider": "api:openai",
+        "api_reasoning_effort": "high",
+        "site_parsing": {
+            "provider": "api:openai",
+            "model": "structure-model",
+            "effort": "low",
+        },
+    }
+    generator.logger = type("Logger", (), {"info": lambda *_args, **_kwargs: None})()
+
+    config = generator._create_site_config()
+
+    assert config.site_parsing_config is not None
+    assert config.site_parsing_config.fallback_provider is None
+    assert config.site_parsing_config.fallback_model is None
+    assert config.site_parsing_config.fallback_effort is None

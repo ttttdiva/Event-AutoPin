@@ -17,10 +17,14 @@ import {
   deleteItemSearchIndexForCircle,
   invalidatePurchaseLookupCache,
 } from "../database";
-import { getApiKey, isGrokEnabled } from "../settings-store";
+import {
+  getApiKey,
+  getGrokSearchModelSelection,
+  isGrokEnabled,
+} from "../settings-store";
 import { downloadImage, guessExt } from "./image-downloader";
+import { LlmClient } from "./llm-client";
 
-const GROK_ENDPOINT = "https://api.x.ai/v1/chat/completions";
 const KEEP_AWAKE_TAG = "post-reprocess";
 const POST_URL_RE = /(?:twitter\.com|x\.com)\/[^/]+\/status(?:es)?\/(\d+)/i;
 
@@ -112,7 +116,7 @@ export async function reprocessCircleFromPost(
   await activateKeepAwakeAsync(KEEP_AWAKE_TAG);
   try {
     onProgress?.({ phase: "fetch", message: "Grokで投稿を解析中..." });
-    const grokResult = await fetchPostWithGrok(apiKey, postUrl);
+    const grokResult = await fetchPostWithGrok(postUrl);
     if (!grokResult) {
       return {
         success: false,
@@ -327,7 +331,6 @@ interface GrokPostResult {
 
 /** Grokに特定ポストURLを渡して画像URL・頒布物を抽出 */
 async function fetchPostWithGrok(
-  apiKey: string,
   postUrl: string,
 ): Promise<GrokPostResult | null> {
   const prompt = `次のXポストを確認し、そこに含まれる「おしながき」画像URLと、頒布物一覧を抽出してください。
@@ -346,33 +349,20 @@ type は次のいずれかを使ってください: 新刊(漫画), 新刊(イ�
 JSONのみを返してください。`;
 
   try {
-    const body = {
-      model: "grok-2-latest",
-      messages: [
-        { role: "system", content: "常にJSON形式で回答してください。" },
-        { role: "user", content: prompt },
-      ],
+    const model = await getGrokSearchModelSelection();
+    const llm = new LlmClient(model);
+    const content = await llm.extractData(prompt, {
       temperature: 0.2,
-    };
-    const res = await fetch(GROK_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
+      reasoningEffort: "none",
     });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const content = data?.choices?.[0]?.message?.content ?? "";
-    if (!content) return null;
-    const parsed = JSON.parse(stripFences(String(content).trim()));
+    const parsed = JSON.parse(stripFences(content));
     return {
       imageUrls: Array.isArray(parsed.image_urls) ? parsed.image_urls : [],
       items: Array.isArray(parsed.items) ? parsed.items : [],
     };
-  } catch (e) {
-    console.warn("Grokポスト解析失敗:", postUrl, e);
+  } catch {
+    // ポスト本文・API応答・秘密値をログへ出さない。
+    console.warn("Grokポスト解析失敗");
     return null;
   }
 }

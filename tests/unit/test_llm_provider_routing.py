@@ -23,6 +23,42 @@ def test_xai_model_uses_xai_key_and_openai_compatible_endpoint(monkeypatch):
     assert client.clients[0]["api_type"] == "xai"
 
 
+def test_xai_arbitrary_model_stays_chat_and_does_not_receive_openai_effort(monkeypatch):
+    from types import SimpleNamespace
+
+    captured = {"client": {}, "calls": []}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured["calls"].append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'))],
+                usage=None,
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured["client"].update(kwargs)
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        def with_options(self, **_kwargs):
+            return self
+
+    monkeypatch.setenv("XAI_API_KEY", "dummy-key-xai")
+    monkeypatch.setattr(llm_client, "OpenAI", FakeOpenAI)
+    client = llm_client.LLMClient(
+        model="latest-generative",
+        reasoning_effort="max",
+        api_provider_map={"latest-generative": "xai"},
+    )
+
+    assert client.extract_data("fixture prompt") == '{"ok":true}'
+    assert captured["client"]["base_url"] == "https://api.x.ai/v1"
+    assert len(captured["calls"]) == 1
+    assert captured["calls"][0]["model"] == "latest-generative"
+    assert "reasoning_effort" not in captured["calls"][0]
+
+
 def test_llm_client_passes_explicit_api_retry_limit_to_openai(monkeypatch):
     from types import SimpleNamespace
 

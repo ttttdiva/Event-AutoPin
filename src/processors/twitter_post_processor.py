@@ -94,6 +94,21 @@ def _safe_catalog_status(circle: Circle) -> str:
 logger = setup_logger(__name__)
 
 
+def _fallback_enabled(config_dict: Dict[str, Any], key: str) -> bool:
+    """既存設定を保ったまま、実行payloadの明示Falseだけを無効にする。"""
+
+    value = config_dict.get(key, True)
+    return True if value is None else bool(value)
+
+
+def _supports_joint_attempt(attempt: Dict[str, Any]) -> bool:
+    """本文+全画像を1回で送れるjoint方式の候補か判定する。"""
+
+    if attempt.get("kind") == "api":
+        return True
+    return attempt.get("kind") == "cli" and str(attempt.get("provider", "")).lower() == "grok"
+
+
 def _call_with_optional_deadline(
     callable_obj: Any,
     *args: Any,
@@ -234,6 +249,14 @@ class TwitterConfig:
         self.text_fallback_llm_effort = (
             config_dict.get('text_fallback_llm_effort') or DEFAULT_TEXT_FALLBACK_EFFORT
         )
+        # 未指定は旧挙動（有効）だが、preflightが実行payloadへ書いたFalseは
+        # 保存設定や既定値で上書きしない。
+        self.text_fallback_llm_enabled = _fallback_enabled(
+            config_dict, 'text_fallback_llm_enabled'
+        )
+        self.image_fallback_llm_enabled = _fallback_enabled(
+            config_dict, 'image_fallback_llm_enabled'
+        )
         text_cli_providers = (
             [text_provider]
             if text_provider and text_provider != 'api'
@@ -300,18 +323,34 @@ class TwitterPostProcessor:
             if not isinstance(post_cli_efforts, dict):
                 post_cli_efforts = config.text_llm_cli_efforts
             post_effort = role.get('effort') or config.api_reasoning_effort
+
+            # 旧role設定はimage fallbackを継承する。fallback_enabledはroleの
+            # 明示値を最優先し、旧roleで未設定の場合だけimage flagへ戻す。
+            post_fallback_enabled = role.get(
+                'fallback_enabled', config.image_fallback_llm_enabled
+            )
+            if post_fallback_enabled is None:
+                post_fallback_enabled = config.image_fallback_llm_enabled
+            post_fallback_provider = role.get('fallback_provider') or config.image_fallback_llm_provider
+            post_fallback_model = role.get('fallback_model') or config.image_fallback_llm_model
+            post_fallback_effort = role.get('fallback_effort') or config.image_fallback_llm_effort
             text_attempts = build_text_llm_attempts(
                 post_provider,
                 post_model,
                 post_cli_models,
                 post_cli_efforts,
+                post_fallback_provider,
+                post_fallback_model,
+                post_fallback_effort,
                 primary_effort=post_effort,
+                fallback_enabled=post_fallback_enabled,
             )
-            post_cli_providers = (
-                [post_provider.split(':', 1)[1]]
-                if isinstance(post_provider, str) and post_provider.startswith('cli:')
-                else []
-            )
+            # CLI候補はprimary/fallbackの保存順をそのまま候補選別へ渡す。
+            post_cli_providers = []
+            for attempt in text_attempts:
+                provider = attempt.get('provider')
+                if attempt.get('kind') == 'cli' and provider and provider not in post_cli_providers:
+                    post_cli_providers.append(provider)
         else:
             post_cli_models = config.tweet_llm_cli_models
             post_cli_efforts = config.tweet_llm_cli_efforts
@@ -325,6 +364,16 @@ class TwitterPostProcessor:
                 config.text_fallback_llm_model,
                 config.text_fallback_llm_effort,
                 primary_effort=config.api_reasoning_effort,
+                fallback_enabled=config.text_fallback_llm_enabled,
+            )
+        if config.oshinagaki_post_role and (
+            not text_attempts or not _supports_joint_attempt(text_attempts[0])
+        ):
+            primary = text_attempts[0] if text_attempts else {}
+            raise ValueError(
+                'oshinagaki_postの主モデルは本文+全画像jointに非対応です '
+                f'(provider={primary.get("provider") or "未選択"}, '
+                f'model={primary.get("model") or "未選択"})'
             )
         self.twitter_extractor = TwitterExtractor(
             model=api_models_from_attempts(text_attempts),
@@ -346,23 +395,55 @@ class TwitterPostProcessor:
             config.image_fallback_llm_provider,
             config.image_fallback_llm_model,
             config.image_fallback_llm_effort,
+            config.image_fallback_llm_enabled,
         )
-        if config.direct_post_text_fallback_only:
-            # 単発のURL指定は取得済み画像を直接送れるAPIを優先する。
-            # ユーザー設定内のモデルだけを使い、APIが使えない場合はCLIへ戻る。
-            image_attempts.sort(key=lambda attempt: attempt.get("kind") != "api")
         has_image_cli = any(attempt.get("kind") == "cli" for attempt in image_attempts)
-        self.catalog_analyzer = CatalogImageAnalyzer(
-            model=api_models_from_attempts(image_attempts),
-            use_cli=has_image_cli,
-            api_reasoning_effort=config.image_llm_effort,
-            api_reasoning_effort_map=config.image_api_reasoning_effort_map,
-            attempts=image_attempts,
+        self._catalog_image_analyzer_kwargs = {
+            "model": api_models_from_attempts(image_attempts),
+            "use_cli": has_image_cli,
+            "api_reasoning_effort": config.image_llm_effort,
+            "api_reasoning_effort_map": config.image_api_reasoning_effort_map,
+            "attempts": image_attempts,
+        }
+        # modern post roleのjoint経路はvision設定を使わない。vision側の
+        # 認証欠落でpost解析開始自体を妨げないよう、必要時まで遅延する。
+        self.catalog_analyzer = (
+            None
+            if config.oshinagaki_post_role
+            else CatalogImageAnalyzer(**self._catalog_image_analyzer_kwargs)
         )
-        self.catalog_post_analyzer = (
-            CatalogPostAnalyzer(self.catalog_analyzer)
-            if CatalogPostAnalyzer.supports(image_attempts) else None
-        )
+        if config.oshinagaki_post_role:
+            # post専用roleがある場合、本文とjointは同じpost候補列を使う。
+            # 主候補が画像joint非対応CLIなら、保存値を別モデルへ変更せず、
+            # 利用者へ明確に設定不備を返す。fallbackだけが非対応なら、その
+            # 候補をjointから除外して対応可能な候補を順序どおり維持する。
+            joint_attempts = [
+                attempt for attempt in text_attempts if _supports_joint_attempt(attempt)
+            ]
+            self.catalog_post_unsupported_attempts = [
+                dict(attempt) for attempt in text_attempts if not _supports_joint_attempt(attempt)
+            ]
+            if self.catalog_post_unsupported_attempts:
+                logger.warning(
+                    'oshinagaki_postのjoint非対応fallbackを除外しました: %s',
+                    ', '.join(
+                        str(attempt.get('provider') or attempt.get('kind'))
+                        for attempt in self.catalog_post_unsupported_attempts
+                    ),
+                )
+            self.catalog_post_analyzer = CatalogPostAnalyzer(
+                self.catalog_analyzer, attempts=joint_attempts
+            ) if joint_attempts else None
+            if self.catalog_post_analyzer is not None:
+                self.catalog_post_analyzer.unsupported_attempts = list(
+                    self.catalog_post_unsupported_attempts
+                )
+        else:
+            self.catalog_post_unsupported_attempts = []
+            self.catalog_post_analyzer = (
+                CatalogPostAnalyzer(self.catalog_analyzer, attempts=image_attempts)
+                if CatalogPostAnalyzer.supports(image_attempts) else None
+            )
         self.output_path = Path(config.output_dir)
         self.output_path.mkdir(exist_ok=True)
         self._post_reprocess_cache: Dict[str, Dict[str, Any]] = {}
@@ -398,6 +479,15 @@ class TwitterPostProcessor:
                 logger.info("Grok search client initialized")
             except Exception as e:
                 logger.warning(f"Grok検索の初期化に失敗（twscrapeにフォールバック）: {e}")
+
+    def _ensure_catalog_analyzer(self) -> Any:
+        """Initialize legacy per-image vision analysis only when it is needed."""
+
+        if self.catalog_analyzer is None:
+            self.catalog_analyzer = CatalogImageAnalyzer(
+                **self._catalog_image_analyzer_kwargs
+            )
+        return self.catalog_analyzer
 
     def metadata_for_event_json(self) -> Dict[str, Any]:
         """event.json の metadata へ載せる、Xアカウント状態(空なら何も載せない)。"""
@@ -1614,17 +1704,18 @@ class TwitterPostProcessor:
             with trace_stage(run_id, "image.analysis", trace):
                 if deadline is not None:
                     deadline.require_time(stage="image.analysis")
+                catalog_analyzer = self._ensure_catalog_analyzer()
                 analysis_kwargs: Dict[str, Any] = {}
-                if post_text and supports_keyword(self.catalog_analyzer.analyze_catalog_result, "post_text"):
+                if post_text and supports_keyword(catalog_analyzer.analyze_catalog_result, "post_text"):
                     analysis_kwargs["post_text"] = post_text
-                if supports_keyword(self.catalog_analyzer.analyze_catalog_result, "verification_mode"):
+                if supports_keyword(catalog_analyzer.analyze_catalog_result, "verification_mode"):
                     analysis_kwargs["verification_mode"] = getattr(
                         self.config, "catalog_verification_mode", "full",
                     )
                 analysis = await _run_in_executor_with_optional_deadline(
                     loop,
                     lambda: _call_with_optional_deadline(
-                        self.catalog_analyzer.analyze_catalog_result,
+                        catalog_analyzer.analyze_catalog_result,
                         Path(image_path),
                         run_id=run_id,
                         trace=trace,

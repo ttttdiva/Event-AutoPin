@@ -21,6 +21,22 @@ function ResolveRoot([string]$Path, [string]$Label) {
     return [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).Path).TrimEnd('\', '/')
 }
 
+function GitRoot([string]$Path, [string]$Label) {
+    $root = ResolveRoot $Path $Label
+    try {
+        $reported = ([string](Run git @('-C', $root, 'rev-parse', '--show-toplevel') |
+            Select-Object -First 1)).Trim()
+        if (-not $reported) { throw 'empty Git top-level path' }
+        $gitRoot = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $reported).Path).TrimEnd('\', '/')
+    } catch {
+        throw "$Label must be a Git working-tree root: $root"
+    }
+    if (-not $gitRoot.Equals($root, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label must be the Git working-tree root: $root"
+    }
+    return $root
+}
+
 function GitText([string]$Repository, [string]$Revision, [string]$Path) {
     return (Run git @('-C', $Repository, 'show', "${Revision}:$Path")) -join "`n"
 }
@@ -82,8 +98,7 @@ function ComparePublicDesktop([string]$Source, [string]$Public, [string]$Revisio
 }
 
 try {
-    $source = ResolveRoot $SourceRoot 'SourceRoot'
-    if (-not (Test-Path -LiteralPath (Join-Path $source '.git'))) { throw 'SourceRoot must be a Git working tree.' }
+    $source = GitRoot $SourceRoot 'SourceRoot'
     if (-not $Base) { $Base = DefaultBase $source }
 
     $changed = @(Run git @('-C', $source, '-c', 'core.quotePath=false', 'diff', '--name-only', "$Base..$Target")) |
@@ -114,8 +129,7 @@ try {
     $releaseTag = "desktop-v$sourcePackageVersion"
     $expectedAsset = 'EventAutoPin.exe'
     if ($PublicRoot) {
-        $public = ResolveRoot $PublicRoot 'PublicRoot'
-        if (-not (Test-Path -LiteralPath (Join-Path $public '.git'))) { throw 'PublicRoot must be a Git working tree.' }
+        $public = GitRoot $PublicRoot 'PublicRoot'
         $expectedRemote = "https://github.com/$PublicRepository.git"
         $publicRemote = ([string](Run git @('-C', $public, 'remote', 'get-url', 'origin') | Select-Object -First 1)).Trim()
         if ($publicRemote -ne $expectedRemote) {

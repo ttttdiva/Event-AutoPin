@@ -65,6 +65,39 @@ def extract_event_keywords_from_text(event_info: str) -> List[str]:
 class LLMClient:
     """LLM APIクライアント（複数モデルのフォールバック対応）"""
 
+    # Responses APIをまだ提供していない既知のChat Completions専用モデル
+    # だけをここに限定する。APIのモデル一覧に現れた新しいOpenAI生成
+    # モデルは、個別IDをこの集合へ追加しなくてもResponses APIへ進める。
+    # GPT-5.6系は既知のResponsesモデルなので、下記のlegacy判定より先に
+    # _is_gpt56_general_model()で扱う。
+    _OPENAI_LEGACY_CHAT_MODEL_IDS = frozenset(
+        {
+            "gpt-3.5-turbo",
+            "gpt-3.5-turbo-0125",
+            "gpt-3.5-turbo-1106",
+            "gpt-3.5-turbo-0613",
+            "gpt-3.5-turbo-16k",
+            "gpt-3.5-turbo-16k-0613",
+            "gpt-4",
+            "gpt-4-0314",
+            "gpt-4-0613",
+            "gpt-4-32k",
+            "gpt-4-32k-0314",
+            "gpt-4-32k-0613",
+            "gpt-4-1106-preview",
+            "gpt-4-0125-preview",
+            "gpt-4-turbo",
+            "gpt-4-turbo-preview",
+            "gpt-4o",
+            "gpt-4o-2024-05-13",
+            "gpt-4o-2024-08-06",
+            "gpt-4o-2024-11-20",
+            "gpt-4o-mini",
+            "gpt-4o-mini-2024-07-18",
+            "chatgpt-4o-latest",
+        }
+    )
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -147,16 +180,7 @@ class LLMClient:
         api_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """個別のクライアントを初期化"""
-        provider = (self.api_provider_map.get(model_name) or "").strip().lower()
-        if not provider:
-            if model_name.startswith("gemini"):
-                provider = "gemini"
-            elif model_name.startswith("claude-"):
-                provider = "anthropic"
-            elif model_name.startswith("grok-"):
-                provider = "xai"
-            else:
-                provider = "openai"
+        provider = self._provider_for_model(model_name)
 
         if provider == "gemini":
             # Gemini API
@@ -267,8 +291,78 @@ class LLMClient:
         except (ValueError, SyntaxError):
             return None
 
+    @staticmethod
+    def _normalize_provider_name(provider: Optional[str]) -> Optional[str]:
+        """設定値のprovider表記をAPI種別へ正規化する。"""
+
+        value = str(provider or "").strip().lower()
+        if value.startswith("api:"):
+            value = value.split(":", 1)[1]
+        if value == "":
+            return None
+        if value == "api":
+            return "openai"
+        if value.startswith("cli:"):
+            value = value.split(":", 1)[1]
+        return value or None
+
+    @classmethod
+    def _provider_from_model_name(cls, model_name: str) -> str:
+        normalized = str(model_name or "").strip().lower()
+        if normalized.startswith("gemini"):
+            return "gemini"
+        if normalized.startswith("claude-"):
+            return "anthropic"
+        if normalized.startswith("grok-"):
+            return "xai"
+        return "openai"
+
+    def _provider_for_model(
+        self, model_name: str, provider: Optional[str] = None
+    ) -> str:
+        """モデルに紐づく明示providerを優先し、未指定時だけIDから推測する。"""
+
+        normalized = self._normalize_provider_name(
+            provider if provider is not None else self.api_provider_map.get(model_name)
+        )
+        return normalized or self._provider_from_model_name(model_name)
+
+    @staticmethod
+    def _openai_reasoning_efforts_for(model_name: str) -> Optional[set]:
+        """Python側で能力を確認できるOpenAIモデルのeffort集合。
+
+        APIのモデル一覧がeffort metadataを返さない未知IDについてはNoneを
+        返す。未知モデルへ既知モデルのmedium等を推測して送らないための
+        境界であり、UIが明示した値を無条件に能力verifiedへ昇格させない。
+        """
+
+        normalized = str(model_name or "").strip().lower()
+        if LLMClient._is_gpt56_general_model(normalized):
+            return {"none", "low", "medium", "high", "xhigh", "max"}
+        if normalized == "gpt-5-pro" or normalized.startswith("gpt-5-pro-"):
+            return {"high"}
+        if normalized == "gpt-5.2" or normalized.startswith("gpt-5.2-"):
+            return {"low", "medium", "high", "xhigh"}
+        if normalized == "gpt-5.1" or normalized.startswith("gpt-5.1-"):
+            return {"low", "medium", "high"}
+        if (
+            normalized == "gpt-5"
+            or normalized.startswith("gpt-5-")
+            or any(
+                normalized == prefix or normalized.startswith(f"{prefix}-")
+                for prefix in ("gpt-5.3", "gpt-5.4", "gpt-5.5")
+            )
+        ):
+            return {"minimal", "low", "medium", "high"}
+        if normalized.startswith(("o1", "o3", "o4")):
+            return {"low", "medium", "high"}
+        return None
+
     def _api_reasoning_effort_for(
-        self, model_name: str, override: Optional[str] = None
+        self,
+        model_name: str,
+        override: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Optional[str]:
         effort = (
             override
@@ -278,12 +372,27 @@ class LLMClient:
         if not effort:
             return None
 
-        # GPT-5.6 Responses APIでは、明示的なnoneをmediumへフォールバック
-        # させず、そのままpayloadへ渡す。旧モデルのnoneは従来どおり省略する。
-        if effort == "none":
-            return "none" if self._is_gpt56_general_model(model_name) else None
+        # xAIはOpenAI互換のChat Completionsを使うが、OpenAIの
+        # reasoning_effort値をそのまま転送してはいけない。Geminiは下流の
+        # thinking configで専用変換するため、ここでは値を保持する。
+        provider_name = self._provider_for_model(model_name, provider)
+        if provider_name in {"xai", "anthropic"}:
+            return None
 
-        # xhigh/maxを含め、選択されたeffortは別の値へ変換せず維持する。
+        if provider_name == "openai":
+            supported = self._openai_reasoning_efforts_for(model_name)
+            if supported is None:
+                # 未知OpenAIモデルはAPI既定へ委ねる。noneもResponses APIの
+                # reasoningフィールドを省略するためのUI上の表現に過ぎない。
+                return None
+            if effort == "none":
+                # noneを明示的にAPIへ送る契約はGPT-5.6 Luna/Terra/Solだけ。
+                return "none" if self._is_gpt56_general_model(model_name) else None
+            if effort not in supported:
+                return None
+
+        # 選択されたeffortは、能力を確認できるモデルでは別の値へ変換せず
+        # 維持する。
         return effort
 
     def _openai_temperature_for(
@@ -318,8 +427,42 @@ class LLMClient:
         )
 
     @classmethod
-    def _uses_responses_api(cls, model_name: str) -> bool:
-        return cls._is_gpt56_general_model(model_name)
+    def _is_known_legacy_chat_model(cls, model_name: str) -> bool:
+        normalized = str(model_name or "").strip().lower()
+        if normalized in cls._OPENAI_LEGACY_CHAT_MODEL_IDS:
+            return True
+        if normalized.startswith(("gpt-3.5-turbo-", "gpt-4-", "gpt-4o-")):
+            return True
+        if normalized.startswith("chatgpt-4o-"):
+            return True
+        # 既存のPython経路でChat Completionsを使ってきた既知GPT-5系。
+        # 5.6系（および将来の5.6系新ID）はこの条件に含めず、Responsesへ
+        # 進める。5.7以降も個別ID追加なしで同じ新経路になる。
+        if re.match(
+            r"^gpt-5(?:$|-mini(?:-|$)|-pro(?:-|$)|\.(?:0|1|2|3|4|5)(?:-|$))",
+            normalized,
+        ):
+            return True
+        return normalized.startswith(("o1", "o3", "o4"))
+
+    @classmethod
+    def _uses_responses_api(
+        cls, model_name: str, provider: Optional[str] = None
+    ) -> bool:
+        """OpenAIの新規生成モデルはResponsesを優先する。
+
+        providerを指定できるが、呼び出し側が旧fixture互換の1引数helperを
+        持つ場合にも対応できるよう、通常のAPI callsiteではapi_typeで先に
+        providerを限定する。モデルIDのprefixだけでxAI等をResponsesへ強制
+        しないことが重要。
+        """
+
+        normalized_provider = cls._normalize_provider_name(provider)
+        if normalized_provider is None:
+            normalized_provider = cls._provider_from_model_name(model_name)
+        if normalized_provider != "openai":
+            return False
+        return not cls._is_known_legacy_chat_model(model_name)
 
     @staticmethod
     def _response_field(value: Any, name: str, default: Any = None) -> Any:
@@ -720,6 +863,7 @@ class LLMClient:
                 effective_reasoning_effort = self._api_reasoning_effort_for(
                     client_info["model"],
                     reasoning_effort,
+                    provider=client_info["api_type"],
                 )
 
                 cost_tracker = get_cost_tracker()
@@ -758,22 +902,27 @@ class LLMClient:
                             usage_metadata.get("input_tokens", 0),
                             usage_metadata.get("output_tokens", 0),
                         )
-                elif self._uses_responses_api(client_info["model"]):
+                elif (
+                    client_info["api_type"] == "openai"
+                    and self._uses_responses_api(client_info["model"])
+                ):
                     client = self._client_with_timeout(
                         client_info["client"],
                         effective_timeout,
                     )
-                    response = client.responses.create(
-                        model=client_info["model"],
-                        instructions=(
+                    responses_kwargs: Dict[str, Any] = {
+                        "model": client_info["model"],
+                        "instructions": (
                             "あなたはHTMLを解析してデータを抽出する専門家です。"
                             "常にJSON形式で回答してください。"
                         ),
-                        input=prompt,
-                        reasoning={
-                            "effort": effective_reasoning_effort or "medium"
-                        },
-                    )
+                        "input": prompt,
+                    }
+                    if effective_reasoning_effort is not None:
+                        responses_kwargs["reasoning"] = {
+                            "effort": effective_reasoning_effort
+                        }
+                    response = client.responses.create(**responses_kwargs)
                     content = self._responses_output_text(response)
                     usage = self._response_field(response, "usage")
                     if usage:
@@ -909,6 +1058,7 @@ HTML:
                 self.logger.info(f"モデル {client_info['model']} で画像解析を試行中...")
                 effective_reasoning_effort = self._api_reasoning_effort_for(
                     client_info["model"],
+                    provider=client_info["api_type"],
                 )
 
                 cost_tracker = get_cost_tracker()
@@ -975,16 +1125,19 @@ HTML:
                     # GPT-5-miniはtemperature=1のみサポート
                     model_name = model or client_info["model"]
 
-                    if self._uses_responses_api(model_name):
+                    if (
+                        client_info["api_type"] == "openai"
+                        and self._uses_responses_api(model_name)
+                    ):
                         mime_type = self._image_mime_type(image_path)
                         client = self._client_with_timeout(
                             client_info["client"],
                             effective_timeout,
                         )
-                        response = client.responses.create(
-                            model=model_name,
-                            instructions="画像を解析して、指定されたJSON形式で回答してください。",
-                            input=[
+                        responses_kwargs: Dict[str, Any] = {
+                            "model": model_name,
+                            "instructions": "画像を解析して、指定されたJSON形式で回答してください。",
+                            "input": [
                                 {
                                     "role": "user",
                                     "content": [
@@ -998,10 +1151,12 @@ HTML:
                                     ],
                                 }
                             ],
-                            reasoning={
-                                "effort": effective_reasoning_effort or "medium"
-                            },
-                        )
+                        }
+                        if effective_reasoning_effort is not None:
+                            responses_kwargs["reasoning"] = {
+                                "effort": effective_reasoning_effort
+                            }
+                        response = client.responses.create(**responses_kwargs)
                         content = self._responses_output_text(response)
                         usage = self._response_field(response, "usage")
                         if usage:

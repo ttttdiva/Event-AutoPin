@@ -65,6 +65,12 @@ export const MODEL_SETTING_KEY = "llm_primary_model";
 export const MODEL_FALLBACK_KEY = "llm_fallback_model";
 export const VISION_MODEL_KEY = "llm_vision_model";
 export const SITE_PARSING_MODEL_KEY = "llm_site_parsing_model";
+export const GROK_SEARCH_MODEL_KEY = "llm_grok_search_model";
+/** モデル ID と別 SQLite キーに provider を保存し、同名 ID の取り違えを防ぐ。 */
+export const MODEL_PROVIDER_KEY = "llm_primary_model_provider";
+export const MODEL_FALLBACK_PROVIDER_KEY = "llm_fallback_model_provider";
+export const VISION_MODEL_PROVIDER_KEY = "llm_vision_model_provider";
+export const SITE_PARSING_MODEL_PROVIDER_KEY = "llm_site_parsing_model_provider";
 export const TEXT_REASONING_EFFORT_KEY = "llm_text_reasoning_effort";
 export const VISION_REASONING_EFFORT_KEY = "llm_vision_reasoning_effort";
 export const SITE_PARSING_REASONING_EFFORT_KEY =
@@ -81,6 +87,7 @@ export const DEFAULT_PRIMARY_MODEL = "gpt-5.6-sol";
 export const DEFAULT_FALLBACK_MODEL = "gpt-5-mini";
 export const DEFAULT_VISION_MODEL = "gemini-3-flash-preview";
 export const DEFAULT_SITE_PARSING_MODEL = "gpt-5.6-sol";
+export const DEFAULT_GROK_SEARCH_MODEL = "grok-2-latest";
 export const DEFAULT_REASONING_EFFORT = "medium";
 
 export type ReasoningEffort =
@@ -89,7 +96,8 @@ export type ReasoningEffort =
   | "low"
   | "medium"
   | "high"
-  | "xhigh";
+  | "xhigh"
+  | "max";
 
 export interface ReasoningEffortChoice {
   id: ReasoningEffort;
@@ -128,6 +136,11 @@ export const REASONING_EFFORT_OPTIONS: ReasoningEffortChoice[] = [
     label: "xhigh",
     description: "最大寄り",
   },
+  {
+    id: "max",
+    label: "max",
+    description: "最大",
+  },
 ];
 
 export interface ModelChoice {
@@ -135,6 +148,12 @@ export interface ModelChoice {
   label: string;
   provider: ApiKeyProvider;
   vision: boolean;
+}
+
+/** 保存済みモデル。provider を必ず解決した状態で各 client へ渡す。 */
+export interface SavedModelSelection {
+  id: string;
+  apiType: ApiKeyProvider;
 }
 
 /** 選択可能モデル一覧 */
@@ -177,36 +196,164 @@ export const AVAILABLE_MODELS: ModelChoice[] = [
   },
 ];
 
-export async function getPrimaryModel(): Promise<string> {
-  return (await getSetting(MODEL_SETTING_KEY)) ?? DEFAULT_PRIMARY_MODEL;
+function normalizeApiKeyProvider(value: string | null): ApiKeyProvider | null {
+  if (value === "openai" || value === "gemini" || value === "xai") return value;
+  return null;
 }
 
-export async function setPrimaryModel(model: string): Promise<void> {
-  await setSetting(MODEL_SETTING_KEY, model);
+/** 旧バージョンの ID-only 設定を壊さずに provider へ移行する。 */
+export function inferApiKeyProvider(modelId: string): ApiKeyProvider {
+  const normalized = modelId.trim().toLowerCase();
+  if (normalized.startsWith("gemini")) return "gemini";
+  if (normalized.startsWith("grok")) return "xai";
+  return "openai";
+}
+
+interface ModelSettingDefinition {
+  modelKey: string;
+  providerKey: string;
+  defaultId: string;
+  defaultProvider: ApiKeyProvider;
+}
+
+async function getSavedModelSelection(
+  definition: ModelSettingDefinition,
+): Promise<SavedModelSelection> {
+  const [storedId, storedProvider] = await Promise.all([
+    getSetting(definition.modelKey),
+    getSetting(definition.providerKey),
+  ]);
+  const id = storedId?.trim() || definition.defaultId;
+  // 明示 provider を ID の接頭辞推測より常に優先する。
+  const apiType =
+    normalizeApiKeyProvider(storedProvider) ??
+    (storedId ? inferApiKeyProvider(id) : definition.defaultProvider);
+  // provider 列がない旧データだけ別キーへ移行する。ID/effort/API key は変更しない。
+  if (!storedProvider) {
+    try {
+      await setSetting(definition.providerKey, apiType);
+    } catch {
+      // 読み取り自体は成功しているため、保存領域の一時エラーで設定を失わない。
+    }
+  }
+  return { id, apiType };
+}
+
+async function setSavedModelSelection(
+  definition: ModelSettingDefinition,
+  modelId: string,
+  provider?: ApiKeyProvider,
+): Promise<void> {
+  const id = modelId.trim();
+  if (!id) return;
+  // provider を明示して保存する呼び出し元（動的 picker）を優先する。
+  const apiType = provider ?? inferApiKeyProvider(id);
+  await setSetting(definition.modelKey, id);
+  await setSetting(definition.providerKey, apiType);
+}
+
+const PRIMARY_MODEL_DEFINITION: ModelSettingDefinition = {
+  modelKey: MODEL_SETTING_KEY,
+  providerKey: MODEL_PROVIDER_KEY,
+  defaultId: DEFAULT_PRIMARY_MODEL,
+  defaultProvider: "openai",
+};
+const FALLBACK_MODEL_DEFINITION: ModelSettingDefinition = {
+  modelKey: MODEL_FALLBACK_KEY,
+  providerKey: MODEL_FALLBACK_PROVIDER_KEY,
+  defaultId: DEFAULT_FALLBACK_MODEL,
+  defaultProvider: "openai",
+};
+const VISION_MODEL_DEFINITION: ModelSettingDefinition = {
+  modelKey: VISION_MODEL_KEY,
+  providerKey: VISION_MODEL_PROVIDER_KEY,
+  defaultId: DEFAULT_VISION_MODEL,
+  defaultProvider: "gemini",
+};
+const SITE_PARSING_MODEL_DEFINITION: ModelSettingDefinition = {
+  modelKey: SITE_PARSING_MODEL_KEY,
+  providerKey: SITE_PARSING_MODEL_PROVIDER_KEY,
+  defaultId: DEFAULT_SITE_PARSING_MODEL,
+  defaultProvider: "openai",
+};
+
+export function getPrimaryModelSelection(): Promise<SavedModelSelection> {
+  return getSavedModelSelection(PRIMARY_MODEL_DEFINITION);
+}
+
+export function getFallbackModelSelection(): Promise<SavedModelSelection> {
+  return getSavedModelSelection(FALLBACK_MODEL_DEFINITION);
+}
+
+export function getVisionModelSelection(): Promise<SavedModelSelection> {
+  return getSavedModelSelection(VISION_MODEL_DEFINITION);
+}
+
+export function getSiteParsingModelSelection(): Promise<SavedModelSelection> {
+  return getSavedModelSelection(SITE_PARSING_MODEL_DEFINITION);
+}
+
+/** Grok検索は xAI 固定。旧バージョンの暗黙 grok-2-latest も保存値として扱う。 */
+export async function getGrokSearchModelSelection(): Promise<SavedModelSelection> {
+  const stored = await getSetting(GROK_SEARCH_MODEL_KEY);
+  return {
+    id: stored?.trim() || DEFAULT_GROK_SEARCH_MODEL,
+    apiType: "xai",
+  };
+}
+
+export async function getGrokSearchModel(): Promise<string> {
+  return (await getGrokSearchModelSelection()).id;
+}
+
+export async function setGrokSearchModel(modelId: string): Promise<void> {
+  const id = modelId.trim();
+  if (!id) return;
+  await setSetting(GROK_SEARCH_MODEL_KEY, id);
+}
+
+export async function getPrimaryModel(): Promise<string> {
+  return (await getPrimaryModelSelection()).id;
+}
+
+export async function setPrimaryModel(
+  model: string,
+  provider?: ApiKeyProvider,
+): Promise<void> {
+  await setSavedModelSelection(PRIMARY_MODEL_DEFINITION, model, provider);
 }
 
 export async function getFallbackModel(): Promise<string> {
-  return (await getSetting(MODEL_FALLBACK_KEY)) ?? DEFAULT_FALLBACK_MODEL;
+  return (await getFallbackModelSelection()).id;
 }
 
-export async function setFallbackModel(model: string): Promise<void> {
-  await setSetting(MODEL_FALLBACK_KEY, model);
+export async function setFallbackModel(
+  model: string,
+  provider?: ApiKeyProvider,
+): Promise<void> {
+  await setSavedModelSelection(FALLBACK_MODEL_DEFINITION, model, provider);
 }
 
 export async function getVisionModel(): Promise<string> {
-  return (await getSetting(VISION_MODEL_KEY)) ?? DEFAULT_VISION_MODEL;
+  return (await getVisionModelSelection()).id;
 }
 
-export async function setVisionModel(model: string): Promise<void> {
-  await setSetting(VISION_MODEL_KEY, model);
+export async function setVisionModel(
+  model: string,
+  provider?: ApiKeyProvider,
+): Promise<void> {
+  await setSavedModelSelection(VISION_MODEL_DEFINITION, model, provider);
 }
 
 export async function getSiteParsingModel(): Promise<string> {
-  return (await getSetting(SITE_PARSING_MODEL_KEY)) ?? DEFAULT_SITE_PARSING_MODEL;
+  return (await getSiteParsingModelSelection()).id;
 }
 
-export async function setSiteParsingModel(model: string): Promise<void> {
-  await setSetting(SITE_PARSING_MODEL_KEY, model);
+export async function setSiteParsingModel(
+  model: string,
+  provider?: ApiKeyProvider,
+): Promise<void> {
+  await setSavedModelSelection(SITE_PARSING_MODEL_DEFINITION, model, provider);
 }
 
 function normalizeReasoningEffort(value: string | null): ReasoningEffort {

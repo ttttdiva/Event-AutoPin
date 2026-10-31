@@ -830,6 +830,7 @@ class ExtractionPipeline:
             self.site_config.image_fallback_llm_provider,
             self.site_config.image_fallback_llm_model,
             self.site_config.image_fallback_llm_effort,
+            getattr(self.site_config, "image_fallback_llm_enabled", True),
         )
         has_image_cli = any(attempt.get("kind") == "cli" for attempt in image_attempts)
         analyzer = CatalogImageAnalyzer(

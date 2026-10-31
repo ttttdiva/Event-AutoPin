@@ -529,6 +529,7 @@ def build_circle_cut_model_attempts(site_config: Any) -> List[Dict[str, Any]]:
         site_config.image_fallback_llm_provider,
         site_config.image_fallback_llm_model,
         site_config.image_fallback_llm_effort,
+        getattr(site_config, "image_fallback_llm_enabled", True),
     )
 
 

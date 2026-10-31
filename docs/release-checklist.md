@@ -36,6 +36,16 @@ node scripts/release_desktop.cjs --notes "欠席切替を右クリックへ統�
 node scripts/release_desktop.cjs --resume
 ```
 
+開発側のsource branchは既定で`main`です。隔離worktreeなどの別branchから実行する場合だけ、現在branch名を明示します。指定branchはdetachedではなく、`origin/<branch>`をupstreamに設定してfetch後のHEADと完全一致させてください。`main`以外のsource branchは、fetch済みの最新`origin/main`を履歴に包含している必要があります。初回version commit直後にpushだけ失敗した未完了stateの`--resume`に限り、保存済みsource HEADへ安全にfast-forwardできる祖先関係を許可します。公開checkoutは常に`main`で、private branchを`main`へpush・mergeする処理はありません。
+
+```powershell
+node scripts/release_desktop.cjs --source-branch codex/example --plan
+node scripts/release_desktop.cjs --source-branch codex/example --notes "変更内容"
+node scripts/release_desktop.cjs --source-branch codex/example --resume
+```
+
+`--resume`では初回stateに保存したsource branchと同じ指定を要求し、旧state（source branchなし）は`main`として再開します。`--plan`はバージョン更新、commit、push、build、upload、metadata更新を行わず、確認だけを実施します。
+
 既定のPublic checkoutは `('D:' + '\Publish\Event-AutoPin')`。別の既存checkoutを使う場合は `--public-root` を指定し、再開時も同じ値を渡す。この開発側専用スクリプトは公開manifestには含めない。
 
 処理順は、公開済み版も確認したpatch繰り上げ → package.json/package-lock.json/Tauri/Cargo.toml/Cargo.lockの更新と対象限定commit・push → 既存buildスクリプトで型チェック・test・Tauri release build・ルートEXE配置 → manifest検査を伴うPublic同期 → draft ReleaseへのEXE upload・SHA256一致確認・公開 → mobile等を保持したlatest.json.desktop更新・commit・push → strict gate → リモートのcommit・Release・metadataの確認。GitHub Actions / Public source build CIの完了は待たず、成否や利用可否を完了条件にしない。既存assetを上書きしない。新しい公開ソースはmanifestへ明示登録してから実行する。

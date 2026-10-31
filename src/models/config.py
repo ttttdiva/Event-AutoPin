@@ -88,6 +88,7 @@ class SiteParsingConfig:
     fallback_provider: Optional[str] = None
     fallback_model: Optional[str] = None
     fallback_effort: Optional[str] = None
+    fallback_enabled: bool = True
 
 
 @dataclass
@@ -125,12 +126,14 @@ class SiteConfig:
     text_fallback_llm_provider: str = DEFAULT_TEXT_FALLBACK_PROVIDER
     text_fallback_llm_model: str = DEFAULT_TEXT_FALLBACK_MODEL
     text_fallback_llm_effort: str = DEFAULT_TEXT_FALLBACK_EFFORT
+    text_fallback_llm_enabled: bool = True
     image_llm_provider: str = DEFAULT_IMAGE_PRIMARY_PROVIDER
     image_llm_model: Optional[str] = DEFAULT_IMAGE_PRIMARY_MODEL
     image_llm_effort: str = DEFAULT_IMAGE_PRIMARY_EFFORT
     image_fallback_llm_provider: str = DEFAULT_IMAGE_FALLBACK_PROVIDER
     image_fallback_llm_model: str = DEFAULT_IMAGE_FALLBACK_MODEL
     image_fallback_llm_effort: str = DEFAULT_IMAGE_FALLBACK_EFFORT
+    image_fallback_llm_enabled: bool = True
     image_api_reasoning_effort_map: Dict[str, str] = field(default_factory=dict)
 
     @property

@@ -8,6 +8,7 @@ import {
   TouchableOpacity,
   View,
   ActivityIndicator,
+  ScrollView,
 } from "react-native";
 import FontAwesome from "@expo/vector-icons/FontAwesome";
 import { ScreenSafeArea } from "@/components/ScreenSafeArea";
@@ -19,17 +20,19 @@ import {
   getApiKey,
   setApiKey,
   maskApiKey,
-  AVAILABLE_MODELS,
+  type SavedModelSelection,
   REASONING_EFFORT_OPTIONS,
   type ReasoningEffort,
-  getPrimaryModel,
+  getPrimaryModelSelection,
   setPrimaryModel,
-  getFallbackModel,
+  getFallbackModelSelection,
   setFallbackModel,
-  getVisionModel,
+  getVisionModelSelection,
   setVisionModel,
-  getSiteParsingModel,
+  getSiteParsingModelSelection,
   setSiteParsingModel,
+  getGrokSearchModelSelection,
+  setGrokSearchModel,
   getTextReasoningEffort,
   setTextReasoningEffort,
   getVisionReasoningEffort,
@@ -43,6 +46,15 @@ import {
   isGlobalSearchEnabled,
   setGlobalSearchEnabled,
 } from "@/lib/settings-store";
+import {
+  getModelCatalogModels,
+  getModelCatalogSnapshot,
+  getModelCapabilities,
+  refreshModelCatalog,
+  subscribeModelCatalog,
+  type ModelCatalogEntry,
+  type ModelCatalogSnapshot,
+} from "@/lib/model-catalog";
 import { testApiKey } from "@/lib/crawl/llm-client";
 import {
   getCurrentVersion,
@@ -54,7 +66,6 @@ type ProviderInfo = {
   id: ApiKeyProvider;
   label: string;
   placeholder: string;
-  testModel: string;
   url: string;
 };
 
@@ -63,21 +74,18 @@ const PROVIDERS: ProviderInfo[] = [
     id: "gemini",
     label: "Google Gemini",
     placeholder: "AIzaSy...",
-    testModel: "gemini-3-flash-preview",
     url: "https://aistudio.google.com/apikey",
   },
   {
     id: "openai",
     label: "OpenAI",
     placeholder: "sk-...",
-    testModel: "gpt-5-mini",
     url: "https://platform.openai.com/api-keys",
   },
   {
     id: "xai",
     label: "xAI (Grok)",
     placeholder: "xai-...",
-    testModel: "grok-2-latest",
     url: "https://console.x.ai/",
   },
 ];
@@ -103,10 +111,30 @@ export default function SettingsScreen() {
   });
   const [testing, setTesting] = useState<ApiKeyProvider | null>(null);
 
-  const [primary, setPrimary] = useState<string>("");
-  const [fallback, setFallback] = useState<string>("");
-  const [vision, setVision] = useState<string>("");
-  const [siteParsing, setSiteParsing] = useState<string>("");
+  const [primary, setPrimary] = useState<SavedModelSelection>({
+    id: "",
+    apiType: "openai",
+  });
+  const [fallback, setFallback] = useState<SavedModelSelection>({
+    id: "",
+    apiType: "openai",
+  });
+  const [vision, setVision] = useState<SavedModelSelection>({
+    id: "",
+    apiType: "gemini",
+  });
+  const [siteParsing, setSiteParsing] = useState<SavedModelSelection>({
+    id: "",
+    apiType: "openai",
+  });
+  const [grokSearch, setGrokSearch] = useState<SavedModelSelection>({
+    id: "",
+    apiType: "xai",
+  });
+  const [catalog, setCatalog] = useState<ModelCatalogSnapshot>(() =>
+    getModelCatalogSnapshot(),
+  );
+  const [catalogRefreshing, setCatalogRefreshing] = useState(false);
   const [textEffort, setTextEffort] = useState<ReasoningEffort>("medium");
   const [visionEffort, setVisionEffort] = useState<ReasoningEffort>("medium");
   const [siteParsingEffort, setSiteParsingEffortState] =
@@ -119,14 +147,22 @@ export default function SettingsScreen() {
   >({});
 
   const [modelPickerFor, setModelPickerFor] = useState<
-    null | "primary" | "fallback" | "vision" | "siteParsing"
+    null | "primary" | "fallback" | "vision" | "siteParsing" | "grokSearch"
   >(null);
+  const [modelPickerQuery, setModelPickerQuery] = useState("");
+  const [modelPickerProvider, setModelPickerProvider] = useState<
+    ApiKeyProvider | "all"
+  >("all");
   const [effortPickerFor, setEffortPickerFor] = useState<
     null | "text" | "vision" | "siteParsing"
   >(null);
 
   useEffect(() => {
-    (async () => {
+    let cancelled = false;
+    const unsubscribe = subscribeModelCatalog(() => {
+      if (!cancelled) setCatalog(getModelCatalogSnapshot());
+    });
+    void (async () => {
       const [
         openai,
         gemini,
@@ -135,6 +171,7 @@ export default function SettingsScreen() {
         fb,
         v,
         sp,
+        grokSearchSelection,
         textReasoning,
         visionReasoning,
         siteReasoning,
@@ -145,10 +182,11 @@ export default function SettingsScreen() {
         getApiKey("openai"),
         getApiKey("gemini"),
         getApiKey("xai"),
-        getPrimaryModel(),
-        getFallbackModel(),
-        getVisionModel(),
-        getSiteParsingModel(),
+        getPrimaryModelSelection(),
+        getFallbackModelSelection(),
+        getVisionModelSelection(),
+        getSiteParsingModelSelection(),
+        getGrokSearchModelSelection(),
         getTextReasoningEffort(),
         getVisionReasoningEffort(),
         getSiteParsingReasoningEffort(),
@@ -156,6 +194,7 @@ export default function SettingsScreen() {
         isVisionAnalysisEnabled(),
         isGlobalSearchEnabled(),
       ]);
+      if (cancelled) return;
       setApiKeys({
         openai: openai ?? "",
         gemini: gemini ?? "",
@@ -165,13 +204,19 @@ export default function SettingsScreen() {
       setFallback(fb);
       setVision(v);
       setSiteParsing(sp);
+      setGrokSearch(grokSearchSelection);
       setTextEffort(textReasoning);
       setVisionEffort(visionReasoning);
       setSiteParsingEffortState(siteReasoning);
       setGrokEnabledState(grok);
       setVisionEnabledState(vis);
       setGlobalSearchEnabledState(globalSearch);
-    })();
+      const nextCatalog = await refreshModelCatalog();
+      if (!cancelled) setCatalog(nextCatalog);
+    })().catch(() => {
+      // 個別 provider のエラーは catalog state に表示し、設定画面自体は開ける。
+    });
+    return unsubscribe;
   }, []);
 
   useEffect(() => {
@@ -185,7 +230,12 @@ export default function SettingsScreen() {
   const handleSaveKey = async (provider: ApiKeyProvider) => {
     try {
       await setApiKey(provider, apiKeys[provider].trim());
-      Alert.alert("保存しました", `${provider} のAPIキーを保存しました`);
+      const nextCatalog = await refreshModelCatalog(provider);
+      setCatalog(nextCatalog);
+      Alert.alert(
+        "保存しました",
+        `${provider} のAPIキーを保存し、モデル一覧を更新しました`,
+      );
     } catch (e: any) {
       Alert.alert("保存エラー", e?.message ?? String(e));
     }
@@ -199,7 +249,7 @@ export default function SettingsScreen() {
     }
     setTesting(provider.id);
     try {
-      const result = await testApiKey(provider.id, key, provider.testModel);
+      const result = await testApiKey(provider.id, key);
       Alert.alert(
         result.ok ? "接続成功" : "接続失敗",
         result.message,
@@ -238,23 +288,38 @@ export default function SettingsScreen() {
     Alert.alert("リセットしました", "優先度カラーを初期値に戻しました。");
   };
 
+  const openModelPicker = (
+    target: "primary" | "fallback" | "vision" | "siteParsing" | "grokSearch",
+  ) => {
+    setModelPickerQuery("");
+    setModelPickerProvider(target === "grokSearch" ? "xai" : "all");
+    setModelPickerFor(target);
+  };
+
   const onPickModel = async (
-    target: "primary" | "fallback" | "vision" | "siteParsing",
-    modelId: string,
+    target: "primary" | "fallback" | "vision" | "siteParsing" | "grokSearch",
+    model: ModelCatalogEntry,
   ) => {
     setModelPickerFor(null);
+    const selection: SavedModelSelection = {
+      id: model.id,
+      apiType: model.provider,
+    };
     if (target === "primary") {
-      setPrimary(modelId);
-      await setPrimaryModel(modelId);
+      setPrimary(selection);
+      await setPrimaryModel(model.id, model.provider);
     } else if (target === "fallback") {
-      setFallback(modelId);
-      await setFallbackModel(modelId);
+      setFallback(selection);
+      await setFallbackModel(model.id, model.provider);
     } else if (target === "vision") {
-      setVision(modelId);
-      await setVisionModel(modelId);
+      setVision(selection);
+      await setVisionModel(model.id, model.provider);
+    } else if (target === "siteParsing") {
+      setSiteParsing(selection);
+      await setSiteParsingModel(model.id, model.provider);
     } else {
-      setSiteParsing(modelId);
-      await setSiteParsingModel(modelId);
+      setGrokSearch(selection);
+      await setGrokSearchModel(model.id);
     }
   };
 
@@ -301,8 +366,35 @@ export default function SettingsScreen() {
     );
   };
 
-  const modelLabel = (id: string) => {
-    return AVAILABLE_MODELS.find((m) => m.id === id)?.label ?? id;
+  const savedSelections = [primary, fallback, vision, siteParsing, grokSearch];
+
+  const modelLabel = (selection: SavedModelSelection) => {
+    const entry = getModelCatalogModels({ savedSelections }).find(
+      (model) =>
+        model.id === selection.id && model.provider === selection.apiType,
+    );
+    return entry?.label ?? selection.id;
+  };
+
+  const selectionForEffort = (
+    target: "text" | "vision" | "siteParsing",
+  ): SavedModelSelection => {
+    if (target === "vision") return vision;
+    if (target === "siteParsing") return siteParsing;
+    return primary;
+  };
+
+  const effortOptionsForTarget = (
+    target: "text" | "vision" | "siteParsing",
+  ) => {
+    const selection = selectionForEffort(target);
+    const capabilities = getModelCapabilities(
+      selection.apiType,
+      selection.id,
+      getModelCatalogModels({ savedSelections }),
+    );
+    const supported = new Set(capabilities.reasoningEfforts);
+    return REASONING_EFFORT_OPTIONS.filter((option) => supported.has(option.id));
   };
 
   const effortLabel = (id: ReasoningEffort) => {
@@ -313,11 +405,11 @@ export default function SettingsScreen() {
   const renderModelRow = (
     title: string,
     desc: string,
-    current: string,
-    target: "primary" | "fallback" | "vision" | "siteParsing",
+    current: SavedModelSelection,
+    target: "primary" | "fallback" | "vision" | "siteParsing" | "grokSearch",
   ) => (
     <TouchableOpacity
-      onPress={() => setModelPickerFor(target)}
+      onPress={() => openModelPicker(target)}
       style={[
         styles.modelRow,
         { backgroundColor: colors.card, borderColor: colors.border },
@@ -329,7 +421,7 @@ export default function SettingsScreen() {
           {desc}
         </Text>
         <Text style={[styles.modelValue, { color: colors.tint }]}>
-          {modelLabel(current)}
+          {modelLabel(current)} ({current.apiType})
         </Text>
       </View>
       <FontAwesome name="chevron-right" size={14} color={colors.textSecondary} />
@@ -357,10 +449,70 @@ export default function SettingsScreen() {
         <Text style={[styles.modelValue, { color: colors.tint }]}>
           {effortLabel(current)}
         </Text>
+        {effortOptionsForTarget(target).every((option) => option.id !== current) && (
+          <Text style={[styles.modelDesc, { color: colors.textSecondary }]}>
+            選択モデルでは能力未確認のため、実行時はAPI既定値を使用
+          </Text>
+        )}
       </View>
       <FontAwesome name="chevron-right" size={14} color={colors.textSecondary} />
     </TouchableOpacity>
   );
+
+  const refreshCatalog = async () => {
+    setCatalogRefreshing(true);
+    try {
+      const nextCatalog = await refreshModelCatalog();
+      setCatalog(nextCatalog);
+    } finally {
+      setCatalogRefreshing(false);
+    }
+  };
+
+  const catalogStatusLabel = (provider: ApiKeyProvider): string => {
+    const state = catalog.providers[provider];
+    if (state.status === "loading") return "取得中…";
+    if (state.status === "credential-missing") return "認証情報未設定";
+    if (state.status === "error") {
+      return state.stale ? "取得失敗・前回候補を表示中" : "取得失敗";
+    }
+    if (state.status === "ready") {
+      const suffix = state.fetchedAt
+        ? `（${new Date(state.fetchedAt).toLocaleString()}）`
+        : "";
+      return `${state.models.length}件・取得済み${suffix}`;
+    }
+    return "未取得（初期候補を表示）";
+  };
+
+  const modelSourceLabel = (model: ModelCatalogEntry): string => {
+    if (model.source === "stale-cache") return "前回取得候補（更新失敗）";
+    if (model.source === "provider-api") {
+      return model.capabilityStatus === "unknown"
+        ? "API取得・能力未確認"
+        : "API取得・能力確認済み";
+    }
+    if (model.source === "saved") return "保存済み（一覧未確認）";
+    return "初期候補（未取得）";
+  };
+
+  const pickerModels = modelPickerFor
+    ? getModelCatalogModels({
+        role: modelPickerFor === "vision" ? "vision" : "text",
+        savedSelections,
+      }).filter((model) => {
+        const matchesProvider =
+          modelPickerFor === "grokSearch"
+            ? model.provider === "xai"
+            : modelPickerProvider === "all" || model.provider === modelPickerProvider;
+        const query = modelPickerQuery.trim().toLowerCase();
+        const matchesQuery =
+          !query ||
+          model.id.toLowerCase().includes(query) ||
+          model.label.toLowerCase().includes(query);
+        return matchesProvider && matchesQuery;
+      })
+    : [];
 
   return (
     <ScreenSafeArea
@@ -535,9 +687,38 @@ export default function SettingsScreen() {
         <Text style={[styles.sectionTitle, { color: colors.text }]}>
           LLMモデル
         </Text>
+        <View
+          style={[
+            styles.catalogStatusCard,
+            { backgroundColor: colors.card, borderColor: colors.border },
+          ]}
+        >
+          <Text style={[styles.modelDesc, { color: colors.textSecondary }]}>
+            APIのモデル一覧を読み取り専用で取得します。未取得の初期候補と、能力未確認の新しいIDは明示して表示します。
+          </Text>
+          {PROVIDERS.map((provider) => (
+            <Text
+              key={provider.id}
+              style={[styles.catalogStatusText, { color: colors.textSecondary }]}
+            >
+              {provider.label}: {catalogStatusLabel(provider.id)}
+            </Text>
+          ))}
+          <TouchableOpacity
+            style={[styles.btn, { backgroundColor: colors.tint, marginTop: 10 }]}
+            onPress={refreshCatalog}
+            disabled={catalogRefreshing}
+          >
+            {catalogRefreshing ? (
+              <ActivityIndicator size="small" color="#fff" />
+            ) : (
+              <Text style={styles.btnText}>モデル一覧を再取得</Text>
+            )}
+          </TouchableOpacity>
+        </View>
         {renderModelRow(
           "メインモデル",
-          "クロール時の第一選択。デフォルトは Gemini 3 Flash",
+          "クロール時の第一選択（保存済み設定を維持）",
           primary,
           "primary",
         )}
@@ -660,6 +841,13 @@ export default function SettingsScreen() {
           />
         </TouchableOpacity>
 
+        {renderModelRow(
+          "Grok検索モデル",
+          "Xのおしながき検索で使うxAIモデル。未取得の保存値も保持します",
+          grokSearch,
+          "grokSearch",
+        )}
+
         {/* バージョン */}
         <Text style={[styles.sectionTitle, { color: colors.text }]}>
           アプリ情報
@@ -703,30 +891,92 @@ export default function SettingsScreen() {
               <Text style={[styles.pickerTitle, { color: colors.text }]}>
                 モデルを選択
               </Text>
-              {AVAILABLE_MODELS.filter((m) =>
-                modelPickerFor === "vision" ? m.vision : true,
-              ).map((m) => (
-                <TouchableOpacity
-                  key={m.id}
-                  style={[
-                    styles.pickerItem,
-                    { borderBottomColor: colors.border },
-                  ]}
-                  onPress={() => onPickModel(modelPickerFor, m.id)}
-                >
-                  <Text style={{ color: colors.text, fontSize: 15 }}>
-                    {m.label}
+              <TextInput
+                style={[
+                  styles.pickerSearch,
+                  {
+                    color: colors.text,
+                    backgroundColor: colors.inputBackground,
+                    borderColor: colors.border,
+                  },
+                ]}
+                value={modelPickerQuery}
+                onChangeText={setModelPickerQuery}
+                placeholder="モデルID・表示名で検索"
+                placeholderTextColor={colors.textSecondary}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+              <View style={styles.providerFilterRow}>
+                {(["all", ...PROVIDERS.map((provider) => provider.id)] as const).map(
+                  (provider) => {
+                    const selected = modelPickerProvider === provider;
+                    const label =
+                      provider === "all"
+                        ? "すべて"
+                        : PROVIDERS.find((item) => item.id === provider)?.label ??
+                          provider;
+                    return (
+                      <TouchableOpacity
+                        key={provider}
+                        onPress={() => setModelPickerProvider(provider)}
+                        style={[
+                          styles.providerFilterButton,
+                          {
+                            backgroundColor: selected
+                              ? colors.tint
+                              : colors.inputBackground,
+                            borderColor: selected ? colors.tint : colors.border,
+                          },
+                        ]}
+                      >
+                        <Text
+                          style={{
+                            color: selected ? "#fff" : colors.text,
+                            fontSize: 12,
+                          }}
+                        >
+                          {label}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  },
+                )}
+              </View>
+              <ScrollView style={styles.pickerList}>
+                {pickerModels.length === 0 ? (
+                  <Text style={[styles.modelDesc, { color: colors.textSecondary }]}>
+                    条件に一致する候補がありません
                   </Text>
-                  <Text
-                    style={{ color: colors.textSecondary, fontSize: 12 }}
-                  >
-                    {m.id} ({m.provider})
-                  </Text>
-                </TouchableOpacity>
-              ))}
+                ) : (
+                  pickerModels.map((m) => (
+                    <TouchableOpacity
+                      key={`${m.provider}:${m.id}`}
+                      style={[
+                        styles.pickerItem,
+                        { borderBottomColor: colors.border },
+                      ]}
+                      onPress={() => onPickModel(modelPickerFor, m)}
+                    >
+                      <Text style={{ color: colors.text, fontSize: 15 }}>
+                        {m.label}
+                      </Text>
+                      <Text
+                        style={{ color: colors.textSecondary, fontSize: 12 }}
+                      >
+                        {m.id} ({m.provider}) · {modelSourceLabel(m)}
+                      </Text>
+                    </TouchableOpacity>
+                  ))
+                )}
+              </ScrollView>
               <TouchableOpacity
                 style={[styles.btn, { backgroundColor: colors.border }]}
-                onPress={() => setModelPickerFor(null)}
+                onPress={() => {
+                  setModelPickerFor(null);
+                  setModelPickerQuery("");
+                  setModelPickerProvider("all");
+                }}
               >
                 <Text style={[styles.btnText, { color: colors.text }]}>
                   キャンセル
@@ -752,7 +1002,7 @@ export default function SettingsScreen() {
               <Text style={[styles.pickerTitle, { color: colors.text }]}>
                 effortを選択
               </Text>
-              {REASONING_EFFORT_OPTIONS.map((effort) => (
+              {effortOptionsForTarget(effortPickerFor).map((effort) => (
                 <TouchableOpacity
                   key={effort.id}
                   style={[
@@ -855,6 +1105,13 @@ const styles = StyleSheet.create({
     padding: 12,
     marginBottom: 12,
   },
+  catalogStatusCard: {
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 12,
+  },
+  catalogStatusText: { fontSize: 12, marginTop: 4 },
   label: { fontSize: 14, fontWeight: "600", marginBottom: 8 },
   inputRow: { flexDirection: "row", alignItems: "center", gap: 6 },
   input: {
@@ -910,6 +1167,27 @@ const styles = StyleSheet.create({
     maxHeight: "80%",
   },
   pickerTitle: { fontSize: 16, fontWeight: "700", marginBottom: 12 },
+  pickerSearch: {
+    borderWidth: 1,
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 14,
+    marginBottom: 8,
+  },
+  providerFilterRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    marginBottom: 8,
+  },
+  providerFilterButton: {
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
+  pickerList: { maxHeight: 420 },
   pickerItem: {
     paddingVertical: 12,
     borderBottomWidth: StyleSheet.hairlineWidth,

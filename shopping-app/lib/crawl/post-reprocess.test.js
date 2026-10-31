@@ -102,7 +102,13 @@ function harness(result, options = {}) {
       async deleteItemSearchIndexForCircle() {},
       invalidatePurchaseLookupCache() {},
     },
-    "../settings-store": { async getApiKey() { return "test-key"; }, async isGrokEnabled() { return true; } },
+    "../settings-store": {
+      async getApiKey() { return "dummy-key-xai"; },
+      async isGrokEnabled() { return true; },
+      async getGrokSearchModelSelection() {
+        return { id: "grok-test-model", apiType: "xai" };
+      },
+    },
     "./image-downloader": {
       guessExt: () => "jpg",
       async downloadImage(url, directory, name) {
@@ -118,6 +124,20 @@ function harness(result, options = {}) {
   const mockFetch = async () => {
     options.duringFetch?.(sqlite);
     return { ok: true, async json() { return { choices: [{ message: { content: JSON.stringify(result) } }] }; } };
+  };
+  mocks["./llm-client"] = {
+    LlmClient: class {
+      constructor(model) {
+        assert.deepEqual(model, { id: "grok-test-model", apiType: "xai" });
+      }
+      async extractData(prompt, requestOptions) {
+        assert.equal(typeof prompt, "string");
+        assert.deepEqual(requestOptions, { temperature: 0.2, reasoningEffort: "none" });
+        const response = await mockFetch();
+        const data = await response.json();
+        return data?.choices?.[0]?.message?.content ?? "";
+      }
+    },
   };
   new Function("exports", "require", "module", "fetch", compiled)(moduleRecord.exports,
     (name) => { assert.ok(mocks[name], `予期しないimport: ${name}`); return mocks[name]; }, moduleRecord, mockFetch);

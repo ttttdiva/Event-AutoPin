@@ -396,6 +396,12 @@ class CircleListGenerator:
         site_parsing_config = None
         sp_raw = self.config.get("site_parsing")
         if sp_raw and isinstance(sp_raw, dict):
+            # provider+modelを持つ新形式の構造解析roleは、fallbackキーを
+            # 省略した場合に通常text roleを自動注入しない。旧形式
+            # (api_model/codex_model)だけ従来の継承fallbackを維持する。
+            explicit_structure_role = bool(
+                sp_raw.get("provider") and sp_raw.get("model")
+            )
             site_reasoning_effort = (
                 sp_raw.get("reasoning_effort")
                 or sp_raw.get("api_reasoning_effort")
@@ -412,14 +418,26 @@ class CircleListGenerator:
                 effort=sp_raw.get("effort"),
                 cli_model_map=sp_raw.get("cli_model_map", {}),
                 cli_effort_map=sp_raw.get("cli_effort_map", {}),
-                # 構造解析の主モデルが容量超過などで落ちても、初見サイトの一覧を
-                # 取りこぼさないよう、未指定なら通常のテキストLLM設定へ切り替える。
-                fallback_provider=sp_raw.get("fallback_provider")
-                or self.config.get("text_llm_provider"),
-                fallback_model=sp_raw.get("fallback_model")
-                or (models[0] if isinstance(models, list) and models else models),
-                fallback_effort=sp_raw.get("fallback_effort")
-                or self.config.get("api_reasoning_effort"),
+                fallback_provider=(
+                    sp_raw.get("fallback_provider")
+                    if explicit_structure_role
+                    else sp_raw.get("fallback_provider") or self.config.get("text_llm_provider")
+                ),
+                fallback_model=(
+                    sp_raw.get("fallback_model")
+                    if explicit_structure_role
+                    else sp_raw.get("fallback_model")
+                    or (models[0] if isinstance(models, list) and models else models)
+                ),
+                fallback_effort=(
+                    sp_raw.get("fallback_effort")
+                    if explicit_structure_role
+                    else sp_raw.get("fallback_effort") or self.config.get("api_reasoning_effort")
+                ),
+                fallback_enabled=sp_raw.get(
+                    "fallback_enabled",
+                    self.config.get("text_fallback_llm_enabled", True),
+                ),
             )
             self.logger.info(
                 "サイト構造解析モデル: "
@@ -470,6 +488,9 @@ class CircleListGenerator:
             or DEFAULT_TEXT_FALLBACK_MODEL,
             text_fallback_llm_effort=self.config.get("text_fallback_llm_effort")
             or DEFAULT_TEXT_FALLBACK_EFFORT,
+            text_fallback_llm_enabled=self.config.get(
+                "text_fallback_llm_enabled", True
+            ),
             image_llm_provider=image_provider,
             image_llm_model=image_model,
             image_llm_effort=image_effort,
@@ -479,6 +500,9 @@ class CircleListGenerator:
             or DEFAULT_IMAGE_FALLBACK_MODEL,
             image_fallback_llm_effort=self.config.get("image_fallback_llm_effort")
             or DEFAULT_IMAGE_FALLBACK_EFFORT,
+            image_fallback_llm_enabled=self.config.get(
+                "image_fallback_llm_enabled", True
+            ),
             image_api_reasoning_effort_map=self.config.get(
                 "image_api_reasoning_effort_map", {}
             ),
@@ -617,6 +641,7 @@ class CircleListGenerator:
                         site_config.text_fallback_llm_model,
                         site_config.text_fallback_llm_effort,
                         primary_effort=site_config.api_reasoning_effort,
+                        fallback_enabled=site_config.text_fallback_llm_enabled,
                     )
                     self.logger.info(f"Text LLM attempts: {text_attempts}")
                     llm_client = LLMClient(
@@ -761,6 +786,9 @@ class CircleListGenerator:
                         "text_fallback_llm_effort": self.config.get(
                             "text_fallback_llm_effort"
                         ) or DEFAULT_TEXT_FALLBACK_EFFORT,
+                        "text_fallback_llm_enabled": self.config.get(
+                            "text_fallback_llm_enabled", True
+                        ),
                         "output_dir": self.config["output_dir"],
                         "debug_limit": self.config.get(
                             "debug_limit", None
@@ -817,6 +845,9 @@ class CircleListGenerator:
                         "image_fallback_llm_effort": self.config.get(
                             "image_fallback_llm_effort"
                         ) or DEFAULT_IMAGE_FALLBACK_EFFORT,
+                        "image_fallback_llm_enabled": self.config.get(
+                            "image_fallback_llm_enabled", True
+                        ),
                         "image_api_reasoning_effort_map": self.config.get(
                             "image_api_reasoning_effort_map", {}
                         ),
@@ -1077,6 +1108,9 @@ class CircleListGenerator:
                     "text_fallback_llm_effort": self.config.get(
                         "text_fallback_llm_effort"
                     ) or DEFAULT_TEXT_FALLBACK_EFFORT,
+                    "text_fallback_llm_enabled": self.config.get(
+                        "text_fallback_llm_enabled", True
+                    ),
                     "output_dir": output_dir,
                     "debug_limit": self.config.get("debug_limit", None),
                     "catalog_additional_prompt": self.config.get(
@@ -1131,6 +1165,9 @@ class CircleListGenerator:
                     "image_fallback_llm_effort": self.config.get(
                         "image_fallback_llm_effort"
                     ) or DEFAULT_IMAGE_FALLBACK_EFFORT,
+                    "image_fallback_llm_enabled": self.config.get(
+                        "image_fallback_llm_enabled", True
+                    ),
                     "image_api_reasoning_effort_map": self.config.get(
                         "image_api_reasoning_effort_map", {}
                     ),

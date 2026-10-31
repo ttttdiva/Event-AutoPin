@@ -140,6 +140,22 @@ function Root([string]$Path, [string]$Name) {
     return [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).Path).TrimEnd('\', '/')
 }
 
+function GitRoot([string]$Path, [string]$Name) {
+    $root = Root $Path $Name
+    try {
+        $reported = ([string](Run git @('-C', $root, 'rev-parse', '--show-toplevel') |
+            Select-Object -First 1)).Trim()
+        if (-not $reported) { throw 'empty Git top-level path' }
+        $gitRoot = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $reported).Path).TrimEnd('\', '/')
+    } catch {
+        throw "$Name must be a Git working-tree root: $root"
+    }
+    if (-not $gitRoot.Equals($root, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Name must be the Git working-tree root: $root"
+    }
+    return $root
+}
+
 function SameOrNested([string]$A, [string]$B) {
     return $A.Equals($B, [StringComparison]::OrdinalIgnoreCase) -or
         $A.StartsWith($B + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
@@ -309,9 +325,8 @@ function Scan([string]$Root, [string[]]$Paths, $AssetHashes) {
 }
 
 try {
-    $source = Root $SourceRoot 'SourceRoot'; $destination = Root $DestinationRoot 'DestinationRoot'
+    $source = GitRoot $SourceRoot 'SourceRoot'; $destination = GitRoot $DestinationRoot 'DestinationRoot'
     if ((SameOrNested $source $destination) -or (SameOrNested $destination $source)) { throw 'SourceRoot and DestinationRoot must be separate, non-nested paths.' }
-    if (-not (Test-Path (Join-Path $source '.git') -PathType Container) -or -not (Test-Path (Join-Path $destination '.git') -PathType Container)) { throw 'Both paths must be Git working-tree roots.' }
 
     $remote = ([string](Run git @('-C',$destination,'remote','get-url','origin') | Select-Object -First 1)).Trim()
     if ($remote -ne $ExpectedRemote) { throw "Destination origin mismatch: $remote" }

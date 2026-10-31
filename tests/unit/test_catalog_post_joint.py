@@ -15,6 +15,7 @@ from src.models import Circle, ItemImage
 from src.processors import catalog_post
 from src.processors.twitter_post_processor import TwitterConfig, TwitterPostProcessor
 from src.utils.catalog_post_analyzer import CatalogPostAnalyzer
+from src.utils.grok_build import GrokBuildError
 from src.utils.llm_attempts import build_image_llm_attempts, build_text_llm_attempts
 from src.utils.reprocess_deadline import ReprocessDeadline, ReprocessDeadlineExceeded
 
@@ -58,6 +59,142 @@ def test_defaults_use_luna_max_for_text_and_images():
     config = TwitterConfig({})
     assert (config.image_llm_provider, config.image_llm_model, config.image_llm_effort) == ("api:openai", LUNA, "max")
     assert config.api_reasoning_effort == "max"
+
+
+def test_fallback_disabled_does_not_inject_an_implicit_candidate():
+    assert build_text_llm_attempts(fallback_enabled=False) == [
+        {"kind": "api", "provider": "", "model": LUNA, "effort": "max"},
+    ]
+    assert build_image_llm_attempts(fallback_enabled=False) == [
+        {"kind": "api", "provider": "openai", "model": LUNA, "effort": "max"},
+    ]
+
+
+def test_post_role_attempts_are_used_for_joint_instead_of_vision_attempts(tmp_path, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        "src.processors.twitter_post_processor.TwitterExtractor",
+        lambda **kwargs: captured.update(text_attempts=kwargs["attempts"]) or SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "src.processors.twitter_post_processor.CatalogImageAnalyzer",
+        lambda **kwargs: SimpleNamespace(
+            attempts=kwargs["attempts"], api_clients={}, api_reasoning_effort_map={}
+        ),
+    )
+    processor = TwitterPostProcessor(TwitterConfig({
+        "output_dir": str(tmp_path),
+        "image_llm_provider": "api:openai",
+        "image_llm_model": "vision-model",
+        "image_llm_effort": "max",
+        "image_fallback_llm_provider": "api:openai",
+        "image_fallback_llm_model": "vision-fallback",
+        "oshinagaki_post": {
+            "provider": "api:openai",
+            "model": "post-model",
+            "effort": "low",
+            "fallback_provider": "api:xai",
+            "fallback_model": "post-fallback",
+            "fallback_effort": "medium",
+        },
+    }))
+    assert [attempt["model"] for attempt in captured["text_attempts"]] == [
+        "post-model", "post-fallback",
+    ]
+    assert [attempt["model"] for attempt in processor.catalog_post_analyzer.attempts] == [
+        "post-model", "post-fallback",
+    ]
+    assert processor.catalog_post_analyzer.attempts[0]["effort"] == "low"
+
+
+def test_grok_unknown_delivery_stops_joint_fallback(monkeypatch):
+    attempts = [
+        {"kind": "cli", "provider": "grok", "model": "grok-4.7", "effort": "medium"},
+        {"kind": "api", "provider": "openai", "model": LUNA, "effort": "max"},
+    ]
+    analyzer = CatalogPostAnalyzer(SimpleNamespace(attempts=attempts, api_clients={LUNA: object()}))
+    monkeypatch.setattr(
+        analyzer,
+        "_request_grok",
+        Mock(side_effect=GrokBuildError("unknown_delivery", "fixture")),
+    )
+    request = Mock(side_effect=AssertionError("後続APIへ進めない"))
+    monkeypatch.setattr(analyzer, "_request", request)
+    with pytest.raises(GrokBuildError) as error:
+        analyzer.analyze([], POST)
+    assert error.value.code == "unknown_delivery"
+    request.assert_not_called()
+
+
+def test_anthropic_joint_request_uses_messages_content_for_all_images(monkeypatch, tmp_path):
+    from src.utils import llm_client
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "content": [{"type": "text", "text": json.dumps(result())}],
+                "usage": {"input_tokens": 2, "output_tokens": 3},
+            }
+
+    monkeypatch.setattr(
+        llm_client.requests,
+        "post",
+        lambda url, **kwargs: calls.append((url, kwargs)) or Response(),
+    )
+    images = []
+    for index in range(2):
+        path = tmp_path / f"anthropic-{index}.png"
+        Image.new("RGB", (8, 8), "white").save(path)
+        images.append(path)
+    model = "claude-post"
+    llm = SimpleNamespace(
+        clients=[{"model": model, "api_type": "anthropic", "api_key": "dummy-key", "client": None}],
+        api_provider_map={model: "anthropic"},
+        _api_reasoning_effort_for=lambda _model: "low",
+    )
+    analyzer = CatalogPostAnalyzer(
+        SimpleNamespace(
+            attempts=[{"kind": "api", "provider": "anthropic", "model": model, "effort": "low"}],
+            api_clients={model: llm},
+        )
+    )
+    parsed = analyzer.analyze(images, POST)
+    assert parsed["model"] == model
+    assert len(calls) == 1
+    body = calls[0][1]["json"]
+    assert body["model"] == model
+    assert len([part for part in body["messages"][0]["content"] if part["type"] == "image"]) == 2
+
+
+def test_modern_post_role_does_not_initialize_unused_vision_analyzer(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.processors.twitter_post_processor.TwitterExtractor",
+        lambda **kwargs: SimpleNamespace(attempts=kwargs["attempts"]),
+    )
+
+    def fail_vision_init(**_kwargs):
+        raise AssertionError("vision analyzer must remain lazy for modern post role")
+
+    monkeypatch.setattr("src.processors.twitter_post_processor.CatalogImageAnalyzer", fail_vision_init)
+    processor = TwitterPostProcessor(TwitterConfig({
+        "output_dir": str(tmp_path),
+        "image_llm_provider": "api:gemini",
+        "image_llm_model": "vision-without-key",
+        "image_fallback_llm_enabled": False,
+        "oshinagaki_post": {
+            "provider": "api:openai",
+            "model": "post-model",
+            "effort": "low",
+            "fallback_enabled": False,
+        },
+    }))
+    assert processor.catalog_analyzer is None
+    assert processor.catalog_post_analyzer.attempts[0]["model"] == "post-model"
 
 
 def test_explicit_cli_configuration_is_not_silently_rerouted():
@@ -158,6 +295,57 @@ def test_responses_payload_contains_all_original_images_text_and_max(tmp_path, m
     assert images[1]["image_url"].startswith("data:image/webp;base64,")
     assert POST in content[0]["text"] and "テストイベント" in content[0]["text"] and "2026-09-13" in content[0]["text"]
     assert costs == [(LUNA, 12, 7)]
+
+
+def test_unknown_openai_joint_request_omits_reasoning_none(tmp_path, monkeypatch):
+    from src.utils import api_cost_tracker
+
+    model = "gpt-new-live-generative"
+    calls = []
+    path = tmp_path / "future.png"
+    Image.new("RGB", (8, 8), "white").save(path)
+
+    sdk = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: calls.append(kwargs)
+            or {
+                "output_text": json.dumps(result(catalog_image_indices=[1])),
+                "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+        )
+    )
+    llm = SimpleNamespace(
+        clients=[{"model": model, "api_type": "openai", "client": sdk}],
+        _api_reasoning_effort_for=lambda _model, override=None, provider=None: None,
+        _client_with_timeout=lambda client, timeout: client,
+        _uses_responses_api=lambda _model: True,
+        _responses_output_text=lambda response: response["output_text"],
+        _response_field=lambda obj, key, default=None: obj.get(key, default),
+    )
+    monkeypatch.setattr(
+        api_cost_tracker,
+        "get_cost_tracker",
+        lambda: SimpleNamespace(add_tokens=lambda *_args: None),
+    )
+    analyzer = CatalogPostAnalyzer(
+        SimpleNamespace(
+            attempts=[
+                {
+                    "kind": "api",
+                    "provider": "openai",
+                    "model": model,
+                    "effort": "none",
+                }
+            ],
+            api_clients={model: llm},
+        )
+    )
+
+    parsed = analyzer.analyze([path], POST)
+    assert parsed["model"] == model
+    assert len(calls) == 1
+    assert "reasoning" not in calls[0]
 
 
 def test_invalid_response_repairs_only_once_then_uses_configured_fallback(monkeypatch):
@@ -439,12 +627,11 @@ def text_fallback_is_distinct():
     return (primary["kind"], primary["provider"]) != (fallback["kind"], fallback["provider"])
 
 
-def test_fallback_identical_to_primary_is_replaced_by_default_fallback():
+def test_fallback_identical_to_primary_is_deduplicated_without_injecting_default():
     attempts = build_image_llm_attempts("api:openai", SOL, "medium", "api:openai", SOL, "medium")
-    assert attempts[0]["model"] == SOL
-    assert (attempts[1]["kind"], attempts[1]["provider"]) == ("cli", "grok")
+    assert attempts == [{"kind": "api", "provider": "openai", "model": SOL, "effort": "medium"}]
     text = build_text_llm_attempts("api", SOL, None, None, "api:openai", SOL, "medium")
-    assert (text[1]["kind"], text[1]["provider"]) == ("cli", "codex")
+    assert text == [{"kind": "api", "provider": "", "model": SOL, "effort": None}]
 
 
 def test_explicit_other_model_fallback_is_kept():

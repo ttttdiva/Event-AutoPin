@@ -179,6 +179,20 @@ def test_dry_run_uses_only_exact_committed_manifest(tmp_path: Path) -> None:
     assert not (destination / "public-payload").exists()
 
 
+def test_accepts_linked_source_worktree_but_rejects_nonroot_child(tmp_path: Path) -> None:
+    source, destination = source_repo(tmp_path), destination_repo(tmp_path)
+    linked = tmp_path / "source-linked"
+    git(source, "worktree", "add", "--detach", str(linked), "HEAD")
+    assert (linked / ".git").is_file()
+
+    linked_result = run(linked, destination, tmp_path, apply=True)
+    assert linked_result.returncode == 0, linked_result.stdout + linked_result.stderr
+
+    child_result = run(source / "src", destination, tmp_path)
+    assert child_result.returncode != 0
+    assert "mustbethegitworking-treeroot" in compact_output(child_result.stderr)
+
+
 def test_dependency_closure_failure_stops_before_destination_changes(tmp_path: Path) -> None:
     source, destination = source_repo(tmp_path), destination_repo(tmp_path)
     entry = source / "desktop-app" / "src" / "main.ts"

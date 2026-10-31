@@ -1197,6 +1197,31 @@ html.dark {
     @apply text-xs mt-1;
   }
 
+  .model-execution-order {
+    color: var(--text-secondary);
+    border-left: 2px solid var(--border-default);
+    padding-left: 0.6rem;
+    @apply text-xs py-1;
+  }
+
+  .model-fallback-details {
+    grid-column: 1 / -1;
+    @apply rounded border border-gray-700 p-2;
+  }
+
+  .model-fallback-details summary {
+    color: var(--text-secondary);
+    cursor: pointer;
+    @apply text-sm;
+  }
+
+  .model-preflight-status {
+    color: var(--text-muted);
+    min-height: 1.2rem;
+    white-space: pre-line;
+    @apply text-xs mt-1;
+  }
+
   /* クリック式の補足説明。初期状態では本文の余白を占有しない。 */
   .help-popover-anchor {
     display: inline-flex;

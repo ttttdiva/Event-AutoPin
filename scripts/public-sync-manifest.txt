@@ -18,6 +18,8 @@ desktop-app/src/history-search-ui.ts
 desktop-app/src/main.ts
 desktop-app/src/model-role-capabilities.ts
 desktop-app/src/model-role-capabilities.test.ts
+desktop-app/src/model-execution-plan.ts
+desktop-app/src/model-execution-plan.test.ts
 desktop-app/src/openai-model-capabilities.test.ts
 desktop-app/src/openai-model-capabilities.ts
 desktop-app/src/purchase-status.ts
@@ -75,6 +77,7 @@ docs/mobile-item-purchase-ui.md
 docs/mockups/map-cell-highlight-ui-mock.html
 docs/public-repository-sync.md
 docs/catalog-joint-analysis.md
+docs/mobile-model-catalog.md
 docs/release-checklist.md
 docs/TWITTER_RATE_LIMIT.md
 docs/unlimited-ocr-migration-plan.md
@@ -140,6 +143,7 @@ shopping-app/lib/crawl/html-fetcher.ts
 shopping-app/lib/crawl/image-downloader.ts
 shopping-app/lib/crawl/image-downloader.test.js
 shopping-app/lib/crawl/llm-client.ts
+shopping-app/lib/crawl/llm-client.test.js
 shopping-app/lib/crawl/pipeline.ts
 shopping-app/lib/crawl/post-reprocess.ts
 shopping-app/lib/crawl/post-reprocess.test.js
@@ -179,6 +183,9 @@ shopping-app/lib/performance.ts
 shopping-app/lib/priority-color-context.tsx
 shopping-app/lib/priority-colors.ts
 shopping-app/lib/settings-store.ts
+shopping-app/lib/settings-store-model.test.ts
+shopping-app/lib/model-catalog.ts
+shopping-app/lib/model-catalog.test.ts
 shopping-app/lib/statusbar-appearance.test.js
 shopping-app/lib/sync-logger.ts
 shopping-app/lib/theme-context.tsx
@@ -287,6 +294,7 @@ tests/unit/test_auto_coordinate_generator_event_json.py
 tests/unit/test_base_adapter.py
 tests/unit/test_catalog_geometry_resolver.py
 tests/unit/test_catalog_post_joint.py
+tests/unit/test_post_model_settings_runtime.py
 tests/unit/test_coordinate_generation_diagnostics.py
 tests/unit/test_circle_master.py
 tests/unit/test_date_utils.py

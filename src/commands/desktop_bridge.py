@@ -415,6 +415,11 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         or DEFAULT_TEXT_FALLBACK_MODEL,
         "text_fallback_llm_effort": payload.get("text_fallback_llm_effort")
         or DEFAULT_TEXT_FALLBACK_EFFORT,
+        # 省略時は従来どおりfallbackを有効にする。明示Falseはそのまま
+        # 実行workerへ渡し、TwitterConfig側で既定値に戻さない。
+        "text_fallback_llm_enabled": payload.get(
+            "text_fallback_llm_enabled", True
+        ),
         "image_llm_provider": payload.get("image_llm_provider")
         or DEFAULT_IMAGE_PRIMARY_PROVIDER,
         "image_llm_model": payload.get("image_llm_model")
@@ -428,6 +433,9 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         or DEFAULT_IMAGE_FALLBACK_MODEL,
         "image_fallback_llm_effort": payload.get("image_fallback_llm_effort")
         or DEFAULT_IMAGE_FALLBACK_EFFORT,
+        "image_fallback_llm_enabled": payload.get(
+            "image_fallback_llm_enabled", True
+        ),
     }
     if len(urls) > 1 and not payload.get("reprocess"):
         config["source_urls"] = urls
@@ -455,12 +463,14 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         "text_fallback_llm_provider",
         "text_fallback_llm_model",
         "text_fallback_llm_effort",
+        "text_fallback_llm_enabled",
         "image_llm_provider",
         "image_llm_model",
         "image_llm_effort",
         "image_fallback_llm_provider",
         "image_fallback_llm_model",
         "image_fallback_llm_effort",
+        "image_fallback_llm_enabled",
         "image_api_reasoning_effort_map",
         "tweet_llm_cli_providers",
         "tweet_llm_cli_models",
@@ -2177,6 +2187,9 @@ def _job_reprocess_circle_from_post_impl(
         or DEFAULT_TEXT_FALLBACK_MODEL,
         "text_fallback_llm_effort": payload.get("text_fallback_llm_effort")
         or DEFAULT_TEXT_FALLBACK_EFFORT,
+        "text_fallback_llm_enabled": payload.get(
+            "text_fallback_llm_enabled", True
+        ),
         "output_dir": output_dir,
         "image_llm_provider": payload.get("image_llm_provider")
         or DEFAULT_IMAGE_PRIMARY_PROVIDER,
@@ -2191,6 +2204,9 @@ def _job_reprocess_circle_from_post_impl(
         or DEFAULT_IMAGE_FALLBACK_MODEL,
         "image_fallback_llm_effort": payload.get("image_fallback_llm_effort")
         or DEFAULT_IMAGE_FALLBACK_EFFORT,
+        "image_fallback_llm_enabled": payload.get(
+            "image_fallback_llm_enabled", True
+        ),
         "image_api_reasoning_effort_map": payload.get(
             "image_api_reasoning_effort_map", {}
         ),
@@ -2202,7 +2218,9 @@ def _job_reprocess_circle_from_post_impl(
         ),
         "tweet_llm_cli_efforts": payload.get("tweet_llm_cli_efforts", {}),
         "tweet_llm_cli_timeout": payload.get("tweet_llm_cli_timeout", 900),
-        "api_reasoning_effort": payload.get("api_reasoning_effort", "medium"),
+        "api_reasoning_effort": payload.get(
+            "api_reasoning_effort", DEFAULT_TEXT_PRIMARY_EFFORT
+        ),
         "api_reasoning_effort_map": payload.get("api_reasoning_effort_map", {}),
         "catalog_additional_prompt": payload.get("catalog_additional_prompt", ""),
         "event_date": payload.get("event_date"),
@@ -2408,6 +2426,7 @@ def _job_reprocess_circle_from_image(payload: Dict[str, Any]) -> Dict[str, Any]:
         payload.get("image_fallback_llm_provider") or DEFAULT_IMAGE_FALLBACK_PROVIDER,
         payload.get("image_fallback_llm_model") or DEFAULT_IMAGE_FALLBACK_MODEL,
         payload.get("image_fallback_llm_effort") or DEFAULT_IMAGE_FALLBACK_EFFORT,
+        payload.get("image_fallback_llm_enabled", True),
     )
     has_image_cli = any(attempt.get("kind") == "cli" for attempt in image_attempts)
     analyzer = CatalogImageAnalyzer(
@@ -3438,6 +3457,7 @@ def _job_auto_place_map_pins(payload: Dict[str, Any]) -> Dict[str, Any]:
         payload.get("image_fallback_llm_provider"),
         payload.get("image_fallback_llm_model"),
         payload.get("image_fallback_llm_effort"),
+        payload.get("image_fallback_llm_enabled", True),
     )
 
     generation_kwargs = {
@@ -4714,6 +4734,10 @@ def _job_parse_site_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
             fallback_provider=sp_raw.get("fallback_provider"),
             fallback_model=sp_raw.get("fallback_model"),
             fallback_effort=sp_raw.get("fallback_effort"),
+            fallback_enabled=sp_raw.get(
+                "fallback_enabled",
+                payload.get("text_fallback_llm_enabled", True),
+            ),
         )
 
     site_config = SiteConfig(
@@ -4738,6 +4762,9 @@ def _job_parse_site_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
         text_fallback_llm_effort=payload.get(
             "text_fallback_llm_effort", "medium"
         ),
+        text_fallback_llm_enabled=payload.get(
+            "text_fallback_llm_enabled", True
+        ),
         image_llm_provider=payload.get("image_llm_provider")
         or DEFAULT_IMAGE_PRIMARY_PROVIDER,
         image_llm_model=payload.get("image_llm_model")
@@ -4753,6 +4780,9 @@ def _job_parse_site_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
         image_fallback_llm_effort=payload.get(
             "image_fallback_llm_effort"
         ) or DEFAULT_IMAGE_FALLBACK_EFFORT,
+        image_fallback_llm_enabled=payload.get(
+            "image_fallback_llm_enabled", True
+        ),
         image_api_reasoning_effort_map=payload.get(
             "image_api_reasoning_effort_map", {}
         ),
@@ -4784,6 +4814,7 @@ def _job_parse_site_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
         payload.get("text_fallback_llm_provider", "cli:codex"),
         payload.get("text_fallback_llm_model", "gpt-5.5"),
         payload.get("text_fallback_llm_effort", "medium"),
+        fallback_enabled=payload.get("text_fallback_llm_enabled", True),
     )
     llm_client = LLMClient(
         model=api_models_from_attempts(text_attempts),
@@ -4921,6 +4952,10 @@ JSONのみを返してください。
             fallback_provider=sp_raw.get("fallback_provider"),
             fallback_model=sp_raw.get("fallback_model"),
             fallback_effort=sp_raw.get("fallback_effort"),
+            fallback_enabled=sp_raw.get(
+                "fallback_enabled",
+                payload.get("text_fallback_llm_enabled", True),
+            ),
         )
         try:
             result = parse_with_high_end_model(prompt, spc)
@@ -4949,6 +4984,7 @@ JSONのみを返してください。
                 payload.get("text_fallback_llm_provider", "cli:codex"),
                 payload.get("text_fallback_llm_model", "gpt-5.5"),
                 payload.get("text_fallback_llm_effort", "medium"),
+                fallback_enabled=payload.get("text_fallback_llm_enabled", True),
             )
             client = LLMClient(
                 model=api_models_from_attempts(text_attempts),

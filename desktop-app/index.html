@@ -169,6 +169,8 @@
 
             <label for="textReasoningEffort">テキスト処理effort</label>
             <select id="textReasoningEffort"></select>
+            <div></div>
+            <div id="textExecutionOrder" class="model-execution-order" role="status" aria-live="polite"></div>
 
             <label for="siteStructureModelProvider">サイト構造解析プロバイダー</label>
             <select id="siteStructureModelProvider"></select>
@@ -179,7 +181,7 @@
             <label for="siteStructureReasoningEffort">サイト構造解析effort</label>
             <select id="siteStructureReasoningEffort"></select>
 
-            <label for="catalogPostModelProvider">おしながきポスト解析プロバイダー</label>
+            <label for="catalogPostModelProvider">おしながきポスト解析（本文+画像）プロバイダー</label>
             <select id="catalogPostModelProvider"></select>
 
             <label for="catalogPostModel">おしながきポスト解析モデル</label>
@@ -187,6 +189,26 @@
 
             <label for="catalogPostReasoningEffort">おしながきポスト解析effort</label>
             <select id="catalogPostReasoningEffort"></select>
+            <div></div>
+            <div id="catalogPostExecutionOrder" class="model-execution-order" role="status" aria-live="polite"></div>
+
+            <div></div>
+            <details id="catalogPostFallbackSettings" class="model-fallback-details">
+              <summary>おしながきポストの予備モデルを設定</summary>
+              <div class="settings-grid mt-3">
+                <label class="setting-check-row" for="catalogPostFallbackEnabled">
+                  <input id="catalogPostFallbackEnabled" type="checkbox" checked />
+                  <span>予備を使う</span>
+                </label>
+                <div class="form-hint">予備なしでは、主モデルが失敗すると処理を終了します。</div>
+                <label for="catalogPostFallbackModelProvider">予備プロバイダー</label>
+                <select id="catalogPostFallbackModelProvider"></select>
+                <label for="catalogPostFallbackModel">予備モデル</label>
+                <select id="catalogPostFallbackModel"></select>
+                <label for="catalogPostFallbackReasoningEffort">予備effort</label>
+                <select id="catalogPostFallbackReasoningEffort"></select>
+              </div>
+            </details>
 
             <label for="visionModel">画像処理プロバイダー</label>
             <select id="visionModel"></select>
@@ -196,11 +218,18 @@
 
             <label for="visionReasoningEffort">画像処理effort</label>
             <select id="visionReasoningEffort"></select>
+            <div></div>
+            <div id="visionExecutionOrder" class="model-execution-order" role="status" aria-live="polite"></div>
 
             <label for="llmAdvancedSettings">LLM詳細設定</label>
             <details id="llmAdvancedSettings" class="rounded border border-gray-700 p-3">
               <summary class="cursor-pointer text-sm">フォールバックモデル</summary>
               <div class="settings-grid mt-3">
+                <label class="setting-check-row" for="textFallbackEnabled">
+                  <input id="textFallbackEnabled" type="checkbox" checked />
+                  <span>テキスト予備を使う</span>
+                </label>
+                <div></div>
                 <label for="textFallbackModelProvider">テキストfallbackプロバイダー</label>
                 <select id="textFallbackModelProvider"></select>
 
@@ -218,6 +247,11 @@
 
                 <label for="visionFallbackReasoningEffort">画像fallback effort</label>
                 <select id="visionFallbackReasoningEffort"></select>
+                <label class="setting-check-row" for="imageFallbackEnabled">
+                  <input id="imageFallbackEnabled" type="checkbox" checked />
+                  <span>画像予備を使う</span>
+                </label>
+                <div></div>
               </div>
             </details>
 
@@ -772,6 +806,9 @@
             <label for="geminiApiKey">Gemini API Key</label>
             <input id="geminiApiKey" type="password" placeholder="AIza..." />
 
+            <label for="anthropicApiKey">Anthropic API Key</label>
+            <input id="anthropicApiKey" type="password" placeholder="sk-ant-..." />
+
             <label for="xaiApiKey">xAI (Grok) API Key</label>
             <input id="xaiApiKey" type="password" placeholder="xai-..." />
           </div>
@@ -887,6 +924,7 @@
             現在の再処理を中止
           </button>
         </div>
+        <div id="modelPreflightStatus" class="model-preflight-status" role="status" aria-live="polite"></div>
         <pre id="result" class="hidden"></pre>
       </div>
     </div>

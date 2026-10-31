@@ -9,9 +9,10 @@ import type { CrawlResult, CrawlCircle, CrawlEventInfo } from "../types";
 import { fetchHtml } from "../html-fetcher";
 import { LlmClient } from "../llm-client";
 import {
-  getPrimaryModel,
-  getFallbackModel,
-  getSiteParsingModel,
+  getPrimaryModelSelection,
+  getFallbackModelSelection,
+  getSiteParsingModelSelection,
+  getTextReasoningEffort,
   getSiteParsingReasoningEffort,
 } from "../../settings-store";
 import {
@@ -142,16 +143,26 @@ async function selectTable(
     if (mapping) return { candidate, mapping, source: "saved" };
   }
 
-  const [primary, fallback, siteParsing, reasoningEffort] = await Promise.all([
-    getPrimaryModel(),
-    getFallbackModel(),
-    getSiteParsingModel(),
+  const [primary, fallback, siteParsing, textEffort, siteParsingEffort] = await Promise.all([
+    getPrimaryModelSelection(),
+    getFallbackModelSelection(),
+    getSiteParsingModelSelection(),
+    getTextReasoningEffort(),
     getSiteParsingReasoningEffort(),
   ]);
-  const models = Array.from(new Set([siteParsing, primary, fallback].filter(Boolean)));
-  if (!models.length) throw new Error("LLMモデルが設定されていません");
+  // site_structureの主候補にはサイト解析effort、本文fallbackにはtext effortを
+  // 候補単位で適用する。同じprovider+IDの重複はLlmClientが先勝ちで除去する。
+  const models = [
+    { ...siteParsing, reasoningEffort: siteParsingEffort },
+    { ...primary, reasoningEffort: textEffort },
+    { ...fallback, reasoningEffort: textEffort },
+  ];
   const llm = new LlmClient(models);
-  const text = await llm.extractData(mappingPrompt(hostname, candidates), { reasoningEffort });
+  // optionsにもtext effortを渡すことで、旧LlmClient互換実装やprimary/fallback
+  // のrequestにも保存済みtext effortが到達する。候補固有値があればそちらを優先。
+  const text = await llm.extractData(mappingPrompt(hostname, candidates), {
+    reasoningEffort: textEffort,
+  });
   const parsed = JSON.parse(text) as { table_index?: unknown };
   if (!Number.isInteger(parsed.table_index)) throw new Error("LLMの表選択結果が不正です");
   const tableIndex = parsed.table_index as number;

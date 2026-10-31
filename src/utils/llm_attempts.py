@@ -83,28 +83,25 @@ def _same_vendor(first: Attempt, second: Attempt) -> bool:
 def distinct_fallback(
     attempts: List[Attempt], default_fallback: Attempt, role: str
 ) -> List[Attempt]:
-    """Keep a fallback that actually adds a second path.
+    """重複した試行だけを取り除き、指定順をそのまま返す。
 
-    A fallback identical to the primary can never help, so it is replaced by the
-    documented default.  A fallback that only differs by model but shares the
-    primary's provider is kept (it was explicitly requested) with a warning,
-    because account-level quota errors hit both.
+    以前は主試行と同じfallbackを見つけると、選択されていない既定の
+    provider/modelを勝手に注入していた。これはGUIで明示的に選んだモデル
+    を別のモデルへ変えてしまうため、同一経路は単純に一度だけ残す。
+    ``default_fallback`` と ``role`` は既存の呼び出し互換のため受け取るが、
+    fallbackの自動補充には使わない。
     """
-    if len(attempts) < 2:
+    del default_fallback
+    if not attempts:
         return attempts
-    primary, fallback = attempts[0], attempts[-1]
-    if _same_attempt(primary, fallback) and not _same_attempt(primary, default_fallback):
-        logger.warning(
-            "%sのfallbackが主モデルと同一のため、既定のfallback(%s:%s)に置き換えます",
-            role, default_fallback.get("provider"), default_fallback.get("model"),
-        )
-        return attempts[:-1] + [dict(default_fallback)]
-    if _same_vendor(primary, fallback):
-        logger.warning(
-            "%sのfallbackが主モデルと同じprovider(%s)です。provider単位の429/障害ではfallbackが効きません",
-            role, fallback.get("provider") or fallback.get("kind"),
-        )
-    return attempts
+
+    result: List[Attempt] = []
+    for attempt in attempts:
+        if any(_same_attempt(attempt, previous) for previous in result):
+            logger.info("%sの同一主/予備モデルを重複除去します: %s", role, attempt.get("model"))
+            continue
+        result.append(attempt)
+    return result
 
 
 def unique_models(models: List[Optional[str]]) -> List[str]:
@@ -134,6 +131,7 @@ def build_text_llm_attempts(
     fallback_model: Optional[str] = None,
     fallback_effort: Optional[str] = None,
     primary_effort: Optional[str] = None,
+    fallback_enabled: Optional[bool] = True,
 ) -> List[Attempt]:
     attempts: List[Attempt] = []
     cli_model_map = cli_model_map or {}
@@ -165,34 +163,38 @@ def build_text_llm_attempts(
             }
         )
 
-    effective_fallback_provider = fallback_provider or (
-        DEFAULT_TEXT_FALLBACK_PROVIDER if primary_was_omitted else None
-    )
-    effective_fallback_model = fallback_model or (
-        DEFAULT_TEXT_FALLBACK_MODEL if primary_was_omitted else None
-    )
-    effective_fallback_effort = fallback_effort or (
-        DEFAULT_TEXT_FALLBACK_EFFORT if primary_was_omitted else None
-    )
-    fallback_kind, fallback_name = split_fallback_provider(effective_fallback_provider)
-    if fallback_kind == "cli":
-        attempts.append(
-            {
-                "kind": "cli",
-                "provider": fallback_name,
-                "model": effective_fallback_model,
-                "effort": effective_fallback_effort,
-            }
+    # ``None``/省略は旧挙動の有効、明示的なFalseだけを無効として扱う。
+    # frontendのpreflightが実行payloadだけをFalseに書き換える場合も、
+    # ここで ``or True`` に戻さない。
+    if fallback_enabled is not False:
+        effective_fallback_provider = fallback_provider or (
+            DEFAULT_TEXT_FALLBACK_PROVIDER if primary_was_omitted else None
         )
-    elif effective_fallback_model:
-        attempts.append(
-            {
-                "kind": "api",
-                "provider": fallback_name,
-                "model": effective_fallback_model,
-                "effort": effective_fallback_effort,
-            }
+        effective_fallback_model = fallback_model or (
+            DEFAULT_TEXT_FALLBACK_MODEL if primary_was_omitted else None
         )
+        effective_fallback_effort = fallback_effort or (
+            DEFAULT_TEXT_FALLBACK_EFFORT if primary_was_omitted else None
+        )
+        fallback_kind, fallback_name = split_fallback_provider(effective_fallback_provider)
+        if fallback_kind == "cli":
+            attempts.append(
+                {
+                    "kind": "cli",
+                    "provider": fallback_name,
+                    "model": effective_fallback_model,
+                    "effort": effective_fallback_effort,
+                }
+            )
+        elif effective_fallback_model:
+            attempts.append(
+                {
+                    "kind": "api",
+                    "provider": fallback_name,
+                    "model": effective_fallback_model,
+                    "effort": effective_fallback_effort,
+                }
+            )
 
     return distinct_fallback(
         attempts,
@@ -217,6 +219,7 @@ def build_image_llm_attempts(
     fallback_provider: Optional[str] = None,
     fallback_model: Optional[str] = None,
     fallback_effort: Optional[str] = None,
+    fallback_enabled: Optional[bool] = True,
 ) -> List[Attempt]:
     attempts: List[Attempt] = []
 
@@ -246,26 +249,27 @@ def build_image_llm_attempts(
 
     # For backwards compatibility, an explicit primary with no fallback
     # remains CLI/API single-attempt.  Fully omitted configuration gets the
-    # Luna-primary + OpenAI-Sol fallback contract.
-    effective_fallback_provider = fallback_provider or (
-        DEFAULT_IMAGE_FALLBACK_PROVIDER if primary_was_omitted else None
-    )
-    effective_fallback_model = fallback_model or (
-        DEFAULT_IMAGE_FALLBACK_MODEL if primary_was_omitted else None
-    )
-    effective_fallback_effort = fallback_effort or (
-        DEFAULT_IMAGE_FALLBACK_EFFORT if primary_was_omitted else None
-    )
-    fallback_kind, fallback_name = split_fallback_provider(effective_fallback_provider)
-    if effective_fallback_provider and effective_fallback_model:
-        attempts.append(
-            {
-                "kind": fallback_kind,
-                "provider": fallback_name,
-                "model": effective_fallback_model,
-                "effort": effective_fallback_effort,
-            }
+    # Luna-primary + Grok Build fallback contract.
+    if fallback_enabled is not False:
+        effective_fallback_provider = fallback_provider or (
+            DEFAULT_IMAGE_FALLBACK_PROVIDER if primary_was_omitted else None
         )
+        effective_fallback_model = fallback_model or (
+            DEFAULT_IMAGE_FALLBACK_MODEL if primary_was_omitted else None
+        )
+        effective_fallback_effort = fallback_effort or (
+            DEFAULT_IMAGE_FALLBACK_EFFORT if primary_was_omitted else None
+        )
+        fallback_kind, fallback_name = split_fallback_provider(effective_fallback_provider)
+        if effective_fallback_provider and effective_fallback_model:
+            attempts.append(
+                {
+                    "kind": fallback_kind,
+                    "provider": fallback_name,
+                    "model": effective_fallback_model,
+                    "effort": effective_fallback_effort,
+                }
+            )
 
     return distinct_fallback(
         attempts,
