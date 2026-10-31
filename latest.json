@@ -1,8 +1,8 @@
 {
   "desktop": {
-    "version": "0.1.34",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.34/EventAutoPin.exe",
-    "notes": "10項目以下のプルダウンを数字キーで選択し、優先度順を最優先からに統一",
+    "version": "0.1.35",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.35/EventAutoPin.exe",
+    "notes": "画像操作・再処理履歴・JSON解析・手動関連投稿抽出を更新",
     "date": "2026-10-31"
   },
   "mobile": {
