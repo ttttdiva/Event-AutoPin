@@ -1955,8 +1955,21 @@ export interface ImportProgress {
   phase: "download" | "events" | "maps" | "circles";
 }
 
+export interface LegacyImportCandidate {
+  id: number;
+  name: string;
+  importedAt: string;
+  totalCircles: number;
+  boughtCircles: number;
+  totalItems: number;
+  boughtItems: number;
+}
+
+export class ImportCancelledError extends Error {}
+
 export interface ImportFromZipOptions {
   deleteSourceAfterUnzip?: boolean;
+  selectLegacyTarget?: (candidates: LegacyImportCandidate[]) => Promise<number | null>;
 }
 
 interface SyncManifestEvent {
@@ -3111,7 +3124,7 @@ async function computeEventSyncRevisions(
 
 interface SingleEventRevisionGuard {
   eventId: number;
-  uid: string;
+  uid: string | null;
   databaseRevision: string;
 }
 
@@ -3120,7 +3133,7 @@ async function finalizeIncrementalDb(
   stageRoot: string,
   publishIds: number[],
   deleteIds: number[],
-  stableUidByEventId: Map<number, string>,
+  stableUidByEventId: Map<number, string | null>,
   changedIdentityByStagedId: Map<number, ChangedEventIdentityMap>,
   revisionGuard?: SingleEventRevisionGuard,
 ): Promise<void> {
@@ -3208,8 +3221,8 @@ async function finalizeIncrementalDb(
         stagedEventId,
       );
       const stableUid = stableUidByEventId.get(stagedEventId);
-      if (!stableUid) throw new Error(`staging UID がありません: ${stagedEventId}`);
-      await txDb.runAsync("UPDATE events SET sync_uid = ? WHERE id = ?", stableUid, stagedEventId);
+      if (!stableUidByEventId.has(stagedEventId)) throw new Error(`staging UID がありません: ${stagedEventId}`);
+      await txDb.runAsync("UPDATE events SET sync_uid = ? WHERE id = ?", stableUid ?? null, stagedEventId);
 
       if (identity) {
         await txDb.runAsync("UPDATE events SET id = ? WHERE id = ?", liveEventId, stagedEventId);
@@ -5243,7 +5256,41 @@ async function hasHealthyLocalAssets(
   }
 }
 
+// PC の event.id は Mobile の events.id ではないため、名前と日付で照合する。
+function legacyEventDate(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = value.normalize("NFKC").trim().match(/^(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?$/);
+  if (!match) return null;
+  const [year, month, day] = match.slice(1).map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function findLegacyImportCandidates<T extends { id: number; sync_uid: string | null; name: string; date: string | null }>(
+  data: ImportData,
+  rows: T[],
+): T[] {
+  // root event_uid is the explicit stable identity used by mobile export and single-event sync.
+  const uid = (data as ImportData & { event_uid?: unknown }).event_uid;
+  if (typeof uid === "string" && uid.trim()) {
+    const matches = rows.filter((row) => row.sync_uid === uid);
+    if (matches.length === 1) return matches;
+  }
+  const name = typeof data.event?.name === "string"
+    ? data.event.name.normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase()
+    : "";
+  const date = legacyEventDate(data.event?.date);
+  return name && date
+    ? rows.filter((row) =>
+      row.name.normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase() === name &&
+      legacyEventDate(row.date) === date,
+    )
+    : [];
+}
+
 interface IncrementalImportOptions {
+  legacyTarget?: { id: number; uid: string | null; revision: string; databaseRevision: string };
   singleEvent?: {
     uid: string;
     targetEventId: number;
@@ -5268,6 +5315,8 @@ async function importIncrementalBundle(
     asset_set_hash: string | null;
   }>(database, "SELECT id, sync_uid, content_hash, asset_set_hash FROM events WHERE sync_uid IS NOT NULL");
   const singleEvent = options.singleEvent;
+  const legacyTarget = options.legacyTarget;
+  const legacyRowIdSeeds = new Map<string, number>();
   const singleEventRevision = singleEvent ? parseEventSyncRevision(singleEvent.expectedRevision) : null;
   if (singleEvent) {
     if (events.length !== 1 || manifestUid(events[0]) !== singleEvent.uid) {
@@ -5292,7 +5341,7 @@ async function importIncrementalBundle(
   const unchangedEventIds: number[] = [];
   let lastEventId: number | null = null;
   const previousChangedIds: number[] = [];
-  const stableUidByEventId = new Map<number, string>();
+  const stableUidByEventId = new Map<number, string | null>();
   const changedIdentityByStagedId = new Map<number, ChangedEventIdentityMap>();
   let phase: ImportPublishPhase = "staging";
   let published: PublishedImageDir[] = [];
@@ -5316,15 +5365,15 @@ async function importIncrementalBundle(
     for (let i = 0; i < events.length; i++) {
       if (singleEvent?.shouldCancel?.()) throw new Error("single-event同期を中断しました");
       const manifestEvent = events[i];
-      const uid = manifestUid(manifestEvent);
+      const uid = manifestUid(manifestEvent) ?? (legacyTarget ? `legacy_${legacyTarget.id}` : null);
       const hash = manifestContentHash(manifestEvent);
-      if (!uid || !hash || !manifestAssetHash(manifestEvent)) {
+      if (!uid || (!legacyTarget && (!hash || !manifestAssetHash(manifestEvent)))) {
         throw new Error("同期manifestにstable uid/content hash/asset hashがありません");
       }
       seen.add(uid);
-      const previous = byUid.get(uid);
+      const previous = legacyTarget ? { id: legacyTarget.id, sync_uid: legacyTarget.uid, content_hash: null, asset_set_hash: null } : byUid.get(uid);
       if (
-        previous &&
+        !legacyTarget && previous &&
         previous.content_hash === hash &&
         previous.asset_set_hash === manifestAssetHash(manifestEvent)
         && await hasHealthyLocalAssets(database, extractDir, manifestEvent, Number(previous.id), rootAssetManifest)) {
@@ -5339,15 +5388,17 @@ async function importIncrementalBundle(
       const newEventId = await importEventFromExtractDir(
         eventDirFromManifestPath(extractDir, manifestEvent.path),
         emitProgress,
-        manifestEvent,
+        legacyTarget ? undefined : manifestEvent,
         stageRoot,
         stagingUid,
         previous ? Number(previous.id) : null,
         stageRoot,
-        scopeAssetManifest(rootAssetManifest ?? null, manifestEvent.path, uid),
+        legacyTarget ? undefined : scopeAssetManifest(rootAssetManifest ?? null, manifestEvent.path, uid),
+        undefined,
+        legacyTarget ? legacyRowIdSeeds : importRowIdSeeds,
       );
       importedEventIds.push(newEventId);
-      stableUidByEventId.set(newEventId, uid);
+      stableUidByEventId.set(newEventId, legacyTarget ? legacyTarget.uid : uid);
       await writeImportStageJournal(stageRoot, {
         version: 1,
         phase,
@@ -5372,7 +5423,7 @@ async function importIncrementalBundle(
       }
     }
 
-    const removedEventIds = singleEvent ? [] : existing
+    const removedEventIds = singleEvent || legacyTarget ? [] : existing
       .filter((row) => !!row.sync_uid && !seen.has(row.sync_uid))
       .map((row) => Number(row.id));
     const plan = buildImportPublishPlan(importedEventIds, previousChangedIds, removedEventIds);
@@ -5443,6 +5494,9 @@ async function importIncrementalBundle(
         throw new Error("画像を公開する前に対象イベントが変更されました。プレビューをやり直してください");
       }
     }
+    if (legacyTarget && (await computeEventSyncRevisions(database, legacyTarget.id)).revision !== legacyTarget.revision) {
+      throw new Error("取込中に対象イベントが変更されました。再度お試しください");
+    }
     phase = advanceImportPublishPhase(phase, "publishing");
     for (const eventId of plan.publishEventIds) {
       if (singleEvent?.shouldCancel?.()) throw new Error("single-event同期を中断しました");
@@ -5486,7 +5540,9 @@ async function importIncrementalBundle(
             uid: singleEvent.uid,
             databaseRevision: singleEventRevision?.databaseRevision ?? "",
           }
-        : undefined,
+        : legacyTarget
+          ? { eventId: legacyTarget.id, uid: legacyTarget.uid, databaseRevision: legacyTarget.databaseRevision }
+          : undefined,
     );
     finalized = true;
     phase = advanceImportPublishPhase(phase, "finalized");
@@ -5515,7 +5571,7 @@ async function importIncrementalBundle(
       ...unchangedEventIds,
     ])];
     lastImportDiff = {
-      kind: singleEvent ? "single" : "full",
+      kind: singleEvent || legacyTarget ? "single" : "full",
       incremental: true,
       importedEventIds: liveImportedEventIds,
       addedEventIds,
@@ -5702,6 +5758,46 @@ export async function importFromZip(
       return legacyResult.lastEventId;
     }
 
+    const legacyData = JSON.parse(await FileSystem.readAsStringAsync(`${extractDir}event.json`)) as ImportData;
+    const legacyDatabase = await getDatabase();
+    const rows = await legacyDatabase.getAllAsync<{ id: number; sync_uid: string | null; name: string; date: string | null }>(
+      "SELECT id, sync_uid, name, date FROM events",
+    );
+    const matches = findLegacyImportCandidates(legacyData, rows);
+    let target = matches[0];
+    let revision: Awaited<ReturnType<typeof computeEventSyncRevisions>> | undefined;
+    if (matches.length > 1) {
+      if (!options?.selectLegacyTarget) throw new Error("同じイベントの候補が複数あります");
+      const revisions = new Map(await Promise.all(matches.map(async (row) =>
+        [row.id, await computeEventSyncRevisions(legacyDatabase, row.id)] as const)));
+      const summaries = await getEventSummaries();
+      const candidates = matches.map((row) => {
+        const summary = summaries.find((item) => item.id === row.id)!;
+        return {
+          id: row.id,
+          name: row.name,
+          importedAt: summary.importedAt,
+          totalCircles: summary.totalCircles,
+          boughtCircles: summary.boughtCircles,
+          totalItems: summary.totalItems,
+          boughtItems: summary.boughtItems,
+        };
+      }).sort((a, b) => a.id - b.id);
+      const selected = await options.selectLegacyTarget(candidates);
+      if (selected == null) throw new ImportCancelledError();
+      target = matches.find((row) => row.id === selected)!;
+      if (!target) throw new Error("更新先の候補が不正です");
+      revision = revisions.get(target.id);
+      if (!revision || (await computeEventSyncRevisions(legacyDatabase, target.id)).revision !== revision.revision) {
+        throw new Error("取込中に対象イベントが変更されました。再度お試しください");
+      }
+    }
+    if (target) {
+      revision ??= await computeEventSyncRevisions(legacyDatabase, target.id);
+      return await importIncrementalBundle(extractDir, [{ path: "event.json" }], onProgress, undefined, {
+        legacyTarget: { id: target.id, uid: target.sync_uid, ...revision },
+      });
+    }
     const eventId = await importEventFromExtractDir(extractDir, onProgress);
     await importSharedBundleSettings(extractDir);
     lastImportDiff = {

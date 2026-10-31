@@ -1223,11 +1223,6 @@ export default function CircleListScreen() {
     }] as const;
   })), [circles]);
 
-  const highPriorityProgress = useMemo(
-    () => selectHighPriorityProgress(circles, eventId),
-    [circles, eventId],
-  );
-
   const filteredCircles = useMemo(() => {
     let result = circles;
     const activeSearchQuery = searchQuery.trim();
@@ -1317,14 +1312,45 @@ export default function CircleListScreen() {
   ]);
 
   // マップピンタップ後、FlatListマウント完了時にスクロール実行
+  const highPriorityProgress = useMemo(
+    () => selectHighPriorityProgress(viewMode === "split" ? filteredCircles : circles, eventId),
+    [filteredCircles, circles, eventId, viewMode],
+  );
+  const filteredStats = useMemo(() => {
+    const boughtCircles = filteredCircles.filter(c => c.purchaseStatus === PURCHASE_STATUS.BOUGHT).length;
+    const couldntBuyCircles = filteredCircles.filter(c => c.purchaseStatus === PURCHASE_STATUS.COULDNT_BUY).length;
+    const skippedCircles = filteredCircles.filter(c => c.purchaseStatus === PURCHASE_STATUS.SKIPPED).length;
+    return { totalCircles: filteredCircles.length, boughtCircles, couldntBuyCircles, skippedCircles,
+      remainingCircles: filteredCircles.length - boughtCircles - couldntBuyCircles - skippedCircles };
+  }, [filteredCircles]);
+
   const pendingScrollCircleId = useRef<number | null>(null);
   const scrollRetryCount = useRef(0);
   const [scrollTick, setScrollTick] = useState(0);
 
-  const catalogViewerIndex = useMemo(() => {
-    if (!catalogViewer) return -1;
-    return filteredCircles.findIndex((c) => c.id === catalogViewer.circleId);
-  }, [catalogViewer, filteredCircles]);
+  const [catalogImages, setCatalogImages] = useState<string[]>([]);
+  const catalogRequest = useRef(0);
+  const catalogViewerRef = useRef(catalogViewer);
+  const filteredCirclesRef = useRef(filteredCircles);
+  catalogViewerRef.current = catalogViewer;
+  filteredCirclesRef.current = filteredCircles;
+  const catalogCircleIndex = catalogViewer
+    ? filteredCircles.findIndex(circle => circle.id === catalogViewer.circleId) : -1;
+  const catalogImageIndex = catalogViewer ? catalogImages.indexOf(catalogViewer.uri) : -1;
+  useEffect(() => {
+    const request = ++catalogRequest.current;
+    setCatalogImages([]);
+    if (!catalogViewer) return;
+    if (catalogCircleIndex < 0) { setCatalogViewer(null); return; }
+    const selected = catalogViewer;
+    getItemImagesByCircle(selected.circleId).then(images => {
+      if (catalogRequest.current !== request) return;
+      const uris = images.map(image => image.filename).filter(Boolean);
+      if (!uris.includes(selected.uri)) { setCatalogViewer(null); return; }
+      setCatalogImages(uris);
+    }).catch(() => { if (catalogRequest.current === request) setCatalogImages([]); });
+    return () => { ++catalogRequest.current; };
+  }, [filteredCircles, catalogViewer?.circleId]);
 
   const focusCircleInList = useCallback((circleId: number) => {
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
@@ -1335,26 +1361,41 @@ export default function CircleListScreen() {
   }, [setExpandedCircleId]);
 
   const openCatalogViewer = useCallback((circle: Circle, uri: string) => {
-    setCatalogViewer({ circleId: circle.id, uri });
+    ++catalogRequest.current;
+    catalogViewerRef.current = { circleId: circle.id, uri };
+    setCatalogViewer(catalogViewerRef.current);
     focusCircleInList(circle.id);
   }, [focusCircleInList]);
 
   async function navigateCatalogViewer(direction: -1 | 1) {
-    if (!catalogViewer || catalogViewerIndex < 0) return;
-
-    for (
-      let index = catalogViewerIndex + direction;
-      index >= 0 && index < filteredCircles.length;
-      index += direction
-    ) {
-      const nextCircle = filteredCircles[index];
-      const images = await getItemImagesByCircle(nextCircle.id);
-      const nextImage = images[0];
-      if (!nextImage?.filename) continue;
-
-      setCatalogViewer({ circleId: nextCircle.id, uri: nextImage.filename });
-      focusCircleInList(nextCircle.id);
-      return;
+    const selected = catalogViewerRef.current;
+    const visible = filteredCirclesRef.current;
+    if (!selected) return;
+    const circleIndex = visible.findIndex(circle => circle.id === selected.circleId);
+    if (circleIndex < 0) return;
+    const request = ++catalogRequest.current;
+    const isCurrent = () => catalogRequest.current === request &&
+      catalogViewerRef.current === selected && filteredCirclesRef.current === visible;
+    try {
+      const current = (await getItemImagesByCircle(selected.circleId)).map(image => image.filename).filter(Boolean);
+      if (!isCurrent()) return;
+      const imageIndex = current.indexOf(selected.uri);
+      if (imageIndex < 0) { setCatalogViewer(null); return; }
+      const sameCircle = current[imageIndex + direction];
+      if (sameCircle) { setCatalogImages(current); setCatalogViewer({ circleId: selected.circleId, uri: sameCircle }); return; }
+      for (let index = circleIndex + direction; index >= 0 && index < visible.length; index += direction) {
+        const circle = visible[index];
+        const images = (await getItemImagesByCircle(circle.id)).map(image => image.filename).filter(Boolean);
+        if (!isCurrent()) return;
+        const uri = direction > 0 ? images[0] : images[images.length - 1];
+        if (!uri) continue;
+        setCatalogImages(images);
+        setCatalogViewer({ circleId: circle.id, uri });
+        focusCircleInList(circle.id);
+        return;
+      }
+    } catch {
+      // 読み込み失敗時は選択を維持し、再操作できるようにする。
     }
   }
 
@@ -2374,14 +2415,11 @@ export default function CircleListScreen() {
       <ImageViewer
         visible={catalogViewer !== null}
         uri={catalogViewer?.uri ?? ""}
-        onClose={() => setCatalogViewer(null)}
+        onClose={() => { ++catalogRequest.current; catalogViewerRef.current = null; setCatalogViewer(null); }}
         onNavigatePrevious={() => navigateCatalogViewer(-1)}
         onNavigateNext={() => navigateCatalogViewer(1)}
-        canNavigatePrevious={catalogViewerIndex > 0}
-        canNavigateNext={
-          catalogViewerIndex >= 0 &&
-          catalogViewerIndex < filteredCircles.length - 1
-        }
+        canNavigatePrevious={catalogImageIndex >= 0 && (catalogImageIndex > 0 || catalogCircleIndex > 0)}
+        canNavigateNext={catalogImageIndex >= 0 && (catalogImageIndex < catalogImages.length - 1 || catalogCircleIndex < filteredCircles.length - 1)}
       />
       <ImageViewer
         visible={circleCutViewer !== null}
@@ -2395,6 +2433,8 @@ export default function CircleListScreen() {
     return (
         <InputScrollView style={{ flexGrow: 0, flexShrink: 0, maxHeight: "45%" }}>
         <CollapsibleHeader
+          compact={viewMode === "split"}
+          onBack={() => router.back()}
           globalSearchEnabled={globalSearchEnabled}
           searchQuery={searchQuery}
           onSearchChange={setSearchQuery}
@@ -2414,7 +2454,7 @@ export default function CircleListScreen() {
           hideSkipped={hideSkipped}
           onHideSkippedChange={setHideSkipped}
           onClearPriorityFilter={clearPriorityFilter}
-          stats={stats}
+          stats={viewMode === "split" ? filteredStats : stats}
           budget={budget}
           filteredCount={filteredCircles.length}
           totalCount={circles.length}
@@ -2431,7 +2471,7 @@ export default function CircleListScreen() {
     return (
       <View style={{ flex: 1 }}>
         {/* 戻るボタン + イベント名 + アクションボタン */}
-        <View
+        {viewMode !== "split" && <View
           style={[
             styles.headerBar,
             { backgroundColor: colors.card, borderBottomColor: colors.border },
@@ -2451,7 +2491,7 @@ export default function CircleListScreen() {
           <Pressable style={styles.headerActionBtn} onPress={openAddCircle}>
             <FontAwesome name="plus" size={16} color={colors.tint} />
           </Pressable>
-        </View>
+        </View>}
 
         {/* フィルター・統計ヘッダー */}
         {renderFilters()}

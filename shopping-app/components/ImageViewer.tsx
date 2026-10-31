@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   StyleSheet,
   View,
@@ -6,6 +6,7 @@ import {
   Pressable,
   Text,
   type LayoutChangeEvent,
+  Platform,
 } from 'react-native';
 import { Image } from 'expo-image';
 import {
@@ -69,6 +70,24 @@ export default function ImageViewer({
       onNavigateNext?.();
     }
   }
+
+  useEffect(() => {
+    if (!visible || Platform.OS !== 'web') return;
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'ArrowLeft' && canNavigatePrevious) {
+        event.preventDefault();
+        handleNavigate(-1);
+      } else if (event.key === 'ArrowRight' && canNavigateNext) {
+        event.preventDefault();
+        handleNavigate(1);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        handleClose();
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  });
 
   const pinchGesture = Gesture.Pinch()
     .onUpdate((e) => {
@@ -180,6 +199,8 @@ export default function ImageViewer({
             <Text style={styles.closeBtnText}>✕</Text>
           </Pressable>
 
+          {canNavigatePrevious && <Pressable accessibilityRole="button" accessibilityLabel="前の画像" style={[styles.navBtn, { left: 12 }]} onPress={() => handleNavigate(-1)}><Text style={styles.closeBtnText}>‹</Text></Pressable>}
+          {canNavigateNext && <Pressable accessibilityRole="button" accessibilityLabel="次の画像" style={[styles.navBtn, { right: 12 }]} onPress={() => handleNavigate(1)}><Text style={styles.closeBtnText}>›</Text></Pressable>}
           <GestureDetector gesture={composedGesture}>
             <AnimatedImage
               source={{ uri }}
@@ -209,6 +230,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
+  navBtn: { position: "absolute", top: "50%", zIndex: 10, width: 40, height: 40, borderRadius: 20, backgroundColor: "rgba(255,255,255,0.2)", alignItems: "center", justifyContent: "center" },
   closeBtn: {
     position: 'absolute',
     top: 50,

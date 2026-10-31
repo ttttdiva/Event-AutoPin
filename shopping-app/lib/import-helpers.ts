@@ -1,6 +1,7 @@
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import {
+  ImportCancelledError,
   getEventImportSummary,
   getLastImportDiff,
   importFromZip,
@@ -10,6 +11,7 @@ import type {
   ImportFromZipOptions,
   ImportKind,
   ImportProgress,
+  LegacyImportCandidate,
 } from "./database";
 
 export interface ImportResult {
@@ -40,6 +42,7 @@ const QR_DOWNLOAD_MAX_TIMEOUT_MS = 20 * 60 * 1000;
 
 export async function handleImportZip(
   onProgress: (p: ImportProgress) => void,
+  selectLegacyTarget?: (candidates: LegacyImportCandidate[]) => Promise<number | null>,
 ): Promise<ImportRunResult | null> {
   const result = await DocumentPicker.getDocumentAsync({
     type: "application/zip",
@@ -48,16 +51,23 @@ export async function handleImportZip(
   if (result.canceled) return null;
 
   const asset = result.assets[0];
-  return importZipWithSummary(asset.uri, onProgress, {
-    // copyToCacheDirectory:true makes this an app-owned temporary copy.
-    deleteSourceAfterUnzip: true,
-  });
+  try {
+    return await importZipWithSummary(asset.uri, onProgress, {
+      // copyToCacheDirectory:true makes this an app-owned temporary copy.
+      deleteSourceAfterUnzip: true,
+      selectLegacyTarget,
+    });
+  } catch (error) {
+    if (error instanceof ImportCancelledError) return null;
+    throw error;
+  }
 }
 
 export async function handleImportFromQRUrl(
   url: string,
   onProgress: (p: ImportProgress) => void,
-): Promise<ImportRunResult> {
+  selectLegacyTarget?: (candidates: LegacyImportCandidate[]) => Promise<number | null>,
+): Promise<ImportRunResult | null> {
   const downloadPath = `${FileSystem.cacheDirectory}qr_import_${Date.now()}.zip`;
 
   try {
@@ -67,7 +77,11 @@ export async function handleImportFromQRUrl(
     }
     return await importZipWithSummary(downloadPath, onProgress, {
       deleteSourceAfterUnzip: true,
+      selectLegacyTarget,
     });
+  } catch (error) {
+    if (error instanceof ImportCancelledError) return null;
+    throw error;
   } finally {
     await FileSystem.deleteAsync(downloadPath, { idempotent: true });
   }

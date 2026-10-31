@@ -12,6 +12,7 @@ function createFileSystem() {
     .replace(/^file:\/\/\//i, "/")
     .replace(/^file:\/\//i, "/")
     .replace(/\\/g, "/")
+    .replace(/\/{2,}/g, "/")
     .replace(/\/+$/, "") || "/";
   const parentOf = (path) => {
     const slash = path.lastIndexOf("/");
@@ -327,6 +328,102 @@ async function runDatabaseSingleEventSyncTests() {
     assert.deepEqual(await database.getFirstAsync("SELECT * FROM events WHERE id = 2"), originalOtherEvent);
     assert.deepEqual(await database.getFirstAsync("SELECT * FROM event_maps WHERE event_id = 2"), originalOtherMap);
     console.log("single-event import: changed image publish succeeds; post-publish DB CAS rejects stale target and restores only target images PASS");
+
+    // Legacy single ZIPs have no sync_bundle.json. PC event IDs are not mobile
+    // row IDs; matching must retain the existing graph and mobile-owned state.
+    for (const [id, uid, incomingUid] of [[10, null, "pc-uid-a"], [20, "old-mobile-uid", "different-pc-uid"]]) {
+      const name = `旧 イベント ${id}`;
+      await database.runAsync(
+        "INSERT INTO events (id, name, url, date, memo, sync_uid, event_image_filename) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        id, name, "", "2026/11/1", "mobile memo", uid, `file:///documents/images/${id}/local.png`,
+      );
+      fileSystem.setFile(`file:///documents/images/${id}/local.png`, `local image ${id}`);
+      const circle = await database.runAsync(
+        "INSERT INTO circles (id, event_id, name, space, checked, raw_json, name_key, penname_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        1000 + id, id, "Target circle", "A-01", 1, JSON.stringify({ name: "Target circle", space: "A-01" }), "target circle", "",
+      );
+      const item = await database.runAsync(
+        "INSERT INTO items (id, circle_id, name, purchase_status, raw_json, name_key) VALUES (?, ?, ?, ?, ?, ?)",
+        2000 + id, circle.lastInsertRowId, "Book", 1, JSON.stringify({ name: "Book" }), "book",
+      );
+      const archive = eventArchive(`旧　イベント　${id}`, "maps/pc-map.png");
+      archive.event_uid = incomingUid;
+      archive.event.id = 9999; // upstream ID, never the mobile events.id
+      archive.event.date = "２０２６年１１月１日";
+      archive.circles[0].items = [{ name: "Book", purchase_status: 0 }];
+      const zip = `file:///cache/legacy-update-${id}.zip`;
+      registerArchive(fileSystem, zip, archive, { "maps/pc-map.png": "incoming map" });
+      assert.equal(await db.importFromZip(zip), id);
+      assert.deepEqual(db.getLastImportDiff().changedEventIds, [id]);
+      const updated = await database.getFirstAsync("SELECT * FROM events WHERE id = ?", id);
+      assert.equal(updated.sync_uid, uid);
+      assert.equal(updated.memo, "mobile memo");
+      assert.equal(fileSystem.fileBytes(updated.event_image_filename).toString(), `local image ${id}`);
+      const updatedCircle = await database.getFirstAsync("SELECT * FROM circles WHERE event_id = ?", id);
+      assert.equal(updatedCircle.id, circle.lastInsertRowId);
+      assert.equal(updatedCircle.checked, 1);
+      const updatedItem = await database.getFirstAsync("SELECT * FROM items WHERE circle_id = ?", updatedCircle.id);
+      assert.equal(updatedItem.id, item.lastInsertRowId);
+      assert.equal(updatedItem.purchase_status, 1);
+      const map = await database.getFirstAsync("SELECT filename FROM event_maps WHERE event_id = ?", id);
+      assert.equal(fileSystem.fileBytes(map.filename).toString(), "incoming map");
+    }
+
+    await database.runAsync("INSERT INTO events (id, name, url, date) VALUES (?, ?, ?, ?)", 30, "同名イベント", "", "2026-11-01");
+    const otherDay = eventArchive("同名イベント", "maps/pc-map.png");
+    delete otherDay.event_uid;
+    otherDay.event.date = "2026-11-02";
+    const otherDayZip = "file:///cache/legacy-other-day.zip";
+    registerArchive(fileSystem, otherDayZip, otherDay, { "maps/pc-map.png": "other day map" });
+    const otherDayId = await db.importFromZip(otherDayZip);
+    assert.notEqual(otherDayId, 30);
+    assert.equal((await database.getFirstAsync("SELECT date FROM events WHERE id = 30")).date, "2026-11-01");
+    assert.deepEqual(db.getLastImportDiff().addedEventIds, [otherDayId]);
+
+    await database.runAsync("INSERT INTO events (id, name, url, date) VALUES (?, ?, ?, ?)", 40, "曖昧イベント", "", "2026-11-01");
+    await database.runAsync("INSERT INTO events (id, name, url, date) VALUES (?, ?, ?, ?)", 41, "曖昧イベント", "", "2026/11/1");
+    const ambiguous = eventArchive("曖昧イベント", "maps/pc-map.png");
+    delete ambiguous.event_uid;
+    ambiguous.event.date = "2026-11-01";
+    const ambiguousZip = "file:///cache/legacy-ambiguous.zip";
+    registerArchive(fileSystem, ambiguousZip, ambiguous, { "maps/pc-map.png": "ambiguous map" });
+    const beforeAmbiguous = await database.getAllAsync("SELECT id, name, date FROM events ORDER BY id");
+    await assert.rejects(db.importFromZip(ambiguousZip), /複数|一意|曖昧/);
+    assert.deepEqual(await database.getAllAsync("SELECT id, name, date FROM events ORDER BY id"), beforeAmbiguous);
+    const cancelSnapshot = await database.getAllAsync("SELECT * FROM events ORDER BY id");
+    await assert.rejects(db.importFromZip(ambiguousZip, undefined, { selectLegacyTarget: async (candidates) => {
+      assert.deepEqual(candidates.map((row) => row.id), [40, 41]);
+      return null;
+    } }), db.ImportCancelledError);
+    assert.deepEqual(await database.getAllAsync("SELECT * FROM events ORDER BY id"), cancelSnapshot);
+    await database.runAsync("INSERT INTO circles (id, event_id, name, space, checked, raw_json, name_key, penname_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 4041, 41, "Other circle", "B-01", 1, "{}", "other circle", "");
+    await database.runAsync("INSERT INTO event_maps (event_id, filename, map_number, raw_json) VALUES (?, ?, ?, ?)", 41, "file:///documents/images/41/other.png", 1, "{}");
+    fileSystem.setFile("file:///documents/images/41/other.png", "other candidate image");
+    await database.runAsync("INSERT INTO circles (id, event_id, name, space, checked, raw_json, name_key, penname_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 4040, 40, "Target circle", "A-01", 1, "{}", "target circle", "");
+    await database.runAsync("INSERT INTO items (id, circle_id, name, purchase_status, raw_json, name_key) VALUES (?, ?, ?, ?, ?, ?)", 4042, 4040, "Book", 1, "{}", "book");
+    ambiguous.circles[0].items = [{ name: "Book", purchase_status: 0 }];
+    registerArchive(fileSystem, ambiguousZip, ambiguous, { "maps/pc-map.png": "ambiguous map" });
+    const otherBefore = await database.getFirstAsync("SELECT * FROM events WHERE id = 41");
+    const circlesBefore = await database.getAllAsync("SELECT * FROM circles WHERE event_id = 41");
+    const countBefore = (await database.getFirstAsync("SELECT COUNT(*) AS count FROM events")).count;
+    assert.equal(await db.importFromZip(ambiguousZip, undefined, { selectLegacyTarget: async () => 40 }), 40);
+    assert.equal((await database.getFirstAsync("SELECT COUNT(*) AS count FROM events")).count, countBefore);
+    assert.equal((await database.getFirstAsync("SELECT checked FROM circles WHERE id = 4040")).checked, 1);
+    assert.equal((await database.getFirstAsync("SELECT purchase_status FROM items WHERE id = 4042")).purchase_status, 1);
+    assert.deepEqual(await database.getFirstAsync("SELECT * FROM events WHERE id = 41"), otherBefore);
+    assert.deepEqual(await database.getAllAsync("SELECT * FROM circles WHERE event_id = 41"), circlesBefore);
+    assert.equal(fileSystem.fileBytes("file:///documents/images/41/other.png").toString(), "other candidate image");
+    await database.runAsync("UPDATE events SET sync_uid = ? WHERE id = 41", "explicit-uid");
+    ambiguous.event_uid = "explicit-uid";
+    registerArchive(fileSystem, ambiguousZip, ambiguous, { "maps/pc-map.png": "uid map" });
+    assert.equal(await db.importFromZip(ambiguousZip, undefined, { selectLegacyTarget: async () => { throw new Error("unexpected selection"); } }), 41);
+    delete ambiguous.event_uid;
+    registerArchive(fileSystem, ambiguousZip, ambiguous, { "maps/pc-map.png": "stale map" });
+    await assert.rejects(db.importFromZip(ambiguousZip, undefined, { selectLegacyTarget: async () => {
+      await database.runAsync("UPDATE events SET memo = ? WHERE id = 40", "concurrent change");
+      return 40;
+    } }), /対象イベントが変更されました/);
+    console.log("legacy ZIP import: unique name/date updates preserve mobile state; different dates and ambiguous candidates remain separate PASS");
   } finally {
     Module._load = originalLoad;
     delete require.cache[databasePath];

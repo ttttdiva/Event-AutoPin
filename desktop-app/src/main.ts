@@ -1,3 +1,4 @@
+import { usableImageValue as isUsableImageValue, catalogPathsForRow, adjacentCatalogImage } from "./catalog-image-viewer";
 import { safeReprocessPostUrl, formatReprocessHistory } from "./reprocess-runtime";
 import "./styles.css";
 import { installNumericSelects } from "./numeric-select";
@@ -2416,6 +2417,7 @@ async function loadModelCatalog(forceRefresh = false): Promise<boolean> {
 
 async function preflightSelectedModels(
   activeSlots: readonly ModelPreflightSlot[],
+  catalogPostSnapshot?: ReturnType<typeof selectedCatalogPostRole>,
 ): Promise<ModelPreflightPlan | null> {
   type RoleCheck = {
     slot: ModelPreflightSlot;
@@ -2446,21 +2448,21 @@ async function preflightSelectedModels(
     {
       slot: "oshinagaki_post",
       selection: parseTextProviderValue(
-        controlValue("catalogPostModelProvider") || DEFAULT_MODEL_SELECTIONS.catalogPost.provider,
+        catalogPostSnapshot?.provider || controlValue("catalogPostModelProvider") || DEFAULT_MODEL_SELECTIONS.catalogPost.provider,
       ),
-      model: controlValue("catalogPostModel") || DEFAULT_MODEL_SELECTIONS.catalogPost.model,
+      model: catalogPostSnapshot?.model ?? (controlValue("catalogPostModel") || DEFAULT_MODEL_SELECTIONS.catalogPost.model),
       // joint postは画像入力能力も要求する。API/Grok CLI以外はbackend非対応。
       role: "image",
     },
     {
       slot: "oshinagaki_post",
       selection: parseTextProviderValue(
-        controlValue("catalogPostFallbackModelProvider") || DEFAULT_MODEL_SELECTIONS.imageFallback.provider,
+        catalogPostSnapshot?.fallback_provider || controlValue("catalogPostFallbackModelProvider") || DEFAULT_MODEL_SELECTIONS.imageFallback.provider,
       ),
-      model: controlValue("catalogPostFallbackModel") || DEFAULT_MODEL_SELECTIONS.imageFallback.model,
+      model: catalogPostSnapshot?.fallback_model ?? (controlValue("catalogPostFallbackModel") || DEFAULT_MODEL_SELECTIONS.imageFallback.model),
       role: "image",
       fallback: true,
-      enabled: checkboxValue("catalogPostFallbackEnabled", true),
+      enabled: catalogPostSnapshot?.fallback_enabled ?? checkboxValue("catalogPostFallbackEnabled", true),
     },
     { slot: "vision", selection: selectedImageProvider(), model: selectedImageModel(), role: "image" },
     {
@@ -4763,16 +4765,6 @@ type ImageModalOptions = {
   onNavigate?: (direction: -1 | 1) => ImageModalNavTarget | null;
 };
 
-function isUsableImageValue(value: string): boolean {
-  const trimmed = value.trim();
-  return Boolean(
-    trimmed &&
-      trimmed !== "0.0" &&
-      trimmed !== "0" &&
-      !/^\d+(\.\d+)?$/.test(trimmed),
-  );
-}
-
 function firstImagePathFromValue(value: string): string | null {
   return (
     value
@@ -4783,12 +4775,16 @@ function firstImagePathFromValue(value: string): string | null {
 }
 
 function renderImageCellContents(value: string): string {
-  const imagePath = firstImagePathFromValue(value);
-  if (!imagePath) {
+  const paths = value.split("\n").map((part) => part.trim()).filter(isUsableImageValue);
+  if (!paths.length) {
     return `<span class="img-placeholder">クリックで選択</span>`;
   }
-  const src = resolveImageSrc(imagePath);
-  return `<img src="${escapeHtml(src)}" alt="" class="img-block" data-fallback="outerhtml" data-fallback-html="<span class='text-red-500 text-xs cursor-pointer'>読み込み失敗<br>クリックで選択</span>" />`;
+  const image = (path: string, style = "") => `<img src="${escapeHtml(resolveImageSrc(path))}" alt="" class="img-block" ${style} data-fallback="outerhtml" data-fallback-html="<span class='text-red-500 text-xs cursor-pointer'>読み込み失敗<br>クリックで選択</span>" />`;
+  if (paths.length === 1) return image(paths[0]);
+  return `<span class="catalog-image-stack" aria-label="画像 ${paths.length}枚">${paths.map((path, index) => {
+    const offset = Math.min(paths.length - 1 - index, 3);
+    return image(path, `style="--stack-x:${offset * 2}px;--stack-y:${-offset}px;--stack-rotation:${offset * 2}deg;--fan-x:${offset * 5}px;--fan-y:${-offset * 2}px;--fan-rotation:${offset * 5}deg"`);
+  }).reverse().join("")}</span>`;
 }
 
 function updateImageCellContents(row: number, col: string) {
@@ -4799,19 +4795,16 @@ function updateImageCellContents(row: number, col: string) {
   );
   const cell = cells.find((candidate) => candidate.dataset.col === col);
   if (!cell) return;
-  cell.innerHTML = renderImageCellContents(String(tableState.rows[row]?.[col] ?? ""));
+  const value = col === "アイテム画像" ? getCircleCatalogImagePaths(row).join("\n") : String(tableState.rows[row]?.[col] ?? "");
+  cell.innerHTML = renderImageCellContents(value);
 }
 
-function getCircleCatalogImagePath(circleIdx: number): string | null {
-  const rowPath = firstImagePathFromValue(
+function getCircleCatalogImagePaths(circleIdx: number): string[] {
+  return catalogPathsForRow(
     String(tableState.rows[circleIdx]?.["アイテム画像"] ?? ""),
+    eventJsonData?.circles?.[circleIdx],
+    catalogImagePathsForCircle,
   );
-  if (rowPath) return rowPath;
-  const image = eventJsonData?.circles?.[circleIdx]?.item_images?.[0];
-  if (image?.path && isUsableImageValue(String(image.path))) {
-    return String(image.path);
-  }
-  return catalogImagePathsForCircle(eventJsonData?.circles?.[circleIdx])?.[0] ?? null;
 }
 
 function visibleCircleIndices(): number[] {
@@ -4824,40 +4817,26 @@ function visibleCircleIndices(): number[] {
     .filter((idx) => Number.isFinite(idx));
 }
 
-function findAdjacentCatalogCircle(
-  currentCircleIdx: number,
-  direction: -1 | 1,
-): { circleIdx: number; src: string } | null {
-  const visibleIndices = visibleCircleIndices();
-  const indices =
-    visibleIndices.length > 0
-      ? visibleIndices
-      : tableState.rows.map((_, idx) => idx);
-  const currentPosition = indices.indexOf(currentCircleIdx);
-  if (currentPosition < 0) return null;
-
-  for (
-    let pos = currentPosition + direction;
-    pos >= 0 && pos < indices.length;
-    pos += direction
-  ) {
-    const circleIdx = indices[pos];
-    const path = getCircleCatalogImagePath(circleIdx);
-    if (path) return { circleIdx, src: resolveImageSrc(path) };
-  }
-  return null;
-}
-
 function showCatalogImageModal(circleIdx: number) {
-  const path = getCircleCatalogImagePath(circleIdx);
-  if (!path) return;
-  let currentCircleIdx = circleIdx;
-  showImageModal(resolveImageSrc(path), {
+  const paths = getCircleCatalogImagePaths(circleIdx);
+  const circles = eventJsonData?.circles;
+  if (!paths.length || !circles?.[circleIdx]) return;
+  let currentCircle = circles[circleIdx];
+  let currentPath = paths[0];
+  let currentImageIndex = 0;
+  showImageModal(resolveImageSrc(currentPath), {
     onNavigate: (direction) => {
-      const next = findAdjacentCatalogCircle(currentCircleIdx, direction);
+      // 再読込・フィルター変更で表示対象が消えた場合、別の行へ飛ばない。
+      if (eventJsonData?.circles !== circles) return null;
+      const next = adjacentCatalogImage(
+        circles, visibleCircleIndices(), currentCircle, currentPath, currentImageIndex, direction,
+        getCircleCatalogImagePaths,
+      );
       if (!next) return null;
-      currentCircleIdx = next.circleIdx;
-      return { src: next.src };
+      currentCircle = next.circle;
+      currentPath = next.path;
+      currentImageIndex = next.imageIndex;
+      return { src: resolveImageSrc(currentPath) };
     },
   });
 }
@@ -4873,6 +4852,23 @@ function showImageModal(src: string, options: ImageModalOptions = {}) {
   let pointerStartY: number | null = null;
   let suppressNextClick = false;
   overlay.appendChild(img);
+  if (options.onNavigate) {
+    for (const [direction, label, symbol, className] of [
+      [-1, "前の画像", "‹", "catalog-modal-prev"],
+      [1, "次の画像", "›", "catalog-modal-next"],
+    ] as const) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `catalog-modal-nav ${className}`;
+      button.setAttribute("aria-label", label);
+      button.textContent = symbol;
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        navigate(direction);
+      });
+      overlay.appendChild(button);
+    }
+  }
 
   function resetZoom() {
     zoomed = false;
@@ -5850,7 +5846,7 @@ function renderCircleEditor() {
             val = String(row[h] ?? "");
           }
           if (isImageCol(h)) {
-            return `<td class="img-cell img-clickable" data-row="${realIdx}" data-col="${escapeHtml(h)}">${renderImageCellContents(val)}</td>`;
+            return `<td class="img-cell img-clickable" data-row="${realIdx}" data-col="${escapeHtml(h)}">${renderImageCellContents(h === "アイテム画像" ? getCircleCatalogImagePaths(realIdx).join("\n") : val)}</td>`;
           }
           // 色列: カラーピッカー
           if (isColorCol(h)) {
@@ -6175,11 +6171,9 @@ function renderCircleEditor() {
         const row = Number(cell.dataset.row);
         const col = String(cell.dataset.col);
         const currentVal = String(tableState.rows[row][col] ?? "").trim();
-        const hasImage =
-          currentVal &&
-          currentVal !== "0.0" &&
-          currentVal !== "0" &&
-          !/^\d+(\.\d+)?$/.test(currentVal);
+        const hasImage = col === "アイテム画像"
+          ? getCircleCatalogImagePaths(row).length > 0
+          : isUsableImageValue(currentVal);
         if (hasImage) {
           // 拡大表示
           if (col === "アイテム画像") {
@@ -6652,6 +6646,7 @@ type ReprocessCircleJob = {
       postUrl: string;
       runId: string;
       telemetryStartMs: number;
+      catalogPostRole: ReturnType<typeof selectedCatalogPostRole>;
     }
   | {
       source: "image";
@@ -7057,7 +7052,9 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
   const requiredModelSlots = modelPreflightSlotsForOperation(
     job.source === "post" ? "circle_post" : "circle_image",
   );
-  const preflightPlan = await preflightSelectedModels(requiredModelSlots);
+  const preflightPlan = await preflightSelectedModels(
+    requiredModelSlots, job.source === "post" ? job.catalogPostRole : undefined,
+  );
   if (!preflightPlan) return;
 
   resultEl.textContent = `「${job.circleName}」の変更を保存中...`;
@@ -7144,7 +7141,7 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
     image_fallback_llm_enabled: selectedImageFallbackEnabled(),
     image_api_reasoning_effort_map: selectedImageApiEffortMap(),
     ...(job.source === "post"
-      ? { oshinagaki_post: selectedCatalogPostRole() }
+      ? { oshinagaki_post: job.catalogPostRole }
       : {}),
     tweet_llm_cli_providers: selectedTweetProviders(),
     tweet_llm_cli_models: selectedTweetModelMap(),
@@ -7416,6 +7413,7 @@ async function reprocessCircleFromPostInteractive(rowIdx: number) {
     postUrl,
     runId: createReprocessRunId(),
     telemetryStartMs: performance.now(),
+    catalogPostRole: selectedCatalogPostRole(),
   });
 }
 

@@ -10,6 +10,7 @@ import {
   Linking,
   ActivityIndicator,
   Alert,
+  Platform,
 } from "react-native";
 import {
   reprocessCircleFromPost,
@@ -125,6 +126,9 @@ export default function CircleExpandedDetail({
   const [editingMemo, setEditingMemo] = useState(false);
   const [loading, setLoading] = useState(true);
   const [viewerImage, setViewerImage] = useState<string | null>(null);
+  const [stackHovered, setStackHovered] = useState(false);
+  const allowStackMotion = Platform.OS === "web" && typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" && !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const [addingItem, setAddingItem] = useState(false);
   const [newItemName, setNewItemName] = useState("");
   const [newItemPrice, setNewItemPrice] = useState("");
@@ -480,25 +484,28 @@ export default function CircleExpandedDetail({
 
       <View style={styles.sectionCompact}>
         {images.length > 0 ? (
-          images.map((img) => (
-            <Pressable
-              key={img.id}
-              onPress={() =>
-                onOpenCatalogImage
-                  ? onOpenCatalogImage(circle, img.filename)
-                  : setViewerImage(img.filename)
-              }
-              onLongPress={() => openCatalogImageMenu(img)}
-            >
-              <Image
-                source={{ uri: img.filename }}
-                style={styles.itemImage}
-                contentFit="contain"
-                cachePolicy="memory-disk"
-                transition={200}
-              />
+          <View style={{ paddingTop: images.length > 1 ? 8 : 0, paddingRight: images.length > 1 ? 8 : 0 }}>
+            {images.length > 1 && images.slice(1, 3).reverse().map((img, index) => (
+              <Image key={img.id} source={{ uri: img.filename }} pointerEvents="none"
+                style={[styles.itemImage, { position: "absolute", top: index * 4, left: 4 + index * 4, right: 0, width: undefined, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.card, transform: [{ translateX: stackHovered && allowStackMotion ? (index + 1) * 8 : 0 }, { rotate: stackHovered && allowStackMotion ? `${(index + 1) * 2}deg` : "0deg" }], ...(allowStackMotion ? { transition: "transform 180ms ease" } as any : {}) }]}
+                contentFit="cover" cachePolicy="memory-disk" />
+            ))}
+            <Pressable onHoverIn={() => setStackHovered(true)} onHoverOut={() => setStackHovered(false)} onPress={() => onOpenCatalogImage
+              ? onOpenCatalogImage(circle, images[0].filename)
+              : setViewerImage(images[0].filename)}
+              onLongPress={() => openCatalogImageMenu(images[0])}>
+              <Image source={{ uri: images[0].filename }} style={[styles.itemImage, { backgroundColor: colors.card }]}
+                contentFit="contain" cachePolicy="memory-disk" transition={200} />
+              {images.length > 1 && <Text style={{ position: "absolute", right: 8, bottom: 12, color: "#fff", backgroundColor: "#333b", paddingHorizontal: 6, borderRadius: 6 }}>{images.length}</Text>}
             </Pressable>
-          ))
+            {images.length > 1 && <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              {images.map(img => <Pressable key={img.id} onPress={() => onOpenCatalogImage
+                ? onOpenCatalogImage(circle, img.filename) : setViewerImage(img.filename)}
+                onLongPress={() => openCatalogImageMenu(img)}>
+                <Image source={{ uri: img.filename }} style={{ width: 54, height: 54, marginRight: 4, borderRadius: 4, backgroundColor: colors.card }} contentFit="cover" />
+              </Pressable>)}
+            </ScrollView>}
+          </View>
         ) : (
           <Pressable
             style={[
@@ -970,6 +977,10 @@ export default function CircleExpandedDetail({
         visible={viewerImage !== null}
         uri={viewerImage ?? ""}
         onClose={() => setViewerImage(null)}
+        canNavigatePrevious={images.findIndex(image => image.filename === viewerImage) > 0}
+        canNavigateNext={images.findIndex(image => image.filename === viewerImage) >= 0 && images.findIndex(image => image.filename === viewerImage) < images.length - 1}
+        onNavigatePrevious={() => setViewerImage(images[images.findIndex(image => image.filename === viewerImage) - 1]?.filename ?? null)}
+        onNavigateNext={() => setViewerImage(images[images.findIndex(image => image.filename === viewerImage) + 1]?.filename ?? null)}
       />
 
       {/* Xポスト再処理モーダル */}

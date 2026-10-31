@@ -45,7 +45,7 @@ import {
   getFileSize,
   shareSyncLog,
 } from "@/lib/sync-logger";
-import type { ImportProgress, ExportProgress } from "@/lib/database";
+import type { ImportProgress, ExportProgress, LegacyImportCandidate } from "@/lib/database";
 import type { EventSummary } from "@/lib/database";
 import { getColors } from "@/constants/Colors";
 import * as FileSystem from "expo-file-system/legacy";
@@ -216,6 +216,30 @@ export default function EventListScreen() {
   }, [eventSortKey, eventSortDirection, sortSettingsLoaded]);
 
   // インポート
+  const [legacyCandidates, setLegacyCandidates] = useState<LegacyImportCandidate[] | null>(null);
+  const legacyChoice = useRef<((id: number | null) => void) | null>(null);
+  const selectLegacyTarget = useCallback(
+    (candidates: LegacyImportCandidate[]) =>
+      new Promise<number | null>((resolve) => {
+        if (legacyChoice.current) {
+          resolve(null);
+          return;
+        }
+        legacyChoice.current = resolve;
+        setLegacyCandidates(candidates);
+      }),
+    [],
+  );
+  const finishLegacyChoice = (id: number | null) => {
+    const resolve = legacyChoice.current;
+    legacyChoice.current = null;
+    setLegacyCandidates(null);
+    resolve?.(id);
+  };
+  useEffect(() => () => {
+    legacyChoice.current?.(null);
+    legacyChoice.current = null;
+  }, []);
   const [importing, setImporting] = useState(false);
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(
     null,
@@ -575,7 +599,7 @@ export default function EventListScreen() {
     try {
       invalidateListLoad();
       setImporting(true);
-      const result = await handleImportZip((p) => setImportProgress({ ...p }));
+      const result = await handleImportZip((p) => setImportProgress({ ...p }), selectLegacyTarget);
       if (result) await finishImport(result);
     } catch (e: any) {
       Alert.alert("エラー", e.message);
@@ -611,10 +635,12 @@ export default function EventListScreen() {
     try {
       invalidateListLoad();
       setImporting(true);
-      const result = await handleImportFromQRUrl(data, (p) =>
-        setImportProgress({ ...p }),
+      const result = await handleImportFromQRUrl(
+        data,
+        (p) => setImportProgress({ ...p }),
+        selectLegacyTarget,
       );
-      await finishImport(result);
+      if (result) await finishImport(result);
     } catch (e: any) {
       Alert.alert("エラー", e.message);
     } finally {
@@ -945,6 +971,42 @@ export default function EventListScreen() {
       </View>
 
       {/* インポート方法選択モーダル (外タップで閉じる) */}
+      <Modal
+        visible={legacyCandidates !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => finishLegacyChoice(null)}
+      >
+        <View style={styles.importOverlay}>
+          <View style={[styles.importCard, { backgroundColor: colors.card, maxHeight: "80%", width: "90%" }]}>
+            <Text style={[styles.importText, { color: colors.text }]}>
+              更新するイベントを選択してください
+            </Text>
+            <FlatList
+              style={{ alignSelf: "stretch", flexShrink: 1 }}
+              data={legacyCandidates ?? []}
+              keyExtractor={(item) => String(item.id)}
+              renderItem={({ item, index }) => (
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={() => finishLegacyChoice(item.id)}
+                  style={{ padding: 12, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.text }}
+                >
+                  <Text style={{ color: colors.text }}>{item.name}（登録順 {index + 1}）</Text>
+                  <Text style={{ color: colors.text }}>
+                    登録: {item.importedAt}　サークル購入: {item.boughtCircles}/{item.totalCircles}
+                    　アイテム購入: {item.boughtItems}/{item.totalItems}
+                  </Text>
+                </Pressable>
+              )}
+            />
+            <Pressable accessibilityRole="button" onPress={() => finishLegacyChoice(null)} style={{ padding: 12 }}>
+              <Text style={{ color: colors.text }}>キャンセル</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
       <Modal
         visible={showImportModal}
         transparent

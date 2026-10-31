@@ -286,7 +286,14 @@ export async function invoke(command, args = {}) {
   if (command === "save_desktop_config" || command === "save_env_keys") {
     return { status: "ok" };
   }
-  if (command === "list_model_catalog") return catalog();
+  if (command === "list_model_catalog") {
+    if (fixture.holdCatalog) {
+      fixture.catalogWaiting = true;
+      await new Promise(resolve => { fixture.releaseCatalog = resolve; });
+      fixture.holdCatalog = false;
+    }
+    return catalog();
+  }
   if (command === "list_event_dirs") {
     return {
       status: "ok",
@@ -326,7 +333,14 @@ export async function invoke(command, args = {}) {
   if (command === "save_event_json_native" || command === "save_event_json_native_checked") {
     return { modified_ms: 2, modified_ns: 2, file_size: 1, content_hash: "fixture-hash-2" };
   }
-  if (command === "append_log") return { status: "ok" };
+  if (command === "append_log") {
+    if (fixture.holdHistory) {
+      fixture.historyWaiting = true;
+      await new Promise(resolve => { fixture.releaseHistory = resolve; });
+      fixture.holdHistory = false;
+    }
+    return { status: "ok" };
+  }
   if (command === "check_for_update" || command === "cleanup_old_update") {
     return command === "check_for_update"
       ? { updateAvailable: false, currentVersion: "fixture" }
@@ -839,9 +853,19 @@ def test_post_model_settings_and_reprocess_runtime_evidence():
                 # 未認証fallbackでもprimaryが正常なら開始し、runtimeだけ無効化する。
                 page.locator('[data-tab="tab-edit"]').click()
                 page.locator("#circleEditor tr.circle-row[data-circle-row='0']").wait_for()
+                # 受付ログ保存を待たせ、その間にUIを変更しても投入時の設定を使う。
+                page.evaluate("() => { window.__eventAutoPinPostModelFixture.holdHistory = true; }")
                 page.once("dialog", lambda dialog: dialog.accept(POST_URL))
                 _open_post_context_menu(page)
                 page.get_by_text("このサークルを再処理（XポストURL指定）", exact=True).click()
+                page.wait_for_function("() => window.__eventAutoPinPostModelFixture.historyWaiting")
+                page.evaluate("""() => {
+                  const model = document.querySelector('#catalogPostModel');
+                  model.value = 'vision-primary-model';
+                  if (model.value !== 'vision-primary-model') throw new Error('fixture model missing');
+                  model.dispatchEvent(new Event('change', { bubbles: true }));
+                  window.__eventAutoPinPostModelFixture.releaseHistory();
+                }""")
                 unauth_call = _wait_for_bridge_call(page, "reprocess_circle_from_post")
                 unauth_payload = unauth_call["payload"]
                 post_role = unauth_payload["oshinagaki_post"]
@@ -854,6 +878,11 @@ def test_post_model_settings_and_reprocess_runtime_evidence():
                 assert post_role["fallback_enabled"] is False
                 assert unauth_payload["image_llm_model"] == "vision-primary-model"
                 assert unauth_payload["image_fallback_llm_model"] == "vision-fallback-model"
+                page.evaluate("""() => {
+                  const model = document.querySelector('#catalogPostModel');
+                  model.value = 'post-primary-model';
+                  model.dispatchEvent(new Event('change', { bubbles: true }));
+                }""")
                 preflight_status = page.locator("#modelPreflightStatus")
                 preflight_status.wait_for(state="visible")
                 expect(preflight_status).to_have_text(re.compile("予備.*主"))
@@ -972,3 +1001,56 @@ def test_post_model_settings_and_reprocess_runtime_evidence():
         _stop_process(process)
         _cleanup_run_dir(run_dir)
 
+
+
+@pytest.mark.skipif(sync_playwright is None, reason="Playwright Python is unavailable")
+def test_saved_luna_changed_to_sol_survives_async_catalog_and_reprocess():
+    """保存済みLunaからUIでSolを選び、更新後のURL再処理payloadを確認する。"""
+    luna, sol = "gpt-5.6-luna", "gpt-5.6-sol"
+    models = [{
+        "id": model, "label": model, "provider": "openai", "source": "fixture",
+        "availability": "available", "capabilities": {"text": "verified", "image": "verified"},
+        "reasoning_efforts": ["none", "low", "medium", "high", "max"],
+    } for model in (luna, sol)]
+    yaml = INITIAL_PROJECT_YAML.replace('model: "post-primary-model"\n  effort: "high"\n  fallback_enabled',
+                                        f'model: "{luna}"\n  effort: "high"\n  fallback_enabled')
+    SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=SCRATCH_ROOT))
+    process = None
+    try:
+        process, url = _start_fixture(run_dir, _free_port(), initial_project_yaml=yaml,
+                                      dynamic_api_models=models, grok_authenticated=True)
+        with sync_playwright() as playwright:
+            args: dict[str, Any] = {"headless": True}
+            executable = _cached_chromium_executable()
+            if executable:
+                args["executable_path"] = executable
+            browser = playwright.chromium.launch(**args)
+            try:
+                page = browser.new_page(viewport={"width": 1440, "height": 960})
+                page.goto(url, wait_until="domcontentloaded")
+                page.wait_for_function("model => document.querySelector('#catalogPostModel')?.value === model && document.querySelector('#catalogPostModel option[value=\"gpt-5.6-sol\"]') && !document.querySelector('#refreshModelCatalogBtn').disabled", arg=luna)
+                page.locator('.event-card[data-slug="ui07-post"]').click()
+                page.locator('.event-card[data-slug="ui07-post"].active').wait_for()
+                page.evaluate("() => { window.__eventAutoPinPostModelFixture.holdCatalog = true; }")
+                page.locator("#refreshModelCatalogBtn").click()
+                page.wait_for_function("() => window.__eventAutoPinPostModelFixture.catalogWaiting")
+                _select_value(page, "#catalogPostModel", sol)
+                _select_value(page, "#catalogPostReasoningEffort", "high")
+                page.evaluate("() => window.__eventAutoPinPostModelFixture.releaseCatalog()")
+                page.locator("#refreshModelCatalogBtn").wait_for(state="visible")
+                page.wait_for_function("() => !document.querySelector('#refreshModelCatalogBtn').disabled")
+                assert page.locator("#catalogPostModel").input_value() == sol
+                assert page.locator("#catalogPostReasoningEffort").input_value() == "high"
+                page.locator('[data-tab="tab-edit"]').click()
+                page.locator("#circleEditor tr.circle-row[data-circle-row='0']").wait_for()
+                page.once("dialog", lambda dialog: dialog.accept(POST_URL))
+                _open_post_context_menu(page)
+                page.get_by_text("このサークルを再処理（XポストURL指定）", exact=True).click()
+                role = _wait_for_bridge_call(page, "reprocess_circle_from_post")["payload"]["oshinagaki_post"]
+                assert (role["provider"], role["model"], role["effort"]) == ("api:openai", sol, "high")
+            finally:
+                browser.close()
+    finally:
+        _stop_process(process)
+        _cleanup_run_dir(run_dir)

@@ -60,6 +60,8 @@ const ShoppingElapsed = React.memo(function ShoppingElapsed({
 });
 
 interface CollapsibleHeaderProps {
+  compact?: boolean;
+  onBack?: () => void;
   // フィルター状態
   globalSearchEnabled: boolean;
   searchQuery: string;
@@ -100,6 +102,7 @@ interface CollapsibleHeaderProps {
 }
 
 export default function CollapsibleHeader({
+  compact = false, onBack,
   globalSearchEnabled,
   searchQuery, onSearchChange,
   statusFilter, onStatusFilterChange,
@@ -164,14 +167,15 @@ export default function CollapsibleHeader({
   return (
     <View style={[styles.container, { backgroundColor: colors.card, borderBottomColor: colors.border }]}>
       {/* 常時表示の行: インポート + 買い物状態 + 展開ボタン */}
-      <View style={styles.topRow}>
-        {onImport && (
+      <View style={[styles.topRow, compact && { paddingVertical: 2, paddingHorizontal: 6 }]}>
+        {compact && <Pressable accessibilityRole="button" accessibilityLabel="戻る" onPress={onBack} style={styles.expandBtn}><FontAwesome name="arrow-left" size={16} color={colors.tint} /></Pressable>}
+        {onImport && !compact && (
           <Pressable style={[styles.importBtn, { backgroundColor: colors.tint }]} onPress={onImport}>
             <FontAwesome name="plus" size={14} color="#fff" />
           </Pressable>
         )}
 
-        {isShoppingMode && (
+        {isShoppingMode && !compact && (
           <View style={styles.shoppingBadge}>
             <Text style={styles.shoppingBadgeText}>買い物中</Text>
             {shoppingStartedAt ? <ShoppingElapsed startedAt={shoppingStartedAt} /> : null}
@@ -179,12 +183,23 @@ export default function CollapsibleHeader({
         )}
 
         {/* 進捗ミニ表示 */}
-        {totalCount > 0 && (
+        {!compact && totalCount > 0 && (
           <Text style={[styles.miniProgress, { color: colors.textSecondary }]}>
             {stats.boughtCircles}/{stats.totalCircles}
           </Text>
         )}
 
+        {compact ? (
+          <View style={styles.highPrioritySlot}>
+            <Text style={[styles.miniProgress, { color: colors.textSecondary }]}>
+              {stats.boughtCircles + stats.couldntBuyCircles + stats.skippedCircles}/{stats.totalCircles}
+            </Text>
+            <View style={[styles.highPriorityTrack, { backgroundColor: colors.border }]}
+              accessibilityRole="progressbar" accessibilityValue={{ min: 0, max: stats.totalCircles, now: stats.boughtCircles + stats.couldntBuyCircles + stats.skippedCircles }}>
+              <View style={[styles.highPriorityFill, { backgroundColor: colors.tint, width: `${stats.totalCircles ? ((stats.boughtCircles + stats.couldntBuyCircles + stats.skippedCircles) / stats.totalCircles) * 100 : 0}%` }]} />
+            </View>
+          </View>
+        ) : (
         <View
           style={styles.highPrioritySlot}
           onLayout={(event) => setProgressSlotWidth(event.nativeEvent.layout.width)}
@@ -214,12 +229,14 @@ export default function CollapsibleHeader({
           </View>
         </View>
 
+        )}
+
         <Pressable style={styles.expandBtn} onPress={toggleExpand}>
           <FontAwesome name={expanded ? 'chevron-up' : 'filter'} size={14} color={colors.textSecondary} />
         </Pressable>
       </View>
 
-      {activeConditions.length > 0 && (
+      {activeConditions.length > 0 && (!compact || expanded) && (
         <View style={{ paddingHorizontal: 12, paddingBottom: 8, gap: 6 }}>
           <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
             {activeConditions.map((condition) => (
@@ -237,7 +254,7 @@ export default function CollapsibleHeader({
         </View>
       )}
 
-      {globalSearchEnabled && (
+      {globalSearchEnabled && (!compact || expanded) && (
         <View style={styles.globalSearchRow}>
           <TextInput
             style={[styles.searchInput, {

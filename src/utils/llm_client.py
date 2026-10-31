@@ -542,6 +542,7 @@ class LLMClient:
         temperature: Optional[float] = None,
         reasoning_effort: Optional[str] = None,
         timeout: Optional[float] = None,
+        include_response_metadata: bool = False,
     ) -> Tuple[str, Dict[str, Any]]:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -575,7 +576,10 @@ class LLMClient:
             for part in parts
             if part.get("text") and not part.get("thought")
         ).strip()
-        return text, data.get("usageMetadata") or {}
+        usage = data.get("usageMetadata") or {}
+        if include_response_metadata:
+            usage = {**usage, "_response_model": data.get("modelVersion")}
+        return text, usage
 
     @staticmethod
     def _image_mime_type(image_path: str) -> str:

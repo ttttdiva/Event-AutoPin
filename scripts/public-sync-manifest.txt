@@ -8,6 +8,8 @@ desktop-app/package.json
 desktop-app/package-lock.json
 desktop-app/README.md
 desktop-app/src/bridge-job.ts
+desktop-app/src/catalog-image-viewer.ts
+desktop-app/src/catalog-image-viewer.test.ts
 desktop-app/src/coordinate-diagnostics.ts
 desktop-app/src/coordinate-diagnostics.test.ts
 desktop-app/src/features/cookie-file.ts

@@ -165,8 +165,12 @@ def test_anthropic_joint_request_uses_messages_content_for_all_images(monkeypatc
         Image.new("RGB", (8, 8), "white").save(path)
         images.append(path)
     model = "claude-post"
+    from unittest.mock import MagicMock
+
+    client_info = MagicMock()
+    client_info.__getitem__.side_effect = {"model": model, "api_type": "anthropic", "client": None}.get
     llm = SimpleNamespace(
-        clients=[{"model": model, "api_type": "anthropic", "api_key": "dummy-key", "client": None}],
+        clients=[client_info],
         api_provider_map={model: "anthropic"},
         _api_reasoning_effort_for=lambda _model: "low",
     )
@@ -281,7 +285,7 @@ def test_text_only_products_require_literal_source():
 
 
 @pytest.mark.parametrize("envelope", ["output_text", "output"])
-def test_responses_payload_contains_all_original_images_text_and_max(tmp_path, monkeypatch, envelope):
+def test_responses_payload_contains_all_original_images_text_and_max(tmp_path, monkeypatch, envelope, capsys):
     from src.utils import api_cost_tracker
     from src.utils.llm_client import LLMClient
 
@@ -292,7 +296,7 @@ def test_responses_payload_contains_all_original_images_text_and_max(tmp_path, m
         Image.new("RGB", (16, 16), (index * 30, 0, 0)).save(path, format=fmt)
         paths.append(path)
     body = json.dumps(result(), ensure_ascii=False)
-    payload = {"status": "completed", "usage": {"input_tokens": 12, "output_tokens": 7}}
+    payload = {"model": "actual-model-2026", "status": "completed", "usage": {"input_tokens": 12, "output_tokens": 7, "output_tokens_details": {"reasoning_tokens": 3}}}
     if envelope == "output_text":
         payload["output_text"] = body
     else:
@@ -304,7 +308,11 @@ def test_responses_payload_contains_all_original_images_text_and_max(tmp_path, m
         _response_field=LLMClient._response_field)
     monkeypatch.setattr(api_cost_tracker, "get_cost_tracker", lambda: SimpleNamespace(add_tokens=lambda *args: costs.append(args)))
     analyzer = CatalogPostAnalyzer(SimpleNamespace(attempts=[build_image_llm_attempts()[0]], api_clients={LUNA: llm}))
-    parsed = analyzer.analyze(paths, POST, "テストイベント", "2026-09-13")
+    parsed = analyzer.analyze(paths, POST, "テストイベント", "2026-09-13", run_id="run-123")
+    log = capsys.readouterr().err
+    receipt = json.loads(log.split("catalog_model_receipt ", 1)[1])
+    assert receipt == {"run_id": "UNKNOWN", "requested_provider": "openai", "requested_model": LUNA, "requested_effort": "max", "actual_model": "UNKNOWN", "status": "completed", "input_tokens": 12, "output_tokens": 7, "reasoning_tokens": 3, "invocation": "sdk", "outcome": "returned"}
+    assert POST not in log and "data:image" not in log and body not in log
     assert parsed["model"] == LUNA
     assert len(calls) == 1
     assert calls[0]["reasoning"] == {"effort": "max"}
@@ -317,7 +325,7 @@ def test_responses_payload_contains_all_original_images_text_and_max(tmp_path, m
     assert costs == [(LUNA, 12, 7)]
 
 
-def test_unknown_openai_joint_request_omits_reasoning_none(tmp_path, monkeypatch):
+def test_unknown_openai_joint_request_omits_reasoning_none(tmp_path, monkeypatch, capsys):
     from src.utils import api_cost_tracker
 
     model = "gpt-new-live-generative"
@@ -366,6 +374,9 @@ def test_unknown_openai_joint_request_omits_reasoning_none(tmp_path, monkeypatch
     assert parsed["model"] == model
     assert len(calls) == 1
     assert "reasoning" not in calls[0]
+    receipt = json.loads(capsys.readouterr().err.split("catalog_model_receipt ", 1)[1])
+    assert receipt["actual_model"] == "UNKNOWN" and receipt["reasoning_tokens"] == "UNKNOWN"
+    assert receipt["requested_effort"] == "UNKNOWN"
 
 
 def test_invalid_response_repairs_only_once_then_uses_configured_fallback(monkeypatch):
@@ -789,3 +800,161 @@ def test_manual_review_price_evidence_and_schema():
         bad = product(needs_review=True, review_reason="要確認", **changes)
         with pytest.raises(ValueError):
             CatalogPostAnalyzer.parse(json.dumps(result(bad), ensure_ascii=False), 2, POST, manual=True)
+
+
+@pytest.mark.parametrize("response, expected", [
+    ('{"secret":"sk-SECRET",', 'stage=json_decode path=$ code=INVALID_JSON'),
+    (json.dumps(result(product(name='sk-SECRET', needs_review=True, review_reason='sk-SECRET'))),
+     'path=$.items[0].needs_review code=NEEDS_REVIEW'),
+    (json.dumps(result(product(price_text='sk-SECRET'))),
+     'path=$.items[0].price_text code=PRICE_AMOUNT_MISMATCH'),
+    ('{"classification":"sk-SECRET"}', 'path=$.classification code=INVALID_CLASSIFICATION'),
+])
+def test_analyze_logs_safe_validation_diagnostics(monkeypatch, caplog, response, expected):
+    analyzer = make_analyzer()
+    monkeypatch.setattr(analyzer, '_request', lambda *args, **kwargs: response)
+    monkeypatch.setattr(analyzer, '_image_data', lambda paths: [{}, {}])
+    with pytest.raises(RuntimeError):
+        analyzer.analyze([], POST, run_id='a' * 32)
+    assert expected in caplog.text
+    assert 'run_id=' + 'a' * 32 in caplog.text
+    assert 'sk-SECRET' not in caplog.text
+
+
+def test_analyze_logs_unknown_exception_without_message(monkeypatch, caplog):
+    analyzer = make_analyzer()
+    def fail(*args, **kwargs):
+        raise ValueError('sk-SECRET')
+    monkeypatch.setattr(analyzer, '_request', fail)
+    with pytest.raises(RuntimeError):
+        analyzer.analyze([], POST, run_id='sk-SECRET')
+    assert 'run_id=UNKNOWN stage=request path=UNKNOWN code=UNKNOWN message=UNKNOWN' in caplog.text
+    assert 'sk-SECRET' not in caplog.text
+
+
+def test_envelope_diagnostic_is_safe(caplog):
+    from src.utils.catalog_post_analyzer import _log_diagnostic, _validation_error
+    error = _validation_error('sk-SECRET', '$', 'ENVELOPE_INCOMPLETE', 'API応答が未完了です')
+    _log_diagnostic(error, 'request', None)
+    assert 'stage=response_envelope path=$ code=ENVELOPE_INCOMPLETE' in caplog.text
+    assert 'sk-SECRET' not in caplog.text
+
+
+@pytest.mark.parametrize("run_id, expected", [
+    ("reprocess-post-c8274416-8230-414a-be28-2af2556a034f", "reprocess-post-c8274416-8230-414a-be28-2af2556a034f"),
+    ("reprocess-image-c8274416-8230-414a-be28-2af2556a034f", "reprocess-image-c8274416-8230-414a-be28-2af2556a034f"),
+    ("c8274416-8230-414a-be28-2af2556a034f", "c8274416-8230-414a-be28-2af2556a034f"),
+    ("reprocess-post-sk-SECRET", "UNKNOWN"),
+    ("c8274416-8230-414a-be28-2af2556a034f-sk-SECRET", "UNKNOWN"),
+])
+def test_diagnostic_run_id_allowlist(caplog, run_id, expected):
+    from src.utils.catalog_post_analyzer import _log_diagnostic
+    _log_diagnostic(ValueError("sk-SECRET"), "request", run_id)
+    assert f"run_id={expected} stage=request" in caplog.text
+    assert "sk-SECRET" not in caplog.text
+
+
+
+def test_process_post_passes_run_id_to_analyzer(tmp_path, monkeypatch):
+    processor, _, _, _ = prepare_processor(tmp_path, monkeypatch, [])
+    observed = []
+    def analyze(paths, text, *, run_id=None, **kwargs):
+        observed.append(run_id)
+        return {"classification": "preview"}
+    monkeypatch.setattr(processor.catalog_post_analyzer, "analyze", analyze)
+    circle = Circle(name="circle")
+    assert asyncio.run(catalog_post.process_post(processor, circle, POST, [], "event", run_id="run-123")) == "preview"
+    assert observed == ["run-123"]
+
+
+def test_failed_sdk_invocation_records_unknown_response_without_exception_text(monkeypatch, capsys):
+    def fail(**kwargs):
+        raise RuntimeError("secret-exception-content")
+    sdk = SimpleNamespace(responses=SimpleNamespace(create=fail))
+    llm = SimpleNamespace(
+        clients=[{"model": SOL, "api_type": "openai", "client": sdk}],
+        _client_with_timeout=lambda client, timeout: client,
+        _uses_responses_api=lambda model: True,
+    )
+    analyzer = CatalogPostAnalyzer(SimpleNamespace(attempts=[], api_clients={}))
+    with pytest.raises(RuntimeError):
+        analyzer._request(llm, SOL, "secret-prompt", [], None, effort="max", run_id="run-456")
+    log = capsys.readouterr().err
+    receipt = json.loads(log.split("catalog_model_receipt ", 1)[1])
+    assert receipt["outcome"] == "error" and receipt["invocation"] == "sdk"
+    assert receipt["actual_model"] == receipt["status"] == receipt["input_tokens"] == "UNKNOWN"
+    assert "secret" not in log
+
+
+def test_gemini_receipt_captures_response_model_and_usage(monkeypatch, capsys):
+    from src.utils import api_cost_tracker
+    from src.utils.llm_client import LLMClient
+
+    response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {
+        "modelVersion": "gemini-actual-001",
+        "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 7, "thoughtsTokenCount": 3},
+        "candidates": [{"content": {"parts": [{"text": "fixture-output"}]}}],
+    })
+    monkeypatch.setattr("src.utils.llm_client.requests.post", lambda *args, **kwargs: response)
+    monkeypatch.setattr(api_cost_tracker, "get_cost_tracker", lambda: SimpleNamespace(add_tokens=lambda *args: None))
+    llm = LLMClient.__new__(LLMClient)
+    from unittest.mock import MagicMock
+
+    client_info = MagicMock()
+    client_info.__getitem__.side_effect = {"model": "gemini-request", "api_type": "gemini"}.get
+    llm.clients = [client_info]
+    llm.api_reasoning_effort_map = {}
+    llm.reasoning_effort = None
+    analyzer = CatalogPostAnalyzer(SimpleNamespace(attempts=[], api_clients={}))
+    assert analyzer._request(llm, "gemini-request", "fixture-prompt", [], None, run_id="run-gemini") == "fixture-output"
+    log = capsys.readouterr().err
+    receipt = json.loads(log.split("catalog_model_receipt ", 1)[1])
+    assert (receipt["run_id"], receipt["requested_provider"], receipt["requested_model"], receipt["actual_model"]) == (
+        "UNKNOWN", "gemini", "UNKNOWN", "UNKNOWN")
+    assert (receipt["input_tokens"], receipt["output_tokens"], receipt["reasoning_tokens"]) == (12, 7, 3)
+    assert receipt["invocation"] == "http"
+    assert "fixture-secret" not in log and "fixture-prompt" not in log and "fixture-output" not in log
+
+
+def test_receipt_rejects_key_like_identifiers(capsys):
+    from src.utils.catalog_post_analyzer import _model_receipt
+    _model_receipt("sk-SECRET", "openai", "sk-SECRET", "high", actual_model="sk-SECRET")
+    output = capsys.readouterr().err
+    assert "sk-SECRET" not in output
+    receipt = json.loads(output.split("catalog_model_receipt ", 1)[1])
+    assert receipt["run_id"] == receipt["requested_model"] == receipt["actual_model"] == "UNKNOWN"
+
+
+def test_failed_validation_does_not_expose_response_in_final_error(monkeypatch):
+    analyzer = make_analyzer()
+    monkeypatch.setattr(analyzer, "_request", lambda *args, **kwargs: '{"sk-SECRET":1,"sk-SECRET":2}')
+    monkeypatch.setattr(analyzer, "_image_data", lambda paths: [{}, {}])
+    with pytest.raises(RuntimeError) as caught:
+        analyzer.analyze([], POST)
+    assert "sk-SECRET" not in str(caught.value)
+
+
+@pytest.mark.parametrize("provider,model,expected", [
+    ("openai", "gpt-5.6-luna", "gpt-5.6-luna"),
+    ("gemini", "gemini-2.5-flash", "gemini-2.5-flash"),
+    ("xai", "grok-4-fast", "grok-4-fast"),
+    ("openai", "private-alias", "UNKNOWN"),
+    ("openai", "gemini-2.5-flash", "UNKNOWN"),
+    ("openai", "gpt-5-sk-SECRET", "UNKNOWN"),
+    ("openai", "gpt-5/secret", "UNKNOWN"),
+    ("openai", "gpt-5-" + "a" * 128, "UNKNOWN"),
+])
+def test_receipt_model_restrictions(provider, model, expected, capsys):
+    from src.utils.catalog_post_analyzer import _model_receipt
+    _model_receipt(None, provider, model, None, actual_model=model)
+    receipt = json.loads(capsys.readouterr().err.split("catalog_model_receipt ", 1)[1])
+    assert receipt["requested_model"] == receipt["actual_model"] == expected
+
+
+def test_validation_diagnostic_emits_only_structured_safe_fields(capsys):
+    from src.utils.catalog_post_analyzer import _log_diagnostic, _validation_error
+    _log_diagnostic(_validation_error("sk-SECRET raw body", "$.items[2].price", "INVALID_PRICE", "safe"), "parse", None)
+    output = capsys.readouterr().err
+    payload = json.loads(output.split("catalog_validation_diagnostic ", 1)[1])
+    assert payload == {"run_id": "UNKNOWN", "stage": "validation", "path": "$.items[2].price", "code": "INVALID_PRICE"}
+    assert "sk-SECRET" not in output

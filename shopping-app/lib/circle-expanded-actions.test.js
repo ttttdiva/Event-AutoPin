@@ -86,6 +86,7 @@ async function runCircleExpandedActionsTests() {
     react: harness.react,
     "react/jsx-runtime": { jsx, jsxs: jsx },
     "react-native": {
+      Platform: { OS: "android" },
       View: "View", Text: "Text", Pressable: "Pressable", ScrollView: "ScrollView",
       ActivityIndicator: "ActivityIndicator", StyleSheet: { create: (styles) => styles },
       Linking: { openURL() {} }, Alert: { alert: (...args) => alerts.push(args) },

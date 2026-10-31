@@ -64,6 +64,29 @@ export function runFilterHeaderTests() {
     props.onClearPriorityFilter = () => { props.priorityFilter = new Set(); render(); };
     act(() => { tree = create(React.createElement(Header, props)); });
     const text = (node: any): string => typeof node === 'string' ? node : (node.children ?? []).map(text).join('');
+    props.compact = true;
+    props.stats = { totalCircles: 18, boughtCircles: 2, couldntBuyCircles: 1, skippedCircles: 1, remainingCircles: 14 };
+    props.highPriorityProgress = { total: 18, done: 4, remaining: 14 };
+    act(() => render());
+    assert(text(tree.root).includes('4/18'), '半画面は表示対象の完了数と件数を表示すること');
+    const compactGauge = () => tree.root.findAllByType('View').find((node: any) => node.props.accessibilityRole === 'progressbar');
+    assert(compactGauge().props.accessibilityValue.now === 4 && compactGauge().props.accessibilityValue.max === 18,
+      'ゲージも表示対象全体の完了数と一致すること');
+    assert(!text(tree.root).includes('高・最優先'), '高優先専用ラベルを半画面に表示しないこと');
+    props.stats = { totalCircles: 3, boughtCircles: 1, couldntBuyCircles: 0, skippedCircles: 0, remainingCircles: 2 };
+    props.highPriorityProgress = { total: 0, done: 0, remaining: 0 };
+    act(() => render());
+    assert(text(tree.root).includes('1/3') && compactGauge().props.accessibilityValue.max === 3 && compactGauge().props.accessibilityValue.now === 1,
+      '低優先だけの選択でも数字とゲージが一致すること');
+
+    assert(!text(tree.root).includes('優先度:') && !text(tree.root).includes('件表示'), '半画面の折りたたみ時は条件と件数行を隠すこと');
+    props.stats = { totalCircles: 0, boughtCircles: 0, couldntBuyCircles: 0, skippedCircles: 0, remainingCircles: 0 };
+    act(() => render());
+    assert(text(tree.root).includes('0/0') && compactGauge().props.accessibilityValue.now === 0 && compactGauge().props.accessibilityValue.max === 0, '半画面の0件を表示すること');
+    props.compact = false;
+    props.highPriorityProgress = undefined;
+    props.stats = { totalCircles: 0 };
+    act(() => render());
     const click = (label: string) => {
       const buttons = tree.root.findAllByType('Pressable').filter((node: any) => text(node) === label);
       assert(buttons.length > 0, `${label}ボタンがあること`);

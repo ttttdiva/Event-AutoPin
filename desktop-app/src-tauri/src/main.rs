@@ -2260,48 +2260,14 @@ fn run_python_bridge_sync(
         .ok_or_else(|| "Failed to capture stderr".to_string())?;
     let stderr_thread = {
         let win = window.clone();
+        let log_root = project_root.clone();
         thread::Builder::new()
             .spawn(move || {
-                let reader = BufReader::new(stderr_pipe);
-                const MAX_CHARS: usize = 24_000;
-                let head_limit = MAX_CHARS / 3;
-                let tail_limit = MAX_CHARS - head_limit;
-                let mut head = Vec::new();
-                let mut tail = VecDeque::new();
-                let mut head_chars = 0usize;
-                let mut tail_chars = 0usize;
-                let mut total_chars = 0usize;
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        let _ = win.emit("pipeline-log", &line);
-                        let line_chars = line.chars().count() + 1;
-                        total_chars += line_chars;
-                        if head_chars < head_limit {
-                            head_chars += line_chars;
-                            head.push(line);
-                        } else {
-                            tail_chars += line_chars;
-                            tail.push_back(line);
-                            while tail_chars > tail_limit {
-                                if let Some(removed) = tail.pop_front() {
-                                    tail_chars = tail_chars.saturating_sub(removed.chars().count() + 1);
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                if total_chars <= MAX_CHARS {
-                    head.into_iter().chain(tail).collect::<Vec<_>>().join("\n")
-                } else {
-                    let marker = format!("…<middle truncated total_chars={total_chars}>…");
-                    head.into_iter()
-                        .chain(std::iter::once(marker))
-                        .chain(tail)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
+                collect_bridge_stderr(BufReader::new(stderr_pipe), |line| {
+                    persist_catalog_model_receipt(&log_root, line);
+                    persist_catalog_validation_diagnostic(&log_root, line);
+                    let _ = win.emit("pipeline-log", line);
+                })
             })
             .map_err(|e| format!("Failed to start stderr reader: {e}"))?
     };
@@ -3676,6 +3642,179 @@ fn read_reprocess_log(project_root: Option<String>) -> Result<String, String> {
 
 fn append_internal_log(project_root: &str, message: &str) {
     let _ = append_log(Some(project_root.to_string()), message.to_string());
+}
+
+// Python側の構造化ログも保存前に許可値だけへ絞る。
+fn safe_run_id(s: &str) -> bool {
+    let s = s.strip_prefix("reprocess-post-").or_else(|| s.strip_prefix("reprocess-image-")).unwrap_or(s);
+    let bytes = s.as_bytes();
+    (bytes.len() == 32 && bytes.iter().all(u8::is_ascii_hexdigit)) ||
+        (bytes.len() == 36 && bytes.iter().enumerate().all(|(i, b)| if [8, 13, 18, 23].contains(&i) { *b == b'-' } else { b.is_ascii_hexdigit() }))
+}
+
+fn safe_receipt_model(provider: &str, value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if value.len() > 128 || ["sk-", "xai-", "aiza", "bearer", "secret", "token", "key-"].iter().any(|p| lower.contains(p)) ||
+        !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') { return false; }
+    let suffix = match provider {
+        "openai" => value.strip_prefix("gpt-").or_else(|| value.strip_prefix("chatgpt-")).or_else(|| value.strip_prefix('o')),
+        "gemini" => value.strip_prefix("gemini-"),
+        "anthropic" => value.strip_prefix("claude-"),
+        "xai" | "grok" => value.strip_prefix("grok-"),
+        _ => None,
+    };
+    suffix.and_then(|s| s.bytes().next()).is_some_and(|b| b.is_ascii_digit())
+}
+
+fn persist_catalog_model_receipt(project_root: &str, line: &str) {
+    const PREFIX: &str = "[EAP_REPROCESS] catalog_model_receipt ";
+    let Some(payload) = line.strip_prefix(PREFIX) else { return };
+    let Ok(serde_json::Value::Object(input)) = serde_json::from_str::<serde_json::Value>(payload) else { return };
+    let provider = input.get("requested_provider").and_then(|v| v.as_str()).filter(|v| ["openai", "gemini", "anthropic", "xai", "grok"].contains(v)).unwrap_or("UNKNOWN");
+    let mut receipt = serde_json::Map::new();
+    for field in ["run_id", "requested_provider", "requested_model", "requested_effort", "actual_model", "status", "invocation", "outcome"] {
+        let value = input.get(field).and_then(|v| v.as_str()).filter(|s| match field {
+            "run_id" => safe_run_id(s),
+            "requested_provider" => *s == provider && provider != "UNKNOWN",
+            "requested_model" | "actual_model" => safe_receipt_model(provider, s),
+            "requested_effort" => ["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(s),
+            "status" => ["completed", "incomplete", "failed", "cancelled", "stop", "end_turn", "max_tokens", "stop_sequence", "tool_use", "length", "content_filter"].contains(s),
+            "invocation" => ["sdk", "http", "cli"].contains(s),
+            "outcome" => ["returned", "error"].contains(s),
+            _ => false,
+        }).unwrap_or("UNKNOWN");
+        receipt.insert(field.into(), value.into());
+    }
+    for field in ["input_tokens", "output_tokens", "reasoning_tokens"] {
+        receipt.insert(field.into(), input.get(field).and_then(|v| v.as_u64()).map(serde_json::Value::from).unwrap_or_else(|| "UNKNOWN".into()));
+    }
+    append_internal_log(project_root, &format!("{PREFIX}{}", serde_json::Value::Object(receipt)));
+}
+
+fn safe_diagnostic_path(path: &str) -> bool {
+    if ["$", "$.classification", "$.event_match", "$.is_existing_only", "$.catalog_image_indices", "$.items"].contains(&path) { return true; }
+    let Some(rest) = path.strip_prefix("$.items[") else { return false };
+    let Some((index, suffix)) = rest.split_once(']') else { return false };
+    !index.is_empty() && index.len() <= 10 && index.bytes().all(|b| b.is_ascii_digit()) &&
+        ["", ".needs_review", ".review_reason", ".name", ".type", ".sale_kind", ".source_image_indices", ".text_evidence", ".price", ".price_text", ".price_basis", ".price_image_index", ".description"].contains(&suffix)
+}
+
+fn persist_catalog_validation_diagnostic(project_root: &str, line: &str) {
+    const PREFIX: &str = "[EAP_REPROCESS] catalog_validation_diagnostic ";
+    let Some(payload) = line.strip_prefix(PREFIX) else { return };
+    let Ok(serde_json::Value::Object(input)) = serde_json::from_str::<serde_json::Value>(payload) else { return };
+    let mut output = serde_json::Map::new();
+    for field in ["run_id", "stage", "path", "code"] {
+        let value = input.get(field).and_then(|v| v.as_str()).filter(|s| match field {
+            "run_id" => safe_run_id(s),
+            "stage" => ["request", "parse", "json_decode", "response_envelope", "validation", "UNKNOWN"].contains(s),
+            "path" => safe_diagnostic_path(s),
+            "code" => ["ARRAY_REQUIRED", "CLASSIFICATION_CONFLICT", "DUPLICATE_KEY", "DUPLICATE_PRICE_CONFLICT", "ENVELOPE_INCOMPLETE", "EVENT_MISMATCH", "EVIDENCE_REQUIRED", "FREE_EVIDENCE_MISSING", "IMAGE_EVIDENCE_MISMATCH", "INVALID_BOOLEAN", "INVALID_CLASSIFICATION", "INVALID_DESCRIPTION", "INVALID_EVENT_MATCH", "INVALID_IMAGE_INDICES", "INVALID_JSON", "INVALID_NAME", "INVALID_NOT_SHOWN", "INVALID_PRICE", "INVALID_PRICE_BASIS", "INVALID_REVIEW_REASON", "INVALID_TYPE_OR_SALE_KIND", "ITEMS_REQUIRED", "NEEDS_REVIEW", "OBJECT_REQUIRED", "PRICE_AMOUNT_MISMATCH", "PRICE_EVIDENCE_REQUIRED", "PRICE_IMAGE_MISMATCH", "PRICE_TEXT_MISMATCH", "TEXT_EVIDENCE_MISMATCH", "UNKNOWN"].contains(s),
+            _ => false,
+        }).unwrap_or("UNKNOWN");
+        output.insert(field.into(), value.into());
+    }
+    append_internal_log(project_root, &format!("{PREFIX}{}", serde_json::Value::Object(output)));
+}
+
+fn collect_bridge_stderr<R: BufRead>(reader: R, mut on_line: impl FnMut(&str)) -> String {
+    const MAX_CHARS: usize = 24_000;
+    let head_limit = MAX_CHARS / 3;
+    let tail_limit = MAX_CHARS - head_limit;
+    let mut head = Vec::new();
+    let mut tail = VecDeque::new();
+    let (mut head_chars, mut tail_chars, mut total_chars) = (0usize, 0usize, 0usize);
+    for line in reader.lines() {
+        if let Ok(line) = line {
+            on_line(&line);
+            let line_chars = line.chars().count() + 1;
+            total_chars += line_chars;
+            if head_chars < head_limit {
+                head_chars += line_chars;
+                head.push(line);
+            } else {
+                tail_chars += line_chars;
+                tail.push_back(line);
+                while tail_chars > tail_limit {
+                    if let Some(removed) = tail.pop_front() {
+                        tail_chars = tail_chars.saturating_sub(removed.chars().count() + 1);
+                    } else { break; }
+                }
+            }
+        }
+    }
+    if total_chars <= MAX_CHARS {
+        head.into_iter().chain(tail).collect::<Vec<_>>().join("\n")
+    } else {
+        let marker = format!("…<middle truncated total_chars={total_chars}>…");
+        head.into_iter().chain(std::iter::once(marker)).chain(tail).collect::<Vec<_>>().join("\n")
+    }
+}
+
+#[cfg(test)]
+mod catalog_receipt_bridge_tests {
+    use super::*;
+    #[test]
+    fn receipt_survives_truncated_stderr_and_uses_normal_log() {
+        let root = std::env::temp_dir().join(format!("receipt-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let root_text = root.to_string_lossy().into_owned();
+        let line = r#"[EAP_REPROCESS] catalog_model_receipt {"run_id":"0123456789abcdef0123456789abcdef","requested_provider":"openai","requested_model":"gpt-5","requested_effort":"high","actual_model":"gpt-5.4","status":"completed","input_tokens":123,"output_tokens":45,"reasoning_tokens":6,"invocation":"sdk","outcome":"returned","secret":"fixture-secret","body":"fixture-body"}"#;
+        let stderr = format!("{}\n{}\n{}", "a".repeat(9000), line, "b\n".repeat(17000));
+        append_log(Some(root_text.clone()), "ordinary fixture".into()).unwrap();
+        let retained = collect_bridge_stderr(std::io::Cursor::new(stderr), |line| persist_catalog_model_receipt(&root_text, line));
+        assert!(retained.contains("middle truncated"));
+        assert!(!retained.contains("catalog_model_receipt"));
+        let log = fs::read_to_string(root.join("logs/eventtrail_studio.log")).unwrap();
+        assert!(log.contains("ordinary fixture"));
+        let payload = log.lines().find_map(|line| line.split_once("[EAP_REPROCESS] catalog_model_receipt ").map(|(_, p)| p)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["run_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(value["requested_provider"], "openai");
+        assert_eq!(value["requested_model"], "gpt-5");
+        assert_eq!(value["actual_model"], "gpt-5.4");
+        assert_eq!(value["input_tokens"], 123);
+        assert_eq!(value["output_tokens"], 45);
+        assert_eq!(value["reasoning_tokens"], 6);
+        assert_eq!(value["invocation"], "sdk");
+        assert!(!log.contains("fixture-secret") && !log.contains("fixture-body"));
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn diagnostic_survives_truncation_and_rejects_raw_fields() {
+        let root = std::env::temp_dir().join(format!("diagnostic-{}", std::process::id()));
+        let root_text = root.to_string_lossy().into_owned();
+        let line = r#"[EAP_REPROCESS] catalog_validation_diagnostic {"stage":"validation","path":"$.items[2].price","code":"INVALID_PRICE","body":"sk-SECRET"}"#;
+        let stderr = format!("{}\n{}\n{}", "a".repeat(9000), line, "b\n".repeat(17000));
+        let retained = collect_bridge_stderr(std::io::Cursor::new(stderr), |line| persist_catalog_validation_diagnostic(&root_text, line));
+        assert!(!retained.contains("catalog_validation_diagnostic"));
+        persist_catalog_validation_diagnostic(&root_text, r#"[EAP_REPROCESS] catalog_validation_diagnostic {"stage":"sk-SECRET","path":"$.items[2].sk-SECRET","code":"sk-SECRET"}"#);
+        let log = fs::read_to_string(root.join("logs/eventtrail_studio.log")).unwrap();
+        assert!(log.contains("$.items[2].price") && log.contains("INVALID_PRICE"));
+        assert!(!log.contains("sk-SECRET"));
+        assert!(log.contains(r#""stage":"UNKNOWN""#));
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn receipt_rejects_unknown_and_secret_models() {
+        assert!(safe_receipt_model("openai", "gpt-5.6-luna"));
+        assert!(safe_receipt_model("gemini", "gemini-2.5-flash"));
+        for value in ["private-alias", "gemini-2.5", "gpt-5-sk-SECRET", "gpt-5/invalid"] {
+            assert!(!safe_receipt_model("openai", value));
+        }
+        assert!(!safe_receipt_model("openai", &format!("gpt-5-{}", "a".repeat(128))));
+    }
+    #[test]
+    fn invalid_and_missing_fields_are_unknown() {
+        let root = std::env::temp_dir().join(format!("receipt-unknown-{}", std::process::id()));
+        let root_text = root.to_string_lossy().into_owned();
+        persist_catalog_model_receipt(&root_text, r#"[EAP_REPROCESS] catalog_model_receipt {"run_id":"bad secret","invocation":"http","outcome":"error"}"#);
+        let log = fs::read_to_string(root.join("logs/eventtrail_studio.log")).unwrap();
+        assert!(log.contains(r#""run_id":"UNKNOWN""#));
+        assert!(log.contains(r#""actual_model":"UNKNOWN""#));
+        assert!(log.contains(r#""invocation":"http""#));
+        assert!(!log.contains("bad secret"));
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 fn truncate_log_value(value: &str, max_chars: usize) -> String {

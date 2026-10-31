@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from ..models import ItemImage
 from ..utils.reprocess_deadline import ReprocessDeadlineExceeded
-from ..utils.reprocess_trace import trace_stage
+from ..utils.reprocess_trace import supports_keyword, trace_stage
 
 logger = logging.getLogger(__name__)
 _FIELDS = ("items", "item_images", "catalog_status", "existing_only_status", "_detected_genre", "_product_types")
@@ -113,6 +113,7 @@ async def process_post(processor: Any, circle: Any, post_text: str, media_urls: 
                 additional_prompt=getattr(processor, "effective_additional_prompt", ""),
                 deadline=deadline, budget=deadline, stage="catalog.joint",
                 **({"manual": True} if manual else {}),
+                **({"run_id": run_id} if supports_keyword(processor.catalog_post_analyzer.analyze, "run_id") else {}),
             )
         _check(deadline)
         status = analysis["classification"]
