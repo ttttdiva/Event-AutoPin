@@ -48,10 +48,10 @@ def _apply(processor: Any, circle: Any, state: Dict[str, Any], post_url: str) ->
 async def process_post(processor: Any, circle: Any, post_text: str, media_urls: List[str],
                        event_name: str, event_date: str = "", post_url: str = "",
                        deadline: Any = None, run_id: Optional[str] = None,
-                       trace: Any = None) -> Optional[str]:
+                       trace: Any = None, manual: bool = False) -> Optional[str]:
     """全画像の取得・検証が成功するまでCircleを書き換えない。
 
-    戻り値はconfirmed/preview。明示的な対象外はNone、取得・解析失敗は例外。
+    戻り値はconfirmed/preview/absence。明示的な対象外はNone、取得・解析失敗は例外。
     途中の1枚だけで成功にしない。解析executorはCircleや永続ファイルに触れない。
     """
     from .twitter_post_processor import (
@@ -94,11 +94,15 @@ async def process_post(processor: Any, circle: Any, post_text: str, media_urls: 
                 event_date=str(event_date or getattr(processor.config, "event_date", "") or ""),
                 additional_prompt=getattr(processor, "effective_additional_prompt", ""),
                 deadline=deadline, budget=deadline, stage="catalog.joint",
+                **({"manual": True} if manual else {}),
             )
         _check(deadline)
         status = analysis["classification"]
         if status == "not_catalog":
             return None
+        if status == "absence":
+            circle.absence_status = "欠席"
+            return status
         if status == "preview":
             # 予告は既存の確定商品を消さない。通常クロールでは他候補の確定版を先に探す。
             circle.catalog_status = "preview"
@@ -173,13 +177,13 @@ async def process_candidates(processor: Any, circle: Any, candidates: List[Dict[
 
 async def process_direct_post(processor: Any, circle: Any, tweet_id: str, post_url: str,
                               event_name: str, deadline: Any = None,
-                              run_id: Optional[str] = None, trace: Any = None) -> bool:
+                              run_id: Optional[str] = None, trace: Any = None, manual: bool = True) -> bool:
     from .twitter_post_processor import _call_with_optional_deadline
 
     _check(deadline)
     processor._last_direct_post_outcome = None
     key = (tweet_id, event_name, str(getattr(processor.config, "event_date", "")),
-           getattr(processor, "effective_additional_prompt", ""))
+           getattr(processor, "effective_additional_prompt", ""), manual)
     cache = getattr(processor, "_joint_post_cache", None)
     if cache is None:
         cache = processor._joint_post_cache = {}
@@ -195,13 +199,14 @@ async def process_direct_post(processor: Any, circle: Any, tweet_id: str, post_u
         return False
     staged = copy.copy(circle)
     status = await process_post(processor, staged, tweet.get("text", ""), tweet.get("media_urls", []) or [],
-                                event_name, post_url=post_url, deadline=deadline, run_id=run_id, trace=trace)
+                                event_name, post_url=post_url, deadline=deadline, run_id=run_id, trace=trace, manual=manual)
     _check(deadline)
     if status is None:
         processor._last_direct_post_outcome = "not_catalog"
         return False
     processor._last_direct_post_outcome = "adopted"
-    state = _snapshot(staged) if status == "confirmed" else {"catalog_status": "preview"}
+    state = (_snapshot(staged) if status == "confirmed" else
+             {"absence_status": "欠席"} if status == "absence" else {"catalog_status": "preview"})
     _check(deadline)
     cache[key] = copy.deepcopy(state)
     _apply(processor, circle, state, post_url)

@@ -207,7 +207,7 @@ async def _apply_finding(processor, circles_with_twitter, results, index, handle
     before = (circle.catalog_status, len(getattr(circle, "items", None) or []))
     try:
         processed = await processor.process_circle_from_post_url(
-            circle, finding.post_url, event.name,
+            circle, finding.post_url, event.name, manual=False,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Grokが見つけた投稿の解析に失敗: %s (%s)", circle.name, type(exc).__name__)

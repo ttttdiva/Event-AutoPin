@@ -1353,6 +1353,7 @@ class TwitterPostProcessor:
         run_id: Optional[str] = None,
         trace: Any = None,
         deadline: Optional[ReprocessDeadline] = None,
+        manual: bool = True,
     ) -> bool:
         """memoなどに残っているX投稿URLを直接再処理する"""
         if deadline is not None:
@@ -1365,7 +1366,7 @@ class TwitterPostProcessor:
         if catalog_post.enabled(self):
             return await catalog_post.process_direct_post(
                 self, circle, tweet_id, post_url, event_name,
-                deadline=deadline, run_id=run_id, trace=trace,
+                deadline=deadline, run_id=run_id, trace=trace, manual=manual,
             )
 
         cached = self._post_reprocess_cache.get(tweet_id)

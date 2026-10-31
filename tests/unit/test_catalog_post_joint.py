@@ -43,6 +43,19 @@ def parse(raw, text=POST, count=2):
     return CatalogPostAnalyzer.parse(json.dumps(raw, ensure_ascii=False), count, text)
 
 
+@pytest.mark.parametrize("language", ["json", "JSON"])
+def test_json_fence_language_case_preserves_valid_response(language):
+    raw = result()
+    response = f"```{language}\n{json.dumps(raw, ensure_ascii=False)}\n```"
+    assert CatalogPostAnalyzer.parse(response, 2, POST) == parse(raw)
+
+
+def test_truncated_json_fence_is_not_accepted():
+    response = "```JSON\n" + json.dumps(result(), ensure_ascii=False)[:-1] + "\n```"
+    with pytest.raises(json.JSONDecodeError):
+        CatalogPostAnalyzer.parse(response, 2, POST)
+
+
 def make_analyzer():
     return CatalogPostAnalyzer(SimpleNamespace(attempts=build_image_llm_attempts(
                                                   fallback_provider="api:openai", fallback_model=SOL,
@@ -267,8 +280,10 @@ def test_text_only_products_require_literal_source():
     assert parsed["items"][0]["catalog_evidence"]["text"] == POST
 
 
-def test_responses_payload_contains_all_original_images_text_and_max(tmp_path, monkeypatch):
+@pytest.mark.parametrize("envelope", ["output_text", "output"])
+def test_responses_payload_contains_all_original_images_text_and_max(tmp_path, monkeypatch, envelope):
     from src.utils import api_cost_tracker
+    from src.utils.llm_client import LLMClient
 
     calls, costs = [], []
     paths = []
@@ -276,12 +291,17 @@ def test_responses_payload_contains_all_original_images_text_and_max(tmp_path, m
         path = tmp_path / f"image{index}.jpg"  # MIMEは拡張子ではなく実体を確認する。
         Image.new("RGB", (16, 16), (index * 30, 0, 0)).save(path, format=fmt)
         paths.append(path)
-    sdk = SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: calls.append(kwargs) or
-          {"output_text": json.dumps(result()), "status": "completed", "usage": {"input_tokens": 12, "output_tokens": 7}}))
+    body = json.dumps(result(), ensure_ascii=False)
+    payload = {"status": "completed", "usage": {"input_tokens": 12, "output_tokens": 7}}
+    if envelope == "output_text":
+        payload["output_text"] = body
+    else:
+        payload["output"] = [{"type": "message", "content": [{"type": "output_text", "text": body}]}]
+    sdk = SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: calls.append(kwargs) or payload))
     llm = SimpleNamespace(clients=[{"model": LUNA, "api_type": "openai", "client": sdk}],
         _api_reasoning_effort_for=lambda model: "max", _client_with_timeout=lambda client, timeout: client,
-        _uses_responses_api=lambda model: True, _responses_output_text=lambda response: response["output_text"],
-        _response_field=lambda obj, key, default=None: obj.get(key, default))
+        _uses_responses_api=LLMClient._uses_responses_api, _responses_output_text=LLMClient._responses_output_text,
+        _response_field=LLMClient._response_field)
     monkeypatch.setattr(api_cost_tracker, "get_cost_tracker", lambda: SimpleNamespace(add_tokens=lambda *args: costs.append(args)))
     analyzer = CatalogPostAnalyzer(SimpleNamespace(attempts=[build_image_llm_attempts()[0]], api_clients={LUNA: llm}))
     parsed = analyzer.analyze(paths, POST, "テストイベント", "2026-09-13")
@@ -552,14 +572,50 @@ def test_timeout_while_executor_finishes_late_does_not_mutate_data(tmp_path, mon
     assert list(tmp_path.iterdir()) == []
 
 
-def test_explicit_other_event_cannot_replace_existing_data(tmp_path, monkeypatch):
+def test_explicit_other_event_auto_does_not_replace_existing_data(tmp_path, monkeypatch):
     raw = result(items=[], classification="not_catalog", event_match="mismatch", catalog_image_indices=[])
     processor, requests, _, _ = prepare_processor(tmp_path, monkeypatch, [raw])
     circle = Circle(name="circle", items=[{"name": "old"}])
     before = copy.deepcopy(circle.__dict__)
-    assert not asyncio.run(processor.process_circle_from_post_url(circle, URL, "event"))
+    assert asyncio.run(catalog_post.process_post(processor, circle, POST, MEDIA, "event")) is None
     assert len(requests) == 1 and circle.__dict__ == before
-    assert list(tmp_path.iterdir()) == []
+
+
+def test_automatic_direct_post_rejects_other_event(tmp_path, monkeypatch):
+    raw = result(items=[], classification="not_catalog", event_match="mismatch", catalog_image_indices=[])
+    processor, requests, _, _ = prepare_processor(tmp_path, monkeypatch, [raw])
+    circle = Circle(name="circle", items=[{"name": "old"}])
+    before = copy.deepcopy(circle.__dict__)
+    assert not asyncio.run(processor.process_circle_from_post_url(circle, URL, "event", manual=False))
+    assert circle.__dict__ == before and len(requests) == 1
+    assert processor._last_direct_post_outcome == "not_catalog"
+
+
+@pytest.mark.parametrize("kind", ["absence", "preview"])
+def test_manual_non_catalog_kinds_preserve_goods_and_cache(tmp_path, monkeypatch, kind):
+    raw = result(items=[], classification=kind, catalog_image_indices=[])
+    processor, requests, _, _ = prepare_processor(tmp_path, monkeypatch, [raw])
+    first = Circle(name="first", items=[{"name": "old", "checked": 1}])
+    second = Circle(name="second", items=[{"name": "other", "checked": 2}])
+    for circle in (first, second):
+        before = copy.deepcopy(circle.items)
+        assert asyncio.run(processor.process_circle_from_post_url(circle, URL))
+        assert circle.items == before
+        assert (circle.absence_status == "欠席") if kind == "absence" else (circle.catalog_status == "preview")
+    assert len(requests) == 1
+    assert '"classification": "confirmed|preview|absence"' in requests[0][1]
+
+
+@pytest.mark.parametrize("kind", ["not_catalog", "irrelevant", "", None])
+def test_manual_invalid_kind_rejected(kind):
+    raw = result(items=[], classification=kind, catalog_image_indices=[])
+    with pytest.raises(ValueError, match="classification"):
+        CatalogPostAnalyzer.parse(json.dumps(raw), 2, POST, manual=True)
+
+
+def test_manual_confirmed_requires_items():
+    with pytest.raises(ValueError, match="商品が抽出"):
+        CatalogPostAnalyzer.parse(json.dumps(result(items=[], catalog_image_indices=[])), 2, POST, manual=True)
 
 
 def test_preview_does_not_delete_existing_goods(tmp_path, monkeypatch):

@@ -2163,6 +2163,7 @@ def _job_reprocess_circle_from_post_impl(
         items=list(circle_dict.get("items", [])),
         memo=circle_dict.get("memo", "") or "",
         existing_only_status=circle_dict.get("existing_only_status"),
+        absence_status=circle_dict.get("absence_status"),
         catalog_status=circle_dict.get("catalog_status"),
     )
     # item_imagesはdict→ItemImageに変換
@@ -2305,6 +2306,9 @@ def _job_reprocess_circle_from_post_impl(
             circle_patch["item_images"] = [
                 {"path": img.path, "source": img.source} for img in circle_obj.item_images
             ]
+
+    if circle_obj.absence_status != circle_dict.get("absence_status"):
+        circle_patch["absence_status"] = circle_obj.absence_status
 
     # memoにポストURLを追記（成功したrunだけ。失敗runはpatchを返さない）
     existing_memo = circle_dict.get("memo", "") or ""

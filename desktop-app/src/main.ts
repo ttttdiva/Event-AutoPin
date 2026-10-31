@@ -1,3 +1,4 @@
+import { safeReprocessPostUrl, formatReprocessHistory } from "./reprocess-runtime";
 import "./styles.css";
 import { installNumericSelects } from "./numeric-select";
 import {
@@ -3438,9 +3439,6 @@ function renderItemPanel(circleIdx: number): string {
       const itemImgHtml = itemImgSrc
         ? `<img src="${escapeHtml(itemImgSrc)}" alt="" class="thumb-sm" data-fallback="outerhtml" data-fallback-html="<span class='img-placeholder-sm'>選択</span>" />`
         : `<span class="img-placeholder-sm">選択</span>`;
-      const purchasedBadge = knownPurchased
-        ? `<span class="purchased-item-badge" style="border-color:${boughtView.color};color:${boughtView.color};">購入済み</span>`
-        : "";
       const rowStyle = knownPurchased
         ? ` style="background:${boughtView.bg || "rgba(46,125,50,0.12)"};"`
         : "";
@@ -3453,7 +3451,7 @@ function renderItemPanel(circleIdx: number): string {
       <td><select class="item-field item-category-select category-select-compact" data-circle="${circleIdx}" data-item="${itemIdx}" data-field="type">
         ${ITEM_CATEGORIES.map((cat) => `<option value="${escapeHtml(cat)}"${(item.type || item.genre || "") === cat ? " selected" : ""}>${cat || "分類なし"}</option>`).join("")}
       </select></td>
-      <td style="background:${knownPurchased ? boughtView.bg || checkedView.bg : checkedView.bg};">${purchasedBadge}
+      <td style="background:${knownPurchased ? boughtView.bg || checkedView.bg : checkedView.bg};">
         <button class="item-check-cycle-btn check-btn-sm" data-circle="${circleIdx}" data-item="${itemIdx}" data-val="${checkedVal}" style="border-color:${checkedView.color};color:${checkedView.color};">${checkedView.icon} ${checkedView.label}</button>
       </td>
       <td><button class="item-review-btn text-xs px-1.5 py-0.5 bg-purple-900/30 hover:bg-purple-800/50 text-purple-300 rounded border border-purple-700/50" data-circle="${circleIdx}" data-item="${itemIdx}" title="感想ファイルに追記して開く">📝</button></td>
@@ -4887,11 +4885,47 @@ function showImageModal(src: string, options: ImageModalOptions = {}) {
     overlay.style.overflow = "hidden";
     overlay.style.cursor = "zoom-out";
     overlay.style.alignItems = "center";
+    overlay.style.justifyContent = "center";
+    img.style.margin = "";
+    img.style.flexShrink = "";
   }
 
   function closeModal() {
     overlay.remove();
     document.removeEventListener("keydown", handleKeyDown);
+    document.removeEventListener("wheel", handleWheel, true);
+  }
+
+  function handleWheel(e: WheelEvent) {
+    if (!e.ctrlKey || !overlay.contains(e.target as Node)) return;
+    e.preventDefault();
+    if (!img.naturalWidth || !img.naturalHeight || !Number.isFinite(e.deltaY) || !e.deltaY) return;
+    const before = img.getBoundingClientRect();
+    if (!before.width || !before.height) return;
+    const fit = Math.min(window.innerWidth * 0.9 / img.naturalWidth, window.innerHeight * 0.9 / img.naturalHeight, 1);
+    const fitWidth = img.naturalWidth * fit;
+    const width = Math.max(fitWidth, Math.min(img.naturalWidth * 4, before.width * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    if (width <= fitWidth + 0.01) {
+      resetZoom();
+      return;
+    }
+    const x = (e.clientX - before.left) / before.width;
+    const y = (e.clientY - before.top) / before.height;
+    zoomed = true;
+    img.style.maxWidth = "none";
+    img.style.maxHeight = "none";
+    img.style.width = `${width}px`;
+    img.style.height = "auto";
+    img.style.flexShrink = "0";
+    img.style.margin = "auto";
+    img.style.cursor = "zoom-out";
+    overlay.style.overflow = "auto";
+    overlay.style.cursor = "default";
+    overlay.style.alignItems = "flex-start";
+    overlay.style.justifyContent = "flex-start";
+    const after = img.getBoundingClientRect();
+    overlay.scrollLeft += after.left + x * after.width - e.clientX;
+    overlay.scrollTop += after.top + y * after.height - e.clientY;
   }
 
   function navigate(direction: -1 | 1): boolean {
@@ -4920,14 +4954,7 @@ function showImageModal(src: string, options: ImageModalOptions = {}) {
       overlay.style.cursor = "default";
       overlay.style.alignItems = "flex-start";
     } else {
-      img.style.maxWidth = "90vw";
-      img.style.maxHeight = "90vh";
-      img.style.width = "";
-      img.style.height = "";
-      img.style.cursor = "zoom-in";
-      overlay.style.overflow = "hidden";
-      overlay.style.cursor = "zoom-out";
-      overlay.style.alignItems = "center";
+      resetZoom();
     }
   });
   img.style.cursor = "zoom-in";
@@ -4969,6 +4996,7 @@ function showImageModal(src: string, options: ImageModalOptions = {}) {
     }
   }
   document.addEventListener("keydown", handleKeyDown);
+  document.addEventListener("wheel", handleWheel, { capture: true, passive: false });
   document.body.appendChild(overlay);
 }
 
@@ -6618,6 +6646,7 @@ type ReprocessCircleJob = {
   eventSlug?: string;
   eventJsonPath?: string;
   outputDir?: string;
+  logRoot?: string | null;
 } & (
   | {
       source: "post";
@@ -6852,7 +6881,33 @@ function mergeReprocessedCircleIntoState(
   updateBudgetPanel();
 }
 
+let reprocessEnqueueChain = Promise.resolve();
+
+async function saveReprocessHistory(job: ReprocessCircleJob, state: "受付" | "処理中" | "成功" | "失敗"): Promise<void> {
+  if (job.source !== "post") return;
+  const url = safeReprocessPostUrl(job.postUrl);
+  if (!url) throw new Error("XポストURLを記録できません");
+  const record = { id: job.runId, state, name: job.circleName, row: job.rowIdx + 1, identity: job.circleIdentity, event: job.eventSlug, url };
+  await invoke("append_log", { projectRoot: job.logRoot ?? null, message: `REPROCESS_HISTORY ${JSON.stringify(record)}` });
+}
+
+function reportReprocessHistoryFailure(): void {
+  const status = document.getElementById("reprocessHistoryStatus");
+  if (status) status.textContent = "再処理の結果ログを保存できませんでした。ログの保存先を確認してください。";
+}
+
 function enqueueReprocessCircle(job: ReprocessCircleJob) {
+  job.eventSlug = activeEventSlug || "";
+  job.eventJsonPath = (document.getElementById("editorJsonPath") as HTMLInputElement).value.trim();
+  job.outputDir = getActiveEventDir() || "";
+  job.logRoot = projectRootEl.value || null;
+  reprocessEnqueueChain = reprocessEnqueueChain.then(() => enqueueReprocessCircleSaved(job)).catch(() => {
+    reportReprocessHistoryFailure();
+    resultEl.textContent = "再処理の受付をログに保存できなかったため、キューに追加していません。";
+  });
+}
+
+async function enqueueReprocessCircleSaved(job: ReprocessCircleJob) {
   logReprocessTelemetry(job, "frontend.enqueue", "begin");
   if (!canEnqueueReprocess(operationState)) {
     resultEl.textContent =
@@ -6861,15 +6916,20 @@ function enqueueReprocessCircle(job: ReprocessCircleJob) {
     logReprocessTelemetry(job, "frontend.cleanup", "error");
     return;
   }
-  job.eventSlug = activeEventSlug || "";
-  job.eventJsonPath = (
-    document.getElementById("editorJsonPath") as HTMLInputElement
-  ).value.trim();
-  job.outputDir = getActiveEventDir() || "";
-  if (!job.eventSlug || !job.eventJsonPath || !job.outputDir) {
+  if (!job.eventSlug || !job.eventJsonPath || !job.outputDir || activeEventSlug !== job.eventSlug ||
+      (document.getElementById("editorJsonPath") as HTMLInputElement).value.trim() !== job.eventJsonPath ||
+      getActiveEventDir() !== job.outputDir) {
     resultEl.textContent = "アクティブなイベントが選択されていません。";
     logReprocessTelemetry(job, "frontend.enqueue", "error");
     logReprocessTelemetry(job, "frontend.cleanup", "error");
+    return;
+  }
+  await saveReprocessHistory(job, "受付");
+  if (!canEnqueueReprocess(operationState) || activeEventSlug !== job.eventSlug ||
+      (document.getElementById("editorJsonPath") as HTMLInputElement).value.trim() !== job.eventJsonPath ||
+      getActiveEventDir() !== job.outputDir) {
+    try { await saveReprocessHistory(job, "失敗"); } catch { reportReprocessHistoryFailure(); }
+    resultEl.textContent = "受付の保存中に対象イベントまたは処理状態が変わったため、キューに追加していません。";
     return;
   }
   const shouldStart =
@@ -6905,6 +6965,9 @@ async function drainReprocessCircleQueue() {
     const initialSave = await saveNow(INTERNAL_OPERATION_SAVE);
     if (!initialSave.ok) {
       resultEl.textContent = `1サークル再処理前の保存に失敗しました: ${String(initialSave.error)}`;
+      for (const pending of reprocessCircleQueue) {
+        try { await saveReprocessHistory(pending, "失敗"); } catch { reportReprocessHistoryFailure(); }
+      }
       logPendingReprocessCleanup("error");
       reprocessCircleQueue.length = 0;
       applyOperationEvent({ type: "abort-reprocess" });
@@ -6919,6 +6982,7 @@ async function drainReprocessCircleQueue() {
           job.circleName = String(draft.circles[job.rowIdx].name || job.circleName);
         }
         applyOperationEvent({ type: "dequeue-reprocess" });
+        try { await saveReprocessHistory(job, "処理中"); } catch { reportReprocessHistoryFailure(); }
         logReprocessTelemetry(job, "frontend.start", "begin");
         await runReprocessCircleJob(job);
       }
@@ -6935,6 +6999,9 @@ async function drainReprocessCircleQueue() {
       if (reprocessCircleQueue.length === 0) {
         applyOperationEvent({ type: "finish-reprocess" });
       } else {
+        for (const pending of reprocessCircleQueue) {
+          try { await saveReprocessHistory(pending, "失敗"); } catch { reportReprocessHistoryFailure(); }
+        }
         logPendingReprocessCleanup("error");
         reprocessCircleQueue.length = 0;
         applyOperationEvent({ type: "abort-reprocess" });
@@ -7294,6 +7361,7 @@ async function runReprocessCircleJob(job: ReprocessCircleJob) {
       );
     }
   } finally {
+    try { await saveReprocessHistory(job, terminalOutcome === "success" ? "成功" : "失敗"); } catch { reportReprocessHistoryFailure(); }
     if (job.source === "post") {
       latestReprocessJobCleanup = {
         job,
@@ -7336,7 +7404,7 @@ async function reprocessCircleFromPostInteractive(rowIdx: number) {
   );
   if (!input || !guard.isCurrent()) return;
   const postUrl = input.trim();
-  if (!/(?:twitter\.com|x\.com)\/[^/]+\/status(?:es)?\/\d+/.test(postUrl)) {
+  if (!safeReprocessPostUrl(postUrl)) {
     alert("Xのポスト(ステータス)URLではありません。\n例: https://x.com/user/status/1234567890");
     return;
   }
@@ -15664,6 +15732,29 @@ function initLogToggle() {
   const logToggle = document.getElementById("logToggle");
   const resultPre = document.getElementById("result");
   if (!logArea || !logToggle || !resultPre) return;
+
+  const historyButton = document.createElement("button");
+  historyButton.type = "button";
+  historyButton.textContent = "再処理履歴を表示";
+  historyButton.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      const text = await invoke<string>("read_reprocess_log", { projectRoot: projectRootEl.value || null });
+      resultPre.textContent = formatReprocessHistory(text) || "保存された再処理履歴はありません。";
+      logArea.classList.remove("collapsed");
+      resultPre.classList.remove("hidden");
+      localStorage.setItem(LOG_COLLAPSED_KEY, "false");
+    } catch {
+      resultPre.textContent = "再処理履歴を読み込めませんでした。";
+      logArea.classList.remove("collapsed");
+      resultPre.classList.remove("hidden");
+    }
+  });
+  logToggle.appendChild(historyButton);
+  const historyStatus = document.createElement("div");
+  historyStatus.id = "reprocessHistoryStatus";
+  historyStatus.setAttribute("role", "alert");
+  logArea.insertBefore(historyStatus, resultPre);
 
   // 初期状態復元（デフォルト: 格納）
   const collapsed = localStorage.getItem(LOG_COLLAPSED_KEY) !== "false";

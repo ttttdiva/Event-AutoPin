@@ -1,3 +1,4 @@
+import { safeReprocessPostUrl, formatReprocessHistory } from "./reprocess-runtime";
 import type { BridgeJobResult } from "./bridge-job";
 import { mergeReprocessEdits } from "./reprocess-edits";
 import { buildEventJsonSnapshot } from "./state/event-document";
@@ -249,3 +250,12 @@ assertEqual(finalSnapshot.circles?.[0].genres[0], "音楽", "終了時の保存�
 assertEqual(finalSnapshot.circles?.[1].items?.[0].name, "再処理の商品", "終了時の保存で商品を巻き戻さない");
 
 console.log("reprocess runtime tests passed");
+
+const safeUrl = safeReprocessPostUrl("https://user:password@twitter.com/author/status/123?token=secret#auth");
+assertEqual(safeUrl, "https://x.com/author/status/123", "URLの認証情報とクエリを除く");
+assertEqual(safeReprocessPostUrl("https://x.com.evil.test/author/status/123"), null, "偽ホストを拒否");
+const historyRecord = (id: string, state: string) => `[1700000000] REPROCESS_HISTORY ${JSON.stringify({ id, state, name: "サークル", row: 2, identity: { space: "A-01" }, event: "event", url: safeUrl })}`;
+const history = formatReprocessHistory([historyRecord("one", "受付"), "broken", historyRecord("one", "処理中"), historyRecord("one", "失敗"), historyRecord("two", "受付"), '[1700000000] REPROCESS_HISTORY {'].join("\n"));
+assert(history.indexOf("受付") < history.indexOf("処理中") && history.indexOf("処理中") < history.indexOf("失敗"), "状態の順序を保持");
+assert(history.includes("one") && history.includes("two") && history.includes("author/status/123"), "受付の識別子とURLを読み戻す");
+assert(!history.includes("secret") && !history.includes("password"), "秘密情報を表示しない");

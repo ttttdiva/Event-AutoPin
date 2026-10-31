@@ -206,3 +206,28 @@ export function formatReprocessTelemetry(
 ): string {
   return `[EAP_REPROCESS] run_id=${runId} stage=${stage} outcome=${outcome} elapsed_ms=${monotonicElapsedMs(startMs, nowMs)}`;
 }
+
+// 結果ログには認証情報やクエリを含めず、ポストの識別子だけを残す。
+export function safeReprocessPostUrl(input: string): string | null {
+  try {
+    const url = new URL(input);
+    if (!['http:', 'https:'].includes(url.protocol) || !['x.com', 'twitter.com', 'www.x.com', 'www.twitter.com'].includes(url.hostname.toLowerCase())) return null;
+    const match = /^\/([A-Za-z0-9_]{1,15})\/status(?:es)?\/(\d+)\/?$/.exec(url.pathname);
+    return match ? `https://x.com/${match[1]}/status/${match[2]}` : null;
+  } catch { return null; }
+}
+
+export function formatReprocessHistory(text: string): string {
+  const lines: string[] = [];
+  for (const line of text.split('\n')) {
+    const match = /^\[(\d+)\] REPROCESS_HISTORY (.*)$/.exec(line);
+    if (!match) continue;
+    try {
+      const r = JSON.parse(match[2]);
+      const url = typeof r.url === 'string' ? safeReprocessPostUrl(r.url) : null;
+      if (!url || typeof r.id !== 'string' || typeof r.name !== 'string' || !Number.isInteger(r.row) || !['受付', '処理中', '成功', '失敗'].includes(r.state)) continue;
+      lines.push(`${new Date(Number(match[1]) * 1000).toLocaleString()} ${r.state} / ${r.name}（行 ${r.row}） / ${url} / ${r.id} / ${typeof r.event === 'string' ? r.event : ''} / ${typeof r.identity === 'object' && r.identity ? JSON.stringify(r.identity) : ''}`);
+    } catch { /* 壊れた末尾や別のログは読み飛ばす */ }
+  }
+  return lines.join('\n');
+}

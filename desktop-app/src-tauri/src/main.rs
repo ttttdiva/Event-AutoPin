@@ -3632,6 +3632,8 @@ fn register_default_cut(
 
 #[tauri::command]
 fn append_log(project_root: Option<String>, message: String) -> Result<(), String> {
+    static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOG_LOCK.lock().map_err(|e| format!("ログロック失敗: {e}"))?;
     let base = project_root.map(PathBuf::from).unwrap_or_else(exe_dir);
     let logs_dir = base.join("logs");
     let _ = fs::create_dir_all(&logs_dir);
@@ -3649,6 +3651,27 @@ fn append_log(project_root: Option<String>, message: String) -> Result<(), Strin
         .as_secs();
     writeln!(f, "[{now}] {message}").map_err(|e| format!("ログ書き込み失敗: {e}"))?;
     Ok(())
+}
+
+#[tauri::command]
+fn read_reprocess_log(project_root: Option<String>) -> Result<String, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let base = project_root.map(PathBuf::from).unwrap_or_else(exe_dir);
+    let path = base.join("logs").join("eventtrail_studio.log");
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(format!("ログ読み込み失敗: {e}")),
+    };
+    const LIMIT: u64 = 1024 * 1024;
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    let offset = len.saturating_sub(LIMIT);
+    file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(LIMIT).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = if offset > 0 { text.split_once('\n').map(|(_, tail)| tail).unwrap_or("") } else { &text };
+    Ok(text.lines().filter(|line| line.contains("] REPROCESS_HISTORY ")).collect::<Vec<_>>().join("\n"))
 }
 
 fn append_internal_log(project_root: &str, message: &str) {
@@ -14073,6 +14096,7 @@ fn main() {
             download_image,
             save_image_bytes,
             append_log,
+            read_reprocess_log,
             list_map_images,
             list_event_map_images,
             start_file_server,
