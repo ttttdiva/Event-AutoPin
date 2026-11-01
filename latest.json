@@ -1,8 +1,8 @@
 {
   "desktop": {
-    "version": "0.1.38",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.38/EventAutoPin.exe",
-    "notes": "UI表示、アップサート処理、モデル診断を修正",
+    "version": "0.1.39",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.39/EventAutoPin.exe",
+    "notes": "列幅・優先度色・購入色を修復し、優先度のカラーピッカーに対応",
     "date": "2026-11-01"
   },
   "mobile": {
