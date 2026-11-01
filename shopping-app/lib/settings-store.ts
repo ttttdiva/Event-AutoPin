@@ -65,6 +65,9 @@ export const MODEL_SETTING_KEY = "llm_primary_model";
 export const MODEL_FALLBACK_KEY = "llm_fallback_model";
 export const VISION_MODEL_KEY = "llm_vision_model";
 export const SITE_PARSING_MODEL_KEY = "llm_site_parsing_model";
+export const CATALOG_POST_MODEL_KEY = "llm_catalog_post_model";
+export const CATALOG_POST_MODEL_PROVIDER_KEY = "llm_catalog_post_model_provider";
+export const CATALOG_POST_REASONING_EFFORT_KEY = "llm_catalog_post_reasoning_effort";
 export const GROK_SEARCH_MODEL_KEY = "llm_grok_search_model";
 /** モデル ID と別 SQLite キーに provider を保存し、同名 ID の取り違えを防ぐ。 */
 export const MODEL_PROVIDER_KEY = "llm_primary_model_provider";
@@ -277,6 +280,23 @@ const SITE_PARSING_MODEL_DEFINITION: ModelSettingDefinition = {
   defaultProvider: "openai",
 };
 
+const CATALOG_POST_MODEL_DEFINITION: ModelSettingDefinition = {
+  modelKey: CATALOG_POST_MODEL_KEY,
+  providerKey: CATALOG_POST_MODEL_PROVIDER_KEY,
+  defaultId: DEFAULT_PRIMARY_MODEL,
+  defaultProvider: "openai",
+};
+
+export async function getCatalogPostModelSelection(): Promise<SavedModelSelection> {
+  const id = await getSetting(CATALOG_POST_MODEL_KEY);
+  if (!id?.trim()) return getPrimaryModelSelection();
+  return getSavedModelSelection(CATALOG_POST_MODEL_DEFINITION);
+}
+
+export async function setCatalogPostModel(model: string, provider?: ApiKeyProvider): Promise<void> {
+  await setSavedModelSelection(CATALOG_POST_MODEL_DEFINITION, model, provider);
+}
+
 export function getPrimaryModelSelection(): Promise<SavedModelSelection> {
   return getSavedModelSelection(PRIMARY_MODEL_DEFINITION);
 }
@@ -370,6 +390,15 @@ export async function setTextReasoningEffort(
   effort: ReasoningEffort,
 ): Promise<void> {
   await setSetting(TEXT_REASONING_EFFORT_KEY, effort);
+}
+
+export async function getCatalogPostReasoningEffort(): Promise<ReasoningEffort> {
+  const value = await getSetting(CATALOG_POST_REASONING_EFFORT_KEY);
+  return value ? normalizeReasoningEffort(value) : getTextReasoningEffort();
+}
+
+export async function setCatalogPostReasoningEffort(effort: ReasoningEffort): Promise<void> {
+  await setSetting(CATALOG_POST_REASONING_EFFORT_KEY, effort);
 }
 
 export async function getVisionReasoningEffort(): Promise<ReasoningEffort> {

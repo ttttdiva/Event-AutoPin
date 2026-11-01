@@ -10,7 +10,8 @@ function loadSettings(settings: Record<string, string>): {
   module: SettingsModule;
   writes: Array<[string, string]>;
 } {
-  const runtimeRequire = eval("require") as (id: string) => any;
+  const runtimeRequire = eval("require") as NodeRequire;
+  delete runtimeRequire.cache[runtimeRequire.resolve("./settings-store")];
   const Module = runtimeRequire("module");
   const originalLoad = Module._load;
   const writes: Array<[string, string]> = [];
@@ -81,6 +82,29 @@ export async function runSettingsStoreModelTests(): Promise<void> {
   assert(grok.id === "grok-future" && grok.apiType === "xai", "Grok検索モデルはxai固定で保存する");
   assert(settings.llm_grok_search_model === "grok-future", "Grok検索モデルの専用キーへ保存する");
 
+  const inherited = await store.getCatalogPostModelSelection();
+  assert(inherited.id === "latest" && inherited.apiType === "xai", "未設定の投稿処理はGrok検索でなくPrimaryを継承する");
+  assert(await store.getCatalogPostReasoningEffort() === "max", "未設定の投稿effortはテキスト設定を継承する");
+  assert(!settings.llm_catalog_post_model && !settings.llm_catalog_post_reasoning_effort, "読み取りだけでは上書きを作らない");
+  await store.setPrimaryModel("primary-next", "openai");
+  await store.setTextReasoningEffort("high");
+  assert((await store.getCatalogPostModelSelection()).id === "primary-next", "未設定時はPrimary変更を継承する");
+  assert(await store.getCatalogPostReasoningEffort() === "high", "未設定時はeffort変更を継承する");
+  await store.setCatalogPostModel("same-model-id", "openai");
+  await store.setCatalogPostReasoningEffort("low");
+  await store.setPrimaryModel("other", "gemini");
+  await store.setTextReasoningEffort("medium");
+  let post = await store.getCatalogPostModelSelection();
+  assert(post.id === "same-model-id" && post.apiType === "openai", "明示したOpenAI選択はPrimary変更後も独立する");
+  assert(await store.getCatalogPostReasoningEffort() === "low", "明示した投稿effortは独立する");
+  await store.setCatalogPostModel("same-model-id", "xai");
+  const reloaded = loadSettings(settings).module;
+  post = await reloaded.getCatalogPostModelSelection();
+  assert(await reloaded.getCatalogPostReasoningEffort() === "low", "再読み込み後も投稿effortを保持する");
+  assert(post.id === "same-model-id" && post.apiType === "xai", "同じモデルIDでもxAI providerを保持する");
+  assert((await store.getVisionModelSelection()).apiType === "xai" && (await store.getFallbackModelSelection()).id === "grok-4.7", "他の役割設定を変更しない");
+  assert((await store.getGrokSearchModelSelection()).id === "grok-future", "Grok検索設定を変更しない");
+  await store.setTextReasoningEffort("max");
   const max = await store.getTextReasoningEffort();
   assert(max === "max", "既存保存effort maxを読み戻す");
   await store.setVisionReasoningEffort("max");

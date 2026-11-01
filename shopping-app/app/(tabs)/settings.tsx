@@ -31,6 +31,10 @@ import {
   setVisionModel,
   getSiteParsingModelSelection,
   setSiteParsingModel,
+  getCatalogPostModelSelection,
+  setCatalogPostModel,
+  getCatalogPostReasoningEffort,
+  setCatalogPostReasoningEffort,
   getGrokSearchModelSelection,
   setGrokSearchModel,
   getTextReasoningEffort,
@@ -127,6 +131,8 @@ export default function SettingsScreen() {
     id: "",
     apiType: "openai",
   });
+  const [catalogPost, setCatalogPost] = useState<SavedModelSelection>({ id: "", apiType: "openai" });
+  const [catalogPostEffort, setCatalogPostEffort] = useState<ReasoningEffort>("medium");
   const [grokSearch, setGrokSearch] = useState<SavedModelSelection>({
     id: "",
     apiType: "xai",
@@ -147,14 +153,14 @@ export default function SettingsScreen() {
   >({});
 
   const [modelPickerFor, setModelPickerFor] = useState<
-    null | "primary" | "fallback" | "vision" | "siteParsing" | "grokSearch"
+    null | "primary" | "fallback" | "vision" | "siteParsing" | "catalogPost" | "grokSearch"
   >(null);
   const [modelPickerQuery, setModelPickerQuery] = useState("");
   const [modelPickerProvider, setModelPickerProvider] = useState<
     ApiKeyProvider | "all"
   >("all");
   const [effortPickerFor, setEffortPickerFor] = useState<
-    null | "text" | "vision" | "siteParsing"
+    null | "text" | "vision" | "siteParsing" | "catalogPost"
   >(null);
 
   useEffect(() => {
@@ -171,6 +177,8 @@ export default function SettingsScreen() {
         fb,
         v,
         sp,
+        catalogPostSelection,
+        catalogPostReasoning,
         grokSearchSelection,
         textReasoning,
         visionReasoning,
@@ -186,6 +194,8 @@ export default function SettingsScreen() {
         getFallbackModelSelection(),
         getVisionModelSelection(),
         getSiteParsingModelSelection(),
+        getCatalogPostModelSelection(),
+        getCatalogPostReasoningEffort(),
         getGrokSearchModelSelection(),
         getTextReasoningEffort(),
         getVisionReasoningEffort(),
@@ -204,6 +214,8 @@ export default function SettingsScreen() {
       setFallback(fb);
       setVision(v);
       setSiteParsing(sp);
+      setCatalogPost(catalogPostSelection);
+      setCatalogPostEffort(catalogPostReasoning);
       setGrokSearch(grokSearchSelection);
       setTextEffort(textReasoning);
       setVisionEffort(visionReasoning);
@@ -289,7 +301,7 @@ export default function SettingsScreen() {
   };
 
   const openModelPicker = (
-    target: "primary" | "fallback" | "vision" | "siteParsing" | "grokSearch",
+    target: "primary" | "fallback" | "vision" | "siteParsing" | "catalogPost" | "grokSearch",
   ) => {
     setModelPickerQuery("");
     setModelPickerProvider(target === "grokSearch" ? "xai" : "all");
@@ -297,7 +309,7 @@ export default function SettingsScreen() {
   };
 
   const onPickModel = async (
-    target: "primary" | "fallback" | "vision" | "siteParsing" | "grokSearch",
+    target: "primary" | "fallback" | "vision" | "siteParsing" | "catalogPost" | "grokSearch",
     model: ModelCatalogEntry,
   ) => {
     setModelPickerFor(null);
@@ -308,6 +320,7 @@ export default function SettingsScreen() {
     if (target === "primary") {
       setPrimary(selection);
       await setPrimaryModel(model.id, model.provider);
+      setCatalogPost(await getCatalogPostModelSelection());
     } else if (target === "fallback") {
       setFallback(selection);
       await setFallbackModel(model.id, model.provider);
@@ -317,6 +330,9 @@ export default function SettingsScreen() {
     } else if (target === "siteParsing") {
       setSiteParsing(selection);
       await setSiteParsingModel(model.id, model.provider);
+    } else if (target === "catalogPost") {
+      setCatalogPost(selection);
+      await setCatalogPostModel(model.id, model.provider);
     } else {
       setGrokSearch(selection);
       await setGrokSearchModel(model.id);
@@ -324,16 +340,20 @@ export default function SettingsScreen() {
   };
 
   const onPickEffort = async (
-    target: "text" | "vision" | "siteParsing",
+    target: "text" | "vision" | "siteParsing" | "catalogPost",
     effort: ReasoningEffort,
   ) => {
     setEffortPickerFor(null);
     if (target === "text") {
       setTextEffort(effort);
       await setTextReasoningEffort(effort);
+      setCatalogPostEffort(await getCatalogPostReasoningEffort());
     } else if (target === "vision") {
       setVisionEffort(effort);
       await setVisionReasoningEffort(effort);
+    } else if (target === "catalogPost") {
+      setCatalogPostEffort(effort);
+      await setCatalogPostReasoningEffort(effort);
     } else {
       setSiteParsingEffortState(effort);
       await setSiteParsingReasoningEffort(effort);
@@ -366,7 +386,7 @@ export default function SettingsScreen() {
     );
   };
 
-  const savedSelections = [primary, fallback, vision, siteParsing, grokSearch];
+  const savedSelections = [primary, fallback, vision, siteParsing, catalogPost, grokSearch];
 
   const modelLabel = (selection: SavedModelSelection) => {
     const entry = getModelCatalogModels({ savedSelections }).find(
@@ -377,15 +397,16 @@ export default function SettingsScreen() {
   };
 
   const selectionForEffort = (
-    target: "text" | "vision" | "siteParsing",
+    target: "text" | "vision" | "siteParsing" | "catalogPost",
   ): SavedModelSelection => {
     if (target === "vision") return vision;
+    if (target === "catalogPost") return catalogPost;
     if (target === "siteParsing") return siteParsing;
     return primary;
   };
 
   const effortOptionsForTarget = (
-    target: "text" | "vision" | "siteParsing",
+    target: "text" | "vision" | "siteParsing" | "catalogPost",
   ) => {
     const selection = selectionForEffort(target);
     const capabilities = getModelCapabilities(
@@ -406,7 +427,7 @@ export default function SettingsScreen() {
     title: string,
     desc: string,
     current: SavedModelSelection,
-    target: "primary" | "fallback" | "vision" | "siteParsing" | "grokSearch",
+    target: "primary" | "fallback" | "vision" | "siteParsing" | "catalogPost" | "grokSearch",
   ) => (
     <TouchableOpacity
       onPress={() => openModelPicker(target)}
@@ -432,7 +453,7 @@ export default function SettingsScreen() {
     title: string,
     desc: string,
     current: ReasoningEffort,
-    target: "text" | "vision" | "siteParsing",
+    target: "text" | "vision" | "siteParsing" | "catalogPost",
   ) => (
     <TouchableOpacity
       onPress={() => setEffortPickerFor(target)}
@@ -498,7 +519,7 @@ export default function SettingsScreen() {
 
   const pickerModels = modelPickerFor
     ? getModelCatalogModels({
-        role: modelPickerFor === "vision" ? "vision" : "text",
+        role: modelPickerFor === "vision" || modelPickerFor === "catalogPost" ? "vision" : "text",
         savedSelections,
       }).filter((model) => {
         const matchesProvider =
@@ -739,6 +760,18 @@ export default function SettingsScreen() {
           "未知サイトのパターン推測（高性能モデル推奨）",
           siteParsing,
           "siteParsing",
+        )}
+        {renderModelRow(
+          "おしながき処理モデル",
+          "投稿の本文・画像を解析。Grok検索は別設定です",
+          catalogPost,
+          "catalogPost",
+        )}
+        {renderEffortRow(
+          "おしながき処理effort",
+          "投稿解析の推論量",
+          catalogPostEffort,
+          "catalogPost",
         )}
         {renderEffortRow(
           "テキスト処理effort",

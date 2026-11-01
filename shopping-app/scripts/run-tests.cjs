@@ -9,6 +9,7 @@ const testCases = [
   ["lib/circle-expanded-actions.test.js", "runCircleExpandedActionsTests"],
   ["lib/circle-reprocess-lifecycle.test.js", "runCircleReprocessLifecycleTests"],
   ["lib/crawl/post-reprocess.test.js"],
+  ["lib/crawl/x-post-lookup.test.js"],
   ["lib/crawl/image-downloader.test.js"],
   ["lib/crawl/llm-client.test.js", "runLlmClientTests"],
   ["lib/model-catalog.test.ts", "runModelCatalogTests"],

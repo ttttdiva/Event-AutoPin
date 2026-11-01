@@ -195,6 +195,67 @@ export class LlmClient {
       : new Error("全てのモデルで画像解析に失敗しました");
   }
 
+  /** 本文と全画像を同一リクエストで解析する。 */
+  async analyzePost(prompt: string, imageUrls: string[], options: LlmRequestOptions = {}): Promise<string> {
+    const model = this.models[0];
+    const key = await getApiKey(model.apiType);
+    if (!key) throw new Error(`${model.apiType} のAPIキーが未設定です（モデル: ${model.id}）`);
+    const effective = optionsForModel(model, options);
+    console.info(`投稿解析 requested=${model.apiType}/${model.id} effort=${effective.reasoningEffort ?? "none"} images=${imageUrls.length}`);
+    let url: string; let body: any; let headers: Record<string, string>;
+    if (model.apiType === "gemini") {
+      const parts: any[] = [{ text: prompt }];
+      for (const imageUrl of imageUrls) {
+        let res: Response;
+        try { res = await fetch(imageUrl); } catch { throw new Error("投稿画像の取得に失敗しました"); }
+        if (!res.ok) throw new Error(`投稿画像の取得に失敗しました (HTTP ${res.status})`);
+        const bytes = new Uint8Array(await res.arrayBuffer());
+        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let encoded = "";
+        for (let i = 0; i < bytes.length; i += 3) {
+          const n = (bytes[i] << 16) | ((bytes[i + 1] ?? 0) << 8) | (bytes[i + 2] ?? 0);
+          encoded += alphabet[n >> 18] + alphabet[(n >> 12) & 63] + (i + 1 < bytes.length ? alphabet[(n >> 6) & 63] : "=") + (i + 2 < bytes.length ? alphabet[n & 63] : "=");
+        }
+        parts.push({ inline_data: { mime_type: res.headers.get("content-type")?.split(";")[0] || "image/jpeg", data: encoded } });
+      }
+      url = `https://generativelanguage.googleapis.com/v1beta/models/${model.id}:generateContent`;
+      headers = { "Content-Type": "application/json", "x-goog-api-key": key };
+      body = { contents: [{ role: "user", parts }] };
+      const config = geminiGenerationConfig(model.id, effective.reasoningEffort); if (config) body.generationConfig = config;
+    } else {
+      headers = { "Content-Type": "application/json", Authorization: `Bearer ${key}` };
+      const responses = model.apiType === "openai" && !usesLegacyChatCompletions(model.id);
+      url = model.apiType === "xai" ? "https://api.x.ai/v1/chat/completions" : responses ? "https://api.openai.com/v1/responses" : "https://api.openai.com/v1/chat/completions";
+      if (responses) {
+        body = { model: model.id, input: [{ role: "user", content: [{ type: "input_text", text: prompt }, ...imageUrls.map(image_url => ({ type: "input_image", image_url }))] }] };
+        applyResponsesReasoning(body, effective.reasoningEffort);
+      } else {
+        body = { model: model.id, messages: [{ role: "user", content: [{ type: "text", text: prompt }, ...imageUrls.map(url => ({ type: "image_url", image_url: { url } }))] }] };
+        const temp = model.apiType === "openai" ? openaiTemperatureFor(model.id, effective.temperature) : effective.temperature;
+        if (temp !== undefined) body.temperature = temp;
+        applyOpenAiReasoningEffort(body, effective.reasoningEffort);
+      }
+    }
+    const res = await fetchApiResponse(model.apiType, url, { method: "POST", headers, body: JSON.stringify(body) });
+    const data = await readApiJson<any>(model.apiType, res);
+    const usage = data?.usage ?? data?.usageMetadata ?? {};
+    const counts = ["input_tokens", "output_tokens", "total_tokens", "promptTokenCount", "candidatesTokenCount", "totalTokenCount"]
+      .filter(k => typeof usage[k] === "number" && Number.isFinite(usage[k]))
+      .map(k => `${k}=${usage[k]}`).join(" ");
+    const responseModel = typeof data?.model === "string" ? data.model : typeof data?.modelVersion === "string" ? data.modelVersion : "UNKNOWN";
+    console.info(`投稿解析 response provider=${model.apiType} model=${responseModel} ${counts}`);
+    const candidate = data?.candidates?.[0];
+    const choice = data?.choices?.[0];
+    const finish = candidate?.finishReason ?? choice?.finish_reason;
+    const refusal = choice?.message?.refusal || data?.output?.some((entry: any) => entry?.content?.some((part: any) => part?.type === "refusal" || part?.refusal));
+    if ((data?.status && data.status !== "completed") || data?.incomplete_details || data?.promptFeedback?.blockReason || refusal || (finish && !["STOP", "stop"].includes(finish))) {
+      throw new Error("投稿解析の応答が未完了または拒否されました");
+    }
+    const content = model.apiType === "gemini" ? data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text ?? "").join("") : model.apiType === "openai" && !usesLegacyChatCompletions(model.id) ? responsesOutputText(data) : data?.choices?.[0]?.message?.content;
+    if (typeof content !== "string" || !content.trim()) throw new Error("投稿解析の応答が空です");
+    return stripJsonFences(content);
+  }
+
   private async callModel(
     model: LlmModelConfig,
     prompt: string,

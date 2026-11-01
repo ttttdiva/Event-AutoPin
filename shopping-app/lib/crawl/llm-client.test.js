@@ -305,7 +305,62 @@ async function runGenericEffortDispatchTest() {
   ]);
 }
 
+async function runJointPostTests() {
+  const images = ["https://pbs.twimg.com/a.jpg", "https://pbs.twimg.com/b.jpg"];
+  await withFetch([response({output_text:'{"classification":"confirmed","items":[]}'})], async calls => {
+    await new LlmClient({id:"gpt-5.6-luna",apiType:"openai"}).analyzePost("全文", images, {reasoningEffort:"max"});
+    assert.equal(calls.length,1);
+    const body = jsonBody(calls[0]);
+    assert.deepEqual(body.reasoning,{effort:"max"});
+    assert.equal(body.input[0].content[0].text,"全文");
+    assert.deepEqual(body.input[0].content.slice(1).map(p=>p.image_url),images);
+    assert.equal(calls[0].init.headers.Authorization,"Bearer dummy-key-openai");
+  });
+  await withFetch([response({choices:[{message:{content:'{}'}}]})], async calls => {
+    await new LlmClient({id:"grok-4",apiType:"xai"}).analyzePost("全文",images);
+    assert.equal(calls.length,1);
+    assert.deepEqual(jsonBody(calls[0]).messages[0].content.slice(1).map(p=>p.image_url.url),images);
+    assert.equal(calls[0].init.headers.Authorization,"Bearer dummy-key-xai");
+  });
+}
+
+async function runPostReceiptTests() {
+  const logs = [];
+  const originalInfo = console.info;
+  console.info = (...args) => logs.push(args.join(" "));
+  try {
+    await withFetch([response({model:"actual-model",usage:{input_tokens:5,output_tokens:"secret",total_tokens:8},output_text:"{}"}),response({output_text:"{}"})], async calls => {
+      const client = new LlmClient({id:"gpt-5.6-luna",apiType:"openai"});
+      await client.analyzePost("本文",[]); await client.analyzePost("本文",[]);
+      assert.equal(calls.length,2);
+    });
+    assert.ok(logs.some(line=>line.includes("model=actual-model") && line.includes("input_tokens=5") && !line.includes("secret")));
+    assert.ok(logs.some(line=>line.includes("model=UNKNOWN")));
+    for (const data of [
+      {status:"incomplete",output_text:"{}"},
+      {status:"completed",output:[{content:[{type:"refusal",refusal:"no"}]}],output_text:"{}"},
+      {choices:[{finish_reason:"length",message:{content:"{}"}}]},
+      {candidates:[{finishReason:"MAX_TOKENS",content:{parts:[{text:"{}"}]}}]},
+      {promptFeedback:{blockReason:"SAFETY"},candidates:[{content:{parts:[{text:"{}"}]}}]},
+    ]) {
+      const provider = data.candidates || data.promptFeedback ? "gemini" : data.choices ? "xai" : "openai";
+      await withFetch([response(data)], async () => assert.rejects(new LlmClient({id:provider === "openai" ? "gpt-5.6-luna" : "model",apiType:provider}).analyzePost("本文",[]),/未完了/));
+    }
+    const image = {ok:true,headers:{get:()=>"image/png"},arrayBuffer:async()=>Uint8Array.from([65,66,67]).buffer};
+    await withFetch([image,image,response({modelVersion:"gemini-actual",candidates:[{finishReason:"STOP",content:{parts:[{text:"{}"}]}}]})],async calls=>{
+      await new LlmClient({id:"gemini-3-flash-preview",apiType:"gemini"}).analyzePost("全文",["https://pbs.twimg.com/a","https://pbs.twimg.com/b"],{reasoningEffort:"high"});
+      const body=jsonBody(calls[2]);
+      assert.equal(body.contents[0].parts[0].text,"全文");
+      assert.deepEqual(body.contents[0].parts.slice(1).map(p=>p.inline_data.data),["QUJD","QUJD"]);
+      assert.deepEqual(body.generationConfig,{thinkingConfig:{thinkingLevel:"high"}});
+    });
+    assert.ok(logs.some(line=>line.includes("model=gemini-actual")));
+  } finally { console.info = originalInfo; }
+}
+
 async function runLlmClientTests() {
+  await runPostReceiptTests();
+  await runJointPostTests();
   await runOpenAiResponsesTests();
   await runFutureAndLegacyRoutingTests();
   await runProviderAndFallbackTests();

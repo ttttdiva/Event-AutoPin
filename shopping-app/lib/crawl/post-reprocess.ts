@@ -1,12 +1,4 @@
-/**
- * 特定サークルをXポストURLから再処理する
- *
- * デスクトップの desktop_bridge.py: reprocess_circle_from_post を移植。
- * - ポストURLからtweet_idを抽出
- * - Grok APIで当該ツイートの画像URL・頒布物情報を取得
- * - 画像をDL、items/item_imagesを置換してDB更新
- * - memoにポストURLを追記
- */
+/** 指定されたX投稿を取得し、選択モデルで本文と画像を同時解析する。 */
 import * as FileSystem from "expo-file-system/legacy";
 import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import {
@@ -17,11 +9,8 @@ import {
   deleteItemSearchIndexForCircle,
   invalidatePurchaseLookupCache,
 } from "../database";
-import {
-  getApiKey,
-  getGrokSearchModelSelection,
-  isGrokEnabled,
-} from "../settings-store";
+import { getCatalogPostModelSelection, getCatalogPostReasoningEffort } from "../settings-store";
+import { fetchXPostDetail } from "./x-post-lookup";
 import { downloadImage, guessExt } from "./image-downloader";
 import { LlmClient } from "./llm-client";
 
@@ -74,23 +63,7 @@ export async function reprocessCircleFromPost(
     };
   }
 
-  if (!(await isGrokEnabled())) {
-    return {
-      success: false,
-      message: "設定でGrok検索が無効になっています",
-      itemCount: 0,
-      imageCount: 0,
-    };
-  }
-  const apiKey = await getApiKey("xai");
-  if (!apiKey) {
-    return {
-      success: false,
-      message: "xAI(Grok) APIキーが未設定です",
-      itemCount: 0,
-      imageCount: 0,
-    };
-  }
+  const [model, effort] = await Promise.all([getCatalogPostModelSelection(), getCatalogPostReasoningEffort()]);
 
   const db = await getDatabase();
   const circleRow = await db.getFirstAsync<{
@@ -115,27 +88,23 @@ export async function reprocessCircleFromPost(
 
   await activateKeepAwakeAsync(KEEP_AWAKE_TAG);
   try {
-    onProgress?.({ phase: "fetch", message: "Grokで投稿を解析中..." });
-    const grokResult = await fetchPostWithGrok(postUrl);
-    if (!grokResult) {
-      return {
-        success: false,
-        message: "Grokから投稿情報を取得できませんでした",
-        itemCount: 0,
-        imageCount: 0,
-      };
+    onProgress?.({ phase: "fetch", message: "投稿を取得中..." });
+    let post: Awaited<ReturnType<typeof fetchXPostDetail>>;
+    let analysis: PostAnalysis;
+    try {
+      post = await fetchXPostDetail(tweetId);
+      onProgress?.({ phase: "fetch", message: "投稿本文と画像を解析中..." });
+      const prompt = `次のイベント関連投稿の本文と全画像を読み、classificationをconfirmed（お品書き）、absence（欠席）、preview（告知・予告）のいずれかに分類してください。対象外判定をせず、判別できなければpreviewとしてください。商品名、価格、種別が確認できるものをitemsに入れ、不明な価格はnullにしてください。情報が不完全な場合はpartialをtrueにしてください。JSONのみ: {"classification":"confirmed|absence|preview","items":[{"name":"商品名","price":null,"type":null}],"partial":false}\n投稿本文:\n${post.text}`;
+      const content = await new LlmClient(model).analyzePost(prompt, post.imageUrls, { reasoningEffort: effort, temperature: 0.2 });
+      analysis = parsePostAnalysis(content);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "投稿の取得または解析に失敗しました";
+      return { success: false, message: `${message}。既存データは保持しました`, itemCount: 0, imageCount: 0 };
     }
-
-    const items = grokResult.items.filter((i) => typeof i?.name === "string" && i.name.trim());
-    const imageUrls = grokResult.imageUrls.filter((u) => typeof u === "string" && u.trim());
-    // 投稿不存在・解析失敗を空のカタログとして公開しない。
-    if (!items.length && !imageUrls.length) {
-      return {
-        success: false,
-        message: "投稿から頒布物や画像を取得できませんでした。既存データは保持しました",
-        itemCount: 0,
-        imageCount: 0,
-      };
+    const items = analysis.items;
+    const imageUrls = analysis.classification === "confirmed" ? post.imageUrls : [];
+    if (analysis.classification === "confirmed" && !items.length && !imageUrls.length) {
+      return { success: false, message: "投稿から利用可能な頒布物や画像を抽出できませんでした。既存データは保持しました", itemCount: 0, imageCount: 0 };
     }
     let oldImages: { filename: string }[] = [];
 
@@ -219,13 +188,13 @@ export async function reprocessCircleFromPost(
           return { item, previous: candidates[0] };
         });
         // 画像のみ/文字のみ抽出された場合は、未取得の側を消さない。
-        if (newImagePaths.length) {
+        if (newImagePaths.length && !analysis.partial) {
           oldImages = await txDb.getAllAsync<{ filename: string }>(
             "SELECT filename FROM item_images WHERE circle_id = ?", circleId,
           );
           await txDb.runAsync("DELETE FROM item_images WHERE circle_id = ?", circleId);
         }
-        if (items.length) {
+        if (items.length && !analysis.partial) {
           await deleteItemSearchIndexForCircle(circleId, txDb);
           await txDb.runAsync("DELETE FROM items WHERE circle_id = ?", circleId);
         }
@@ -238,6 +207,7 @@ export async function reprocessCircleFromPost(
           );
         }
         for (const { item, previous } of replacements) {
+          if (analysis.partial && previous) continue;
           await txDb.runAsync(
             "INSERT INTO items (circle_id, name, price, type, description, purchase_status, purchase_status_source, name_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             circleId,
@@ -257,8 +227,12 @@ export async function reprocessCircleFromPost(
           const newMemo = existingMemo ? `${existingMemo}\n${postUrl}` : postUrl;
           await txDb.runAsync("UPDATE circles SET memo = ? WHERE id = ?", newMemo, circleId);
         }
-        const catalogStatus = items.length || savedImages ? "confirmed" : "no_extractable_items";
-        await txDb.runAsync("UPDATE circles SET catalog_status = ? WHERE id = ?", catalogStatus, circleId);
+        if (analysis.classification === "absence") {
+          await txDb.runAsync("UPDATE circles SET absence_status = ? WHERE id = ?", "欠席", circleId);
+        } else {
+          const catalogStatus = analysis.partial ? "needs_recheck" : analysis.classification === "preview" ? "preview" : items.length || savedImages ? "confirmed" : "no_extractable_items";
+          await txDb.runAsync("UPDATE circles SET catalog_status = ? WHERE id = ?", catalogStatus, circleId);
+        }
         if (!currentCircle.circle_cut_filename && firstSavedImage) {
           await txDb.runAsync("UPDATE circles SET circle_cut_filename = ? WHERE id = ?", firstSavedImage, circleId);
           postCommit.defaultCut = {
@@ -324,53 +298,23 @@ export async function reprocessCircleFromPost(
   }
 }
 
-interface GrokPostResult {
-  imageUrls: string[];
-  items: { name: string; price?: number | null; type?: string | null }[];
+interface PostAnalysis {
+  classification: "confirmed" | "absence" | "preview";
+  items: { name: string; price: number | null; type: string | null }[];
+  partial: boolean;
 }
-
-/** Grokに特定ポストURLを渡して画像URL・頒布物を抽出 */
-async function fetchPostWithGrok(
-  postUrl: string,
-): Promise<GrokPostResult | null> {
-  const prompt = `次のXポストを確認し、そこに含まれる「おしながき」画像URLと、頒布物一覧を抽出してください。
-ポストURL: ${postUrl}
-
-以下のJSON形式で返してください。
-{
-  "image_urls": ["画像URL1", "画像URL2"],
-  "items": [
-    { "name": "頒布物名", "price": 500, "type": "新刊(漫画)" }
-  ]
-}
-
-type は次のいずれかを使ってください: 新刊(漫画), 新刊(イラスト), 既刊, 小説, 合同誌, 雑誌, 音楽, グッズ, その他
-ポストが存在しない・画像がない場合は {"image_urls": [], "items": []} を返してください。
-JSONのみを返してください。`;
-
-  try {
-    const model = await getGrokSearchModelSelection();
-    const llm = new LlmClient(model);
-    const content = await llm.extractData(prompt, {
-      temperature: 0.2,
-      reasoningEffort: "none",
-    });
-    const parsed = JSON.parse(stripFences(content));
-    return {
-      imageUrls: Array.isArray(parsed.image_urls) ? parsed.image_urls : [],
-      items: Array.isArray(parsed.items) ? parsed.items : [],
-    };
-  } catch {
-    // ポスト本文・API応答・秘密値をログへ出さない。
-    console.warn("Grokポスト解析失敗");
-    return null;
+function parsePostAnalysis(content: string): PostAnalysis {
+  let value: any;
+  try { value = JSON.parse(content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")); }
+  catch { throw new Error("投稿解析のJSONが不正です"); }
+  if (!value || typeof value !== "object" || !["confirmed", "absence", "preview"].includes(value.classification) || !Array.isArray(value.items)) throw new Error("投稿解析の応答形式が不正です");
+  let partial = value.partial === true;
+  const items: PostAnalysis["items"] = [];
+  for (const item of value.items) {
+    if (!item || typeof item.name !== "string" || !item.name.trim()) { partial = true; continue; }
+    const price = typeof item.price === "number" && Number.isFinite(item.price) && item.price >= 0 ? item.price : null;
+    if (price === null || item.needs_review === true || (item.type != null && typeof item.type !== "string")) partial = true;
+    items.push({ name: item.name.trim(), price, type: typeof item.type === "string" ? item.type : null });
   }
-}
-
-function stripFences(text: string): string {
-  let t = text.trim();
-  if (t.startsWith("```json")) t = t.slice(7);
-  else if (t.startsWith("```")) t = t.slice(3);
-  if (t.endsWith("```")) t = t.slice(0, -3);
-  return t.trim();
+  return { classification: value.classification, items: value.classification === "confirmed" ? items : [], partial };
 }

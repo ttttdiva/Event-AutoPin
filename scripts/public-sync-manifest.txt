@@ -154,6 +154,8 @@ shopping-app/lib/crawl/site-schema-store.ts
 shopping-app/lib/crawl/twitter-grok.ts
 shopping-app/lib/crawl/types.ts
 shopping-app/lib/crawl/url-validation.ts
+shopping-app/lib/crawl/x-post-lookup.ts
+shopping-app/lib/crawl/x-post-lookup.test.js
 shopping-app/lib/crawl/vision-analyzer.ts
 shopping-app/lib/database-core.test.ts
 shopping-app/lib/database-filesystem.test.ts

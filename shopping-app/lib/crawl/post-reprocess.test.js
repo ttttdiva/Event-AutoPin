@@ -23,7 +23,7 @@ function harness(result, options = {}) {
   const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(`
     PRAGMA foreign_keys = ON;
-    CREATE TABLE circles (id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL, name TEXT NOT NULL, penname TEXT, memo TEXT NOT NULL DEFAULT '', circle_cut_filename TEXT, catalog_status TEXT);
+    CREATE TABLE circles (id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL, name TEXT NOT NULL, penname TEXT, memo TEXT NOT NULL DEFAULT '', circle_cut_filename TEXT, catalog_status TEXT, absence_status TEXT);
     CREATE TABLE items (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       circle_id INTEGER NOT NULL REFERENCES circles(id) ON DELETE CASCADE,
@@ -36,7 +36,7 @@ function harness(result, options = {}) {
       circle_id INTEGER NOT NULL REFERENCES circles(id) ON DELETE CASCADE,
       filename TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'unknown', raw_json TEXT
     );
-    INSERT INTO circles VALUES (1, 1, '既存サークル', '', '元のメモ', NULL, 'confirmed');
+    INSERT INTO circles VALUES (1, 1, '既存サークル', '', '元のメモ', NULL, 'confirmed', NULL);
     INSERT INTO items (circle_id, name, price, type, description, purchase_status, purchase_status_source, name_key)
       VALUES (1, '既存の商品', 500, '本', '手動説明', 1, 'manual', '既存の商品');
   `);
@@ -102,12 +102,12 @@ function harness(result, options = {}) {
       async deleteItemSearchIndexForCircle() {},
       invalidatePurchaseLookupCache() {},
     },
-    "../settings-store": {
-      async getApiKey() { return "dummy-key-xai"; },
-      async isGrokEnabled() { return true; },
-      async getGrokSearchModelSelection() {
-        return { id: "grok-test-model", apiType: "xai" };
-      },
+    "../settings-store": options.settings ?? {
+      async getCatalogPostModelSelection() { return options.model ?? { id: "gpt-test", apiType: "openai" }; },
+      async getCatalogPostReasoningEffort() { return options.effort ?? "none"; },
+    },
+    "./x-post-lookup": {
+      async fetchXPostDetail() { options.duringFetch?.(sqlite); return { text: "投稿全文", imageUrls: result.image_urls ?? [] }; },
     },
     "./image-downloader": {
       guessExt: () => "jpg",
@@ -121,21 +121,17 @@ function harness(result, options = {}) {
     },
   };
   const moduleRecord = { exports: {} };
-  const mockFetch = async () => {
-    options.duringFetch?.(sqlite);
-    return { ok: true, async json() { return { choices: [{ message: { content: JSON.stringify(result) } }] }; } };
-  };
+  const mockFetch = async () => { throw new Error("unexpected fetch"); };
   mocks["./llm-client"] = {
     LlmClient: class {
-      constructor(model) {
-        assert.deepEqual(model, { id: "grok-test-model", apiType: "xai" });
-      }
-      async extractData(prompt, requestOptions) {
-        assert.equal(typeof prompt, "string");
-        assert.deepEqual(requestOptions, { temperature: 0.2, reasoningEffort: "none" });
-        const response = await mockFetch();
-        const data = await response.json();
-        return data?.choices?.[0]?.message?.content ?? "";
+      constructor(model) { assert.deepEqual(model, options.model ?? { id: "gpt-test", apiType: "openai" }); }
+      async analyzePost(prompt, urls, requestOptions) {
+        assert.match(prompt, /投稿全文/);
+        assert.deepEqual(urls, result.image_urls ?? []);
+        assert.equal(requestOptions.reasoningEffort, options.effort ?? "none");
+        if (options.response !== undefined) return options.response;
+        if (!result.items.length && !(result.image_urls ?? []).length && !result.classification) return "{}";
+        return JSON.stringify({ classification: result.classification ?? "confirmed", items: result.items.map(i => ({ price: 100, ...i })), partial: result.partial ?? false });
       }
     },
   };
@@ -359,4 +355,58 @@ for (const fault of ["reference", "oldImage", "staging", "search"]) test(`${faul
     assert.ok(h.files.has(h.rows("item_images")[0].filename));
     if (fault === "reference" || fault === "oldImage") assert.ok(h.files.has(oldImage));
   } finally { h.close(); }
+});
+
+for (const model of [{id:"gpt-5",apiType:"openai"},{id:"grok-4",apiType:"xai"}]) test(`選択した${model.apiType}モデルとeffortで本文と全画像を解析`, async () => {
+ const h = harness({image_urls:["https://pbs.twimg.com/a.jpg","https://pbs.twimg.com/b.jpg"],items:[{name:"本",price:500}]},{model,effort:"high"});
+ try { assert.equal((await h.run()).success,true); } finally { h.close(); }
+});
+for (const classification of ["absence", "preview"]) test(`${classification}は画像なしでも既存商品を保持`, async () => {
+ const h = harness({classification,image_urls:[],items:[]});
+ try { assert.equal((await h.run()).success,true); h.assertPreserved(); assert.equal(h.rows("circles")[0][classification === "absence" ? "absence_status" : "catalog_status"], classification === "absence" ? "欠席" : "preview"); } finally { h.close(); }
+});
+test("不完全な商品は既存商品を残し価格不明のまま確認待ちで追加", async () => {
+ const h = harness({image_urls:[],items:[{name:"新刊",price:null},{name:""}]});
+ try { assert.equal((await h.run()).success,true); assert.equal(h.rows("items").length,2); assert.equal(h.rows("items")[1].price,null); assert.equal(h.rows("circles")[0].catalog_status,"needs_recheck"); } finally { h.close(); }
+});
+test("不正JSONは既存データを保持", async () => {
+ const h = harness({image_urls:[],items:[]},{response:"broken"});
+ try { assert.match((await h.run()).message,/JSON/); h.assertPreserved(); } finally { h.close(); }
+});
+
+test("確定結果が空ならDBを一切変更しない", async () => {
+ const h = harness({classification:"confirmed",image_urls:[],items:[]});
+ try { assert.match((await h.run()).message,/利用可能/); assert.equal(h.transactions,0); h.assertPreserved(); assert.deepEqual(h.rows("circles"),h.before.circles); } finally { h.close(); }
+});
+test("商品単位の要確認を全体へ伝える", async () => {
+ const h = harness({image_urls:[],items:[{name:"新刊",price:500,needs_review:true}]});
+ try { assert.equal((await h.run()).success,true); assert.equal(h.rows("circles")[0].catalog_status,"needs_recheck"); assert.equal(h.rows("items").length,2); } finally { h.close(); }
+});
+
+test("実設定の保存と再読込から投稿処理へ選択が渡る", async () => {
+ const Module = require("node:module");
+ const settings = {};
+ const original = Module._load;
+ delete require.cache[require.resolve("../settings-store")];
+ Module._load = function(request, parent, isMain) {
+   if (request === "expo-secure-store") return {getItemAsync:async()=>null,setItemAsync:async()=>{},deleteItemAsync:async()=>{}};
+   if (request === "./database" && parent?.filename.endsWith("settings-store.ts")) return {getSetting:async key=>settings[key] ?? null,setSetting:async (key,value)=>{settings[key]=value;}};
+   return original.call(this,request,parent,isMain);
+ };
+ let store;
+ try { store = require("../settings-store"); } finally { Module._load = original; }
+ for (const [enabled,model,effort] of [[false,{id:"gpt-5.6-luna",apiType:"openai"},"high"],[true,{id:"gpt-5.6-luna",apiType:"openai"},"low"],[true,{id:"grok-4",apiType:"xai"},"none"]]) {
+   await store.setGrokEnabled(enabled);
+   await store.setCatalogPostModel(model.id,model.apiType);
+   await store.setCatalogPostReasoningEffort(effort);
+   delete require.cache[require.resolve("../settings-store")];
+   Module._load = function(request,parent,isMain) {
+     if (request === "expo-secure-store") return {getItemAsync:async()=>null,setItemAsync:async()=>{},deleteItemAsync:async()=>{}};
+     if (request === "./database" && parent?.filename.endsWith("settings-store.ts")) return {getSetting:async key=>settings[key] ?? null,setSetting:async (key,value)=>{settings[key]=value;}};
+     return original.call(this,request,parent,isMain);
+   };
+   try { store = require("../settings-store"); } finally { Module._load = original; }
+   const h = harness({image_urls:[],items:[{name:"本",price:500}]},{settings:store,model,effort});
+   try { assert.equal((await h.run()).success,true); } finally { h.close(); }
+ }
 });
