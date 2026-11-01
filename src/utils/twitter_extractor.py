@@ -450,6 +450,12 @@ class TwitterExtractor:
                     return catalog_tweets
 
                 stats["user_lookup_success_count"] = 1
+                # 既存の lookup 応答を再利用し、人気指標のための追加通信は行わない。
+                count = getattr(user, "followersCount", None)
+                if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                    stats["follower_count"] = count
+                    stats["follower_observed_at"] = datetime.now(timezone.utc).isoformat()
+                    stats["follower_source"] = "twscrape_user_by_login"
                 
                 logger.info(f"Found user @{username} (ID: {user.id})")
                 

@@ -197,3 +197,54 @@ def test_timeline_scan_continues_past_isolated_old_tweet():
         pass  # 後段の判定が未設定でも、タイムラインを最後まで読んだかだけを確認する。
 
     assert UnorderedTimelineApi.consumed == len(order)
+
+
+def test_follower_observation_reuses_normal_lookup_without_extra_requests():
+    class Api:
+        def __init__(self, count):
+            self.count = count
+            self.lookups = 0
+            self.timelines = 0
+
+        async def user_by_login(self, _username):
+            self.lookups += 1
+            return SimpleNamespace(id=123, followersCount=self.count)
+
+        async def user_tweets(self, _user_id, limit=-1):
+            self.timelines += 1
+            if False:
+                yield None
+
+    for count in (0, 1234, -1, True, "42", None):
+        api = Api(count)
+        result = asyncio.run(make_extractor([api]).extract_catalog_tweets(
+            username="sample", event_date=datetime(2026, 7, 4), event_name="event"
+        ))
+        assert (api.lookups, api.timelines) == (1, 1)
+        if type(count) is int and count >= 0:
+            assert result.fetch_stats["follower_count"] == count
+            assert result.fetch_stats["follower_source"] == "twscrape_user_by_login"
+            assert datetime.fromisoformat(result.fetch_stats["follower_observed_at"]).utcoffset().total_seconds() == 0
+        else:
+            assert "follower_count" not in result.fetch_stats
+
+
+def test_processor_carries_lookup_observation_when_timeline_unresolved():
+    from src.models import Circle
+    from src.processors.twitter_post_processor import TwitterPostProcessor
+
+    async def extract_catalog_tweets(**_kwargs):
+        return CatalogTweetResult(fetch_stats={
+            "outcome": "timeline_unresolved", "follower_count": 0,
+            "follower_observed_at": "2026-01-01T00:00:00+00:00",
+            "follower_source": "twscrape_user_by_login",
+        })
+
+    processor = object.__new__(TwitterPostProcessor)
+    processor.config = SimpleNamespace(days_before_event=30, days_after_event=7)
+    processor.twitter_extractor = SimpleNamespace(extract_catalog_tweets=extract_catalog_tweets)
+    circle = asyncio.run(processor._process_with_twscrape(
+        Circle(name="A"), "sample", datetime(2026, 7, 4), "event"
+    ))
+    assert circle.follower_count == 0
+    assert circle.to_dict()["follower_source"] == "twscrape_user_by_login"

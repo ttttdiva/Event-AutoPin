@@ -10,16 +10,6 @@
     <meta http-equiv="Pragma" content="no-cache" />
     <meta http-equiv="Expires" content="0" />
     <title>Event AutoPin</title>
-    <style>
-      .catalog-image-stack { display: inline-grid; vertical-align: middle; isolation: isolate; padding: 3px 6px; }
-      .catalog-image-stack img { grid-area: 1 / 1; background: var(--bg-primary); box-shadow: 0 1px 4px #0008; transform: translate(var(--stack-x), var(--stack-y)) rotate(var(--stack-rotation)); transition: transform 180ms ease; }
-      .img-clickable:hover .catalog-image-stack img, .img-clickable:focus-within .catalog-image-stack img { transform: translate(var(--fan-x), var(--fan-y)) rotate(var(--fan-rotation)); }
-      .catalog-modal-nav { position: fixed; top: 50%; transform: translateY(-50%); z-index: 1; border: 1px solid #fff8; border-radius: 50%; width: 2.75rem; height: 2.75rem; color: #fff; background: #222c; font-size: 1.5rem; cursor: pointer; }
-      .catalog-modal-nav:focus-visible { outline: 3px solid #60a5fa; outline-offset: 2px; }
-      .catalog-modal-prev { left: 1rem; }
-      .catalog-modal-next { right: 1rem; }
-      @media (prefers-reduced-motion: reduce) { .catalog-image-stack img { transition: none; } }
-    </style>
     <script>
       // テーマをFOUC防止で即適用
       (function () {

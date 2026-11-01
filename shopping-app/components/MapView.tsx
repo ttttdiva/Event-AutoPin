@@ -42,6 +42,7 @@ import {
   startUiMetric,
 } from "@/lib/performance";
 import { buildMapPinIndex, selectMapPins } from "@/lib/map-pin-index";
+import { calculateRecommendedRoute } from "@/lib/recommended-route";
 import {
   calculatePinDisplayGeometry,
   getMapPinSpaceSpan,
@@ -72,6 +73,7 @@ const PIN_OUTLINE_ALPHA = 0.76;
 export interface MapViewHandle {
   /** 指定サークルのピン位置にマップをアニメーション移動 */
   focusOnCircle: (circleId: number) => void;
+  showRouteInfo: () => void;
 }
 
 interface MapViewProps {
@@ -93,6 +95,7 @@ interface MapViewProps {
   onPinMove?: (circle: Circle, newNormX: number, newNormY: number) => void;
   highlightCircleId?: number | null;
   showFilters?: boolean;
+  routeEnabled?: boolean;
   // 親のフィルター状態（M2: リストと同じフィルターをマップにも適用）
   parentStatusFilter?: ReadonlySet<number> | number | null;
   onPriorityFilterChange?: (value: Set<number>) => void;
@@ -303,6 +306,7 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
       onPinMove,
       highlightCircleId: externalHighlight,
       showFilters = true,
+      routeEnabled = false,
       parentStatusFilter,
       parentPriorityFilter,
       onPriorityFilterChange,
@@ -531,19 +535,6 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
       }
     }, [pendingFocusCircleId, focusCircleNow]);
 
-    // 外部からピン位置にフォーカスするAPI
-    useImperativeHandle(
-      ref,
-      () => ({
-        focusOnCircle(circleId: number) {
-          if (!focusCircleNow(circleId)) {
-            setPendingFocusCircleId(circleId);
-          }
-        },
-      }),
-      [focusCircleNow],
-    );
-
     const mapPinIndex = useMemo(() => buildMapPinIndex(circles), [circles]);
 
     // The helper applies all map filters in one predicate pass, avoiding up to
@@ -576,6 +567,45 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
         parentHideSkipped,
       ],
     );
+
+    // The parent already applies the list filters. Keep coordinate-less and
+    // unassigned entries here so the route can report them as unavailable.
+    const route = useMemo(() => {
+      if (!routeEnabled || !currentMap || !naturalSize) return null;
+      const allRows = new Map<number, Circle[]>([[0, [...circles]]]);
+      const candidates = selectMapPins(allRows, {
+        mapNumber: null, colors: colorFilter, status: parentStatusFilter,
+        priorities: parentPriorityFilter, hall: parentHallFilter,
+        searchQuery: parentSearchQuery, globalSearchEnabled: parentGlobalSearchEnabled,
+        itemSearchText: parentSearchTextMap, catalogPostOnly: parentCatalogPostOnly,
+        hideSkipped: parentHideSkipped,
+      });
+      return calculateRecommendedRoute(candidates, {
+        mapNumber: currentMap.mapNumber,
+        mapNumberUnique: maps.filter(map => map.mapNumber === currentMap.mapNumber).length === 1,
+        imageWidth: naturalSize.w,
+        imageHeight: naturalSize.h,
+      });
+    }, [routeEnabled, currentMap, naturalSize, maps, circles, colorFilter, parentStatusFilter,
+      parentPriorityFilter, parentHallFilter, parentSearchQuery, parentGlobalSearchEnabled,
+      parentSearchTextMap, parentCatalogPostOnly, parentHideSkipped]);
+
+    useImperativeHandle(ref, () => ({
+      focusOnCircle(circleId: number) {
+        if (!focusCircleNow(circleId)) setPendingFocusCircleId(circleId);
+      },
+      showRouteInfo() {
+              if (!route) {
+                Alert.alert("巡回の推定", "地図画像の読み込みを待っています。");
+                return;
+              }
+              if (route.ambiguousMap) {
+                Alert.alert("巡回の推定", `同じ地図番号の画像が複数あるため巡回を表示できません。地図・座標不明 ${route.unavailableCount}件 / 対象外 ${route.excludedCount}件`);
+                return;
+              }
+              Alert.alert("巡回の推定", `表示中の候補 ${route.steps.length}件 / 地図・座標不明 ${route.unavailableCount}件 / 対象外 ${route.excludedCount}件\n買えた・見送り・欠席は対象外です。買えなかったは対象に含みます。\n起は地図左上の仮の開始点です。優先度を最優先し、同じ地図内の直線距離の目安とフォロワー数の推定を組み合わせます。\n人気の情報: 30日以内 ${route.popularityCounts.fresh}件、古い ${route.popularityCounts.stale}件、人気不明 ${route.popularityCounts.unknown}件。通常取得時のXフォロワー数を使用し、古い・不明は中立として扱います。人数は混雑や待ち時間を示しません。`);
+      },
+    }), [focusCircleNow, route]);
 
     const updateScaleJS = useCallback((s: number) => setCurrentScale(s), []);
 
@@ -1217,6 +1247,18 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                   <StaticPin {...commonPinProps} />
                 );
                 })}
+              {route && route.steps.map((step, index) => {
+                const geometry = getPinDisplayGeometry(step.circle);
+                if (!geometry) return null;
+                return <View key={`route-${step.circle.id}`} pointerEvents="none"
+                  style={[styles.routeNumber, { left: geometry.centerX, top: geometry.centerY }]}>
+                  <Text style={styles.routeNumberText}>{index + 1}</Text>
+                </View>;
+              })}
+              {route?.startPoint && <View pointerEvents="none" style={[styles.routeStart, {
+                left: route.startPoint.x * displaySize.w,
+                top: route.startPoint.y * displaySize.h,
+              }]}><Text style={styles.routeNumberText}>起</Text></View>}
             </Animated.View>
             {naturalSize && activeHighlight != null && (() => {
               const circle = pinsForMap.find((p) => p.id === activeHighlight);
@@ -1227,6 +1269,7 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
             })()}
             </View>
           </GestureDetector>
+
         </View>
       </GestureHandlerRootView>
     );
@@ -1283,6 +1326,9 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   mapArea: { flex: 1, overflow: "hidden", backgroundColor: "#1a1a2e" },
+  routeNumber: { position: "absolute", backgroundColor: "#155eef", borderRadius: 10, minWidth: 20, height: 20, alignItems: "center", justifyContent: "center" },
+  routeStart: { position: "absolute", backgroundColor: "#343434", borderRadius: 10, width: 20, height: 20, alignItems: "center", justifyContent: "center" },
+  routeNumberText: { color: "white", fontSize: 11, fontWeight: "700" },
   pinTouchTarget: {
     position: "absolute",
   },

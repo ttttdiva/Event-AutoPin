@@ -3466,7 +3466,7 @@ function renderItemPanel(circleIdx: number): string {
       ? `<tr><td colspan="10" class="text-center text-gray-400 text-sm">アイテムなし</td></tr>`
       : "";
 
-  return `<tr class="item-panel-row" data-circle="${circleIdx}"><td colspan="100">
+  return `<tr class="item-panel-row" data-circle="${circleIdx}"><td colspan="${getDisplayHeaders(tableState.headers).length + 1}">
     <div class="item-panel">
       <table class="item-table">
         <thead><tr><th class="w-8"></th><th class="w-11">画像</th><th>アイテム名</th><th class="w-[90px]">単価</th><th>メモ</th><th class="w-[110px]">分類</th><th class="w-[100px]">チェック</th><th class="w-8">感想</th><th class="w-15"></th></tr></thead>
@@ -5549,9 +5549,10 @@ function updatePriorityColorSettingsUI() {
       <div class="priority-color-settings-body">
         ${COLOR_OPTIONS.map((opt) => `
           <label class="priority-color-setting-row">
-            <span class="priority-color-setting-swatch" style="background:${opt.color};"></span>
             <span class="priority-color-setting-label">${escapeHtml(opt.label)}</span>
-            <input data-priority-color="${escapeHtml(opt.value)}" value="${escapeHtml(opt.color)}" />
+            <input type="color" data-priority-color="${escapeHtml(opt.value)}" value="${escapeHtml(opt.color)}" aria-label="${escapeHtml(opt.label)}の色" />
+            <span class="priority-color-setting-swatch" style="background:${opt.color};" aria-hidden="true"></span>
+            <output>${escapeHtml(opt.color)}</output>
           </label>
         `).join("")}
         <button type="button" id="priorityColorResetBtn" class="priority-color-reset-btn">初期値に戻す</button>
@@ -5568,15 +5569,19 @@ function updatePriorityColorSettingsUI() {
         return;
       }
       input.classList.remove("invalid");
+      const row = input.closest(".priority-color-setting-row");
+      const swatch = row?.querySelector<HTMLElement>(".priority-color-setting-swatch");
+      const output = row?.querySelector<HTMLOutputElement>("output");
+      if (swatch) swatch.style.backgroundColor = normalized;
+      if (output) output.textContent = normalized;
       opt.color = normalized;
       opt.bgColor = priorityBgFromColor(normalized);
       savePriorityColorOptions();
       renderCircleColorFilterOptions();
-      updatePriorityColorSettingsUI();
       renderCircleEditorAndMap();
     };
+    input.addEventListener("input", save);
     input.addEventListener("change", save);
-    input.addEventListener("blur", save);
   });
   document.getElementById("priorityColorResetBtn")?.addEventListener("click", () => {
     COLOR_OPTIONS = DEFAULT_COLOR_OPTIONS.map((o) => ({ ...o }));
@@ -5945,10 +5950,17 @@ function renderCircleEditor() {
     サークル画像: "サークルカット",
     アイテム画像: "おしながき",
   };
+  const effectiveWidths = displayHeaders.map((h) => {
+    const width = colWidths[h];
+    return Number.isFinite(width) && width >= 40 ? width : 100;
+  });
+  const tableWidth = effectiveWidths.reduce((sum, width) => sum + width, 36);
+  const colHtml = effectiveWidths.map((width) => `<col style="width:${width}px">`).join("") +
+    `<col style="width:36px">`;
   const thHtml =
     displayHeaders
-      .map((h) => {
-        const w = colWidths[h] || 100;
+      .map((h, index) => {
+        const w = effectiveWidths[index];
         const label = headerLabels[h] || h;
         return `<th style="width:${w}px;min-width:40px;" data-col-name="${escapeHtml(h)}">${escapeHtml(label)}<div class="col-resize-handle"></div></th>`;
       })
@@ -5957,7 +5969,8 @@ function renderCircleEditor() {
 
   circleEditorEl.innerHTML = `
     <div class="table-scroll">
-    <table>
+    <table class="circle-editor-table" style="width:${tableWidth}px !important">
+      <colgroup>${colHtml}</colgroup>
       <thead><tr>${thHtml}</tr></thead>
       <tbody>${topSpacer}${rowsHtml}${bottomSpacer}</tbody>
     </table>
@@ -6032,17 +6045,25 @@ function renderCircleEditor() {
         const th = handle.parentElement as HTMLTableCellElement;
         const colName = th.dataset.colName || "";
         const startX = e.clientX;
-        const startW = th.offsetWidth;
+        const startW = th.getBoundingClientRect().width;
+        const table = th.closest("table")!;
+        const col = table.querySelectorAll<HTMLTableColElement>("colgroup col")[th.cellIndex];
+        const startTableWidth = table.getBoundingClientRect().width;
+        const setWidth = (width: number) => {
+          th.style.width = `${width}px`;
+          col.style.width = `${width}px`;
+          table.style.setProperty("width", `${startTableWidth + width - startW}px`, "important");
+        };
         handle.classList.add("dragging");
 
         const onMove = (ev: MouseEvent) => {
           const newW = Math.max(40, startW + (ev.clientX - startX));
-          th.style.width = `${newW}px`;
+          setWidth(newW);
         };
         const onUp = (ev: MouseEvent) => {
           handle.classList.remove("dragging");
           const finalW = Math.max(40, startW + (ev.clientX - startX));
-          th.style.width = `${finalW}px`;
+          setWidth(finalW);
           if (colName) {
             colWidths[colName] = finalW;
             saveColWidths(colWidths);

@@ -179,3 +179,25 @@ def test_load_existing_json_returns_data(tmp_path: Path):
     reprocessor = JSONReprocessor(str(path), output_dir=str(tmp_path))
 
     assert reprocessor.load_existing_json() == {"circles": [{"name": "A"}]}
+
+
+def test_follower_metadata_reprocess_patch_preserves_old_and_rejects_invalid(tmp_path):
+    reprocessor = JSONReprocessor(str(tmp_path / "event.json"), output_dir=str(tmp_path))
+    data = {"circles": [{"name": "A", "twitter_url": "https://twitter.com/A/", "items": [{"name": "本", "purchase_status": 1}], "catalog_status": "complete"}, {"name": "B", "follower_count": 7}]}
+    update = {"circle_index": 0, "twitter_url": "https://www.x.com/a", "follower_count": 0,
+              "follower_observed_at": "2026-01-01T00:00:00+00:00",
+              "follower_source": "twscrape_user_by_login"}
+    result = reprocessor.update_catalog_links(data, [update, {"circle_index": 1, "follower_count": -1}])
+    assert result["circles"][0]["follower_count"] == 0
+    assert result["circles"][0]["follower_observed_at"] == update["follower_observed_at"]
+    assert result["circles"][1]["follower_count"] == 7
+
+
+def test_metric_update_requires_same_known_account(tmp_path):
+    r = JSONReprocessor(str(tmp_path / "event.json"), output_dir=str(tmp_path))
+    for stored, incoming in [("https://x.com/a", "https://x.com/b"), (None, "https://x.com/a"), ("https://x.com/a", None), ("bad", "bad")]:
+        data = {"circles": [{"twitter_url": stored, "items": [{"name": "本", "purchase_status": 1}], "catalog_status": "complete"}]}
+        r.update_catalog_links(data, [{"circle_index": 0, "twitter_url": incoming, "follower_count": 3}])
+        assert "follower_count" not in data["circles"][0]
+        assert data["circles"][0]["items"][0]["purchase_status"] == 1
+        assert data["circles"][0]["catalog_status"] == "complete"

@@ -165,6 +165,11 @@ shopping-app/lib/database-lifetime.test.ts
 shopping-app/lib/database-shared-settings.test.ts
 shopping-app/lib/database-core.ts
 shopping-app/lib/database.ts
+shopping-app/lib/follower-metadata.ts
+shopping-app/lib/follower-metadata.test.ts
+shopping-app/lib/recommended-route.ts
+shopping-app/lib/recommended-route.test.ts
+shopping-app/lib/recommended-route-ui.test.js
 shopping-app/lib/event-load-epoch.test.ts
 shopping-app/lib/event-context.tsx
 shopping-app/lib/event-load-epoch.ts

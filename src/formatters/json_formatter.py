@@ -8,6 +8,7 @@ import logging
 from ..core import BaseOutputFormatter
 from ..models import Circle, Event
 from ..utils.atomic_json import atomic_write_json
+from ..utils.url_validation import normalize_twitter_profile_url
 
 
 NL = chr(10)
@@ -143,6 +144,16 @@ class JSONFormatter(BaseOutputFormatter):
             if old is None:
                 continue
             changed = False
+            # 未取得時には前回の観測日時ごと保持する（新規取得なら更新）。
+            old_count = old.get('follower_count')
+            old_account = normalize_twitter_profile_url(old.get('twitter_url'))
+            new_account = normalize_twitter_profile_url(circle.get('twitter_url'))
+            if (circle.get('follower_count') is None and isinstance(old_count, int)
+                    and not isinstance(old_count, bool) and old_count >= 0
+                    and (old_account and new_account and old_account.lower() == new_account.lower())):
+                for key in ('follower_count', 'follower_observed_at', 'follower_source'):
+                    circle[key] = old.get(key)
+                changed = True
             if old.get('checked') and not circle.get('checked'):
                 circle['checked'] = old['checked']
                 changed = True

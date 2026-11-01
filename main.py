@@ -1257,6 +1257,16 @@ class CircleListGenerator:
                 "partial",
             }
             if has_failures:
+                # 投稿取得が未解決でも、成功した lookup の観測値だけは保存する。
+                metric_updates = [
+                    {"circle_index": c._circle_index, "twitter_url": c.twitter_url, "follower_count": c.follower_count,
+                     "follower_observed_at": c.follower_observed_at, "follower_source": c.follower_source}
+                    for c in updated_circles
+                    if getattr(c, "follower_count", None) is not None
+                    and hasattr(c, "_circle_index")
+                    and not getattr(c, "_twitter_processing_succeeded", False)
+                ]
+                reprocessor.update_catalog_links(event_data, metric_updates)
                 # 途中で失敗したサークルの品目・checked stateは保存せず、
                 # 正常終了したサークルだけ既存event.jsonへ反映する。
                 updated_circles = [
@@ -1474,11 +1484,16 @@ class CircleListGenerator:
             or circle.items
             or catalog_status
             or circle.existing_only_status
+            or getattr(circle, "follower_count", None) is not None
         ):
             return None
 
         return {
             "circle_index": circle._circle_index,
+            "twitter_url": circle.twitter_url,
+            "follower_count": getattr(circle, "follower_count", None),
+            "follower_observed_at": getattr(circle, "follower_observed_at", None),
+            "follower_source": getattr(circle, "follower_source", None),
             "catalog_url": catalog_url,
             "catalog_image": catalog_image,
             "catalog_type": catalog_type,

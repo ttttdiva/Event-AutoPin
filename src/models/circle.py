@@ -63,6 +63,11 @@ class Circle:
     existing_only_status: Optional[str] = None  # "既刊のみ" if the circle only sells existing items
     catalog_status: Optional[str] = None  # "confirmed", "preview", or "no_extractable_items"
 
+    # 通常のアカウント取得時に観測した人気指標（未取得は None）
+    follower_count: Optional[int] = None
+    follower_observed_at: Optional[str] = None
+    follower_source: Optional[str] = None
+
     # マップ座標（スマホアプリのピン表示用、0.0〜1.0の正規化座標）
     pin_x: Optional[float] = None
     pin_y: Optional[float] = None
@@ -111,6 +116,9 @@ class Circle:
             'pin_y': self.pin_y,
             'map_number': self.map_number,
             'checked': self.checked,
+            'follower_count': self.follower_count,
+            'follower_observed_at': self.follower_observed_at,
+            'follower_source': self.follower_source,
         }
     
     def validate(self) -> List[str]:

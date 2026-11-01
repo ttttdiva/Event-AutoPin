@@ -1238,6 +1238,14 @@ class TwitterPostProcessor:
             skip_tweet_ids=skip_tweet_ids
         )
 
+        # タイムラインが未解決でも、成功したユーザー取得の観測値は保持する。
+        stats = getattr(catalog_tweets, "fetch_stats", {})
+        count = stats.get("follower_count") if isinstance(stats, dict) else None
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            circle.follower_count = stats["follower_count"]
+            circle.follower_observed_at = stats.get("follower_observed_at")
+            circle.follower_source = stats.get("follower_source")
+
         # チェック済みツイートIDを記録（checked_tweets.json更新用）
         checked_ids = list(getattr(catalog_tweets, 'checked_tweet_ids', []))
         # direct処理に失敗した一時除外IDは永続保存しない。

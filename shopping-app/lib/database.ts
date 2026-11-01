@@ -1,3 +1,5 @@
+import { normalizeXProfileUrl } from "./crawl/url-validation";
+import { mapFollowerMetadata } from "./follower-metadata";
 import * as SQLite from "expo-sqlite";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
@@ -1070,6 +1072,9 @@ export interface CircleListRow {
   space: string | null;
   hall: string | null;
   twitterUrl: string | null;
+  followerCount?: number | null;
+  followerObservedAt?: string | null;
+  followerSource?: string | null;
   websiteUrl: string | null;
   pixivUrl: string | null;
   description: string | null;
@@ -1107,6 +1112,10 @@ export async function getCircleListRows(eventId: number): Promise<CircleListRow[
       c.genres, c.tags, c.circle_cut_filename, c.priority_color, c.memo,
       c.checked, c.pin_x, c.pin_y, c.map_number, c.absence_status,
       c.existing_only_status, c.catalog_status,
+      json_extract(c.raw_json, '$.follower_count') AS follower_count,
+      json_type(c.raw_json, '$.follower_count') AS follower_count_type,
+      json_extract(c.raw_json, '$.follower_observed_at') AS follower_observed_at,
+      json_extract(c.raw_json, '$.follower_source') AS follower_source,
       json_extract(c.raw_json, '$.sub_event') AS sub_event,
       json_extract(c.raw_json, '$.menu_url') AS menu_url,
       CASE
@@ -1127,6 +1136,7 @@ export async function getCircleListRows(eventId: number): Promise<CircleListRow[
     space: row.space ?? null,
     hall: row.hall ?? null,
     twitterUrl: row.twitter_url ?? null,
+    ...mapFollowerMetadata(row),
     websiteUrl: row.website_url ?? null,
     pixivUrl: row.pixiv_url ?? null,
     description: row.description ?? null,
@@ -1149,7 +1159,7 @@ export async function getCircleListRows(eventId: number): Promise<CircleListRow[
     // revisionへ含め、編集後にmemo行が古いまま残らないようにする。
     renderRevision: renderRevisionHash([
       row.id, row.event_id, row.name, row.penname, row.space, row.hall,
-      row.twitter_url, row.website_url, row.pixiv_url, row.description,
+      row.twitter_url, row.follower_count, row.follower_count_type, row.follower_observed_at, row.follower_source, row.website_url, row.pixiv_url, row.description,
       row.genres, row.tags, row.circle_cut_filename, row.priority_color,
       row.memo, row.has_catalog_post, row.checked, row.pin_x, row.pin_y,
       row.map_number, row.absence_status, row.existing_only_status,
@@ -1168,6 +1178,10 @@ export async function getCirclesByEvent(eventId: number): Promise<Circle[]> {
       c.genres, c.tags, c.circle_cut_filename, c.priority_color, c.memo,
       c.checked, c.pin_x, c.pin_y, c.map_number, c.absence_status,
       c.existing_only_status, c.catalog_status,
+      json_extract(c.raw_json, '$.follower_count') AS follower_count,
+      json_type(c.raw_json, '$.follower_count') AS follower_count_type,
+      json_extract(c.raw_json, '$.follower_observed_at') AS follower_observed_at,
+      json_extract(c.raw_json, '$.follower_source') AS follower_source,
       json_extract(c.raw_json, '$.sub_event') AS sub_event,
       json_extract(c.raw_json, '$.menu_url') AS menu_url,
       CASE
@@ -1196,6 +1210,10 @@ async function getCirclesByEventForExport(eventId: number): Promise<Circle[]> {
   const rows = await measuredGetAll<any>(
     txDb,
     `SELECT c.*,
+      json_extract(c.raw_json, '$.follower_count') AS follower_count,
+      json_type(c.raw_json, '$.follower_count') AS follower_count_type,
+      json_extract(c.raw_json, '$.follower_observed_at') AS follower_observed_at,
+      json_extract(c.raw_json, '$.follower_source') AS follower_source,
       json_extract(c.raw_json, '$.sub_event') AS sub_event,
       json_extract(c.raw_json, '$.menu_url') AS menu_url,
       CASE
@@ -1219,6 +1237,10 @@ export async function getCircle(id: number): Promise<Circle | null> {
       twitter_url, website_url, pixiv_url, description, genres, tags,
       circle_cut_filename, priority_color, memo, checked, pin_x, pin_y,
       map_number, absence_status, existing_only_status, catalog_status,
+      json_extract(raw_json, '$.follower_count') AS follower_count,
+      json_type(raw_json, '$.follower_count') AS follower_count_type,
+      json_extract(raw_json, '$.follower_observed_at') AS follower_observed_at,
+      json_extract(raw_json, '$.follower_source') AS follower_source,
       json_extract(raw_json, '$.sub_event') AS sub_event,
       json_extract(raw_json, '$.menu_url') AS menu_url
      FROM circles WHERE id = ?`,
@@ -1302,14 +1324,20 @@ export async function updateCircle(
   existingOnlyStatus?: string | null,
 ): Promise<void> {
   const txDb = await getDatabase();
+  const previous = await txDb.getFirstAsync<{ twitter_url: string | null }>("SELECT twitter_url FROM circles WHERE id = ?", id);
+  const oldAccount = normalizeXProfileUrl(previous?.twitter_url)?.toLowerCase();
+  const newAccount = normalizeXProfileUrl(twitterUrl)?.toLowerCase();
+  const accountChanged = !!previous && (!oldAccount || !newAccount || oldAccount !== newAccount);
   await txDb.runAsync(
     `UPDATE circles SET
+      raw_json = CASE WHEN ? THEN json_remove(COALESCE(raw_json, '{}'), '$.follower_count', '$.follower_observed_at', '$.follower_source') ELSE raw_json END,
       name = ?, penname = ?, space = ?, hall = ?,
       priority_color = ?, memo = ?,
       twitter_url = ?, website_url = ?, pixiv_url = ?,
       description = ?, absence_status = ?, existing_only_status = ?,
       name_key = ?, penname_key = ?
      WHERE id = ?`,
+    accountChanged ? 1 : 0,
     name,
     penname ?? null,
     space ?? null,
@@ -6252,6 +6280,9 @@ export async function exportEventData(
       space: c.space ?? undefined,
       hall: c.hall ?? undefined,
       twitter_url: c.twitterUrl ?? undefined,
+      follower_count: c.followerCount ?? null,
+      follower_observed_at: c.followerObservedAt ?? null,
+      follower_source: c.followerSource ?? null,
       website_url: c.websiteUrl ?? undefined,
       pixiv_url: c.pixivUrl ?? undefined,
       description: c.description ?? undefined,
@@ -6859,6 +6890,7 @@ function mapCircle(row: any): Circle {
     space: row.space,
     hall: row.hall,
     twitterUrl: row.twitter_url,
+    ...mapFollowerMetadata(row),
     websiteUrl: row.website_url,
     pixivUrl: row.pixiv_url,
     description: row.description,

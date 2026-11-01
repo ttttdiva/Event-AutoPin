@@ -210,6 +210,8 @@ export default function CircleListScreen() {
   const flatListRef = useRef<FlatList>(null);
   // マップViewのref（リスト→マップ連動用）
   const mapViewRef = useRef<MapViewHandle>(null);
+  const [routeEnabled, setRouteEnabled] = useState(false);
+  useEffect(() => { setRouteEnabled(false); }, [eventId]);
   const [pendingMapFocusCircleId, setPendingMapFocusCircleId] = useState<
     number | null
   >(null);
@@ -309,6 +311,9 @@ export default function CircleListScreen() {
       space: row.space,
       hall: row.hall,
       twitterUrl: row.twitterUrl,
+      followerCount: row.followerCount ?? null,
+      followerObservedAt: row.followerObservedAt ?? null,
+      followerSource: row.followerSource ?? null,
       websiteUrl: row.websiteUrl,
       pixivUrl: row.pixivUrl,
       description: row.description,
@@ -1540,6 +1545,7 @@ export default function CircleListScreen() {
             <MapViewComponent
               ref={mapViewRef}
               eventId={eventId}
+              routeEnabled={routeEnabled}
               mapFmpRequestKey={mapFmpRequest?.key ?? null}
               mapFmpStartedAt={mapFmpRequest?.startedAt ?? null}
               circles={filteredCircles}
@@ -2434,6 +2440,9 @@ export default function CircleListScreen() {
         <InputScrollView style={{ flexGrow: 0, flexShrink: 0, maxHeight: "45%" }}>
         <CollapsibleHeader
           compact={viewMode === "split"}
+          routeEnabled={routeEnabled}
+          onToggleRoute={showMap ? () => setRouteEnabled(value => !value) : undefined}
+          onRouteInfo={() => mapViewRef.current?.showRouteInfo()}
           onBack={() => router.back()}
           globalSearchEnabled={globalSearchEnabled}
           searchQuery={searchQuery}

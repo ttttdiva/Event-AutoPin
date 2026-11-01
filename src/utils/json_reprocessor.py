@@ -13,6 +13,7 @@ import logging
 from .circle_cut_policy import KIND_DEFAULT_CUT, KIND_SUBSTITUTE, make_origin
 from .circle_master import CircleMasterManager
 from .atomic_json import atomic_write_json
+from .url_validation import normalize_twitter_profile_url
 from .reprocess_helpers import (
     REASON_NO_CATALOG,
     REASON_PREVIEW_ONLY,
@@ -124,6 +125,14 @@ class JSONReprocessor:
             idx = update.get('circle_index')
             if valid_index(idx, len(circles)):
                 circle = circles[idx]
+
+                count = update.get('follower_count')
+                account = normalize_twitter_profile_url(circle.get('twitter_url'))
+                update_account = normalize_twitter_profile_url(update.get('twitter_url'))
+                if (isinstance(count, int) and not isinstance(count, bool) and count >= 0
+                        and account and update_account and account.lower() == update_account.lower()):
+                    for key in ('follower_count', 'follower_observed_at', 'follower_source'):
+                        circle[key] = update.get(key)
 
                 if update.get('catalog_url'):
                     # memoにお品書きURL追加

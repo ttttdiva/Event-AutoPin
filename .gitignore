@@ -41,3 +41,7 @@ desktop-app/.claude/
 app_backup.ab
 /.local/
 /.worktrees/
+
+# 生成された検証結果と一時パッチ
+/artifacts/
+/shopping-app/temp/recommended-route-source.patch

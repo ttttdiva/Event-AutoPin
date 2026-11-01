@@ -87,12 +87,15 @@ function addWindowsNativeBuildDirectory(contents) {
   return contents.trimEnd() + `
 ${marker}
 if (System.getProperty('os.name').toLowerCase().contains('windows')) {
-    // CMake/Ninjaの260文字制限を避け、checkoutごとに中間生成物を分離する。
+    // checkoutごとに中間生成物を分離する。
     def buildKey = java.security.MessageDigest.getInstance('SHA-256')
         .digest(rootDir.canonicalPath.getBytes('UTF-8')).encodeHex().toString().substring(0, 8)
-    def driveRoot = rootDir.toPath().root.toFile()
-    android.externalNativeBuild.cmake.buildStagingDirectory = new File(driveRoot, '.ec/' + buildKey)
+    android.externalNativeBuild.cmake.buildStagingDirectory = new File(rootDir, '.cxx/' + buildKey)
     android.defaultConfig.externalNativeBuild.cmake.arguments '-DCMAKE_OBJECT_PATH_MAX=250'
+    def ninjaPath = System.getenv('EVENT_AUTOPIN_NINJA')
+    if (ninjaPath) {
+        android.defaultConfig.externalNativeBuild.cmake.arguments '-DCMAKE_MAKE_PROGRAM=' + ninjaPath
+    }
 }
 `;
 }

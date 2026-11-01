@@ -176,3 +176,39 @@ class TestValidateOutput:
     def test_dict以外はエラー(self, formatter):
         errors = formatter.validate_output("not dict")
         assert len(errors) == 1
+
+
+def test_follower_metadata_roundtrip_and_old_event_compatibility(formatter, sample_event, tmp_path):
+    path = tmp_path / "event.json"
+    # 旧イベントにメタデータがなくても、通常どおり読み込み・保存できる。
+    path.write_text(json.dumps({"event": {}, "circles": [{"name": "A"}]}), encoding="utf-8")
+    circle = Circle(name="A", twitter_url="https://twitter.com/Example/", follower_count=0,
+                    follower_observed_at="2026-01-01T00:00:00+00:00",
+                    follower_source="twscrape_user_by_login")
+    formatter.save(formatter.format_data([circle], sample_event), "event.json")
+    saved = json.loads(path.read_text(encoding="utf-8"))["circles"][0]
+    assert (saved["follower_count"], saved["follower_observed_at"], saved["follower_source"]) == (
+        0, "2026-01-01T00:00:00+00:00", "twscrape_user_by_login")
+    fresh = formatter.format_data([Circle(name="A", twitter_url="https://www.x.com/eXaMpLe")], sample_event)
+    JSONFormatter._carry_circle_manual_state([saved], fresh["circles"])
+    assert fresh["circles"][0]["follower_count"] == 0
+    assert fresh["circles"][0]["follower_observed_at"] == saved["follower_observed_at"]
+    invalid = formatter.format_data([Circle(name="A")], sample_event)
+    JSONFormatter._carry_circle_manual_state([{**saved, "follower_count": -1}], invalid["circles"])
+    assert invalid["circles"][0]["follower_count"] is None
+    changed = formatter.format_data([Circle(name="A", twitter_url="https://x.com/new")], sample_event)
+    JSONFormatter._carry_circle_manual_state([{**saved, "twitter_url": "https://x.com/old"}], changed["circles"])
+    assert changed["circles"][0]["follower_count"] is None
+
+
+@pytest.mark.parametrize("old_url,new_url", [
+    ("https://x.com/old", "https://x.com/new"),
+    ("https://x.com/old", None), (None, "https://x.com/old"),
+    (None, None), ("invalid", "invalid"),
+])
+def test_follower_metadata_never_transfers_between_unknown_or_different_accounts(old_url, new_url):
+    old = {"name": "A", "twitter_url": old_url, "follower_count": 42, "follower_observed_at": "2026-01-01T00:00:00Z"}
+    new = {"name": "A", "twitter_url": new_url, "follower_count": None}
+    JSONFormatter._carry_circle_manual_state([old], [new])
+    assert new["follower_count"] is None
+    assert not new.get("follower_observed_at")

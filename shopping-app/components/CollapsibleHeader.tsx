@@ -61,6 +61,9 @@ const ShoppingElapsed = React.memo(function ShoppingElapsed({
 
 interface CollapsibleHeaderProps {
   compact?: boolean;
+  routeEnabled?: boolean;
+  onToggleRoute?: () => void;
+  onRouteInfo?: () => void;
   onBack?: () => void;
   // フィルター状態
   globalSearchEnabled: boolean;
@@ -102,7 +105,7 @@ interface CollapsibleHeaderProps {
 }
 
 export default function CollapsibleHeader({
-  compact = false, onBack,
+  compact = false, onBack, routeEnabled = false, onToggleRoute, onRouteInfo,
   globalSearchEnabled,
   searchQuery, onSearchChange,
   statusFilter, onStatusFilterChange,
@@ -274,6 +277,17 @@ export default function CollapsibleHeader({
       {/* 展開部分 */}
       {expanded && (
         <View style={styles.expandedContent}>
+          {onToggleRoute && <View style={{ flexDirection: 'row', flexWrap: 'wrap' }}>
+            <Pressable testID="route-toggle" accessibilityRole="switch" accessibilityLabel="おすすめ巡回の推定表示"
+              accessibilityState={{ checked: routeEnabled }} onPress={onToggleRoute}
+              style={{ minHeight: 44, minWidth: 44, justifyContent: 'center', paddingHorizontal: 12 }}>
+              <Text style={{ color: colors.text }}>巡回推定 {routeEnabled ? 'ON' : 'OFF'}</Text>
+            </Pressable>
+            {routeEnabled && <Pressable testID="route-info" accessibilityRole="button" onPress={onRouteInfo}
+              style={{ minHeight: 44, minWidth: 44, justifyContent: 'center', paddingHorizontal: 12 }}>
+              <Text style={{ color: colors.tint }}>巡回の詳細 ⓘ</Text>
+            </Pressable>}
+          </View>}
           {/* 進捗バー */}
           {stats.totalCircles > 0 && (
             <>

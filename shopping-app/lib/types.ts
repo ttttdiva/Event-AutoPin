@@ -48,6 +48,9 @@ export interface ImportCircle {
   space?: string;
   hall?: string;
   twitter_url?: string;
+  follower_count?: number | null;
+  follower_observed_at?: string | null;
+  follower_source?: string | null;
   website_url?: string;
   pixiv_url?: string;
   description?: string;
@@ -201,6 +204,9 @@ export interface Circle {
   space: string | null;
   hall: string | null;
   twitterUrl: string | null;
+  followerCount?: number | null;
+  followerObservedAt?: string | null;
+  followerSource?: string | null;
   websiteUrl: string | null;
   pixivUrl: string | null;
   description: string | null;

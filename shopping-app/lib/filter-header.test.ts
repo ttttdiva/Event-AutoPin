@@ -64,10 +64,22 @@ export function runFilterHeaderTests() {
     props.onClearPriorityFilter = () => { props.priorityFilter = new Set(); render(); };
     act(() => { tree = create(React.createElement(Header, props)); });
     const text = (node: any): string => typeof node === 'string' ? node : (node.children ?? []).map(text).join('');
+    // 巡回機能を渡しても折りたたみ時の構造は変わらない。
+    const beforeRoute = JSON.stringify(tree.toJSON());
+    props.routeEnabled = false;
+    props.onToggleRoute = () => { props.routeEnabled = !props.routeEnabled; render(); };
+    props.onRouteInfo = () => {};
+    act(() => render());
+    assert(JSON.stringify(tree.toJSON()) === beforeRoute, 'OFFの巡回操作は閉じたヘッダーの高さを変えないこと');
     props.compact = true;
     props.stats = { totalCircles: 18, boughtCircles: 2, couldntBuyCircles: 1, skippedCircles: 1, remainingCircles: 14 };
     props.highPriorityProgress = { total: 18, done: 4, remaining: 14 };
     act(() => render());
+    assert(tree.root.findAllByProps({ testID: 'route-toggle' }).length === 0, '半画面で閉じた時に追加行がないこと');
+    const compactExpand = tree.root.findAllByType('Pressable').find((node: any) => node.findAllByType('Icon').some((icon: any) => icon.props.name === 'filter'));
+    act(() => compactExpand.props.onPress());
+    assert(tree.root.findByProps({ testID: 'route-toggle' }).props.style.minHeight >= 44, '半画面でも巡回操作へ到達できること');
+    act(() => compactExpand.props.onPress());
     assert(text(tree.root).includes('4/18'), '半画面は表示対象の完了数と件数を表示すること');
     const compactGauge = () => tree.root.findAllByType('View').find((node: any) => node.props.accessibilityRole === 'progressbar');
     assert(compactGauge().props.accessibilityValue.now === 4 && compactGauge().props.accessibilityValue.max === 18,
@@ -100,6 +112,13 @@ export function runFilterHeaderTests() {
     assert(!text(tree.root).includes('検索:') && props.statusFilter.size === 0 && props.hallFilter === null && props.priorityFilter.size === 0, '解除で全条件と表示を消すこと');
     const expand = tree.root.findAllByType('Pressable').find((node: any) => node.findAllByType('Icon').some((icon: any) => icon.props.name === 'filter'));
     act(() => expand.props.onPress());
+    const routeToggle = tree.root.findByProps({ testID: 'route-toggle' });
+    assert(routeToggle.props.style.minHeight >= 44 && routeToggle.props.style.minWidth >= 44, '巡回操作は44dp以上であること');
+    act(() => routeToggle.props.onPress());
+    assert(tree.root.findByProps({ testID: 'route-toggle' }).props.accessibilityState.checked, 'マップのフィルターから巡回を有効化できること');
+    assert(tree.root.findByProps({ testID: 'route-info' }).props.style.minHeight >= 44, '詳細も44dp以上であること');
+    act(() => tree.root.findByProps({ testID: 'route-toggle' }).props.onPress());
+
     const chipScroll = tree.root.findByType('ScrollView');
     const style = Object.assign({}, ...[chipScroll.props.style].flat(Infinity));
     assert(style.flexShrink === 0 && style.flexGrow === 0 && style.height == null && style.maxHeight == null,

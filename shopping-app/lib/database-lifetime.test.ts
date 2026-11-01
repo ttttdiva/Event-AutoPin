@@ -24,6 +24,7 @@ type Row = Record<string, any>;
 
 // 実DB/端末データを使わず、接続identity・closeとpublish先を検証する。
 function createHarness(options: {
+  fixtureCircles?: Row[];
   liveInit?: ReturnType<typeof deferred>;
   stageInit?: ReturnType<typeof deferred>;
   eventRead?: ReturnType<typeof deferred>;
@@ -203,7 +204,7 @@ function createHarness(options: {
         const root = `file://${destination}`;
         mkdir(root);
         files.set(`${root}sync_bundle.json`, JSON.stringify({ sync_mode: "full", events: [{ path: "event.json" }] }));
-        files.set(`${root}event.json`, JSON.stringify({ event: { name: "imported", url: "", maps: [] }, circles: [{ name: "circle", penname: "artist", items: [{ name: "book", price: 500 }] }], metadata: {} }));
+        files.set(`${root}event.json`, JSON.stringify({ event: { name: "imported", url: "", maps: [] }, circles: options.fixtureCircles ?? [{ name: "circle", penname: "artist", items: [{ name: "book", price: 500 }] }], metadata: {} }));
         files.set(`${root}circle_master.json`, JSON.stringify({ circles: { favorite: { penname: "tag", favorite: true } } }));
       },
       async zip() {},
@@ -219,6 +220,70 @@ function createHarness(options: {
 
 async function run(): Promise<void> {
   const checks: Array<[string, () => Promise<void>]> = [
+    ["旧・新イベントJSONのimportからSQLite getterとexportまでメタデータを保持", async () => {
+      const fixtureCircles = [
+        { name: "旧" },
+        { name: "新", follower_count: 123, follower_observed_at: "2026-01-01T00:00:00Z", follower_source: "twscrape_user_by_login" },
+        { name: "不正", follower_count: -1 },
+      ];
+      const { api, opened } = createHarness({ fixtureCircles });
+      await api.importFromZip("file:///fixture.zip");
+      const stage = opened.find((entry) => entry.name.startsWith("eventtrail_legacy_stage_"))!;
+      const inserts = stage.queries.filter((query) => query.sql.includes("INSERT INTO circles ("));
+      assert.equal(inserts.length, 3);
+      const native = new DatabaseSync(":memory:");
+      try {
+        native.exec(`CREATE TABLE circles (id INTEGER PRIMARY KEY, event_id INTEGER, name TEXT, penname TEXT,
+          space TEXT, hall TEXT, twitter_url TEXT, website_url TEXT, pixiv_url TEXT, description TEXT,
+          genres TEXT, tags TEXT, circle_cut_filename TEXT, priority_color INTEGER, memo TEXT,
+          pin_x REAL, pin_y REAL, map_number INTEGER, absence_status TEXT, existing_only_status TEXT,
+          catalog_status TEXT, checked INTEGER, raw_json TEXT, name_key TEXT, penname_key TEXT);
+          CREATE TABLE items (id INTEGER, circle_id INTEGER, sort_order INTEGER); CREATE TABLE item_images (circle_id INTEGER);
+          CREATE TABLE event_maps (event_id INTEGER, map_number INTEGER);`);
+        for (const [index, query] of inserts.entries()) {
+          const params = [...query.params];
+          params[0] = index + 1; params[1] = 1;
+          native.prepare(query.sql).run(...params);
+        }
+        const live = opened.find((entry) => entry.name === "doujin_shopping.db")!;
+        live.getAllAsync = async (sql: string, ...params: any[]) => native.prepare(sql).all(...params) as Row[];
+        live.getFirstAsync = async (sql: string, ...params: any[]) => {
+          if (sql === "SELECT * FROM events WHERE id = ?") return { id: 1, name: "イベント", url: "", raw_json: "{}", metadata_json: "{}" };
+          if (sql.includes("SELECT sync_root_json, sync_uid")) return { sync_root_json: "{}", sync_uid: null };
+          return native.prepare(sql).get(...params) as Row | null;
+        };
+        live.runAsync = async (sql: string, ...params: any[]) => {
+          native.prepare(sql).run(...params);
+          return { lastInsertRowId: 1, changes: 1 };
+        };
+        const list = await api.getCircleListRows(1);
+        assert.equal(list.find((c) => c.name === "新")?.followerCount, 123);
+        assert.equal(list.find((c) => c.name === "旧")?.followerCount, null);
+        assert.equal(list.find((c) => c.name === "不正")?.followerCount, null);
+        const exported = await api.exportEventData(1);
+        const fresh = exported!.circles.find((c) => c.name === "新")!;
+        assert.equal(fresh.follower_count, 123);
+        assert.equal(fresh.follower_observed_at, "2026-01-01T00:00:00Z");
+        assert.equal(fresh.follower_source, "twscrape_user_by_login");
+        assert.equal(exported!.circles.find((c) => c.name === "旧")!.follower_count, null);
+        assert.equal(exported!.circles.find((c) => c.name === "不正")!.follower_count, null);
+        const freshId = list.find((c) => c.name === "新")!.id;
+        native.prepare("UPDATE circles SET twitter_url = ? WHERE id = ?").run("https://twitter.com/Example", freshId);
+        await api.updateCircle(freshId, "新", null, null, null, 5, null, "https://x.com/example/");
+        assert.equal((await api.getCircle(freshId))!.followerCount, 123, "同じアカウントなら保持");
+        await api.updateCircle(freshId, "新", null, null, null, 5, null, "https://x.com/other");
+        const changed = (await api.getCircle(freshId))!;
+        assert.equal(changed.followerCount, null);
+        assert.equal(changed.followerObservedAt, null);
+        assert.equal(changed.followerSource, null);
+        for (const [oldUrl, newUrl] of [["https://x.com/example", null], [null, "https://x.com/example"], ["invalid", "invalid"]] as const) {
+          native.prepare("UPDATE circles SET twitter_url = ?, raw_json = ? WHERE id = ?").run(oldUrl, JSON.stringify({ follower_count: 0, follower_observed_at: "2026-01-01T00:00:00Z", follower_source: "lookup" }), freshId);
+          await api.updateCircle(freshId, "新", null, null, null, 5, null, newUrl);
+          assert.equal((await api.getCircle(freshId))!.followerCount, null, "削除・不明なアカウントの観測値を消去");
+        }
+
+      } finally { native.close(); }
+    }],
     ["FTS検索は実SQLiteで表名MATCH・イベント分離・件数制限を保持", async () => {
       const native = new DatabaseSync(":memory:");
       try {
