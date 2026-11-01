@@ -17,6 +17,8 @@ import {
   Text,
   Pressable,
   Alert,
+  Modal,
+  ScrollView,
   useWindowDimensions,
   type LayoutChangeEvent,
 } from "react-native";
@@ -69,6 +71,9 @@ const PIN_MAP_DIMENSION_STEP = 2;
 const PIN_MAP_OFFSET_STEP = 2;
 const PIN_FILL_ALPHA = 0.36;
 const PIN_OUTLINE_ALPHA = 0.76;
+const PIN_Z_INDEX = 1;
+const HIGHLIGHTED_PIN_Z_INDEX = 100;
+const ROUTE_OVERLAY_Z_INDEX = HIGHLIGHTED_PIN_Z_INDEX + 1;
 
 export interface MapViewHandle {
   /** 指定サークルのピン位置にマップをアニメーション移動 */
@@ -201,7 +206,7 @@ function DraggablePin({
             top: top - insetY,
             width: hitWidth,
             height: hitHeight,
-            zIndex: isHighlighted ? 100 : 1,
+            zIndex: isHighlighted ? HIGHLIGHTED_PIN_Z_INDEX : PIN_Z_INDEX,
           },
           animStyle,
         ]}
@@ -268,7 +273,7 @@ const StaticPin = ({
           top: top - insetY,
           width: hitWidth,
           height: hitHeight,
-          zIndex: isHighlighted ? 100 : 1,
+          zIndex: isHighlighted ? HIGHLIGHTED_PIN_Z_INDEX : PIN_Z_INDEX,
         },
       ]}
     >
@@ -339,6 +344,7 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
       number | null
     >(null);
     const [currentScale, setCurrentScale] = useState(1);
+    const [routeInfoVisible, setRouteInfoVisible] = useState(false);
     const [pinMapWidth, setPinMapWidth] = useState(DEFAULT_PIN_MAP_WIDTH);
     const [pinMapHeight, setPinMapHeight] = useState(DEFAULT_PIN_MAP_HEIGHT);
     const [pinMapOffsetX, setPinMapOffsetX] = useState(DEFAULT_PIN_MAP_OFFSET_X);
@@ -594,18 +600,8 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
       focusOnCircle(circleId: number) {
         if (!focusCircleNow(circleId)) setPendingFocusCircleId(circleId);
       },
-      showRouteInfo() {
-              if (!route) {
-                Alert.alert("巡回の推定", "地図画像の読み込みを待っています。");
-                return;
-              }
-              if (route.ambiguousMap) {
-                Alert.alert("巡回の推定", `同じ地図番号の画像が複数あるため巡回を表示できません。地図・座標不明 ${route.unavailableCount}件 / 対象外 ${route.excludedCount}件`);
-                return;
-              }
-              Alert.alert("巡回の推定", `表示中の候補 ${route.steps.length}件 / 地図・座標不明 ${route.unavailableCount}件 / 対象外 ${route.excludedCount}件\n買えた・見送り・欠席は対象外です。買えなかったは対象に含みます。\n起は地図左上の仮の開始点です。優先度を最優先し、同じ地図内の直線距離の目安とフォロワー数の推定を組み合わせます。\n人気の情報: 30日以内 ${route.popularityCounts.fresh}件、古い ${route.popularityCounts.stale}件、人気不明 ${route.popularityCounts.unknown}件。通常取得時のXフォロワー数を使用し、古い・不明は中立として扱います。人数は混雑や待ち時間を示しません。`);
-      },
-    }), [focusCircleNow, route]);
+      showRouteInfo() { setRouteInfoVisible(true); },
+    }), [focusCircleNow]);
 
     const updateScaleJS = useCallback((s: number) => setCurrentScale(s), []);
 
@@ -1247,18 +1243,52 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
                   <StaticPin {...commonPinProps} />
                 );
                 })}
-              {route && route.steps.map((step, index) => {
-                const geometry = getPinDisplayGeometry(step.circle);
-                if (!geometry) return null;
-                return <View key={`route-${step.circle.id}`} pointerEvents="none"
-                  style={[styles.routeNumber, { left: geometry.centerX, top: geometry.centerY }]}>
-                  <Text style={styles.routeNumberText}>{index + 1}</Text>
+              {route && (() => {
+                const points = route.steps.map((step, index) => {
+                  const geometry = getPinDisplayGeometry(step.circle);
+                  return geometry ? { x: geometry.centerX, y: geometry.centerY, index, id: step.circle.id } : null;
+                }).filter((point): point is { x: number; y: number; index: number; id: number } => point != null);
+                const badgeSize = 24 / currentScale;
+                const badgePosition = (point: { x: number; y: number }) => ({
+                  x: Math.max(0, Math.min(displaySize.w - badgeSize, point.x - badgeSize / 2)),
+                  y: Math.max(0, Math.min(displaySize.h - badgeSize, point.y - badgeSize / 2)),
+                });
+                const start = route.startPoint ? { x: route.startPoint.x * displaySize.w, y: route.startPoint.y * displaySize.h } : null;
+                const startPosition = start && badgePosition(start);
+                const positioned = points.map(point => ({ ...point, position: badgePosition(point) }));
+                const selected = positioned.find(point => point.id === activeHighlight);
+                const occupied: { x: number; y: number }[] = [];
+                const visible = new Set<number>();
+                const fits = (position: { x: number; y: number }) => occupied.every(other =>
+                  Math.abs(position.x - other.x) * currentScale >= 26 || Math.abs(position.y - other.y) * currentScale >= 26);
+                if (selected) {
+                  occupied.push(selected.position);
+                  visible.add(selected.index);
+                }
+                const showStart = startPosition != null && fits(startPosition);
+                if (showStart) occupied.push(startPosition);
+                for (const point of positioned) {
+                  if (!visible.has(point.index) && fits(point.position)) {
+                    occupied.push(point.position);
+                    visible.add(point.index);
+                  }
+                }
+                const path = start ? [start, ...points] : points;
+                return <View testID="route-overlay" pointerEvents="none" style={[StyleSheet.absoluteFillObject, { zIndex: ROUTE_OVERLAY_Z_INDEX }]}>
+                  {path.slice(1).map((point, i) => {
+                    const previous = path[i];
+                    const dx = point.x - previous.x, dy = point.y - previous.y;
+                    const length = Math.hypot(dx, dy);
+                    return <View key={`segment-${i}`} testID="route-segment" style={{ position: "absolute", left: (previous.x + point.x - length) / 2, top: (previous.y + point.y) / 2 - 1 / currentScale, width: length, height: 2 / currentScale, backgroundColor: "#155eef", opacity: 0.7, transform: [{ rotate: `${Math.atan2(dy, dx)}rad` }] }} />;
+                  })}
+                  {points.map(point => <View key={`dot-${point.id}`} testID="route-dot" style={{ position: "absolute", left: point.x - 3 / currentScale, top: point.y - 3 / currentScale, width: 6 / currentScale, height: 6 / currentScale, borderRadius: 3 / currentScale, backgroundColor: "#155eef" }} />)}
+                  {showStart && startPosition && <View testID="route-start" style={[styles.routeStart, { left: startPosition.x, top: startPosition.y, width: badgeSize, height: badgeSize, borderRadius: badgeSize / 2 }]}><Text style={[styles.routeNumberText, { fontSize: 11 / currentScale }]}>起</Text></View>}
+                  {positioned.filter(point => visible.has(point.index)).map(point => <View key={`route-${point.id}`} testID="route-badge" style={[styles.routeNumber, { left: point.position.x, top: point.position.y, width: badgeSize, height: badgeSize, borderRadius: badgeSize / 2 }]}>
+                    <Text style={[styles.routeNumberText, { fontSize: 11 / currentScale }]}>{point.index + 1}</Text>
+                  </View>)}
                 </View>;
-              })}
-              {route?.startPoint && <View pointerEvents="none" style={[styles.routeStart, {
-                left: route.startPoint.x * displaySize.w,
-                top: route.startPoint.y * displaySize.h,
-              }]}><Text style={styles.routeNumberText}>起</Text></View>}
+              })()}
+
             </Animated.View>
             {naturalSize && activeHighlight != null && (() => {
               const circle = pinsForMap.find((p) => p.id === activeHighlight);
@@ -1271,6 +1301,19 @@ const MapViewComponent = forwardRef<MapViewHandle, MapViewProps>(
           </GestureDetector>
 
         </View>
+        <Modal visible={routeInfoVisible} animationType="slide" onRequestClose={() => setRouteInfoVisible(false)}>
+          <View style={{ flex: 1, backgroundColor: colors.background, padding: 20, paddingTop: 48 }}>
+            <Text style={{ color: colors.text, fontSize: 20, fontWeight: "700" }}>巡回の推定</Text>
+            <ScrollView>
+              {!route ? <Text style={{ color: colors.text }}>地図画像の読み込みを待っています。</Text> : <>
+                <Text style={{ color: colors.text, marginVertical: 12 }}>{route.ambiguousMap ? "同じ地図番号の画像が複数あるため巡回を表示できません。" : `表示中の候補 ${route.steps.length}件`} / 地図・座標不明 {route.unavailableCount}件 / 対象外 {route.excludedCount}件</Text>
+                {!route.ambiguousMap && <Text style={{ color: colors.textSecondary, marginBottom: 12 }}>左上を仮の開始点とした直線距離の目安です。優先度と人気の参考値から推定し、人気情報は30日以内 {route.popularityCounts.fresh}件・古い {route.popularityCounts.stale}件・不明 {route.popularityCounts.unknown}件。古い・不明は中立に扱い、混雑や待ち時間は示しません。開始点と選択中の番号が重なる場合は番号を優先します。</Text>}
+                {route.steps.map((step, index) => <Text key={step.circle.id} testID="route-list-row" style={{ color: colors.text, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.border }}>#{index + 1}　{step.circle.space || "スペース不明"}　{step.circle.name || "名称不明"}</Text>)}
+              </>}
+            </ScrollView>
+            <Pressable accessibilityRole="button" onPress={() => setRouteInfoVisible(false)} style={{ padding: 16, alignItems: "center" }}><Text style={{ color: colors.tint }}>閉じる</Text></Pressable>
+          </View>
+        </Modal>
       </GestureHandlerRootView>
     );
   },
@@ -1326,7 +1369,7 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   mapArea: { flex: 1, overflow: "hidden", backgroundColor: "#1a1a2e" },
-  routeNumber: { position: "absolute", backgroundColor: "#155eef", borderRadius: 10, minWidth: 20, height: 20, alignItems: "center", justifyContent: "center" },
+  routeNumber: { position: "absolute", backgroundColor: "#155eef", borderRadius: 10, height: 20, alignItems: "center", justifyContent: "center" },
   routeStart: { position: "absolute", backgroundColor: "#343434", borderRadius: 10, width: 20, height: 20, alignItems: "center", justifyContent: "center" },
   routeNumberText: { color: "white", fontSize: 11, fontWeight: "700" },
   pinTouchTarget: {
