@@ -6,9 +6,11 @@
     "date": "2026-11-01"
   },
   "mobile": {
-    "version": "1.4.81",
-    "versionCode": 221,
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.81/EventAutoPin.apk",
+    "version": "1.4.82",
+    "versionCode": 222,
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/mobile-v1.4.82/EventAutoPin.apk",
+    "sha256": "4e4cbbf0f60fb94dd7b85c91837cae0f385f3dd7754861b409d7635c855fbeeb",
+    "size": 115860699,
     "notes": "Grok OFFでもURL再処理に選択したOpenAI等のプロバイダー・モデル・推論設定を適用し、本文とすべての画像を抽出します。投稿処理設定も反映します。",
     "date": "2026-11-01"
   }
