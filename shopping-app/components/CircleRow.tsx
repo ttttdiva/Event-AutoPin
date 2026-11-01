@@ -42,6 +42,10 @@ function CircleRowInner({
   // ホール + スペース番号
   const spaceLabel = [circle.hall, circle.space].filter(Boolean).join(' ');
   const catalogStatusLabel = CATALOG_STATUS_LABELS[circle.catalogStatus ?? ''];
+  const memoWithoutUrls = (circle.memo ?? '').replace(/https?:\/\/[^\s\)\]}>"'）］｝〉》」』】〕〗〙〛、。，，！!]+/gi, '').trim();
+  const summaryMemo = memoWithoutUrls !== (circle.memo ?? '').trim()
+    && /^[\s([{<"'（［｛〈《「『【〔〖〘〚)\]}>）］｝〉》」』】〕〗〙〛]*$/.test(memoWithoutUrls)
+    ? '' : memoWithoutUrls;
 
   const imagePath = circle.circleCutFilename
     ? circle.circleCutFilename.startsWith('file://') || circle.circleCutFilename.startsWith('/')
@@ -151,9 +155,9 @@ function CircleRowInner({
             </Text>
           )}
           {/* メモ (あれば) */}
-          {circle.memo !== '' && (
+          {summaryMemo !== '' && (
             <Text style={[styles.memo, { color: surface.secondary }]} numberOfLines={1}>
-              {circle.memo}
+              {summaryMemo}
             </Text>
           )}
         </View>
