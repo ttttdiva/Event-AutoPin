@@ -1,9 +1,9 @@
 {
   "desktop": {
-    "version": "0.1.39",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.39/EventAutoPin.exe",
-    "notes": "列幅・優先度色・購入色を修復し、優先度のカラーピッカーに対応",
-    "date": "2026-11-01"
+    "version": "0.1.40",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.40/EventAutoPin.exe",
+    "notes": "おしながきポストの予備モデル設定の横幅を揃えました",
+    "date": "2026-11-02"
   },
   "mobile": {
     "version": "1.4.85",
