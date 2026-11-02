@@ -103,6 +103,7 @@ def _write_fixture(
     dynamic_api_models: list[dict[str, Any]] | None = None,
     grok_authenticated: bool = False,
     env_keys: dict[str, str] | None = None,
+    event_entries: list[dict[str, Any]] | None = None,
 ) -> Path:
     """Tauri APIを同一ページ内の記録用fixtureへ置き換える。"""
 
@@ -113,6 +114,7 @@ def _write_fixture(
         "anthropicApiKey": "",
         "xaiApiKey": "",
     }
+    event_entries = event_entries or []
     stubs = run_dir / "tauri-stubs"
     stubs.mkdir(parents=True)
     tauri_source = r"""
@@ -161,6 +163,7 @@ const EVENT = {
   event: {
     name: "UI07 post model fixture",
     date: "2026-10-17",
+    venue: "Fixture Hall",
     url: "https://example.invalid/event",
     source_urls: ["https://example.invalid/event"],
   },
@@ -179,6 +182,35 @@ const EVENT = {
     priority_color: 5,
   }],
 };
+const EVENT_ENTRIES = __EVENT_ENTRIES__;
+
+function eventOverrideForDir(dir) {
+  return EVENT_ENTRIES.find(entry => entry.dir === dir) || null;
+}
+
+function eventMetaForData(data) {
+  const event = data?.event || {};
+  return {
+    ...event,
+    event_url: event.event_url || event.url || "https://example.invalid/event",
+    event_urls: event.event_urls || event.source_urls || ["https://example.invalid/event"],
+  };
+}
+
+function eventMetaForDir(dir) {
+  const override = eventOverrideForDir(dir);
+  return override?.meta ? { ...override.meta } : eventMetaForData(EVENT);
+}
+
+function eventDataForDir(dir) {
+  return eventOverrideForDir(dir)?.data || EVENT;
+}
+
+function eventEntries() {
+  return EVENT_ENTRIES.length
+    ? EVENT_ENTRIES
+    : [{ slug: "ui07-post", dir: "fixture-event", data: EVENT, meta: eventMetaForData(EVENT) }];
+}
 
 function catalog() {
   const grokAuthenticated = GROK_AUTHENTICATED_DEFAULT || localStorage.getItem("ui07-post-grok-auth") === "true";
@@ -286,6 +318,9 @@ export async function invoke(command, args = {}) {
   if (command === "save_desktop_config" || command === "save_env_keys") {
     return { status: "ok" };
   }
+  if (command === "open_file_default") {
+    return { status: "ok" };
+  }
   if (command === "list_model_catalog") {
     if (fixture.holdCatalog) {
       fixture.catalogWaiting = true;
@@ -297,27 +332,18 @@ export async function invoke(command, args = {}) {
   if (command === "list_event_dirs") {
     return {
       status: "ok",
-      events: [{
-        slug: "ui07-post",
-        dir: "fixture-event",
-        meta: {
-          name: "UI07 post model fixture",
-          date: "2026-10-17",
-          event_url: "https://example.invalid/event",
-          event_urls: ["https://example.invalid/event"],
-        },
-      }],
+      events: eventEntries().map(entry => ({
+        slug: entry.slug,
+        dir: entry.dir,
+        meta: { ...entry.meta, ...eventMetaForData(entry.data) },
+      })),
     };
   }
   if (command === "load_event_bundle") {
+    const data = eventDataForDir(args.eventDir);
     return {
-      data: EVENT,
-      meta: {
-        name: "UI07 post model fixture",
-        date: "2026-10-17",
-        event_url: "https://example.invalid/event",
-        event_urls: ["https://example.invalid/event"],
-      },
+      data,
+      meta: eventMetaForDir(args.eventDir),
       modified_ms: 1,
       modified_ns: 1,
       file_size: 1,
@@ -326,6 +352,13 @@ export async function invoke(command, args = {}) {
   }
   if (command === "list_event_map_images" || command === "list_map_images") {
     return { status: "ok", maps: [] };
+  }
+  if (command === "write_event_meta") {
+    const override = eventOverrideForDir(args.eventDir);
+    if (override?.data?.event) Object.assign(override.data.event, args.meta || {});
+    else Object.assign(EVENT.event, args.meta || {});
+    if (override?.meta) Object.assign(override.meta, args.meta || {});
+    return { status: "ok" };
   }
   if (command === "get_desktop_performance_counters") {
     return { python_bridge_spawn_count: 0, tauri_event_io_ipc_count: 0 };
@@ -354,6 +387,33 @@ export async function invoke(command, args = {}) {
       // 外部処理は行わず、payloadを観測した時点でfixtureジョブを終了する。
       return { ok: false, bridge: { status: "error", error: "fixture-stop-before-network" } };
     }
+    if (args.job === "save_crawl_project_config") {
+      localStorage.setItem("ui07-post-project-yaml", String(args.payload?.yaml_content || ""));
+      return { ok: true, bridge: { status: "ok" } };
+    }
+    if (["probe_grok_search", "probe_grok_search_availability", "check_grok_search_availability"].includes(args.job)) {
+      return {
+        ok: true,
+        bridge: {
+          status: "ok",
+          available: true,
+          selected_mode: args.payload?.mode || args.payload?.grok_search_mode || "api",
+          modes: {
+            api: { available: true, reason: null },
+            build: { available: true, reason: null },
+            bot: { available: false, reason: "fixtureではBotへ送信しない" },
+          },
+        },
+      };
+    }
+    if (args.job === "run_main_pipeline" && fixture.holdPipeline) {
+      fixture.pipelineWaiting = true;
+      await new Promise(resolve => { fixture.releasePipeline = resolve; });
+      fixture.holdPipeline = false;
+    }
+    if (args.job === "run_main_pipeline" && fixture.pipelineFailure) {
+      return { ok: false, bridge: { status: "error", error: "fixture-pipeline-failure" } };
+    }
     return { ok: true, bridge: { status: "ok", data: {} } };
   }
   throw new Error("UI07 post model fixture blocked Tauri command: " + command);
@@ -366,6 +426,7 @@ export function convertFileSrc(path) { return path; }
         .replace("__INITIAL_PROJECT_YAML__", json.dumps(initial_project_yaml))
         .replace("__DYNAMIC_OPENAI_MODELS__", json.dumps(dynamic_api_models))
         .replace("__GROK_AUTHENTICATED_DEFAULT__", json.dumps(grok_authenticated))
+        .replace("__EVENT_ENTRIES__", json.dumps(event_entries))
         .replace("__ENV_KEYS__", json.dumps(env_keys)),
         encoding="utf-8",
     )
@@ -495,7 +556,7 @@ def _stop_process(process: subprocess.Popen[str] | None) -> None:
 def _select_value(page: Page, selector: str, value: str) -> None:
     """selectのイベントをUIへ渡し、更新後のvalueを確認する。"""
 
-    control = page.locator(selector)
+    control = _visible_model_control(page, selector)
     control.wait_for(state="visible")
     option_state = control.locator(f"option[value='{value}']").evaluate(
         "(option) => ({disabled: option.disabled, parentDisabled: option.parentElement.disabled})"
@@ -505,6 +566,29 @@ def _select_value(page: Page, selector: str, value: str) -> None:
     )
     control.select_option(value)
     assert control.input_value() == value
+
+
+def _visible_model_control(page: Page, selector: str):
+    """native dialog内のモデルproxyを優先し、背面selectを直接操作しない。"""
+
+    if selector.startswith("#"):
+        canonical_id = selector[1:]
+        proxy = page.locator(
+            f'#crawlModelSettingsDialog [data-crawl-model-proxy="{canonical_id}"], '
+            f'#crawlModelSettingsDialog [data-crawl-model-proxy="{selector}"]'
+        ).first
+        if proxy.count() and proxy.is_visible():
+            return proxy
+    return page.locator(selector)
+
+
+def _open_model_settings_dialog(page: Page) -> None:
+    """新クロールUIのnative dialogを開く（旧summary/detailsの代替）。"""
+
+    dialog = page.locator("#crawlModelSettingsDialog")
+    if not dialog.is_visible():
+        page.locator("#crawlModelsDetailsBtn").click()
+    dialog.wait_for(state="visible")
 
 
 def _wait_for_bridge_call(page: Page, job: str) -> dict[str, Any]:
@@ -626,7 +710,8 @@ def test_live_api_model_catalog_supports_unknown_future_openai_models():
             browser = playwright.chromium.launch(**browser_args)
             try:
                 page = browser.new_page(viewport={"width": 1440, "height": 960})
-                page.goto(url, wait_until="domcontentloaded")
+                page.goto(url, wait_until="commit")
+                page.locator("#tab-crawl").wait_for(state="attached", timeout=30_000)
 
                 # 起動時loadModelCatalog()が手動refreshなしに実行されること、
                 # provider-apiの動的候補がそのままUIへ反映されることを確認する。
@@ -653,6 +738,7 @@ def test_live_api_model_catalog_supports_unknown_future_openai_models():
                     assert "能力未確認" in option.inner_text()
 
                 # API metadataのない未知OpenAI IDはeffortを推測せずnone(API既定)にする。
+                _open_model_settings_dialog(page)
                 for selector in (
                     "#textReasoningEffort",
                     "#visionReasoningEffort",
@@ -690,6 +776,7 @@ def test_live_api_model_catalog_supports_unknown_future_openai_models():
                 anthropic_key = page.locator("#anthropicApiKey")
                 assert anthropic_key.get_attribute("type") == "password"
                 assert anthropic_key.input_value() == "dummy-key"
+                page.keyboard.press("Escape")
                 page.locator('[data-tab="tab-settings"]').click()
                 before_env_save = page.evaluate(
                     "() => window.__eventAutoPinPostModelFixture.calls.length"
@@ -765,22 +852,23 @@ def test_post_model_settings_and_reprocess_runtime_evidence():
             browser = playwright.chromium.launch(**browser_args)
             try:
                 page = browser.new_page(viewport={"width": 1440, "height": 960})
-                page.goto(url, wait_until="domcontentloaded")
+                page.goto(url, wait_until="commit")
+                page.locator("#tab-crawl").wait_for(state="attached", timeout=30_000)
                 page.locator('.event-card[data-slug="ui07-post"]').click()
                 page.locator('.event-card[data-slug="ui07-post"].active').wait_for()
 
                 # UIのモデル候補をfixtureから取得する。外部APIは呼ばれない。
+                _open_model_settings_dialog(page)
                 page.locator("#refreshModelCatalogBtn").click()
                 page.wait_for_function(
                     "() => document.querySelectorAll('#catalogPostModel option').length > 0"
                 )
-                page.locator("#catalogPostFallbackSettings summary").click()
 
                 primary_provider = page.locator("#catalogPostModelProvider")
-                primary_model = page.locator("#catalogPostModel")
+                primary_model = _visible_model_control(page, "#catalogPostModel")
                 primary_effort = page.locator("#catalogPostReasoningEffort")
                 fallback_provider = page.locator("#catalogPostFallbackModelProvider")
-                fallback_model = page.locator("#catalogPostFallbackModel")
+                fallback_model = _visible_model_control(page, "#catalogPostFallbackModel")
                 fallback_effort = page.locator("#catalogPostFallbackReasoningEffort")
                 for control in (
                     primary_provider,
@@ -807,9 +895,8 @@ def test_post_model_settings_and_reprocess_runtime_evidence():
                 _select_value(page, "#visionModel", "api:openai")
                 _select_value(page, "#visionModelId", "vision-primary-model")
                 _select_value(page, "#visionReasoningEffort", "medium")
-                # 画像fallbackはLLM詳細設定内にあるため、閉じたdetailsを
-                # 直接操作せず開いてから、別モデルを選択する。
-                page.locator("#llmAdvancedSettings summary").click()
+                # 画像fallbackはnativeのAIモデル詳細dialogから別モデルを選択する。
+                _open_model_settings_dialog(page)
                 _select_value(page, "#visionFallbackModelProvider", "api:openai")
                 _select_value(page, "#visionFallbackModel", "vision-fallback-model")
 
@@ -825,6 +912,7 @@ def test_post_model_settings_and_reprocess_runtime_evidence():
                 )
 
                 # 隣接するクリック式ヘルプのEscape/外側クリックを確認する。
+                page.keyboard.press("Escape")
                 page.locator('[data-tab="tab-history"]').click()
                 help_trigger = page.locator("#historySearchHelpTrigger")
                 help_trigger.click()
@@ -840,7 +928,7 @@ def test_post_model_settings_and_reprocess_runtime_evidence():
                 page.locator('[data-tab="tab-settings"]').click()
                 page.locator("#saveConfigBtn").click()
                 page.wait_for_function(
-                    "() => (window.__eventAutoPinPostModelFixture?.calls || []).some(call => call.command === 'save_project_config')"
+                    "() => (window.__eventAutoPinPostModelFixture?.calls || []).some(call => call.command === 'save_project_config' || call.job === 'save_crawl_project_config')"
                 )
                 saved_yaml = page.evaluate(
                     "() => localStorage.getItem('ui07-post-project-yaml') || ''"
@@ -889,6 +977,7 @@ def test_post_model_settings_and_reprocess_runtime_evidence():
 
                 # 認証状態を切替え、手動再取得を実行直前に行う。
                 page.locator('[data-tab="tab-crawl"]').click()
+                _open_model_settings_dialog(page)
                 page.evaluate("() => localStorage.setItem('ui07-post-grok-auth', 'true')")
                 before_refresh = page.evaluate(
                     "() => window.__eventAutoPinPostModelFixture.calls.length"
@@ -906,6 +995,7 @@ def test_post_model_settings_and_reprocess_runtime_evidence():
                 assert "未認証" not in fallback_provider.locator(
                     "option[value='cli:grok']"
                 ).inner_text()
+                page.keyboard.press("Escape")
 
                 # 認証反映後の再処理では、実行直前forceRefresh=trueの結果を
                 # 使って予備をruntimeで再有効化する。
@@ -944,9 +1034,11 @@ def test_post_model_settings_and_reprocess_runtime_evidence():
                 # 予備を無効化して保存し、選択値を残したまま
                 # YAML/payloadの両方で復元可能なことを確認。
                 page.locator('[data-tab="tab-crawl"]').click()
+                _open_model_settings_dialog(page)
                 fallback_enabled.uncheck()
                 assert not fallback_enabled.is_checked()
                 assert "フォールバックなし" in order.inner_text()
+                page.keyboard.press("Escape")
 
                 # 保存設定を無効にしても、選択した予備値は保持したまま、
                 # runtime payloadだけfallback_enabled=falseになる。
@@ -973,19 +1065,20 @@ def test_post_model_settings_and_reprocess_runtime_evidence():
                 page.locator('[data-tab="tab-settings"]').click()
                 page.locator("#saveConfigBtn").click()
                 page.wait_for_function(
-                    "() => (window.__eventAutoPinPostModelFixture?.calls || []).filter(call => call.command === 'save_project_config').length >= 2"
+                    "() => (window.__eventAutoPinPostModelFixture?.calls || []).filter(call => call.command === 'save_project_config' || call.job === 'save_crawl_project_config').length >= 2"
                 )
                 none_yaml = page.evaluate(
                     "() => localStorage.getItem('ui07-post-project-yaml') || ''"
                 )
                 assert "fallback_enabled: false" in none_yaml
 
-                page.reload(wait_until="domcontentloaded")
+                page.reload(wait_until="commit")
+                page.locator("#tab-crawl").wait_for(state="attached", timeout=30_000)
+                _open_model_settings_dialog(page)
                 page.locator("#refreshModelCatalogBtn").click()
                 page.wait_for_function(
                     "() => document.querySelectorAll('#catalogPostModel option').length > 0"
                 )
-                page.locator("#catalogPostFallbackSettings summary").click()
                 assert page.locator("#catalogPostModel").input_value() == "post-primary-model"
                 assert page.locator("#catalogPostFallbackModelProvider").input_value() == "cli:grok"
                 assert page.locator("#catalogPostFallbackModel").input_value() == "grok-post-fallback"
@@ -1028,10 +1121,12 @@ def test_saved_luna_changed_to_sol_survives_async_catalog_and_reprocess():
             browser = playwright.chromium.launch(**args)
             try:
                 page = browser.new_page(viewport={"width": 1440, "height": 960})
-                page.goto(url, wait_until="domcontentloaded")
+                page.goto(url, wait_until="commit")
+                page.locator("#tab-crawl").wait_for(state="attached", timeout=30_000)
                 page.wait_for_function("model => document.querySelector('#catalogPostModel')?.value === model && document.querySelector('#catalogPostModel option[value=\"gpt-5.6-sol\"]') && !document.querySelector('#refreshModelCatalogBtn').disabled", arg=luna)
                 page.locator('.event-card[data-slug="ui07-post"]').click()
                 page.locator('.event-card[data-slug="ui07-post"].active').wait_for()
+                _open_model_settings_dialog(page)
                 page.evaluate("() => { window.__eventAutoPinPostModelFixture.holdCatalog = true; }")
                 page.locator("#refreshModelCatalogBtn").click()
                 page.wait_for_function("() => window.__eventAutoPinPostModelFixture.catalogWaiting")
@@ -1042,6 +1137,7 @@ def test_saved_luna_changed_to_sol_survives_async_catalog_and_reprocess():
                 page.wait_for_function("() => !document.querySelector('#refreshModelCatalogBtn').disabled")
                 assert page.locator("#catalogPostModel").input_value() == sol
                 assert page.locator("#catalogPostReasoningEffort").input_value() == "high"
+                page.keyboard.press("Escape")
                 page.locator('[data-tab="tab-edit"]').click()
                 page.locator("#circleEditor tr.circle-row[data-circle-row='0']").wait_for()
                 page.once("dialog", lambda dialog: dialog.accept(POST_URL))

@@ -124,235 +124,1319 @@
 
       <main class="flex-1 overflow-hidden flex flex-col">
         <section id="tab-crawl" class="tab-pane active">
-          <h2>クロール実行</h2>
-          <div class="mb-3">
-            <progress id="crawlProgress" max="100" value="0"></progress>
-            <div
-              class="text-xs mt-1"
-              style="color: var(--text-muted)"
-              id="crawlProgressText"
-            >
-              待機中
-            </div>
-          </div>
-          <input id="eventJsonHidden" type="hidden" />
-          <input id="pipelineOutputDir" type="hidden" />
-          <div id="crawlActiveEvent" class="active-event-box">
-            <span style="color: var(--text-muted)"
-              >サイドバーでイベントを選択してください</span
-            >
-          </div>
-          <div class="settings-grid">
-            <label for="eventName">イベント名</label>
-            <input id="eventName" placeholder="イベント名" />
-
-            <label for="eventUrl">イベントURL</label>
-            <div>
-              <textarea id="eventUrl" placeholder="https://...&#10;https://..."></textarea>
-              <div id="concurrentEventSummary" class="form-hint"></div>
-            </div>
-
-            <label for="eventDate">イベント日付</label>
-            <input id="eventDate" placeholder="2026-12-30" />
-
-            <label for="mapUrl">マップURL（任意）</label>
-            <textarea id="mapUrl" placeholder="https://...&#10;https://... => https://..."></textarea>
-
-            <label for="additionalPrompt">追加プロンプト</label>
-            <textarea id="additionalPrompt"></textarea>
-
-            <label for="modelProvider">テキスト処理プロバイダー</label>
-            <select id="modelProvider"></select>
-
-            <label for="model">テキスト処理モデル</label>
-            <select id="model"></select>
-
-            <label for="textReasoningEffort">テキスト処理effort</label>
-            <select id="textReasoningEffort"></select>
-            <div></div>
-            <div id="textExecutionOrder" class="model-execution-order" role="status" aria-live="polite"></div>
-
-            <label for="siteStructureModelProvider">サイト構造解析プロバイダー</label>
-            <select id="siteStructureModelProvider"></select>
-
-            <label for="siteStructureModel">サイト構造解析モデル</label>
-            <select id="siteStructureModel"></select>
-
-            <label for="siteStructureReasoningEffort">サイト構造解析effort</label>
-            <select id="siteStructureReasoningEffort"></select>
-
-            <label for="catalogPostModelProvider">おしながきポスト解析（本文+画像）プロバイダー</label>
-            <select id="catalogPostModelProvider"></select>
-
-            <label for="catalogPostModel">おしながきポスト解析モデル</label>
-            <select id="catalogPostModel"></select>
-
-            <label for="catalogPostReasoningEffort">おしながきポスト解析effort</label>
-            <select id="catalogPostReasoningEffort"></select>
-            <div></div>
-            <div id="catalogPostExecutionOrder" class="model-execution-order" role="status" aria-live="polite"></div>
-
-            <div></div>
-            <details id="catalogPostFallbackSettings" class="model-fallback-details">
-              <summary>おしながきポストの予備モデルを設定</summary>
-              <div class="settings-grid mt-3">
-                <label class="setting-check-row" for="catalogPostFallbackEnabled">
-                  <input id="catalogPostFallbackEnabled" type="checkbox" checked />
-                  <span>予備を使う</span>
-                </label>
-                <div class="form-hint">予備なしでは、主モデルが失敗すると処理を終了します。</div>
-                <label for="catalogPostFallbackModelProvider">予備プロバイダー</label>
-                <select id="catalogPostFallbackModelProvider"></select>
-                <label for="catalogPostFallbackModel">予備モデル</label>
-                <select id="catalogPostFallbackModel"></select>
-                <label for="catalogPostFallbackReasoningEffort">予備effort</label>
-                <select id="catalogPostFallbackReasoningEffort"></select>
+          <div class="crawl-workspace">
+            <header class="crawl-header">
+              <div class="crawl-heading">
+                <span class="crawl-app-mark"
+                  ><svg
+                    class="crawl-icon"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="m8 4 13 8-13 8Z" /></svg
+                ></span>
+                <h2>クロール実行</h2>
+                <span class="help-popover-anchor"
+                  ><button
+                    type="button"
+                    class="help-trigger"
+                    id="crawlOverviewHelpTrigger"
+                    aria-label="説明"
+                    aria-expanded="false"
+                    aria-controls="crawlOverviewHelp"
+                  >
+                    ?</button
+                  ><span
+                    id="crawlOverviewHelp"
+                    class="help-popover"
+                    role="note"
+                    hidden
+                    >イベントサイトからサークル情報・おしながき・マップを収集し、解析します。</span
+                  ></span
+                >
               </div>
-            </details>
-
-            <label for="visionModel">画像処理プロバイダー</label>
-            <select id="visionModel"></select>
-
-            <label for="visionModelId">画像処理モデル</label>
-            <select id="visionModelId"></select>
-
-            <label for="visionReasoningEffort">画像処理effort</label>
-            <select id="visionReasoningEffort"></select>
-            <div></div>
-            <div id="visionExecutionOrder" class="model-execution-order" role="status" aria-live="polite"></div>
-
-            <label for="llmAdvancedSettings">LLM詳細設定</label>
-            <details id="llmAdvancedSettings" class="rounded border border-gray-700 p-3">
-              <summary class="cursor-pointer text-sm">フォールバックモデル</summary>
-              <div class="settings-grid mt-3">
-                <label class="setting-check-row" for="textFallbackEnabled">
-                  <input id="textFallbackEnabled" type="checkbox" checked />
-                  <span>テキスト予備を使う</span>
-                </label>
-                <div></div>
-                <label for="textFallbackModelProvider">テキストfallbackプロバイダー</label>
-                <select id="textFallbackModelProvider"></select>
-
-                <label for="textFallbackModel">テキストfallbackモデル</label>
-                <select id="textFallbackModel"></select>
-
-                <label for="textFallbackReasoningEffort">テキストfallback effort</label>
-                <select id="textFallbackReasoningEffort"></select>
-
-                <label for="visionFallbackModelProvider">画像fallbackプロバイダー</label>
-                <select id="visionFallbackModelProvider"></select>
-
-                <label for="visionFallbackModel">画像fallbackモデル</label>
-                <select id="visionFallbackModel"></select>
-
-                <label for="visionFallbackReasoningEffort">画像fallback effort</label>
-                <select id="visionFallbackReasoningEffort"></select>
-                <label class="setting-check-row" for="imageFallbackEnabled">
-                  <input id="imageFallbackEnabled" type="checkbox" checked />
-                  <span>画像予備を使う</span>
-                </label>
-                <div></div>
+              <div class="crawl-header-actions">
+                <button
+                  type="button"
+                  id="crawlLoadSettingsBtn"
+                  class="crawl-button"
+                >
+                  <svg
+                    class="crawl-icon"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M3 7V4h6l3 3h9v13H3Z" /></svg
+                  >設定の読み込み</button
+                ><button
+                  type="button"
+                  id="crawlSaveSettingsBtn"
+                  class="crawl-button"
+                >
+                  <svg
+                    class="crawl-icon"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M4 3h13l4 4v14H3V3Z" />
+                    <path d="M7 3v6h10V3M7 21v-8h10v8" /></svg
+                  >設定の保存</button
+                ><button
+                  type="button"
+                  id="crawlManagePresetsBtn"
+                  class="crawl-button"
+                >
+                  <svg
+                    class="crawl-icon"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path
+                      d="m12 3 10 5-10 5L2 8Zm-10 9 10 5 10-5M2 16l10 5 10-5"
+                    /></svg
+                  >プリセット管理
+                </button>
               </div>
-            </details>
-
-            <label for="refreshModelCatalogBtn">モデル候補</label>
-            <div class="flex items-center gap-2">
-              <button id="refreshModelCatalogBtn" class="btn-secondary text-xs px-3 py-1 rounded">
-                再取得
-              </button>
-              <span
-                id="modelCatalogStatus"
-                class="text-xs"
-                style="color: var(--text-muted)"
+            </header>
+            <div class="crawl-event-bar">
+              <span class="crawl-event-icon"
+                ><svg
+                  class="crawl-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <rect x="3" y="5" width="18" height="16" rx="2" />
+                  <path d="M7 2v6m10-6v6M3 11h18" /></svg
               ></span>
-            </div>
-
-            <label for="outputDir">Twitter出力先</label>
-            <input id="outputDir" value="twitter_catalogs" />
-
-            <label for="cookieFileBrowseBtn">Cookieファイル（任意）</label>
-            <div id="cookieFileDropZone" class="cookie-file-drop-zone" role="button" tabindex="0" aria-label="Cookieファイルを選択またはドロップ">
-              <input id="cookieFile" type="hidden" />
-              <div class="flex items-center gap-2">
-                <button id="cookieFileBrowseBtn" type="button" class="btn-secondary px-3 py-1.5 rounded">参照…</button>
-                <button id="cookieFileClearBtn" type="button" class="btn-secondary px-3 py-1.5 rounded" aria-label="選択済みCookieを解除" disabled>解除</button>
-                <span id="cookieFileStatus" class="cookie-file-status" role="status" aria-live="polite">明示Cookieファイル: 未選択（実行時に自動検出される場合があります）</span>
+              <div id="crawlActiveEvent" class="active-event-box">
+                <span>サイドバーでイベントを選択してください</span>
               </div>
-              <div id="cookieFileDropHint" class="cookie-file-drop-hint">ここへNetscape形式の .txt（最大2MB）を1件ドロップ</div>
-              <div id="cookieFileDropState" class="cookie-file-drop-state" aria-hidden="true">明示ファイル未選択（自動検出は無効化されません）。</div>
+              <button
+                type="button"
+                id="crawlEditEventBtn"
+                class="crawl-button crawl-button-accent"
+              >
+                <svg
+                  class="crawl-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="m4 16 12-12 4 4L8 20H4Zm10-10 4 4" /></svg
+                >イベント情報を編集
+              </button>
             </div>
-            <details id="cookieConsoleGuide" class="cookie-console-guide">
-              <summary>ブラウザConsoleから取得（任意）</summary>
-              <p class="cookie-console-warning">Event AutoPinへの送信・保存は行いません。DevTools Consoleで実行すると、ブラウザが現在のページで取得できるCookie（HttpOnlyを除く）だけをNetscape .txtとしてローカル保存します。Cookieが0件ならファイルは作成されません。HttpOnly Cookieはdocument.cookie/Consoleから取得できないため、完全な認証Cookie取得は保証されません。</p>
-              <pre id="cookieConsoleCommand" class="cookie-console-command" tabindex="0"></pre>
-              <div class="flex items-center gap-2 mt-2">
-                <button id="cookieConsoleCopyBtn" type="button" class="btn-secondary px-3 py-1 rounded">コマンドをコピー</button>
-                <span id="cookieConsoleCopyStatus" class="cookie-file-status" role="status" aria-live="polite"></span>
+            <div class="crawl-main-grid">
+              <div class="crawl-left-column">
+                <section class="crawl-panel crawl-source-panel">
+                  <div class="crawl-panel-heading">
+                    <h3>
+                      <span class="crawl-step">1</span
+                      >収集対象（イベントソース）
+                    </h3>
+                    <div class="crawl-panel-actions">
+                      <span class="help-popover-anchor"
+                        ><button
+                          type="button"
+                          class="help-trigger"
+                          id="crawlSourcesHelpTrigger"
+                          aria-label="説明"
+                          aria-expanded="false"
+                          aria-controls="crawlSourcesHelp"
+                        >
+                          ?</button
+                        ><span
+                          id="crawlSourcesHelp"
+                          class="help-popover"
+                          role="note"
+                          hidden
+                          >各ソースにマップURLと追加プロンプトを設定できます。共通プロンプトはすべてのソースに適用します。</span
+                        ></span
+                      ><button
+                        type="button"
+                        id="crawlAddSourceBtn"
+                        class="crawl-button"
+                      >
+                        ＋ ソースを追加
+                      </button>
+                    </div>
+                  </div>
+                  <div class="crawl-table-scroll">
+                    <table class="crawl-source-table">
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>ソース名</th>
+                          <th>URL</th>
+                          <th>マップURL</th>
+                          <th>追加プロンプト</th>
+                          <th aria-label="操作"></th>
+                        </tr>
+                      </thead>
+                      <tbody id="crawlSourceRows"></tbody>
+                    </table>
+                  </div>
+                  <div class="crawl-source-footer">
+                    <span id="concurrentEventSummary" class="form-hint"></span
+                    ><button
+                      type="button"
+                      id="crawlCommonPromptBtn"
+                      class="crawl-button"
+                    >
+                      <svg
+                        class="crawl-icon"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.6"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="m4 16 12-12 4 4L8 20H4Zm10-10 4 4" /></svg
+                      >共通プロンプト
+                    </button>
+                  </div>
+                </section>
+                <section class="crawl-panel crawl-options-panel">
+                  <div class="crawl-panel-heading">
+                    <h3><span class="crawl-step">2</span>収集オプション</h3>
+                  </div>
+                  <div class="crawl-options-grid">
+                    <div class="crawl-image-options">
+                      <div class="crawl-option-row">
+                        <svg
+                          class="crawl-icon"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.6"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          aria-hidden="true"
+                        >
+                          <rect x="3" y="3" width="18" height="18" rx="2" />
+                          <circle cx="8" cy="8" r="1" />
+                          <path d="m3 17 5-5 4 4 4-6 5 7" /></svg
+                        ><span>おしながき（本文＋画像）を取得</span
+                        ><button
+                          type="button"
+                          class="crawl-switch"
+                          role="switch"
+                          data-crawl-toggle="collectCatalogs"
+                          aria-checked="true"
+                          aria-label="おしながきを取得"
+                        >
+                          <span></span>
+                        </button>
+                      </div>
+                      <div class="crawl-option-row">
+                        <svg
+                          class="crawl-icon"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.6"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          aria-hidden="true"
+                        >
+                          <rect x="3" y="3" width="18" height="18" rx="2" />
+                          <circle cx="8" cy="8" r="1" />
+                          <path d="m3 17 5-5 4 4 4-6 5 7" /></svg
+                        ><span>サークル画像を取得</span
+                        ><button
+                          type="button"
+                          class="crawl-switch"
+                          role="switch"
+                          data-crawl-toggle="skipCircleImages"
+                          data-crawl-invert="true"
+                          aria-checked="false"
+                          aria-label="サークル画像を取得"
+                        >
+                          <span></span>
+                        </button>
+                      </div>
+                    </div>
+                    <div class="crawl-twitter-options">
+                      <div class="crawl-option-row crawl-twitter-heading">
+                        <span class="crawl-x-icon" aria-hidden="true">𝕏</span
+                        ><strong>Twitter / X 収集設定</strong
+                        ><button
+                          type="button"
+                          class="crawl-switch"
+                          role="switch"
+                          data-crawl-toggle="enableTwitter"
+                          aria-checked="true"
+                          aria-label="Twitter / X収集"
+                        >
+                          <span></span>
+                        </button>
+                      </div>
+                      <div class="crawl-date-inputs">
+                        <svg
+                          class="crawl-icon"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.6"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          aria-hidden="true"
+                        >
+                          <rect x="3" y="5" width="18" height="16" rx="2" />
+                          <path d="M7 2v6m10-6v6M3 11h18" /></svg
+                        ><span>検索期間（開催日の前後）</span
+                        ><label for="daysBefore">前</label
+                        ><input
+                          id="daysBefore"
+                          type="number"
+                          min="0"
+                          value="30"
+                        /><span>〜</span><label for="daysAfter">後</label
+                        ><input
+                          id="daysAfter"
+                          type="number"
+                          min="0"
+                          value="7"
+                        />
+                      </div>
+                      <div id="crawlDateRange" class="crawl-date-range">
+                        検索対象期間：イベントを選択してください
+                      </div>
+                      <div class="crawl-option-row">
+                        <svg
+                          class="crawl-icon"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.6"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          aria-hidden="true"
+                        >
+                          <circle cx="10" cy="10" r="7" />
+                          <path d="m15 15 7 7" /></svg
+                        ><label for="grokSearchMode">Grok検索を使用</label
+                        ><select id="grokSearchMode">
+                          <option value="api">API</option>
+                          <option value="build">Grok Build</option>
+                          <option value="bot">Grok Bot</option></select
+                        ><button
+                          type="button"
+                          class="crawl-switch"
+                          role="switch"
+                          data-crawl-toggle="useGrokSearch"
+                          aria-checked="true"
+                          aria-label="Grok検索を使用"
+                        >
+                          <span></span>
+                        </button>
+                      </div>
+                      <div
+                        id="crawlGrokAvailability"
+                        class="crawl-availability"
+                        role="status"
+                      ></div>
+                      <div
+                        id="cookieFileDropZone"
+                        class="cookie-file-drop-zone"
+                        role="button"
+                        tabindex="0"
+                        aria-label="Cookieファイルを選択またはドロップ"
+                      >
+                        <input id="cookieFile" type="hidden" />
+                        <div class="crawl-cookie-line">
+                          <label for="cookieFileBrowseBtn"
+                            >Cookieファイル</label
+                          >
+                          <span
+                            id="cookieFileStatus"
+                            class="cookie-file-status"
+                            role="status"
+                            aria-live="polite"
+                            >未選択</span
+                          >
+                          <button
+                            id="cookieFileBrowseBtn"
+                            type="button"
+                            class="btn-secondary rounded"
+                          >
+                            参照…
+                          </button>
+                          <button
+                            id="cookieFileClearBtn"
+                            type="button"
+                            class="btn-secondary rounded"
+                            aria-label="選択済みCookieを解除"
+                            disabled
+                          >
+                            解除
+                          </button>
+                          <div class="help-popover-anchor">
+                            <button
+                              type="button"
+                              class="help-trigger"
+                              id="crawlCookieHelpTrigger"
+                              aria-label="Cookieファイルの説明"
+                              aria-expanded="false"
+                              aria-controls="crawlCookieHelp"
+                            >
+                              ?
+                            </button>
+                            <div
+                              id="crawlCookieHelp"
+                              class="help-popover"
+                              role="note"
+                              hidden
+                            >
+                              <p>
+                                認証用のCookieファイルは任意です。未選択でも実行時の自動検出は有効です。
+                              </p>
+                              <details
+                                id="cookieConsoleGuide"
+                                class="cookie-console-guide"
+                              >
+                                <summary>
+                                  ブラウザConsoleから取得（任意）
+                                </summary>
+                                <p class="cookie-console-warning">
+                                  Event
+                                  AutoPinへの送信・保存は行いません。DevTools
+                                  Consoleで実行すると、ブラウザが現在のページで取得できるCookie（HttpOnlyを除く）だけをNetscape
+                                  .txtとしてローカル保存します。Cookieが0件ならファイルは作成されません。HttpOnly
+                                  Cookieはdocument.cookie/Consoleから取得できないため、完全な認証Cookie取得は保証されません。
+                                </p>
+                                <pre
+                                  id="cookieConsoleCommand"
+                                  class="cookie-console-command"
+                                  tabindex="0"
+                                ></pre>
+                                <div class="flex items-center gap-2 mt-2">
+                                  <button
+                                    id="cookieConsoleCopyBtn"
+                                    type="button"
+                                    class="btn-secondary px-3 py-1 rounded"
+                                  >
+                                    コマンドをコピー
+                                  </button>
+                                  <span
+                                    id="cookieConsoleCopyStatus"
+                                    class="cookie-file-status"
+                                    role="status"
+                                    aria-live="polite"
+                                  ></span>
+                                </div>
+                              </details>
+                            </div>
+                          </div>
+                        </div>
+                        <div
+                          id="cookieFileDropHint"
+                          class="cookie-file-drop-hint"
+                        >
+                          Netscape .txt（最大2MB）を1件選択・ドロップ
+                        </div>
+                        <div
+                          id="cookieFileDropState"
+                          class="cookie-file-drop-state"
+                          aria-hidden="true"
+                        >
+                          明示ファイル未選択（自動検出は無効化されません）。
+                        </div>
+                      </div>
+                      <div class="crawl-output-row">
+                        <svg
+                          class="crawl-icon"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.6"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path d="M3 7V4h6l3 3h9v13H3Z" /></svg
+                        ><label for="outputDir">出力先フォルダ</label
+                        ><input
+                          id="outputDir"
+                          readonly
+                          placeholder="イベントを選択してください"
+                        /><button
+                          type="button"
+                          id="crawlOutputBrowseBtn"
+                          aria-label="出力先フォルダを開く"
+                          title="出力先フォルダを開く"
+                          class="crawl-button"
+                        >
+                          <svg
+                            class="crawl-icon"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.6"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M3 7V4h6l3 3h9v13H3Z" />
+                          </svg>
+                        </button>
+                        <span class="help-popover-anchor">
+                          <button
+                            type="button"
+                            class="help-trigger"
+                            id="crawlOutputHelpTrigger"
+                            aria-label="出力先フォルダの説明"
+                            aria-expanded="false"
+                            aria-controls="crawlOutputHelp"
+                          >
+                            ?
+                          </button>
+                          <span
+                            id="crawlOutputHelp"
+                            class="help-popover"
+                            role="note"
+                            aria-labelledby="crawlOutputHelpTrigger"
+                            hidden
+                            >データは選択イベントのフォルダに保存します。保存先は左のイベント選択に連動します。</span
+                          >
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+                <section class="crawl-panel crawl-other-panel">
+                  <div class="crawl-panel-heading">
+                    <h3><span class="crawl-step">3</span>その他の設定</h3>
+                  </div>
+                  <div class="crawl-other-options">
+                    <div>
+                      <svg
+                        class="crawl-icon"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.6"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                      >
+                        <ellipse cx="12" cy="5" rx="9" ry="3" />
+                        <path
+                          d="M3 5v14c0 4 18 4 18 0V5M3 12c0 4 18 4 18 0"
+                        /></svg
+                      ><label for="backup">バックアップ</label
+                      ><select id="backup">
+                        <option value="false">しない</option>
+                        <option value="true">する</option>
+                      </select>
+                    </div>
+                    <div>
+                      <svg
+                        class="crawl-icon"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.6"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                      >
+                        <rect x="8" y="2" width="8" height="6" rx="1" />
+                        <path d="M12 8v5M4 13h16M4 13v3m16-3v3" />
+                        <rect x="1" y="16" width="6" height="5" rx="1" />
+                        <rect x="17" y="16" width="6" height="5" rx="1" /></svg
+                      ><label for="reprocess">再処理</label
+                      ><select id="reprocess">
+                        <option value="false">しない</option>
+                        <option value="true">する</option>
+                      </select>
+                    </div>
+                    <div>
+                      <svg
+                        class="crawl-icon"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.6"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path
+                          d="M19 9c0 6-7 13-7 13S5 15 5 9a7 7 0 0 1 14 0Z"
+                        />
+                        <circle cx="12" cy="9" r="2" /></svg
+                      ><label for="regen">座標再生成</label
+                      ><select id="regen">
+                        <option value="false">しない</option>
+                        <option value="true">する</option>
+                      </select>
+                    </div>
+                    <div>
+                      <svg
+                        class="crawl-icon"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.6"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path
+                          d="M5 2h9l5 5v15H5ZM14 2v6h5M8 12h8m-8 4h8"
+                        /></svg
+                      ><span>詳細ログ</span
+                      ><button
+                        type="button"
+                        class="crawl-switch"
+                        role="switch"
+                        data-crawl-toggle="verbose"
+                        aria-checked="true"
+                        aria-label="詳細ログ"
+                      >
+                        <span></span>
+                      </button>
+                    </div>
+                  </div>
+                </section>
               </div>
-            </details>
-
-            <label for="daysBefore">イベント前日数</label>
-            <input id="daysBefore" type="number" value="30" />
-
-            <label for="daysAfter">イベント後日数</label>
-            <input id="daysAfter" type="number" value="7" />
-
-            <label for="backup">バックアップ</label>
-            <select id="backup">
-              <option value="false">しない</option>
-              <option value="true">する</option>
-            </select>
-
-            <label for="enableTwitter">Twitter処理</label>
-            <select id="enableTwitter">
+              <section class="crawl-panel crawl-model-panel">
+                <div class="crawl-panel-heading">
+                  <h3><span class="crawl-step">4</span>AIモデル設定</h3>
+                  <span class="help-popover-anchor"
+                    ><button
+                      type="button"
+                      class="help-trigger"
+                      id="crawlModelsHelpTrigger"
+                      aria-label="説明"
+                      aria-expanded="false"
+                      aria-controls="crawlModelsHelp"
+                    >
+                      ?</button
+                    ><span
+                      id="crawlModelsHelp"
+                      class="help-popover"
+                      role="note"
+                      hidden
+                      >処理ごとに主モデルとフォールバックを設定します。歯車からプロバイダー・推論effort・予備の有効状態を変更できます。</span
+                    ></span
+                  ><label class="crawl-preset-label" for="crawlPresetSelect"
+                    >プリセット：</label
+                  ><select id="crawlPresetSelect">
+                    <option value="">標準設定</option>
+                  </select>
+                </div>
+                <div class="crawl-table-scroll">
+                  <table class="crawl-model-table">
+                    <thead>
+                      <tr>
+                        <th>処理</th>
+                        <th>使用モデル（主）</th>
+                        <th>フォールバック</th>
+                        <th aria-label="設定"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <th scope="row">
+                          <span class="crawl-model-title"
+                            ><svg
+                              class="crawl-icon"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.6"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path
+                                d="M5 2h9l5 5v15H5ZM14 2v6h5M8 12h8m-8 4h8"
+                              /></svg
+                            >テキスト解析</span
+                          >
+                        </th>
+                        <td>
+                          <select
+                            id="model"
+                            aria-label="テキスト解析の主モデル"
+                          ></select
+                          ><span id="crawlTextEffort" class="crawl-effort"
+                            >effort : —</span
+                          >
+                        </td>
+                        <td>
+                          <select
+                            id="textFallbackModel"
+                            aria-label="テキスト解析のフォールバック"
+                          ></select>
+                        </td>
+                        <td>
+                          <button
+                            type="button"
+                            class="crawl-icon-button"
+                            data-crawl-model-settings="text"
+                            aria-label="テキスト解析の詳細設定"
+                          >
+                            <svg
+                              class="crawl-icon"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.6"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path
+                                d="m9 3 1-2h4l1 2 3 2 2 1v4l-2 2v3l-2 3h-3l-3 2-3-2H4l-2-3v-3L1 10V6l3-1 2-2Z"
+                              />
+                              <circle cx="11" cy="10" r="3" />
+                            </svg>
+                          </button>
+                        </td>
+                      </tr>
+                      <tr>
+                        <th scope="row">
+                          <span class="crawl-model-title"
+                            ><svg
+                              class="crawl-icon"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.6"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              aria-hidden="true"
+                            >
+                              <rect x="8" y="2" width="8" height="6" rx="1" />
+                              <path d="M12 8v5M4 13h16M4 13v3m16-3v3" />
+                              <rect x="1" y="16" width="6" height="5" rx="1" />
+                              <rect
+                                x="17"
+                                y="16"
+                                width="6"
+                                height="5"
+                                rx="1"
+                              /></svg
+                            >サイト構造解析</span
+                          >
+                        </th>
+                        <td>
+                          <select
+                            id="siteStructureModel"
+                            aria-label="サイト構造解析の主モデル"
+                          ></select
+                          ><span id="crawlSiteEffort" class="crawl-effort"
+                            >effort : —</span
+                          >
+                        </td>
+                        <td>
+                          <select
+                            id="siteStructureFallbackModel"
+                            aria-label="サイト構造解析のフォールバック"
+                          ></select>
+                        </td>
+                        <td>
+                          <button
+                            type="button"
+                            class="crawl-icon-button"
+                            data-crawl-model-settings="site"
+                            aria-label="サイト構造解析の詳細設定"
+                          >
+                            <svg
+                              class="crawl-icon"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.6"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path
+                                d="m9 3 1-2h4l1 2 3 2 2 1v4l-2 2v3l-2 3h-3l-3 2-3-2H4l-2-3v-3L1 10V6l3-1 2-2Z"
+                              />
+                              <circle cx="11" cy="10" r="3" />
+                            </svg>
+                          </button>
+                        </td>
+                      </tr>
+                      <tr>
+                        <th scope="row">
+                          <span class="crawl-model-title"
+                            ><svg
+                              class="crawl-icon"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.6"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path
+                                d="M5 2h9l5 5v15H5ZM14 2v6h5M8 12h8m-8 4h8"
+                              /></svg
+                            >おしながき解析</span
+                          >
+                        </th>
+                        <td>
+                          <select
+                            id="catalogPostModel"
+                            aria-label="おしながき解析の主モデル"
+                          ></select
+                          ><span id="crawlPostEffort" class="crawl-effort"
+                            >effort : —</span
+                          >
+                        </td>
+                        <td>
+                          <select
+                            id="catalogPostFallbackModel"
+                            aria-label="おしながき解析のフォールバック"
+                          ></select>
+                        </td>
+                        <td>
+                          <button
+                            type="button"
+                            class="crawl-icon-button"
+                            data-crawl-model-settings="post"
+                            aria-label="おしながき解析の詳細設定"
+                          >
+                            <svg
+                              class="crawl-icon"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.6"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path
+                                d="m9 3 1-2h4l1 2 3 2 2 1v4l-2 2v3l-2 3h-3l-3 2-3-2H4l-2-3v-3L1 10V6l3-1 2-2Z"
+                              />
+                              <circle cx="11" cy="10" r="3" />
+                            </svg>
+                          </button>
+                        </td>
+                      </tr>
+                      <tr>
+                        <th scope="row">
+                          <span class="crawl-model-title"
+                            ><svg
+                              class="crawl-icon"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.6"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              aria-hidden="true"
+                            >
+                              <rect x="3" y="3" width="18" height="18" rx="2" />
+                              <circle cx="8" cy="8" r="1" />
+                              <path d="m3 17 5-5 4 4 4-6 5 7" /></svg
+                            >画像処理</span
+                          >
+                        </th>
+                        <td>
+                          <select
+                            id="visionModelId"
+                            aria-label="画像処理の主モデル"
+                          ></select
+                          ><span id="crawlImageEffort" class="crawl-effort"
+                            >effort : —</span
+                          >
+                        </td>
+                        <td>
+                          <select
+                            id="visionFallbackModel"
+                            aria-label="画像処理のフォールバック"
+                          ></select>
+                        </td>
+                        <td>
+                          <button
+                            type="button"
+                            class="crawl-icon-button"
+                            data-crawl-model-settings="image"
+                            aria-label="画像処理の詳細設定"
+                          >
+                            <svg
+                              class="crawl-icon"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.6"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path
+                                d="m9 3 1-2h4l1 2 3 2 2 1v4l-2 2v3l-2 3h-3l-3 2-3-2H4l-2-3v-3L1 10V6l3-1 2-2Z"
+                              />
+                              <circle cx="11" cy="10" r="3" />
+                            </svg>
+                          </button>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="crawl-model-actions">
+                  <button
+                    type="button"
+                    id="crawlModelsDetailsBtn"
+                    class="crawl-button"
+                  >
+                    <svg
+                      class="crawl-icon"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.6"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="m9 3 1-2h4l1 2 3 2 2 1v4l-2 2v3l-2 3h-3l-3 2-3-2H4l-2-3v-3L1 10V6l3-1 2-2Z"
+                      />
+                      <circle cx="11" cy="10" r="3" /></svg
+                    >詳細設定</button
+                  ><button
+                    type="button"
+                    id="crawlSavePresetBtn"
+                    class="crawl-button"
+                  >
+                    <svg
+                      class="crawl-icon"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.6"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M4 3h13l4 4v14H3V3Z" />
+                      <path d="M7 3v6h10V3M7 21v-8h10v8" /></svg
+                    >プリセットとして保存
+                  </button>
+                </div>
+              </section>
+            </div>
+            <footer class="crawl-run-bar" data-state="invalid">
+              <span
+                id="crawlReadyIcon"
+                class="crawl-ready-icon"
+                aria-hidden="true"
+                ><svg
+                  class="crawl-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="m5 12 5 5L21 6" /></svg></span
+              ><strong id="crawlRunState">実行準備</strong
+              ><span id="crawlRunEvent" class="crawl-run-chip"
+                >イベント未選択</span
+              ><span
+                id="crawlSettingsCheck"
+                class="crawl-run-chip"
+                role="status"
+                >設定を確認してください</span
+              ><button
+                type="button"
+                id="runPipelineBtn"
+                class="crawl-button crawl-run-button"
+              >
+                <svg
+                  class="crawl-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="m8 4 13 8-13 8Z" /></svg
+                >実行開始
+              </button>
+              <div class="crawl-progress">
+                <progress id="crawlProgress" max="100" value="0"></progress
+                ><span id="crawlProgressText" role="status" aria-live="polite"
+                  >待機中</span
+                >
+              </div>
+            </footer>
+          </div>
+          <div hidden>
+            <input id="eventJsonHidden" type="hidden" /><input
+              id="pipelineOutputDir"
+              type="hidden"
+            /><textarea id="eventUrl"></textarea
+            ><textarea id="mapUrl"></textarea
+            ><textarea id="additionalPrompt"></textarea
+            ><select id="collectCatalogs">
+              <option value="true">取得する</option>
+              <option value="false">取得しない</option></select
+            ><select id="enableTwitter">
               <option value="true">有効</option>
-              <option value="false">無効</option>
-            </select>
-
-            <label for="useGrokSearch">Grok検索</label>
-            <select id="useGrokSearch">
+              <option value="false">無効</option></select
+            ><select id="useGrokSearch">
               <option value="true">有効</option>
-              <option value="false">無効</option>
-            </select>
-
-            <label for="reprocess">再処理</label>
-            <select id="reprocess">
-              <option value="false">しない</option>
-              <option value="true">する</option>
-            </select>
-
-            <label for="regen">座標再生成</label>
-            <select id="regen">
-              <option value="false">しない</option>
-              <option value="true">する</option>
-            </select>
-
-            <label for="skipCircleImages">サークル画像スキップ</label>
-            <select id="skipCircleImages">
+              <option value="false">無効</option></select
+            ><select id="skipCircleImages">
               <option value="true">スキップ</option>
-              <option value="false">取得する</option>
-            </select>
-
-            <label for="verbose">詳細ログ</label>
-            <select id="verbose">
+              <option value="false">取得する</option></select
+            ><select id="verbose">
               <option value="true">ON</option>
               <option value="false">OFF</option>
             </select>
           </div>
-          <div class="flex gap-2 mt-4">
-            <button id="runExtractBtn" class="btn-secondary px-4 py-2 rounded">
-              Twitterお品書き抽出
-            </button>
-            <button
-              id="runPipelineBtn"
-              class="btn-primary px-4 py-2 rounded font-semibold"
-            >
-              フルパイプライン実行
-            </button>
-          </div>
+          <dialog id="crawlEventDialog" class="crawl-dialog">
+            <div class="crawl-dialog-heading">
+              <h3>イベント情報を編集</h3>
+              <button
+                type="button"
+                class="crawl-icon-button"
+                data-crawl-close="crawlEventDialog"
+                aria-label="閉じる"
+              >
+                ×
+              </button>
+            </div>
+            <div class="crawl-dialog-fields">
+              <label for="eventName">イベント名</label
+              ><input id="eventName" placeholder="イベント名" /><label
+                for="eventDate"
+                >開催日</label
+              ><input id="eventDate" type="date" /><label for="eventVenue"
+                >会場</label
+              ><input id="eventVenue" placeholder="会場名" />
+            </div>
+            <div class="crawl-dialog-actions">
+              <button type="button" id="crawlEventSaveBtn" class="crawl-button">
+                <svg
+                  class="crawl-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M4 3h13l4 4v14H3V3Z" />
+                  <path d="M7 3v6h10V3M7 21v-8h10v8" /></svg
+                >保存
+              </button>
+            </div>
+          </dialog>
+          <dialog id="crawlSourceDialog" class="crawl-dialog">
+            <div class="crawl-dialog-heading">
+              <h3>収集ソースを編集</h3>
+              <button
+                type="button"
+                class="crawl-icon-button"
+                data-crawl-close="crawlSourceDialog"
+                aria-label="閉じる"
+              >
+                ×
+              </button>
+            </div>
+            <div class="crawl-dialog-fields">
+              <label for="crawlSourceName">ソース名</label
+              ><input
+                id="crawlSourceName"
+                placeholder="公式（サークル一覧）"
+              /><label for="crawlSourceUrl">URL</label
+              ><input
+                id="crawlSourceUrl"
+                type="url"
+                placeholder="https://…"
+              /><label for="crawlSourceMaps">マップURL</label
+              ><textarea
+                id="crawlSourceMaps"
+                placeholder="1行に1件のURL"
+              ></textarea
+              ><label for="crawlSourcePrompt">追加プロンプト</label
+              ><textarea id="crawlSourcePrompt" rows="4"></textarea>
+            </div>
+            <div class="crawl-dialog-actions">
+              <button
+                type="button"
+                id="crawlSourceSaveBtn"
+                class="crawl-button"
+              >
+                <svg
+                  class="crawl-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M4 3h13l4 4v14H3V3Z" />
+                  <path d="M7 3v6h10V3M7 21v-8h10v8" /></svg
+                >保存
+              </button>
+            </div>
+          </dialog>
+          <dialog id="crawlCommonPromptDialog" class="crawl-dialog">
+            <div class="crawl-dialog-heading">
+              <h3>共通プロンプト</h3>
+              <button
+                type="button"
+                class="crawl-icon-button"
+                data-crawl-close="crawlCommonPromptDialog"
+                aria-label="閉じる"
+              >
+                ×
+              </button>
+            </div>
+            <label for="crawlCommonPrompt">すべてのソースに適用する指示</label
+            ><textarea id="crawlCommonPrompt" rows="7"></textarea>
+            <div class="crawl-dialog-actions">
+              <button
+                type="button"
+                id="crawlCommonPromptSaveBtn"
+                class="crawl-button"
+              >
+                <svg
+                  class="crawl-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M4 3h13l4 4v14H3V3Z" />
+                  <path d="M7 3v6h10V3M7 21v-8h10v8" /></svg
+                >保存
+              </button>
+            </div>
+          </dialog>
+          <dialog id="crawlModelSettingsDialog" class="crawl-dialog">
+            <div class="crawl-dialog-heading">
+              <h3>AIモデル詳細設定</h3>
+              <button
+                type="button"
+                class="crawl-icon-button"
+                data-crawl-close="crawlModelSettingsDialog"
+                aria-label="閉じる"
+              >
+                ×
+              </button>
+            </div>
+            <div id="llmAdvancedSettings">
+              <section class="crawl-model-section" data-model-section="text">
+                <h4>テキスト解析</h4>
+                <div class="crawl-dialog-fields">
+                  <label for="modelProvider">主プロバイダー</label
+                  ><select id="modelProvider"></select
+                  ><label for="textReasoningEffort">主effort</label
+                  ><select id="textReasoningEffort"></select
+                  ><label for="textFallbackEnabled">フォールバック</label
+                  ><label class="setting-check-row"
+                    ><input
+                      id="textFallbackEnabled"
+                      type="checkbox"
+                      checked
+                    />予備を使う</label
+                  ><label for="textFallbackModelProvider"
+                    >予備プロバイダー</label
+                  ><select id="textFallbackModelProvider"></select
+                  ><label for="textFallbackReasoningEffort">予備effort</label
+                  ><select id="textFallbackReasoningEffort"></select>
+                </div>
+                <div
+                  id="textExecutionOrder"
+                  class="model-execution-order"
+                  role="status"
+                  aria-live="polite"
+                ></div>
+              </section>
+              <section class="crawl-model-section" data-model-section="site">
+                <h4>サイト構造解析</h4>
+                <div class="crawl-dialog-fields">
+                  <label for="siteStructureModelProvider">主プロバイダー</label
+                  ><select id="siteStructureModelProvider"></select
+                  ><label for="siteStructureReasoningEffort">主effort</label
+                  ><select id="siteStructureReasoningEffort"></select
+                  ><label for="siteStructureFallbackEnabled"
+                    >フォールバック</label
+                  ><label class="setting-check-row"
+                    ><input
+                      id="siteStructureFallbackEnabled"
+                      type="checkbox"
+                      checked
+                    />予備を使う</label
+                  ><label for="siteStructureFallbackModelProvider"
+                    >予備プロバイダー</label
+                  ><select id="siteStructureFallbackModelProvider"></select
+                  ><label for="siteStructureFallbackReasoningEffort"
+                    >予備effort</label
+                  ><select id="siteStructureFallbackReasoningEffort"></select>
+                </div>
+                <div
+                  id="siteExecutionOrder"
+                  class="model-execution-order"
+                  role="status"
+                  aria-live="polite"
+                ></div>
+              </section>
+              <section class="crawl-model-section" data-model-section="post">
+                <h4>おしながき解析</h4>
+                <div class="crawl-dialog-fields">
+                  <label for="catalogPostModelProvider">主プロバイダー</label
+                  ><select id="catalogPostModelProvider"></select
+                  ><label for="catalogPostReasoningEffort">主effort</label
+                  ><select id="catalogPostReasoningEffort"></select
+                  ><label for="catalogPostFallbackEnabled">フォールバック</label
+                  ><label class="setting-check-row"
+                    ><input
+                      id="catalogPostFallbackEnabled"
+                      type="checkbox"
+                      checked
+                    />予備を使う</label
+                  ><label for="catalogPostFallbackModelProvider"
+                    >予備プロバイダー</label
+                  ><select id="catalogPostFallbackModelProvider"></select
+                  ><label for="catalogPostFallbackReasoningEffort"
+                    >予備effort</label
+                  ><select id="catalogPostFallbackReasoningEffort"></select>
+                </div>
+                <div
+                  id="catalogPostExecutionOrder"
+                  class="model-execution-order"
+                  role="status"
+                  aria-live="polite"
+                ></div>
+              </section>
+              <section class="crawl-model-section" data-model-section="image">
+                <h4>画像処理</h4>
+                <div class="crawl-dialog-fields">
+                  <label for="visionModel">主プロバイダー</label
+                  ><select id="visionModel"></select
+                  ><label for="visionReasoningEffort">主effort</label
+                  ><select id="visionReasoningEffort"></select
+                  ><label for="imageFallbackEnabled">フォールバック</label
+                  ><label class="setting-check-row"
+                    ><input
+                      id="imageFallbackEnabled"
+                      type="checkbox"
+                      checked
+                    />予備を使う</label
+                  ><label for="visionFallbackModelProvider"
+                    >予備プロバイダー</label
+                  ><select id="visionFallbackModelProvider"></select
+                  ><label for="visionFallbackReasoningEffort">予備effort</label
+                  ><select id="visionFallbackReasoningEffort"></select>
+                </div>
+                <div
+                  id="visionExecutionOrder"
+                  class="model-execution-order"
+                  role="status"
+                  aria-live="polite"
+                ></div>
+              </section>
+            </div>
+            <div id="catalogPostFallbackSettings"></div>
+            <div class="crawl-dialog-actions">
+              <button
+                type="button"
+                id="refreshModelCatalogBtn"
+                class="crawl-button"
+              >
+                モデル候補を再取得</button
+              ><span id="modelCatalogStatus" role="status"></span>
+            </div>
+          </dialog>
+          <dialog id="crawlPresetDialog" class="crawl-dialog">
+            <div class="crawl-dialog-heading">
+              <h3>プリセット管理</h3>
+              <button
+                type="button"
+                class="crawl-icon-button"
+                data-crawl-close="crawlPresetDialog"
+                aria-label="閉じる"
+              >
+                ×
+              </button>
+            </div>
+            <div id="crawlPresetList" class="crawl-preset-list"></div>
+            <div class="crawl-preset-create">
+              <label for="crawlPresetName">プリセット名</label
+              ><input
+                id="crawlPresetName"
+                placeholder="新しいプリセット"
+              /><button
+                type="button"
+                id="crawlPresetCreateBtn"
+                class="crawl-button"
+              >
+                <svg
+                  class="crawl-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M4 3h13l4 4v14H3V3Z" />
+                  <path d="M7 3v6h10V3M7 21v-8h10v8" /></svg
+                >現在の設定を保存
+              </button>
+            </div>
+          </dialog>
         </section>
 
-        <section id="tab-edit" class="tab-pane">
+  <section id="tab-edit" class="tab-pane">
           <h2>サークルリスト編集</h2>
           <input id="editorJsonPath" type="hidden" />
           <input id="editorOutputJsonPath" type="hidden" />
@@ -872,7 +1956,7 @@
               </tr>
               <tr>
                 <td><kbd class="kbd">Ctrl + Enter</kbd></td>
-                <td>フルパイプライン実行</td>
+                <td>実行開始</td>
               </tr>
               <tr>
                 <td><kbd class="kbd">Ctrl + Tab</kbd></td>

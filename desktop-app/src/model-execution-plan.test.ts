@@ -58,6 +58,21 @@ if (!formatModelPreflightIssue(plan.warnings[0]).includes("おしながきポス
   throw new Error("preflight issue must name the concrete role");
 }
 
+const siteFallbackPlan = modelPreflightPlan(
+  [{
+    slot: "site_structure_fallback",
+    fallback: true,
+    selection: { provider: "cli:codex", model: "gpt-5.5", effort: "medium" },
+  }],
+  () => "未認証",
+);
+const siteRuntime = applyModelPreflightToPayload({
+  site_parsing: { provider: "api:openai", model: "gpt-5.6-luna", fallback_enabled: true },
+}, siteFallbackPlan);
+if ((siteRuntime.site_parsing as { fallback_enabled: boolean }).fallback_enabled !== false) {
+  throw new Error("site structure fallback must be disabled only in runtime payload");
+}
+
 const unknownLive = modelPreflightPlan(
   [
     {

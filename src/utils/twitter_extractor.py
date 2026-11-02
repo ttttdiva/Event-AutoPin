@@ -13,9 +13,10 @@ except ImportError:
     pass
 
 import asyncio
+import hashlib
 import re
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Optional, Any, Union, Tuple
 from pathlib import Path
 import os
 import json
@@ -118,12 +119,78 @@ from ..utils.logger import setup_logger
 from ..utils.llm_client import LLMClient
 from ..utils.downloader import Downloader
 from ..utils.llm_attempts import DEFAULT_TEXT_PRIMARY_MODEL
+from .cookie_loader import (
+    COOKIE_MAX_BYTES,
+    CookieFileValidationError,
+    _parse_netscape_cookie_content,
+    validate_cookie_file_path,
+)
 
 
 # .envファイルを読み込み
 load_dotenv()
 
 logger = setup_logger(__name__)
+
+
+_X_COOKIE_DOMAINS = ("x.com", "twitter.com")
+
+
+def _is_x_cookie_domain(domain: Any) -> bool:
+    """CookieのdomainがX/Twitter向けかを判定する。"""
+
+    normalized = str(domain or "").strip().lower().lstrip(".").rstrip(".")
+    return any(
+        normalized == base or normalized.endswith(f".{base}")
+        for base in _X_COOKIE_DOMAINS
+    )
+
+
+def _extract_x_cookie_pair(
+    cookie_jar: Any,
+) -> Tuple[Optional[str], Optional[str], bool, bool]:
+    """Cookie jarからX用tokenだけを抽出する。
+
+    戻り値は ``(auth_token, ct0, x_domain_seen, x_token_name_seen)``。
+    サイト固有Cookieに同名の属性があっても、X/Twitter domainでなければ
+    X認証情報として扱わない。
+    """
+
+    auth_token: Optional[str] = None
+    ct0: Optional[str] = None
+    x_domain_seen = False
+    x_token_name_seen = False
+
+    for cookie in cookie_jar or ():
+        if not _is_x_cookie_domain(getattr(cookie, "domain", "")):
+            continue
+        x_domain_seen = True
+        name = str(getattr(cookie, "name", "") or "")
+        value = getattr(cookie, "value", None)
+        value = str(value).strip() if value is not None else ""
+        if name == "auth_token":
+            x_token_name_seen = True
+            if value and not auth_token:
+                auth_token = value
+        elif name == "ct0":
+            x_token_name_seen = True
+            if value and not ct0:
+                ct0 = value
+
+    return auth_token, ct0, x_domain_seen, x_token_name_seen
+
+
+def _read_cookie_jar_without_logging(path: Path) -> Any:
+    """検証済みCookieを読み込む（秘匿値・pathをログへ出さない）。"""
+
+    try:
+        with path.open("rb") as handle:
+            raw_content = handle.read(COOKIE_MAX_BYTES + 1)
+        return _parse_netscape_cookie_content(raw_content)
+    except CookieFileValidationError:
+        raise
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise CookieFileValidationError("unreadable") from exc
 
 
 class CatalogTweetResult(list):
@@ -156,6 +223,8 @@ class TwitterExtractor:
         reasoning_effort: Optional[str] = None,
         api_reasoning_effort_map: Optional[Dict[str, str]] = None,
         attempts: Optional[List[Dict[str, Any]]] = None,
+        cookie_file: Optional[Union[str, Path]] = None,
+        project_root: Optional[Union[str, Path]] = None,
     ):
         """初期化
 
@@ -166,6 +235,14 @@ class TwitterExtractor:
         """
         self.model = model
         self.additional_prompt = additional_prompt
+        self.event_date = event_date
+        self.cookie_file = (
+            str(cookie_file).strip()
+            if cookie_file is not None and str(cookie_file).strip()
+            else None
+        )
+        self.project_root = self._resolve_project_root(project_root)
+        self._cookie_routing_reason: Optional[str] = None
         # event_dateから日付文字列を自動生成し、LLM用プロンプトに付加
         from .date_utils import format_event_date_jp
         date_jp = format_event_date_jp(event_date) if event_date else None
@@ -219,6 +296,7 @@ class TwitterExtractor:
 
         # 動的キーワード（イベント固有）
         self.dynamic_keywords = []
+        self._dynamic_keyword_cache: Dict[str, List[str]] = {}
 
         # additional_promptからイベント固有キーワードを抽出
         if additional_prompt:
@@ -229,8 +307,72 @@ class TwitterExtractor:
                     logger.info(f"動的キーワードを追加: {self.dynamic_keywords}")
                 else:
                     logger.info("動的キーワードは抽出されませんでした")
+                self._dynamic_keyword_cache[additional_prompt] = list(
+                    self.dynamic_keywords or []
+                )
             except Exception as e:
                 logger.warning(f"動的キーワードの抽出に失敗: {e}")
+                self._dynamic_keyword_cache[additional_prompt] = []
+
+    def set_additional_prompt(
+        self, additional_prompt: str = "", event_date: Optional[str] = None
+    ) -> str:
+        """source切替時に実効promptと動的キーワードを同期する。
+
+        timelineのLLM呼出しは ``effective_additional_prompt`` を使う一方、
+        候補tweetの事前絞り込みは ``dynamic_keywords`` を使うため、
+        processor側だけを更新するとsource別設定が片方にしか反映されない。
+        同一promptの再切替はキャッシュし、外部APIを追加で呼ばない。
+        """
+
+        prompt = str(additional_prompt or "")
+        if event_date is not None:
+            self.event_date = event_date
+        current_event_date = getattr(self, "event_date", None)
+        self.additional_prompt = prompt
+
+        from .date_utils import format_event_date_jp
+
+        date_jp = format_event_date_jp(current_event_date) if current_event_date else None
+        if date_jp and prompt:
+            self.effective_additional_prompt = f"{date_jp}\n{prompt}"
+        elif date_jp:
+            self.effective_additional_prompt = date_jp
+        else:
+            self.effective_additional_prompt = prompt
+
+        cache = getattr(self, "_dynamic_keyword_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._dynamic_keyword_cache = cache
+        if prompt in cache:
+            self.dynamic_keywords = list(cache[prompt])
+            return self.effective_additional_prompt
+
+        keywords: List[str] = []
+        if prompt:
+            try:
+                extracted = self.llm_client.extract_event_keywords(prompt)
+                if isinstance(extracted, list):
+                    keywords = [str(item).strip() for item in extracted if str(item).strip()]
+            except Exception as exc:  # noqa: BLE001 - keyword hint is best effort
+                logger.warning(f"動的キーワードの抽出に失敗: {exc}")
+        self.dynamic_keywords = list(dict.fromkeys(keywords))
+        cache[prompt] = list(self.dynamic_keywords)
+        return self.effective_additional_prompt
+
+    @staticmethod
+    def _resolve_project_root(project_root: Optional[Union[str, Path]]) -> Path:
+        """Cookie自動検出に使うプロジェクトrootを確定する。"""
+
+        if project_root is None or not str(project_root).strip():
+            return Path(__file__).resolve().parents[2]
+        try:
+            return Path(project_root).expanduser().resolve()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            # 呼び出し側のpath検証はcookie_fileに対して別途行う。
+            # rootの変換だけで認証を無言無効化しないよう、既定rootへ戻す。
+            return Path(__file__).resolve().parents[2]
     
     async def initialize(self):
         """Twitter API の初期化（Cookie認証）"""
@@ -250,70 +392,151 @@ class TwitterExtractor:
         # 各アカウント用のAPIインスタンスを作成
         for i, cookies in enumerate(self.all_accounts):
             api = self._create_api_instance()
+            account_username = self._account_username(cookies)
             # twscrapeアカウントを追加
             await api.pool.add_account(
-                username=f"twitter_user_{i+1}",
+                username=account_username,
                 password="dummy_password",
-                email=f"dummy{i+1}@example.com",
+                email=f"event-autopin-{i+1}@example.invalid",
                 email_password="dummy_email_password",
                 cookies=cookies
             )
-            
-            await api.pool.login_all()
+
+            # 共有accounts.db上の既存アカウントを再ログイン対象にしない。
+            # 古いtwscrape互換実装には引数なしlogin_allしかないため、
+            # その場合だけ後方互換fallbackを使う。
+            try:
+                await api.pool.login_all(usernames=[account_username])
+            except TypeError:
+                await api.pool.login_all()
             self.api_instances.append(api)
             logger.info(f"Twitter API instance {i+1} initialized successfully")
         
         self._initialized = True
         logger.info(f"すべてのTwitter APIインスタンスの初期化が完了")
     
-    def _get_all_cookies_from_files(self) -> List[str]:
-        """cookiesフォルダからNetscape形式のCookieファイルを読み込み、Cookie文字列のリストを返す"""
-        all_cookies = []
-        
-        # cookiesフォルダのパスを取得（プロジェクトルート/cookies）
-        project_root = Path(__file__).parent.parent.parent
+    @staticmethod
+    def _account_username(cookies: str) -> str:
+        """Cookie値から既存アカウントと衝突しにくい追加用名を作る。
+
+        生Cookieやファイル名をDBのusername・ログへ入れない。Cookieが同じ場合は
+        同じ名前になるため、同一認証情報を実行のたびに無制限に増やさない。
+        """
+
+        digest = hashlib.sha256(cookies.encode("utf-8")).hexdigest()[:24]
+        return f"event_autopin_{digest}"
+
+    def _load_x_cookie_file(
+        self,
+        path: Path,
+    ) -> Tuple[Optional[str], Optional[str], bool, bool]:
+        """検証済みNetscapeファイルからX認証情報を読み込む。"""
+
+        cookie_jar = _read_cookie_jar_without_logging(path)
+        return _extract_x_cookie_pair(cookie_jar)
+
+    def _discover_x_cookies(self) -> List[str]:
+        """project_root/cookiesからX用Cookieを自動検出する。"""
+
+        project_root = self._resolve_project_root(
+            getattr(self, "project_root", None)
+        )
         cookies_dir = project_root / "cookies"
-        
-        if not cookies_dir.exists():
-            logger.warning(f"cookiesフォルダが見つかりません: {cookies_dir}")
-            return all_cookies
-        
-        # Cookieファイルを名前順にソートして処理
-        cookie_files = sorted(cookies_dir.glob("*.txt"))
-        
-        for cookie_file in cookie_files:
-            auth_token = None
-            ct0 = None
-            
+        try:
+            if not cookies_dir.is_dir():
+                logger.warning(
+                    "X用Cookieの自動検出先が見つかりません。"
+                    "プロジェクトroot/cookiesを確認してください"
+                )
+                return []
+            cookie_files = sorted(cookies_dir.glob("*.txt"))
+        except OSError:
+            logger.warning("X用Cookieの自動検出先を確認できません")
+            return []
+
+        all_cookies: List[str] = []
+        for cookie_path in cookie_files:
             try:
-                with open(cookie_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        # コメント行・空行をスキップ
-                        if not line or line.startswith('#'):
-                            continue
-                        
-                        # Netscape形式: domain\tflag\tpath\tsecure\texpiry\tname\tvalue
-                        parts = line.split('\t')
-                        if len(parts) >= 7:
-                            name = parts[5]
-                            value = parts[6]
-                            
-                            if name == 'auth_token':
-                                auth_token = value
-                            elif name == 'ct0':
-                                ct0 = value
-                
-                if auth_token and ct0:
-                    all_cookies.append(f"auth_token={auth_token}; ct0={ct0}")
-                    logger.info(f"Cookieファイルからアカウントを追加: {cookie_file.name}")
-                else:
-                    logger.warning(f"auth_tokenまたはct0が見つかりません: {cookie_file.name}")
-                    
-            except Exception as e:
-                logger.error(f"Cookieファイルの読み込みに失敗: {cookie_file.name} - {e}")
-        
+                validated_path = validate_cookie_file_path(
+                    str(cookie_path), project_root
+                )
+                auth_token, ct0, x_domain_seen, x_token_name_seen = (
+                    self._load_x_cookie_file(validated_path)
+                )
+            except CookieFileValidationError:
+                logger.warning("X用Cookie候補の検証に失敗したためスキップしました")
+                continue
+
+            if auth_token and ct0:
+                all_cookies.append(
+                    f"auth_token={auth_token}; ct0={ct0}"
+                )
+            elif x_domain_seen and x_token_name_seen:
+                logger.warning(
+                    "自動検出したX用Cookieのauth_tokenまたはct0が不足しています"
+                )
+
+        if all_cookies:
+            logger.info(
+                f"プロジェクトroot/cookiesからX用Cookieを"
+                f"{len(all_cookies)}件自動検出しました"
+            )
+        else:
+            logger.warning(
+                "プロジェクトroot/cookiesに利用可能なX用Cookieがありません"
+            )
         return all_cookies
+
+    def _get_all_cookies_from_files(self) -> List[str]:
+        """明示Cookieまたはproject_root/cookiesからX認証Cookieを取得する。"""
+
+        self._cookie_routing_reason = None
+        cookie_file = getattr(self, "cookie_file", None)
+        if cookie_file:
+            # 明示指定の失敗は自動検出へfallbackしない。選択内容と無関係な
+            # credentialを使わず、validatorの日本語エラーだけを呼び出し元へ返す。
+            try:
+                project_root = self._resolve_project_root(
+                    getattr(self, "project_root", None)
+                )
+                validated_path = validate_cookie_file_path(
+                    str(cookie_file), project_root
+                )
+                auth_token, ct0, x_domain_seen, x_token_name_seen = (
+                    self._load_x_cookie_file(validated_path)
+                )
+            except CookieFileValidationError:
+                logger.error("選択されたCookieファイルを検証できませんでした")
+                raise
+
+            if auth_token and ct0:
+                self._cookie_routing_reason = (
+                    "選択されたCookieファイルからX用認証Cookieを使用します"
+                )
+                logger.info(self._cookie_routing_reason)
+                return [f"auth_token={auth_token}; ct0={ct0}"]
+
+            if x_domain_seen and x_token_name_seen:
+                self._cookie_routing_reason = (
+                    "選択されたX用Cookieのauth_tokenまたはct0が不足しています"
+                )
+                logger.error(self._cookie_routing_reason)
+                raise ValueError(self._cookie_routing_reason)
+
+            self._cookie_routing_reason = (
+                "選択されたCookieにX用認証情報がないため、"
+                "プロジェクトroot/cookiesからX用Cookieを自動検出します"
+            )
+            logger.warning(self._cookie_routing_reason)
+
+        else:
+            self._cookie_routing_reason = (
+                "Cookie未指定のため、プロジェクトroot/cookiesから"
+                "X用Cookieを自動検出します"
+            )
+            logger.info(self._cookie_routing_reason)
+
+        return self._discover_x_cookies()
 
     def _create_api_instance(self) -> API:
         """共有project poolを使い、全アカウントロック時は長時間待たないAPIを作る。"""

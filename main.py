@@ -509,6 +509,15 @@ class CircleListGenerator:
             catalog_additional_prompt=self.config.get("catalog_additional_prompt", ""),
             event_date=self.config.get("event_date"),
             event_name=self.config.get("event_name") or None,
+            project_root=str(
+                self.config.get("project_root") or Path(__file__).resolve().parent
+            ),
+            collect_catalogs=bool(self.config.get("collect_catalogs", True)),
+            enable_twitter_catalog=bool(
+                self.config.get("enable_twitter_catalog", True)
+            ),
+            use_grok_search=bool(self.config.get("use_grok_search", False)),
+            grok_search_mode=str(self.config.get("grok_search_mode") or "api"),
             site_parsing_config=site_parsing_config,
             cookie_file=self.config.get("cookie_file"),
             pagination=pagination_config,
@@ -528,7 +537,12 @@ class CircleListGenerator:
                 timeout=site_config.timeout,
                 retry_count=site_config.retry_count,
                 cookies=load_cookies_for_url(
-                    site_config.base_url, cookie_file=site_config.cookie_file
+                    site_config.base_url,
+                    cookie_file=site_config.cookie_file,
+                    project_root=Path(
+                        site_config.project_root
+                        or Path(__file__).resolve().parent
+                    ),
                 ),
             )
             page_url = site_config.get_full_url(site_config.list_page_path or "")
@@ -549,6 +563,20 @@ class CircleListGenerator:
             format=output_format,
             output_dir=self.config["output_dir"],
             skip_circle_images=self.config.get("skip_circle_images", False),
+            collect_catalogs=bool(self.config.get("collect_catalogs", True)),
+            event_metadata={
+                key: self.config.get(key)
+                for key in (
+                    "event_sources",
+                    "event_urls",
+                    "crawl_data_source_urls",
+                    "crawl_settings",
+                    "map_config",
+                    "source_urls",
+                    "source_events",
+                )
+                if self.config.get(key) is not None
+            },
             create_zip=False,
         )
 
@@ -610,7 +638,12 @@ class CircleListGenerator:
             output_dir.mkdir(parents=True, exist_ok=True)
 
             # 全体進捗の初期化
-            twitter_enabled = self.config.get("enable_twitter_catalog", True)
+            # collect_catalogs はX検索スイッチとは独立した上位ガード。
+            # false のときは本文・画像解析/取得を起動しない。
+            collect_catalogs = self.config.get("collect_catalogs", True)
+            twitter_enabled = bool(
+                self.config.get("enable_twitter_catalog", True) and collect_catalogs
+            )
             has_map = regenerate_coordinates and self._should_generate_coordinates()
             total_steps = 3  # 基本: 初期化 + パイプライン + 後処理
             if twitter_enabled:
@@ -790,6 +823,10 @@ class CircleListGenerator:
                             "text_fallback_llm_enabled", True
                         ),
                         "output_dir": self.config["output_dir"],
+                         "project_root": self.config.get(
+                             "project_root", str(Path(__file__).resolve().parent)
+                         ),
+                         "cookie_file": self.config.get("cookie_file"),
                         "debug_limit": self.config.get(
                             "debug_limit", None
                         ),  # デバッグ用の処理数制限
@@ -798,6 +835,17 @@ class CircleListGenerator:
                         ),  # 追加プロンプト
                         "event_date": self.config.get("event_date"),
                         "use_grok_search": self.config.get("use_grok_search", False),
+                         "grok_search_mode": self.config.get("grok_search_mode", "api"),
+                         "grok_search_run_id": self.config.get(
+                             "grok_search_run_id", self.config.get("run_id")
+                         ),
+                         "grok_bot_chat": self.config.get("grok_bot_chat"),
+                         "grok_bot_root": self.config.get("grok_bot_root"),
+                         "grok_bot_python": self.config.get("grok_bot_python"),
+                         "grok_bot_owner_id": self.config.get("grok_bot_owner_id"),
+                         "grok_bot_chat_id": self.config.get("grok_bot_chat_id"),
+                         "grok_bot_timeout": self.config.get("grok_bot_timeout"),
+                         "collect_catalogs": collect_catalogs,
                         "use_grok_rescue": self.config.get("use_grok_rescue", True),
                         "grok_rescue_batch_size": self.config.get("grok_rescue_batch_size", 12),
                         "grok_rescue_timeout": self.config.get("grok_rescue_timeout", 900),
@@ -1042,11 +1090,27 @@ class CircleListGenerator:
                         f"event_dateが不正です（YYYY-MM-DD形式の実在日が必要）: {config_event_date}"
                     ) from exc
             else:
-                event_date_obj = datetime.now()
+                # 再処理で日付を省略した場合は保存済みevent.dateを正本に
+                # する。今日の日付で検索範囲をずらさない。
+                saved_date = (event_data.get("event") or {}).get("date")
+                event_date_obj = None
+                if isinstance(saved_date, str) and saved_date.strip():
+                    candidate = saved_date.strip()
+                    try:
+                        event_date_obj = datetime.strptime(candidate[:10], "%Y-%m-%d")
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"保存済みevent.dateが不正です（YYYY-MM-DD形式の実在日が必要）: {saved_date}"
+                        ) from exc
+                if event_date_obj is None:
+                    event_date_obj = datetime.now()
 
             circles_without_catalog = reprocessor.extract_circles_without_catalog(
                 event_data
             )
+
+            collect_catalogs = bool(self.config.get("collect_catalogs", True))
+            twitter_enabled = bool(self.config.get("enable_twitter_catalog", True))
 
             reprocess_progress.update(1, "event.json読み込み完了")
 
@@ -1069,12 +1133,38 @@ class CircleListGenerator:
 
                 return not coordinate_requested or coordinate_ok
 
+            # 再処理でも collect_catalogs は本文・画像収集の上位ガード。
+            # 既存event.jsonを壊さず、座標だけを明示された場合は後段へ進む。
+            if not collect_catalogs:
+                self.logger.info(
+                    "collect_catalogs=falseのため、保存済みevent.jsonのおしながき再処理をスキップします"
+                )
+                coordinate_requested = bool(
+                    regenerate_coordinates and self._should_generate_coordinates()
+                )
+                coordinate_ok = True
+                if coordinate_requested:
+                    coordinate_ok = self._generate_coordinates()
+                return not coordinate_requested or coordinate_ok
+
             self.logger.info(
                 f"\n{len(circles_without_catalog)}件のサークルを再処理します"
             )
 
             event_info = event_data.get("event", {})
             event_name = event_info.get("name", "")
+            source_prompts: Dict[str, str] = {}
+            raw_event_sources = self.config.get("event_sources")
+            if isinstance(raw_event_sources, list):
+                for raw_source in raw_event_sources:
+                    if not isinstance(raw_source, dict):
+                        continue
+                    source_url = str(raw_source.get("url") or "").strip()
+                    if not source_url:
+                        continue
+                    prompt = raw_source.get("catalog_additional_prompt")
+                    if isinstance(prompt, str):
+                        source_prompts[source_url.rstrip("/")] = prompt
 
             checked_tweets = self._load_checked_tweets(output_dir)
 
@@ -1083,7 +1173,7 @@ class CircleListGenerator:
             )
             twitter_config = TwitterConfig(
                 {
-                    "enabled": True,
+                    "enabled": twitter_enabled,
                     "days_before_event": self.config.get("days_before", 30),
                     "days_after_event": self.config.get("days_after", 7),
                     "max_workers": 1,
@@ -1112,12 +1202,27 @@ class CircleListGenerator:
                         "text_fallback_llm_enabled", True
                     ),
                     "output_dir": output_dir,
+                    "project_root": self.config.get(
+                        "project_root", str(Path(__file__).resolve().parent)
+                    ),
+                    "cookie_file": self.config.get("cookie_file"),
                     "debug_limit": self.config.get("debug_limit", None),
                     "catalog_additional_prompt": self.config.get(
                         "catalog_additional_prompt", ""
                     ),
-                    "event_date": self.config.get("event_date"),
-                    "use_grok_search": False,
+                    "event_date": event_date_obj.strftime("%Y-%m-%d"),
+                    "use_grok_search": self.config.get("use_grok_search", False),
+                    "grok_search_mode": self.config.get("grok_search_mode", "api"),
+                    "grok_search_run_id": self.config.get(
+                        "grok_search_run_id", self.config.get("run_id")
+                    ),
+                    "grok_bot_chat": self.config.get("grok_bot_chat"),
+                    "grok_bot_root": self.config.get("grok_bot_root"),
+                    "grok_bot_python": self.config.get("grok_bot_python"),
+                    "grok_bot_owner_id": self.config.get("grok_bot_owner_id"),
+                    "grok_bot_chat_id": self.config.get("grok_bot_chat_id"),
+                    "grok_bot_timeout": self.config.get("grok_bot_timeout"),
+                    "collect_catalogs": collect_catalogs,
                     "use_grok_rescue": self.config.get("use_grok_rescue", True),
                     "grok_rescue_batch_size": self.config.get("grok_rescue_batch_size", 12),
                     "grok_rescue_timeout": self.config.get("grok_rescue_timeout", 900),
@@ -1193,6 +1298,15 @@ class CircleListGenerator:
                     twitter_url=c.get("twitter_url", ""),
                 )
                 circle._circle_index = c["circle_index"]
+                source_circle = (
+                    (event_data.get("circles") or [])[c["circle_index"]]
+                    if isinstance(c.get("circle_index"), int)
+                    and 0 <= c["circle_index"] < len(event_data.get("circles") or [])
+                    else {}
+                )
+                circle._source_event_url = str(
+                    c.get("source_event_url") or source_circle.get("source_event_url") or ""
+                ).strip()
                 memo_catalog_urls = c.get("catalog_urls", [])
                 if memo_catalog_urls:
                     circle._memo_catalog_urls = memo_catalog_urls
@@ -1233,6 +1347,8 @@ class CircleListGenerator:
                     twitter_processor,
                     event,
                     on_circle_complete=checkpoint_reprocess_circle,
+                    allow_search=twitter_enabled,
+                    source_prompts=source_prompts,
                 )
             )
             twitter_summary = dict(twitter_processor.last_run_summary)
@@ -1375,10 +1491,64 @@ class CircleListGenerator:
         twitter_processor: Any,
         event: Any,
         on_circle_complete: Any = None,
+        allow_search: bool = True,
+        source_prompts: Optional[Dict[str, str]] = None,
     ) -> List[Any]:
-        """再処理対象を保存URL優先・timeline fallback付きで処理する。"""
-        search_targets = []
+        """再処理対象を保存URL優先・timeline fallback付きで処理する。
+
+        ``allow_search=False`` は enable_twitter_catalog=false の契約で、
+        event.jsonに残る明示ポストURLだけを直接処理する。
+        """
+        search_targets_by_prompt: Dict[str, List[Any]] = {}
+        source_prompts = source_prompts or {}
+        base_prompt = str(
+            getattr(getattr(twitter_processor, "config", None), "additional_prompt", "")
+            or ""
+        )
+
+        def prompt_for_circle(circle: Any) -> Optional[str]:
+            source_url = str(getattr(circle, "_source_event_url", "") or "").strip()
+            if not source_url:
+                return None
+            normalized = source_url.rstrip("/")
+            if normalized in source_prompts:
+                return source_prompts[normalized]
+            for candidate, prompt in source_prompts.items():
+                if candidate.rstrip("/") == normalized:
+                    return prompt
+            return None
+
+        def apply_prompt(prompt: Optional[str]) -> None:
+            config = getattr(twitter_processor, "config", None)
+            if config is None:
+                return
+            if prompt is None:
+                prompt = base_prompt
+            config.additional_prompt = prompt
+            extractor = getattr(twitter_processor, "twitter_extractor", None)
+            setter = getattr(extractor, "set_additional_prompt", None)
+            if callable(setter):
+                effective_prompt = setter(
+                    prompt,
+                    event_date=getattr(config, "event_date", None),
+                )
+                twitter_processor.effective_additional_prompt = effective_prompt
+                return
+            event_date = getattr(config, "event_date", None)
+            try:
+                from src.utils.date_utils import format_event_date_jp
+
+                date_jp = format_event_date_jp(event_date) if event_date else None
+            except Exception:
+                date_jp = None
+            twitter_processor.effective_additional_prompt = (
+                f"{date_jp}\n{prompt}" if date_jp and prompt else date_jp or prompt
+            )
+            if extractor is not None:
+                extractor.additional_prompt = prompt
+
         for circle in circles_to_process:
+            apply_prompt(prompt_for_circle(circle))
             direct_urls = getattr(circle, "_memo_catalog_urls", []) or []
             run_skip_ids = set(getattr(circle, "_skip_tweet_ids", []) or [])
 
@@ -1426,18 +1596,56 @@ class CircleListGenerator:
 
             # 保存URLがない場合だけでなく、保存URLで品目を得られなかった
             # 場合もtimeline検索へ進め、新しい投稿を拾えるようにする。
-            if not circle.items:
-                search_targets.append(circle)
+            if allow_search and not circle.items:
+                prompt = prompt_for_circle(circle)
+                search_targets_by_prompt.setdefault(prompt or "", []).append(circle)
 
-        if search_targets:
+        search_summaries: List[Dict[str, Any]] = []
+        for prompt_key, search_targets in search_targets_by_prompt.items():
+            apply_prompt(prompt_key if prompt_key else None)
             kwargs = {"debug_limit": len(search_targets)}
             if on_circle_complete is not None:
                 kwargs["on_circle_complete"] = on_circle_complete
-            await twitter_processor.process_circles(
-                search_targets,
-                event,
-                **kwargs,
-            )
+            await twitter_processor.process_circles(search_targets, event, **kwargs)
+            if isinstance(getattr(twitter_processor, "last_run_summary", None), dict):
+                search_summaries.append(dict(twitter_processor.last_run_summary))
+        if len(search_summaries) > 1:
+            merged_summary = dict(search_summaries[0])
+            for summary in search_summaries[1:]:
+                for key in (
+                    "target_count",
+                    "attempted_count",
+                    "processed_count",
+                    "failed_count",
+                    "invalid_url_count",
+                    "user_lookup_success_count",
+                    "tweet_fetch_success_count",
+                    "catalog_found_count",
+                    "no_catalog_found_count",
+                ):
+                    merged_summary[key] = int(merged_summary.get(key) or 0) + int(
+                        summary.get(key) or 0
+                    )
+                unresolved = merged_summary.setdefault("unresolved_targets", [])
+                unresolved.extend(summary.get("unresolved_targets") or [])
+                for key in ("target_outcomes", "queue_failure_details"):
+                    merged_list = merged_summary.setdefault(key, [])
+                    if isinstance(merged_list, list):
+                        merged_list.extend(summary.get(key) or [])
+                reasons = [
+                    str(value)
+                    for value in (merged_summary.get("reason"), summary.get("reason"))
+                    if value
+                ]
+                if reasons:
+                    merged_summary["reason"] = "; ".join(dict.fromkeys(reasons))
+                statuses = {str(merged_summary.get("status") or ""), str(summary.get("status") or "")}
+                merged_summary["status"] = (
+                    "failed" if "failed" in statuses else
+                    "partial" if "partial" in statuses else
+                    "ok"
+                )
+            twitter_processor.last_run_summary = merged_summary
         return circles_to_process
 
     def _build_reprocess_update(self, circle: Any) -> Optional[Dict[str, Any]]:

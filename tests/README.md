@@ -31,6 +31,13 @@ tests/
 
 2026-10-26のrole経路修正前に完了した全件実行は **847 passed**。最終role/diagnostic修正後のfocused Python testsは **99 passed**。最新の全件再実行はPlaywrightの`test_help_escape_consumes_document_event_before_map_shortcut`でViteページの`DOMContentLoaded` timeoutとなり、全件結果は未完了扱い。テスト追加時は記録を実測に合わせて更新する。
 
+2026-11-03の最終統合実測（修正前fixtureを含む）:
+
+- `tests/unit/test_crawl_screen_runtime.py` + `tests/unit/test_post_model_settings_runtime.py`: **12 passed**。
+- `tests/unit/` 全件: **1045 passed, 1 failed**（719.76秒）。一括実測時の唯一の失敗は `test_repository_manifest_candidates_pass_sensitive_data_scan` で、テストfixtureのダミーCookie値がcredential assignment判定に該当したもの。fixture修正後の `python -m pytest tests/unit/test_twitter_cookie_routing.py tests/unit/test_sync_public_repo_script.py -q` は **55 passed**（187.41秒）となり、この失敗原因を解消した。全unit一括の1046件成功とは記載しない。
+- venv focused backend 8-file: **67 passed**。release script: **13 passed**。Rust structured: **1 passed**。TypeScript全件/typecheck/build: **成功**。
+- Bot固有の実送信・外部サービス接続検証は、ユーザー免除により未実施。
+
 ## テスト対象外
 
 次のLLM関連テストは固定fixture/mockを使い、外部APIを呼び出さない。

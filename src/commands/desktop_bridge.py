@@ -52,6 +52,14 @@ from src.utils.reprocess_trace import (
     supports_keyword,
     trace_stage,
 )
+from src.utils.crawl_execution import (
+    CrawlValidationError,
+    crawl_output_lock,
+    create_backup,
+    normalize_crawl_payload,
+    save_crawl_project_config,
+    validate_crawl_payload,
+)
 
 
 def _utc_now_iso() -> str:
@@ -293,6 +301,18 @@ def _payload_url_list(payload: Dict[str, Any]) -> List[str]:
     raw_urls = payload.get("urls", payload.get("event_urls"))
     urls = _value_url_list(raw_urls)
 
+    # 新契約では event_sources がURLの正本になる。旧形式の url/urls を
+    # 先に採用し、同じURLを重複させずに後から補完する。
+    raw_sources = payload.get("event_sources")
+    if isinstance(raw_sources, list):
+        for source in raw_sources:
+            if not isinstance(source, dict):
+                continue
+            source_url = source.get("url")
+            for url in _value_url_list(source_url):
+                if url not in urls:
+                    urls.append(url)
+
     raw_url = payload.get("url")
     if isinstance(raw_url, str):
         for url in _value_url_list(raw_url):
@@ -335,10 +355,11 @@ def _payload_event_source_settings(payload: Dict[str, Any]) -> Dict[str, Dict[st
         source_url = url.strip()
         source_settings: Dict[str, Any] = {}
         map_urls = _value_url_list(raw_source.get("map_urls"))
+        map_urls_explicit = "map_urls" in raw_source or "map_url" in raw_source
         for map_url in _value_url_list(raw_source.get("map_url")):
             if map_url not in map_urls:
                 map_urls.append(map_url)
-        if map_urls:
+        if map_urls or map_urls_explicit:
             source_settings["map_urls"] = map_urls
 
         prompt = raw_source.get("catalog_additional_prompt")
@@ -350,6 +371,20 @@ def _payload_event_source_settings(payload: Dict[str, Any]) -> Dict[str, Dict[st
         if source_settings:
             settings[source_url] = source_settings
     return settings
+
+
+def _event_source_settings_for_url(
+    settings: Mapping[str, Dict[str, Any]], url: str
+) -> Optional[Dict[str, Any]]:
+    """URL末尾スラッシュ差を許容してsource設定を一つ選ぶ。"""
+
+    if url in settings:
+        return settings[url]
+    normalized = str(url or "").rstrip("/")
+    for source_url, source_settings in settings.items():
+        if str(source_url or "").rstrip("/") == normalized:
+            return source_settings
+    return None
 
 
 def _build_extract_command(payload: Dict[str, Any]) -> list[str]:
@@ -403,8 +438,13 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     config: Dict[str, Any] = {
         "url": urls[0] if urls else "",
         "output_dir": output_dir,
+        "project_root": str(project_root),
         "models": models,
+        "collect_catalogs": payload.get("collect_catalogs", True),
         "enable_twitter_catalog": payload.get("enable_twitter_catalog", True),
+        "use_grok_search": payload.get("use_grok_search", False),
+        "grok_search_mode": payload.get("grok_search_mode", "api"),
+        "skip_circle_images": payload.get("skip_circle_images", False),
         "text_llm_provider": payload.get("text_llm_provider")
         or DEFAULT_TEXT_PRIMARY_PROVIDER,
         "api_reasoning_effort": payload.get("api_reasoning_effort")
@@ -453,7 +493,25 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         "event_name",
         "catalog_additional_prompt",
         "debug_limit",
-        "use_grok_search",
+        "grok_search_mode",
+        "grok_search_run_id",
+        "run_id",
+        "collect_catalogs",
+        "backup",
+        "reprocess",
+        "regenerate_coordinates",
+        "verbose",
+        "event_sources",
+        "event_urls",
+        "crawl_data_source_urls",
+        "crawl_settings",
+        "map_config",
+        "grok_bot_chat",
+        "grok_bot_root",
+        "grok_bot_python",
+        "grok_bot_owner_id",
+        "grok_bot_chat_id",
+        "grok_bot_timeout",
         "text_llm_provider",
         "text_llm_cli_models",
         "text_llm_cli_efforts",
@@ -496,6 +554,11 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
                 config[key] = str(
                     validate_cookie_file_path(str(payload[key]), project_root)
                 )
+            elif key in {"grok_bot_root", "grok_bot_python"}:
+                bot_path = Path(str(payload[key]))
+                config[key] = str(
+                    bot_path if bot_path.is_absolute() else (project_root / bot_path).resolve()
+                )
             else:
                 config[key] = payload[key]
 
@@ -525,6 +588,28 @@ def _build_main_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         }
         if flat_config:
             config["ocr_config"] = flat_config
+
+    # multi-sourceだけでなくsingle-sourceでも、sourceごとのmap/promptを
+    # 実行設定へ接続する。source promptはfrontendでcommon+specificへ展開
+    # 済みなので、top-level commonを再度連結しない。optional_keysの
+    # top-level反映後に適用して上書きを防ぐ。
+    source_settings = _payload_event_source_settings(payload)
+    if len(urls) == 1 and source_settings:
+        single_source_settings = _event_source_settings_for_url(
+            source_settings, urls[0]
+        )
+        if single_source_settings is not None:
+            source_map_urls = single_source_settings.get("map_urls")
+            if isinstance(source_map_urls, list):
+                config.pop("map_url", None)
+                config.pop("map_urls", None)
+                if source_map_urls:
+                    config["map_url"] = source_map_urls[0]
+                    config["map_urls"] = list(source_map_urls)
+            if "catalog_additional_prompt" in single_source_settings:
+                config["catalog_additional_prompt"] = single_source_settings[
+                    "catalog_additional_prompt"
+                ]
 
     return config
 
@@ -1307,6 +1392,116 @@ def _job_ping(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _job_validate_crawl(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """クロール実行前の純粋な入力検証。
+
+    UIはこのjobで表示用の errors/warnings と、実行時にそのまま渡せる
+    normalized/plan を取得できます。外部サイト・LLM・Botへは接続しません。
+    """
+
+    result = validate_crawl_payload(
+        payload,
+        require_output_dir=False,
+        require_event_date=True,
+    )
+    normalized = result.get("normalized")
+    if result.get("valid") and isinstance(normalized, dict):
+        cookie_file = normalized.get("cookie_file")
+        if cookie_file not in (None, ""):
+            project_root = Path(
+                normalized.get("project_root") or payload.get("project_root") or Path.cwd()
+            ).resolve()
+            try:
+                normalized["cookie_file"] = str(
+                    validate_cookie_file_path(str(cookie_file), project_root)
+                )
+            except (OSError, ValueError) as exc:
+                result["valid"] = False
+                result["errors"] = [f"Cookieファイルが不正です: {exc}"]
+    return {
+        "status": "ok" if result.get("valid") else "error",
+        "job": "validate_crawl",
+        "timestamp": _utc_now_iso(),
+        **result,
+    }
+
+
+def _job_probe_grok_search(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Grok API/Build/Botの送信前probeを返す。"""
+
+    project_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+    try:
+        from dotenv import load_dotenv
+
+        # probeと実runで同じプロジェクトrootの.envを参照する。値自体は
+        # 戻り値へ含めず、既存の環境変数を明示的に上書きしない。
+        load_dotenv(project_root / ".env", override=False)
+    except (ImportError, OSError):
+        pass
+
+    from src.utils.grok_search_modes import check_grok_search_availability
+
+    def merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> Dict[str, Any]:
+        merged = deepcopy(dict(base))
+        for key, value in overlay.items():
+            if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+                merged[key] = merge(merged[key], value)
+            else:
+                merged[key] = deepcopy(value)
+        return merged
+
+    project_config: Dict[str, Any] = {}
+    config_path = project_root / "config.yaml"
+    if config_path.is_file():
+        try:
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, Mapping):
+                project_config = dict(loaded)
+        except (OSError, UnicodeError, yaml.YAMLError):
+            # Probe is non-fatal; malformed project config will be reported by
+            # the actual run/validation job instead of hiding mode availability.
+            project_config = {}
+    nested = payload.get("crawl_settings")
+    probe_config = merge(project_config, nested if isinstance(nested, Mapping) else {})
+    probe_config = merge(probe_config, payload)
+    probe_config["project_root"] = str(project_root)
+    for path_key in ("grok_bot_root", "grok_bot_python"):
+        raw_path = probe_config.get(path_key)
+        if raw_path:
+            bot_path = Path(str(raw_path))
+            probe_config[path_key] = str(
+                bot_path if bot_path.is_absolute() else (project_root / bot_path).resolve()
+            )
+
+    # UIへは常に3方式の可否を返す。選択方式はsettings.modeで示し、
+    # 利用可否表示のために未選択方式まで送信せずprobeする。
+    probe = check_grok_search_availability(mode=None, config=probe_config)
+    return {
+        "status": "ok",
+        "job": "probe_grok_search",
+        "timestamp": _utc_now_iso(),
+        **probe,
+    }
+
+
+# 呼び出し側の旧試作名を壊さないためのbridge alias。
+_job_check_grok_search = _job_probe_grok_search
+
+
+def _job_save_crawl_project_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """既存config.yamlを未知キー保持で更新する。機密値は返さない。"""
+
+    project_root = payload.get("project_root")
+    yaml_content = payload.get("yaml_content")
+    if not project_root:
+        raise ValueError("必須payload項目が不足しています: project_root")
+    if not isinstance(yaml_content, str):
+        raise ValueError("必須payload項目が不足しています: yaml_content")
+    # save_crawl_project_configは意図的にstatusだけを返す。config内容や
+    # credentialをbridge応答へエコーしない。
+    return save_crawl_project_config(project_root, yaml_content)
+
+
 def _hidden_process_options() -> Dict[str, int]:
     if os.name != "nt":
         return {}
@@ -1521,7 +1716,13 @@ def _aggregate_twitter_processing_results(
     failed = [summary for summary in summaries if summary.get("status") == "failed"]
     reasons = [str(summary.get("reason")) for summary in failed if summary.get("reason")]
     return {
-        "status": "failed" if failed else "ok",
+        "status": (
+            "failed"
+            if failed
+            else "partial"
+            if any(summary.get("status") == "partial" for summary in summaries)
+            else "ok"
+        ),
         "target_count": sum(int(s.get("target_count") or 0) for s in summaries),
         "processed_count": sum(int(s.get("processed_count") or 0) for s in summaries),
         "failed_count": sum(int(s.get("failed_count") or 0) for s in summaries),
@@ -1593,6 +1794,7 @@ def _merge_multi_event_outputs(
     sources: List[Dict[str, Any]],
     final_output_dir: Path,
     final_event_name: Optional[str] = None,
+    execution_metadata: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     _clear_output_dir(final_output_dir)
 
@@ -1601,6 +1803,7 @@ def _merge_multi_event_outputs(
     event_dicts: List[Dict[str, Any]] = []
     merged_maps: List[Dict[str, Any]] = []
     merged_circles: List[Dict[str, Any]] = []
+    merged_event_image: Any = None
 
     for source_index, source in enumerate(sources, start=1):
         source_dir = Path(source["output_dir"])
@@ -1640,6 +1843,14 @@ def _merge_multi_event_outputs(
                 {"name": source_name, "url": source_url, "circle_count": len(circles)}
             )
 
+        # event_imageも他の参照画像と同じく最終ディレクトリへコピーする。
+        if event.get("event_image"):
+            event_image = _copy_referenced_output_file(
+                source_dir, final_output_dir, event.get("event_image"), prefix
+            )
+            if merged_event_image in (None, ""):
+                merged_event_image = event_image
+
         map_number_map: Dict[int, int] = {}
         for event_map in event.get("maps") or []:
             if not isinstance(event_map, dict):
@@ -1677,13 +1888,18 @@ def _merge_multi_event_outputs(
             )
             item_images = []
             for image in merged_circle.get("item_images") or []:
-                if not isinstance(image, dict):
-                    continue
-                new_image = dict(image)
-                new_image["path"] = _copy_referenced_output_file(
-                    source_dir, final_output_dir, new_image.get("path"), prefix
-                )
-                item_images.append(new_image)
+                if isinstance(image, dict):
+                    new_image = dict(image)
+                    new_image["path"] = _copy_referenced_output_file(
+                        source_dir, final_output_dir, new_image.get("path"), prefix
+                    )
+                    item_images.append(new_image)
+                else:
+                    # 旧event.jsonでは item_images が文字列配列のことが
+                    # あるため、無効扱いで落とさず参照を維持する。
+                    item_images.append(
+                        _copy_referenced_output_file(source_dir, final_output_dir, image, prefix)
+                    )
             merged_circle["item_images"] = item_images
 
             if map_number_map and merged_circle.get("map_number") is not None:
@@ -1723,11 +1939,27 @@ def _merge_multi_event_outputs(
         "venue": _same_or_first([e.get("venue") for e in event_dicts]),
         "organizer": _same_or_first([e.get("organizer") for e in event_dicts]),
         "maps": merged_maps,
+        "event_image": merged_event_image,
         "memo": _first_non_empty([e.get("memo") for e in event_dicts])
         or "併催イベント:\n"
         + "\n".join(f"- {e['name']}: {e['url']}" for e in source_events),
         "created_at": _utc_now_iso(),
     }
+    if merged_event.get("event_image") in (None, ""):
+        merged_event.pop("event_image", None)
+    if isinstance(execution_metadata, Mapping):
+        for key in (
+            "event_sources",
+            "event_urls",
+            "crawl_data_source_urls",
+            "crawl_settings",
+            "map_config",
+        ):
+            value = execution_metadata.get(key)
+            if value not in (None, "", [], {}):
+                merged_event[key] = deepcopy(value)
+    if "event_urls" not in merged_event:
+        merged_event["event_urls"] = list(source_urls)
 
     merged_data = {
         "event": merged_event,
@@ -1865,6 +2097,17 @@ def _job_run_multi_main_pipeline(
             source_outputs,
             final_output_dir,
             final_event_name=str(payload.get("event_name") or "").strip() or None,
+            execution_metadata={
+                key: payload.get(key)
+                for key in (
+                    "event_sources",
+                    "event_urls",
+                    "crawl_data_source_urls",
+                    "crawl_settings",
+                    "map_config",
+                )
+                if payload.get(key) not in (None, "", [], {})
+            },
         )
 
         twitter_processing = _aggregate_twitter_processing_results(run_results)
@@ -1873,7 +2116,13 @@ def _job_run_multi_main_pipeline(
             atomic_write_json(final_output_dir / "event.json", merged)
 
     result = {
-        "status": "ok",
+        "status": (
+            "partial"
+            if twitter_processing and twitter_processing.get("status") == "partial"
+            else "error"
+            if twitter_processing and twitter_processing.get("status") == "failed"
+            else "ok"
+        ),
         "job": "run_main_pipeline",
         "timestamp": _utc_now_iso(),
         "mode": "multi_event",
@@ -1892,19 +2141,109 @@ def _job_run_multi_main_pipeline(
 
 
 def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
-    project_root = Path(payload.get("project_root") or Path.cwd()).resolve()
+    """Validate, lock, backup, and run the crawl subprocess."""
+
+    execution_input = dict(payload)
+    if execution_input.get("reprocess") and not execution_input.get("event_sources"):
+        output_dir_value = execution_input.get("output_dir")
+        if output_dir_value:
+            saved_event_path = Path(str(output_dir_value)) / "event.json"
+            try:
+                saved_data = json.loads(saved_event_path.read_text(encoding="utf-8"))
+                saved_sources = (saved_data.get("event") or {}).get("event_sources")
+                if isinstance(saved_sources, list) and saved_sources:
+                    execution_input["event_sources"] = deepcopy(saved_sources)
+            except (OSError, UnicodeError, ValueError, TypeError):
+                # JSONReprocessor/main will return the authoritative error if
+                # the saved event cannot be read.
+                pass
+
+    try:
+        execution_payload = normalize_crawl_payload(
+            execution_input,
+            require_output_dir=True,
+            # 旧CLIはサイトから開催日を取得できるため、未指定を許可。
+            # 明示されたevent_dateの形式はnormalize側で必ず検証する。
+            require_event_date=False,
+        )
+    except CrawlValidationError as exc:
+        return {
+            "status": "error",
+            "job": "run_main_pipeline",
+            "timestamp": _utc_now_iso(),
+            "returncode": 2,
+            "error_code": "invalid_crawl_payload",
+            "error": "; ".join(exc.errors),
+            "errors": list(exc.errors),
+            "warnings": list(exc.warnings),
+            "stdout": "",
+            "stderr": "; ".join(exc.errors),
+        }
+
+    project_root = Path(execution_payload.get("project_root") or Path.cwd()).resolve()
     main_py = project_root / "main.py"
     if not main_py.exists():
         raise FileNotFoundError(f"main.py not found under project_root: {project_root}")
 
-    urls = _payload_url_list(payload)
-    if len(urls) > 1 and not payload.get("reprocess"):
-        return _job_run_multi_main_pipeline(payload, project_root, main_py, urls)
+    try:
+        from dotenv import load_dotenv
 
-    config = _build_main_config(payload)
+        load_dotenv(project_root / ".env", override=False)
+    except (ImportError, OSError):
+        pass
+
+    urls = _payload_url_list(execution_payload)
+    output_dir = execution_payload.get("output_dir")
+    if not output_dir:
+        raise ValueError("output_dir is required")
+
+    # 出力ディレクトリ単位で二重実行を防ぐ。バックアップはロックを
+    # 取得した後、既存event.json/アセットを一度だけ複製する。
+    with crawl_output_lock(str(output_dir)):
+        backup_path = (
+            create_backup(
+                output_dir,
+                label="crawl",
+                backup_root=project_root / ".local" / "crawl-backups",
+            )
+            if execution_payload.get("backup")
+            else None
+        )
+        result = _job_run_main_pipeline_impl(
+            execution_payload,
+            project_root,
+            main_py,
+            urls,
+            backup_path=backup_path,
+        )
+        return result
+
+
+def _job_run_main_pipeline_impl(
+    execution_payload: Dict[str, Any],
+    project_root: Path,
+    main_py: Path,
+    urls: List[str],
+    *,
+    backup_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    if len(urls) > 1 and not execution_payload.get("reprocess"):
+        result = _job_run_multi_main_pipeline(
+            execution_payload, project_root, main_py, urls
+        )
+        if backup_path is not None:
+            result["backup"] = {
+                "status": "created",
+                "path": str(backup_path),
+            }
+        result["execution_plan"] = execution_payload.get("execution_plan")
+        result["validation_warnings"] = execution_payload.get("validation_warnings") or []
+        return result
+
+    config = _build_main_config(execution_payload)
 
     coordinate_started_ns: Optional[int] = None
-    if payload.get("regenerate_coordinates"):
+    if execution_payload.get("regenerate_coordinates"):
         coordinate_started_ns = time.time_ns()
         try:
             _invalidate_coordinate_artifacts(config.get("output_dir"))
@@ -1920,7 +2259,7 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
                 {
                     "returncode": 1,
                     "project_root": str(project_root),
-                    "config_used": _safe_config_for_result(config),
+                "config_used": _safe_config_for_result(config),
                     "stdout": "",
                     "stderr": _safe_diagnostic_text(exc),
                 }
@@ -1935,11 +2274,11 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         cmd = [sys.executable, str(main_py)]
-        if payload.get("verbose"):
+        if execution_payload.get("verbose"):
             cmd.append("--verbose")
-        if payload.get("reprocess"):
+        if execution_payload.get("reprocess"):
             cmd.append("--reprocess")
-        if payload.get("regenerate_coordinates"):
+        if execution_payload.get("regenerate_coordinates"):
             cmd.append("--regenerate-coordinates")
 
         env = os.environ.copy()
@@ -1990,7 +2329,7 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
             "config_used": _safe_config_for_result(config),
             **_pipeline_diagnostic_fields(
                 config,
-                payload,
+                execution_payload,
                 proc.returncode,
                 stdout_output,
                 stderr_lines.lines(),
@@ -2002,15 +2341,15 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
             _collect_coordinate_diagnostics(
                 config.get("output_dir"), minimum_mtime_ns=coordinate_started_ns
             )
-            if payload.get("regenerate_coordinates")
+            if execution_payload.get("regenerate_coordinates")
             else None
         )
-        if payload.get("regenerate_coordinates") and coordinate_diagnostics is None:
+        if execution_payload.get("regenerate_coordinates") and coordinate_diagnostics is None:
             coordinate_diagnostics = _missing_coordinate_diagnostic()
         if coordinate_diagnostics is not None:
             result["coordinate_generation"] = coordinate_diagnostics
             if (
-                payload.get("regenerate_coordinates")
+                execution_payload.get("regenerate_coordinates")
                 and coordinate_diagnostics.get("status") == "failed"
                 and proc.returncode == 0
             ):
@@ -2021,6 +2360,13 @@ def _job_run_main_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
         twitter_processing = _extract_twitter_processing_result(stderr_lines.lines())
         if twitter_processing:
             result["twitter_processing"] = twitter_processing
+        result["execution_plan"] = execution_payload.get("execution_plan")
+        result["validation_warnings"] = execution_payload.get("validation_warnings") or []
+        if backup_path is not None:
+            result["backup"] = {
+                "status": "created",
+                "path": str(backup_path),
+            }
         return result
 
 
@@ -5026,6 +5372,12 @@ JSONのみを返してください。
 def run_job(job: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if job == "ping":
         return _job_ping(payload)
+    if job == "validate_crawl":
+        return _job_validate_crawl(payload)
+    if job == "probe_grok_search":
+        return _job_probe_grok_search(payload)
+    if job == "save_crawl_project_config":
+        return _job_save_crawl_project_config(payload)
     if job == "extract_twitter_catalogs":
         return _job_extract_twitter_catalogs(payload)
     if job == "run_main_pipeline":
@@ -5065,6 +5417,9 @@ def run_job(job: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             "jobs": [
                 "ping",
                 "list_jobs",
+                "validate_crawl",
+                "probe_grok_search",
+                "save_crawl_project_config",
                 "extract_twitter_catalogs",
                 "run_main_pipeline",
                 "parse_site_preview",

@@ -20,7 +20,7 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .grok_build import GrokBuildError, classify_grok_build_failure, resolve_grok_bin
@@ -63,12 +63,22 @@ class GrokReply:
     findings: Dict[str, GrokFinding] = field(default_factory=dict)
 
 
-def build_prompt(handles: Iterable[str], event_name: str, event_date: datetime) -> str:
+def build_prompt(
+    handles: Iterable[str],
+    event_name: str,
+    event_date: datetime,
+    *,
+    days_before: int = 30,
+    days_after: int = 7,
+) -> str:
     """手作業で実績のあったプロンプト(アカウント一覧付き)。"""
     date_text = f"{event_date.year}年{event_date.month}月{event_date.day}日"
+    from_date = (event_date - timedelta(days=int(days_before))).strftime("%Y-%m-%d")
+    to_date = (event_date + timedelta(days=int(days_after))).strftime("%Y-%m-%d")
     lines = "\n".join(f"@{h}" for h in handles)
     return (
         f"Xで次のアカウントについて、{date_text}開催の同人イベント（{event_name}）向けの"
+        f"検索対象期間は{from_date}から{to_date}までです。"
         "『お品書き』ポストを探してください。各アカウントについて "
         "(a)アカウントが存在するか (b)今回のイベントのお品書きポストがあればURLと投稿日 "
         "(c)なければ未発見、を正直に。推測・捏造しない。別イベントや古い投稿は含めない。"
@@ -259,9 +269,25 @@ class GrokBuildXSearch:
     def batches(self, handles: List[str]) -> List[List[str]]:
         return [handles[i:i + self.batch_size] for i in range(0, len(handles), self.batch_size)]
 
-    def ask_batch(self, handles: List[str], event_name: str, event_date: datetime) -> GrokReply:
+    def ask_batch(
+        self,
+        handles: List[str],
+        event_name: str,
+        event_date: datetime,
+        *,
+        days_before: int = 30,
+        days_after: int = 7,
+    ) -> GrokReply:
         """1バッチ送信。例外時は呼び出し側で再送しないこと。"""
         text, model = self.runner(
-            build_prompt(handles, event_name, event_date), model=self.model, timeout=self.timeout
+            build_prompt(
+                handles,
+                event_name,
+                event_date,
+                days_before=days_before,
+                days_after=days_after,
+            ),
+            model=self.model,
+            timeout=self.timeout,
         )
         return GrokReply(text=text, model=model, findings=parse_reply(text, handles))

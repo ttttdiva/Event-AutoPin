@@ -12,6 +12,12 @@ desktop-app/src/catalog-image-viewer.ts
 desktop-app/src/catalog-image-viewer.test.ts
 desktop-app/src/coordinate-diagnostics.ts
 desktop-app/src/coordinate-diagnostics.test.ts
+desktop-app/src/crawl-presets.ts
+desktop-app/src/crawl-presets.test.ts
+desktop-app/src/crawl-settings.ts
+desktop-app/src/crawl-settings.test.ts
+desktop-app/src/crawl-validation.ts
+desktop-app/src/crawl-validation.test.ts
 desktop-app/src/features/cookie-file.ts
 desktop-app/src/file-asset-path.ts
 desktop-app/src/file-asset-path.test.ts
@@ -74,6 +80,7 @@ desktop-app/src-tauri/tauri.conf.json
 desktop-app/tsconfig.json
 desktop-app/vite.config.ts
 docs/desktop/tauri-python-windows-plan.md
+docs/crawl-execution-ui.md
 docs/mobile_crawl_plan.md
 docs/mobile-auto-update-standard.md
 docs/mobile-item-purchase-ui.md
@@ -266,9 +273,12 @@ src/utils/catalog_updater.py
 src/utils/circle_master.py
 src/utils/circle_cut_vision.py
 src/utils/circle_cut_policy.py
+src/utils/crawl_execution.py
 src/utils/cli_llm.py
 src/utils/grok_build.py
 src/utils/grok_build_x_search.py
+src/utils/grok_bot_search.py
+src/utils/grok_search_modes.py
 src/utils/x_account_status.py
 src/utils/antigravity_models.py
 src/utils/cookie_loader.py
@@ -308,11 +318,14 @@ tests/unit/test_catalog_post_joint.py
 tests/unit/test_post_model_settings_runtime.py
 tests/unit/test_coordinate_generation_diagnostics.py
 tests/unit/test_circle_master.py
+tests/unit/test_crawl_execution.py
+tests/unit/test_crawl_screen_runtime.py
 tests/unit/test_date_utils.py
 tests/unit/test_desktop_release_gate.py
 tests/unit/test_desktop_bridge.py
 tests/unit/test_desktop_mobile_zip_security.py
 tests/unit/test_grok_build.py
+tests/unit/test_grok_search_modes.py
 tests/unit/test_grok_rescue.py
 tests/unit/test_generic_adapter.py
 tests/unit/test_json_formatter.py
@@ -333,6 +346,8 @@ tests/unit/test_site_parsing_llm.py
 tests/unit/test_site_structure_role.py
 tests/unit/test_sync_public_repo_script.py
 tests/unit/test_twitter_extractor_fail_fast.py
+tests/unit/test_twitter_cookie_routing.py
+tests/unit/test_twitter_extractor_prompt.py
 tests/unit/test_twitter_post_processor_items.py
 tests/unit/test_twitter_processing_summary.py
 tests/unit/test_unlimited_ocr_parser.py

@@ -4,6 +4,7 @@ export type ModelPreflightSlot =
   | "text"
   | "text_fallback"
   | "site_structure"
+  | "site_structure_fallback"
   | "oshinagaki_post"
   | "vision"
   | "vision_fallback";
@@ -70,6 +71,7 @@ export function modelPreflightSlotsForOperation(
         "text",
         "text_fallback",
         "site_structure",
+        "site_structure_fallback",
         ...visionSlots,
         ...(twitterEnabled ? ["oshinagaki_post" as const] : []),
       ];

@@ -163,6 +163,13 @@ class SiteConfig:
     event_date: Optional[str] = None  # YYYY-MM-DD形式
     event_name: Optional[str] = None  # デスクトップアプリ側で入力されたイベント名
 
+    # クロール実行契約（TwitterConfigへ渡す前の正規化済み設定）。
+    collect_catalogs: bool = True
+    enable_twitter_catalog: bool = True
+    use_grok_search: bool = False
+    grok_search_mode: str = "api"
+    project_root: Optional[str] = None  # Cookie自動検出/相対設定の基準root
+
     def get_full_url(self, path: str = "") -> str:
         """完全なURLを生成"""
         if path.startswith("http"):
@@ -185,6 +192,14 @@ class OutputConfig:
     # ZIP設定
     create_zip: bool = True
     zip_compression: bool = True
+
+    # desktop bridgeのクロール契約をevent.jsonへ保存するための付帯情報。
+    # 旧呼び出しは未指定のまま利用できる。
+    event_metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # おしながき本文/画像由来の後処理を切り替える上位スイッチ。
+    # サークルカット取得はskip_circle_imagesで独立して制御する。
+    collect_catalogs: bool = True
 
     def get_output_path(self, filename: str) -> str:
         """出力ファイルパスを生成"""

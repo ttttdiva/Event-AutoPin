@@ -98,4 +98,22 @@ assert(
   revertedMemo.event.future_field.preserve,
   "memo競合の解決で未知event fieldが失われました",
 );
+
+const crawlSettings = {
+  event: {
+    event_sources: [{ name: "旧", url: "https://old.example" }],
+    crawl_settings: { enable_twitter_catalog: true },
+    crawl_data_source_urls: ["https://old.example"],
+    future_crawl_setting: { preserve: true },
+  },
+};
+mergeCommittedEventMetaPreservingUnknown(crawlSettings, {
+  event_sources: [{ name: "新", url: "https://new.example" }],
+  crawl_settings: { enable_twitter_catalog: false },
+  crawl_data_source_urls: ["https://new.example"],
+});
+assert((crawlSettings.event.event_sources as Array<{ name: string }>)[0].name === "新", "event_sources metadataがmergeされません");
+assert((crawlSettings.event.crawl_settings as { enable_twitter_catalog: boolean }).enable_twitter_catalog === false, "crawl_settings metadataがmergeされません");
+assert((crawlSettings.event.crawl_data_source_urls as string[])[0] === "https://new.example", "crawl_data_source_urls metadataがmergeされません");
+assert((crawlSettings.event.future_crawl_setting as { preserve: boolean }).preserve, "crawl_settings mergeで未知fieldが失われました");
 console.log("event-meta-merge tests passed");

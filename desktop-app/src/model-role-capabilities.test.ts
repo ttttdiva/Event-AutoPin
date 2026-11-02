@@ -158,6 +158,9 @@ if (!modelPreflightSlotsForOperation("pipeline", true).includes("oshinagaki_post
 if (!modelPreflightSlotsForOperation("pipeline", true).includes("site_structure")) {
   throw new Error("a pipeline must preflight the site structure role it invokes");
 }
+if (!modelPreflightSlotsForOperation("pipeline", true).includes("site_structure_fallback")) {
+  throw new Error("a pipeline must preflight the site structure fallback role it invokes");
+}
 if (modelPreflightSlotsForOperation("catalog_reprocess").join(",") !== "oshinagaki_post") {
   throw new Error("catalog reprocess must preflight only the post joint role");
 }

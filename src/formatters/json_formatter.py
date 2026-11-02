@@ -4,6 +4,7 @@ from typing import List, Dict, Any
 import json
 from pathlib import Path
 import logging
+from copy import deepcopy
 
 from ..core import BaseOutputFormatter
 from ..models import Circle, Event
@@ -24,8 +25,15 @@ class JSONFormatter(BaseOutputFormatter):
         """データをevent.jsonスキーマに変換して返す"""
         from datetime import datetime
 
+        event_data = event.to_dict()
+        configured_event_metadata = getattr(self.config, 'event_metadata', {})
+        if isinstance(configured_event_metadata, dict):
+            for key, value in configured_event_metadata.items():
+                if value is not None:
+                    event_data[key] = deepcopy(value)
+
         data = {
-            'event': event.to_dict(),
+            'event': event_data,
             'circles': [circle.to_dict() for circle in circles],
             'metadata': {
                 'generated_at': datetime.now().isoformat(),
@@ -82,6 +90,16 @@ class JSONFormatter(BaseOutputFormatter):
                     'completed',
                     'shopping_started_at',
                     'shopping_ended_at',
+                    # 新しいクロール契約。省略された値は既存event.json
+                    # から保持し、手動編集・再処理で失わない。
+                    'event_sources',
+                    'crawl_settings',
+                    'event_urls',
+                    'crawl_data_source_urls',
+                    'map_config',
+                    'source_urls',
+                    'source_events',
+                    'event_url',
                 ):
                     existing_value = existing_event.get(key)
                     if (

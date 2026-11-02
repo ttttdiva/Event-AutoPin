@@ -86,12 +86,21 @@ async def run_grok_rescue(
     config = processor.config
     summary: Dict[str, Any] = {
         "status": "skipped",
+        "mode": "build",
         "reason": None,
         "discovery_model": None,
         "candidate_count": 0,
         "batches": 0,
         "processed": [],
     }
+    # 新GUIの明示modeでは、Build選択時だけ救済段を実行する。
+    # mode未指定のlegacyはuse_grok_rescue(default=true)を維持する。
+    if getattr(config, "grok_search_mode_explicit", False) and not getattr(
+        config, "grok_build_enabled", False
+    ):
+        selected = getattr(config, "grok_search_mode", None) or "未指定"
+        summary["reason"] = f"disabled by selected mode ({selected})"
+        return summary
     if not getattr(config, "use_grok_rescue", True):
         summary["reason"] = "disabled by config (use_grok_rescue=false)"
         return summary
@@ -133,7 +142,14 @@ async def run_grok_rescue(
         for batch in searcher.batches(handles):
             summary["batches"] += 1
             try:
-                reply = await asyncio.to_thread(searcher.ask_batch, batch, event.name, event_date)
+                reply = await asyncio.to_thread(
+                    searcher.ask_batch,
+                    batch,
+                    event.name,
+                    event_date,
+                    days_before=getattr(config, "days_before_event", 30),
+                    days_after=getattr(config, "days_after_event", 7),
+                )
                 consecutive_failures = 0
             except GrokBuildError as exc:
                 # unknown_deliveryは再送しない。以降のバッチも続けるが、連続失敗で打ち切る。

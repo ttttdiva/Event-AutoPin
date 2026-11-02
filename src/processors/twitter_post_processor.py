@@ -46,6 +46,7 @@ from ..utils.llm_attempts import (
     DEFAULT_TEXT_PRIMARY_MODEL,
     DEFAULT_TEXT_PRIMARY_PROVIDER,
 )
+from ..utils.grok_search_modes import resolve_grok_search_settings
 
 
 _SAFE_FETCH_OUTCOMES = {
@@ -199,16 +200,38 @@ class TwitterConfig:
             else raw_model
         )  # モデル名を直接指定
         self.output_dir = config_dict.get('output_dir', 'twitter_catalogs')
+        # サイト用Cookieの選択値も受け取るが、X認証への利用可否は
+        # TwitterExtractor側でdomainとauth_token/ct0の組み合わせを検証する。
+        self.cookie_file = config_dict.get('cookie_file') or None
+        self.project_root = config_dict.get('project_root') or None
         self.debug_limit = config_dict.get('debug_limit', None)  # デバッグ用の処理数制限
         self.additional_prompt = config_dict.get('catalog_additional_prompt', '')  # 追加プロンプト
         self.event_date = config_dict.get('event_date')  # YYYY-MM-DD形式
-        self.use_grok_search = config_dict.get('use_grok_search', False)
+        # Grok検索の新契約とlegacy設定を一箇所で解決する。
+        # use_grok_searchはGUI全体のon/off、新GUIの明示modeでは選択方式
+        # だけが実行される。mode未指定時はAPI/Buildの旧独立挙動を保つ。
+        grok_settings = resolve_grok_search_settings(config_dict)
+        self.grok_search_settings = grok_settings
+        self.use_grok_search = grok_settings.enabled
+        self.grok_search_mode = grok_settings.mode
+        self.grok_search_mode_explicit = grok_settings.explicit_mode
+        self.grok_search_mode_valid = grok_settings.mode_valid
+        self.grok_api_enabled = grok_settings.api_enabled
+        self.grok_build_enabled = grok_settings.build_enabled
+        self.grok_bot_enabled = grok_settings.bot_enabled
         # twscrape後もお品書きが空のサークルを、Grok Build(grok.exe, web検索)で再探索する段。
-        # use_grok_search(xAI API版)とは別物。grok.exeが無い/未ログインなら理由を記録して続行する。
+        # mode未指定の旧設定でのみ、use_grok_rescueの既定trueを維持する。
         self.use_grok_rescue = bool(config_dict.get('use_grok_rescue', True))
         self.grok_rescue_batch_size = int(config_dict.get('grok_rescue_batch_size') or 12)
         self.grok_rescue_timeout = float(config_dict.get('grok_rescue_timeout') or 900)
         self.grok_rescue_model = config_dict.get('grok_rescue_model') or None
+        self.grok_bot_chat = config_dict.get('grok_bot_chat')
+        self.grok_bot_owner_id = config_dict.get('grok_bot_owner_id')
+        self.grok_bot_chat_id = config_dict.get('grok_bot_chat_id')
+        self.grok_bot_root = config_dict.get('grok_bot_root')
+        self.grok_bot_python = config_dict.get('grok_bot_python')
+        self.grok_bot_timeout = float(config_dict.get('grok_bot_timeout') or self.grok_rescue_timeout)
+        self.grok_search_run_id = config_dict.get('grok_search_run_id') or config_dict.get('run_id')
         self.image_llm_provider = config_dict.get('image_llm_provider') or DEFAULT_IMAGE_PRIMARY_PROVIDER
         if ':' in self.image_llm_provider:
             self.image_provider_kind, self.image_llm_provider_name = self.image_llm_provider.split(':', 1)
@@ -386,6 +409,8 @@ class TwitterPostProcessor:
             reasoning_effort=config.api_reasoning_effort,
             api_reasoning_effort_map=config.api_reasoning_effort_map,
             attempts=text_attempts,
+            cookie_file=config.cookie_file,
+            project_root=config.project_root,
         )
         self.progress = ProgressLogger()
         image_attempts = build_image_llm_attempts(
@@ -451,6 +476,10 @@ class TwitterPostProcessor:
         self.x_account_status: Dict[str, Dict[str, Any]] = {}
         self.last_run_summary: Dict[str, Any] = {
             "status": "not_started",
+            "grok_search_mode": getattr(config, "grok_search_mode", None),
+            "grok_search_mode_explicit": bool(
+                getattr(config, "grok_search_mode_explicit", False)
+            ),
             "target_count": 0,
             "attempted_count": 0,
             "processed_count": 0,
@@ -470,15 +499,29 @@ class TwitterPostProcessor:
             "reason": None,
         }
 
-        # Grok検索クライアントの初期化
+        # Grok検索クライアントの初期化。API/Build/Botの方式を混在させない。
         self.grok_client = None
-        if config.use_grok_search:
+        self.grok_bot_client = None
+        if getattr(config, 'grok_api_enabled', getattr(config, 'use_grok_search', False)):
             try:
                 from ..utils.grok_search_client import GrokSearchClient
                 self.grok_client = GrokSearchClient()
                 logger.info("Grok search client initialized")
             except Exception as e:
                 logger.warning(f"Grok検索の初期化に失敗（twscrapeにフォールバック）: {e}")
+        if getattr(config, 'grok_bot_enabled', False):
+            try:
+                from ..utils.grok_bot_search import GrokBotSearchClient
+
+                self.grok_bot_client = GrokBotSearchClient(config)
+                logger.info("Grok Bot search client initialized")
+            except Exception as e:
+                # Botは選択方式以外へ自動切替せず、処理時に安全なエラーを
+                # 記録してtwscrapeへ戻す。認証値はログへ出さない。
+                logger.warning(
+                    "Grok Bot検索の初期化に失敗（twscrapeにフォールバック）: %s",
+                    type(e).__name__,
+                )
 
     def _ensure_catalog_analyzer(self) -> Any:
         """Initialize legacy per-image vision analysis only when it is needed."""
@@ -804,6 +847,10 @@ class TwitterPostProcessor:
         """
         self.last_run_summary = {
             "status": "running",
+            "grok_search_mode": getattr(self.config, "grok_search_mode", None),
+            "grok_search_mode_explicit": bool(
+                getattr(self.config, "grok_search_mode_explicit", False)
+            ),
             "target_count": 0,
             "attempted_count": 0,
             "processed_count": 0,
@@ -827,7 +874,19 @@ class TwitterPostProcessor:
             return circles
 
         logger.info(f"Starting Twitter processing for {len(circles)} circles")
-        if self.grok_client:
+        if getattr(self.config, "grok_search_mode_explicit", False):
+            selected_mode = getattr(self.config, "grok_search_mode", None)
+            if not getattr(self.config, "use_grok_search", False):
+                logger.info("Grok検索: OFF（明示modeのためBuild救済も停止）")
+            elif selected_mode == "api":
+                logger.info("Mode: Grok x_search API (with twscrape fallback)")
+            elif selected_mode == "bot":
+                logger.info("Mode: AoiTalk Grok Bot Chat (with twscrape fallback)")
+            elif selected_mode == "build":
+                logger.info("Mode: twscrape + Grok Build rescue")
+            else:
+                logger.warning("Grok検索modeが不正のため、Grok方式を停止します")
+        elif self.grok_client:
             logger.info("Mode: Grok x_search (with twscrape fallback)")
         else:
             logger.info("Mode: twscrape + LLM")
@@ -1123,7 +1182,21 @@ class TwitterPostProcessor:
             # レート制限対策
             await asyncio.sleep(self.config.rate_limit_seconds)
 
-            # Grokモード or twscrapeモード
+            # Grok方式 or twscrapeモード。新契約は選択方式だけを通す。
+            if getattr(self, "grok_bot_client", None):
+                try:
+                    return await self._process_with_grok_bot(
+                        circle, username, event_date, event_name
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Grok Bot検索に失敗（twscrapeにフォールバック）: %s: %s",
+                        circle.name,
+                        type(e).__name__,
+                    )
+                    return await self._process_with_twscrape(
+                        circle, username, event_date, event_name
+                    )
             if self.grok_client:
                 try:
                     return await self._process_with_grok(circle, username, event_date, event_name)
@@ -1212,6 +1285,86 @@ class TwitterPostProcessor:
             else:
                 logger.info(f"Grok: 画像なし - {circle.name}")
 
+        return circle
+
+    async def _process_with_grok_bot(
+        self,
+        circle: Circle,
+        username: str,
+        event_date: datetime,
+        event_name: str,
+    ) -> Circle:
+        """AoiTalkのChat専用Grok Bot方式で検索する。"""
+
+        result = await self.grok_bot_client.search_catalog_tweet(
+            username=username,
+            event_name=event_name,
+            event_date=event_date,
+            days_before=self.config.days_before_event,
+            days_after=self.config.days_after_event,
+            additional_prompt=self.effective_additional_prompt,
+        )
+        if result.get("error"):
+            raise RuntimeError(f"Grok Bot error: {str(result['error'])[:120]}")
+
+        # API方式と同じJSON契約へ正規化し、画像取得・分類は既存処理へ委譲する。
+        return await self._apply_grok_search_result(
+            circle, username, result, event_name,
+        )
+
+    async def _apply_grok_search_result(
+        self,
+        circle: Circle,
+        username: str,
+        result: Dict[str, Any],
+        event_name: str,
+    ) -> Circle:
+        """API/Botの検索結果をサークルへ適用する共通処理。"""
+
+        if not result.get("found"):
+            logger.info(f"Grok: お品書きツイートなし - {circle.name} (@{username})")
+            return circle
+
+        if result.get("is_absence"):
+            circle.absence_status = "欠席"
+            logger.info(f"Grok: 欠席 - {circle.name} (reason: {result.get('reason', '')})")
+            return circle
+
+        if result.get("is_existing_only"):
+            circle.existing_only_status = "既刊のみ"
+            logger.info(f"Grok: 既刊のみ - {circle.name} (reason: {result.get('reason', '')})")
+
+        if result.get("is_preview"):
+            circle.catalog_status = "preview"
+            logger.info(f"Grok: おしながき予告 - {circle.name} (reason: {result.get('reason', '')})")
+        else:
+            circle.catalog_status = "confirmed"
+
+        tweet_url = result.get("tweet_url")
+        tweet_id = result.get("tweet_id")
+        if tweet_id:
+            circle._checked_tweet_ids = [int(tweet_id)]
+
+        detected_genre = result.get("genre", "")
+        if detected_genre:
+            circle._detected_genre = detected_genre
+        product_types = result.get("product_types", []) or []
+        circle._product_types = list(product_types) if isinstance(product_types, list) else []
+
+        if tweet_url:
+            memo_prefix = circle.memo + "\n" if circle.memo else ""
+            circle.memo = memo_prefix + tweet_url
+            logger.info(f"Grok: お品書き発見 - {circle.name} -> {tweet_url}")
+
+        if circle.catalog_status == "preview":
+            return circle
+
+        if tweet_id:
+            media_urls = await self._fetch_tweet_media(tweet_id)
+            if media_urls:
+                await self._download_and_process_images(circle, media_urls)
+            else:
+                logger.info(f"Grok: 画像なし - {circle.name}")
         return circle
 
     async def _process_with_twscrape(

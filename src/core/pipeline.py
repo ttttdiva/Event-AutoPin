@@ -165,6 +165,11 @@ class ExtractionPipeline:
         cookies = load_cookies_for_url(
             site_config.base_url,
             cookie_file=site_config.cookie_file,
+            project_root=(
+                Path(site_config.project_root)
+                if getattr(site_config, "project_root", None)
+                else None
+            ),
         )
         if cookies:
             self.logger.info(f"Cookieを読み込みました ({len(cookies)} cookies)")
@@ -259,11 +264,16 @@ class ExtractionPipeline:
                     "last": {"status": "not_checked", "reason": "skip_circle_images"},
                 }
 
-            # 5.5. サークルカット未設定 & おしながき画像ありのサークルをデフォルトカットに登録
-            self._register_missing_cuts_as_default(circles)
-
-            # 5.6. おしながき画像からサークルジャンルを判定・保存
-            self._detect_and_save_genres(circles)
+            # 5.5/5.6. おしながき由来の代用カット・ジャンル判定は
+            # collect_catalogs=false なら起動しない。サークルカット自体の
+            # 取得/validation は上のskip_circle_imagesだけで独立制御する。
+            if getattr(self.output_config, "collect_catalogs", True):
+                self._register_missing_cuts_as_default(circles)
+                self._detect_and_save_genres(circles)
+            else:
+                self.logger.info(
+                    "おしながき収集をスキップ（本文/画像由来のジャンル・代用カット処理なし）"
+                )
 
             # 6. マップ画像ダウンロード
             self._download_maps(event)

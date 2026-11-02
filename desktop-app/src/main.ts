@@ -128,6 +128,33 @@ import {
 } from "./history-search-ui";
 import { mergeCommittedEventMetaPreservingUnknown } from "./state/event-meta-merge";
 import {
+  DEFAULT_CRAWL_SETTINGS,
+  normalizeCrawlSettings,
+  normalizeCrawlSources,
+  normalizedSource,
+  parseUrlList,
+  promptForSource,
+  serializePromptSections,
+  sourceUrls,
+  splitPromptSections,
+  type CrawlSettings,
+  type CrawlSource,
+} from "./crawl-settings";
+import {
+  crawlValidationMessage,
+  validateCrawlRequest,
+} from "./crawl-validation";
+import {
+  CRAWL_PRESETS_STORAGE_KEY,
+  CRAWL_MODEL_PRESET_FORM_IDS,
+  filterCrawlModelPresetForm,
+  readCrawlPresets,
+  removeCrawlPreset,
+  upsertCrawlPreset,
+  writeCrawlPresets,
+  type CrawlPreset,
+} from "./crawl-presets";
+import {
   eventSyncFingerprintsMatch,
   type EventSyncChangeKind,
   type EventSyncPreview,
@@ -1116,6 +1143,18 @@ function cookieExpirySummary(validation: CookieValidationMetadata): string {
 
 function renderCookieSnapshot(snapshot: CookieFileSnapshot) {
   if (cookieFileClearBtn) cookieFileClearBtn.disabled = !snapshot.hasSelection;
+  const cookieState = snapshot.state === "validating"
+    ? "validating"
+    : snapshot.state === "ready"
+      ? "ready"
+      : snapshot.state === "error"
+        ? "error"
+        : "idle";
+  cookieFileDropZoneEl?.setAttribute("data-cookie-state", cookieState);
+  if (cookieFileDropStateEl) {
+    cookieFileDropStateEl.hidden = cookieState === "idle";
+    cookieFileDropStateEl.setAttribute("aria-hidden", String(cookieState === "idle"));
+  }
   cookieFileDropZoneEl?.setAttribute(
     "data-drop-state",
     snapshot.state === "validating"
@@ -1164,10 +1203,10 @@ function renderCookieSnapshot(snapshot: CookieFileSnapshot) {
   if (cookieFileStatusEl) cookieFileStatusEl.textContent = "明示Cookieファイル: 未選択";
   if (cookieFileDropHintEl) {
     cookieFileDropHintEl.textContent =
-      "明示ファイルを使う場合はNetscape .txtを1件指定してください。未選択でも、対象URLに応じたCookieファイルの自動検出が実行時に行われる場合があります。";
+      "Netscape .txt・最大2MB。未選択時は対象URLに応じて自動検出されます。";
   }
   if (cookieFileDropStateEl) {
-    cookieFileDropStateEl.textContent = "明示ファイル未選択（自動検出は無効化されません）。";
+    cookieFileDropStateEl.textContent = "";
   }
 }
 
@@ -1290,6 +1329,11 @@ function safeDroppedCookieFileName(name: string): string {
 
 function renderCookieDropHover() {
   cookieFileDropZoneEl?.setAttribute("data-drop-state", "hover");
+  cookieFileDropZoneEl?.setAttribute("data-cookie-state", "validating");
+  if (cookieFileDropStateEl) {
+    cookieFileDropStateEl.hidden = false;
+    cookieFileDropStateEl.setAttribute("aria-hidden", "false");
+  }
   if (cookieFileStatusEl) cookieFileStatusEl.textContent = "Cookieファイルを確認中…";
   if (cookieFileDropHintEl) {
     cookieFileDropHintEl.textContent = "Netscape .txtを1件ドロップしてください。";
@@ -2227,6 +2271,7 @@ function hydrateModelControls(preferences: ModelControlPreferences = {}) {
     siteStructurePreference,
     "text",
   );
+  hydrateSiteStructureFallbackControls(siteStructurePreference, legacySiteStructureFallback);
   const mirroredPostRole = {
     provider: controlValue("visionModel") || DEFAULT_MODEL_SELECTIONS.image.provider,
     model: controlValue("visionModelId") || DEFAULT_MODEL_SELECTIONS.image.model,
@@ -2348,6 +2393,50 @@ function hydrateRoleFallbackControls(
   }
 }
 
+function hydrateSiteStructureFallbackControls(
+  preference: ModelSelectionPreference,
+  legacyFallback: ModelSelectionPreference | null = null,
+): void {
+  const providerId = "siteStructureFallbackModelProvider";
+  const modelId = "siteStructureFallbackModel";
+  const effortId = "siteStructureFallbackReasoningEffort";
+  const providerSelect = document.getElementById(providerId) as HTMLSelectElement | null;
+  const modelSelect = document.getElementById(modelId) as HTMLSelectElement | null;
+  if (!providerSelect || !modelSelect) return;
+  const fallbackDefault = DEFAULT_MODEL_SELECTIONS.textFallback;
+  const providerValue = firstNonEmpty(
+    preference.fallback_provider,
+    legacyFallback?.fallback_provider,
+    controlValue(providerId),
+    fallbackDefault.provider,
+  );
+  setSelectOptions(providerSelect, textProviderOptions(), providerValue);
+  const modelValue = firstNonEmpty(
+    preference.fallback_model,
+    legacyFallback?.fallback_model,
+    controlValue(modelId),
+    providerValue === fallbackDefault.provider ? fallbackDefault.model : "",
+  );
+  updateProviderModelSelect(providerId, modelId, effortId, modelValue || undefined, "text");
+  const selection = parseTextProviderValue(providerSelect.value || providerValue);
+  setEffortOptions(
+    effortId,
+    firstNonEmpty(
+      preference.fallback_effort,
+      legacyFallback?.fallback_effort,
+      controlValue(effortId),
+      providerValue === fallbackDefault.provider && modelSelect.value === fallbackDefault.model
+        ? fallbackDefault.effort
+        : undefined,
+    ),
+    reasoningEffortsForSelection(selection, modelSelect.value),
+  );
+  const enabledEl = document.getElementById("siteStructureFallbackEnabled") as HTMLInputElement | null;
+  if (enabledEl && preference.fallback_enabled !== undefined) {
+    enabledEl.checked = preference.fallback_enabled;
+  }
+}
+
 async function loadModelCatalog(forceRefresh = false): Promise<boolean> {
   const requestGeneration = ++modelCatalogRequestGeneration;
   const requestProjectRoot = projectRootEl.value || ".";
@@ -2444,6 +2533,16 @@ async function preflightSelectedModels(
       ),
       model: controlValue("siteStructureModel") || DEFAULT_MODEL_SELECTIONS.siteStructure.model,
       role: "text",
+    },
+    {
+      slot: "site_structure_fallback",
+      selection: parseTextProviderValue(
+        controlValue("siteStructureFallbackModelProvider") || DEFAULT_MODEL_SELECTIONS.textFallback.provider,
+      ),
+      model: controlValue("siteStructureFallbackModel") || DEFAULT_MODEL_SELECTIONS.textFallback.model,
+      role: "text",
+      fallback: true,
+      enabled: checkboxValue("siteStructureFallbackEnabled", true),
     },
     {
       slot: "oshinagaki_post",
@@ -2786,14 +2885,24 @@ function selectedRoleSettings(
 }
 
 function selectedSiteStructureRole() {
-  return {
-    ...selectedRoleSettings(
+  const primary = selectedRoleSettings(
       "siteStructureModelProvider",
       "siteStructureModel",
       "siteStructureReasoningEffort",
       DEFAULT_MODEL_SELECTIONS.siteStructure,
-    ),
-    ...(legacySiteStructureFallback || {}),
+    );
+  const fallback = selectedRoleSettings(
+    "siteStructureFallbackModelProvider",
+    "siteStructureFallbackModel",
+    "siteStructureFallbackReasoningEffort",
+    DEFAULT_MODEL_SELECTIONS.textFallback,
+  );
+  return {
+    ...primary,
+    fallback_enabled: checkboxValue("siteStructureFallbackEnabled", true),
+    fallback_provider: fallback.provider || legacySiteStructureFallback?.fallback_provider || "",
+    fallback_model: fallback.model || legacySiteStructureFallback?.fallback_model || "",
+    fallback_effort: fallback.effort || legacySiteStructureFallback?.fallback_effort || "",
     cli_timeout: 900,
   };
 }
@@ -2828,6 +2937,16 @@ function modelSelectionLabel(selection: TextProviderSelection, model: string, ef
 }
 
 function updateModelExecutionOrderSummaries(): void {
+  const effortLabels: Array<[string, string]> = [
+    ["crawlTextEffort", selectedTextEffort()],
+    ["crawlSiteEffort", selectedSiteStructureRole().effort],
+    ["crawlPostEffort", selectedCatalogPostRole().effort],
+    ["crawlImageEffort", selectedImageConfig().effort],
+  ];
+  for (const [id, effort] of effortLabels) {
+    const element = document.getElementById(id);
+    if (element) element.textContent = `effort : ${effort || "—"}`;
+  }
   const textFallback = selectedTextFallbackEnabled()
     ? modelSelectionLabel(
         selectedTextFallbackProvider(),
@@ -3086,7 +3205,14 @@ function saveColWidths(widths: Record<string, number>) {
 let colWidths = loadColWidths();
 
 function boolFromSelect(id: string): boolean {
-  return (document.getElementById(id) as HTMLSelectElement).value === "true";
+  const element = document.getElementById(id) as HTMLSelectElement | null;
+  if (!element) return false;
+  return element.value === "true";
+}
+
+function setBoolSelect(id: string, value: boolean): void {
+  const element = document.getElementById(id) as HTMLSelectElement | null;
+  if (element) element.value = value ? "true" : "false";
 }
 
 function escapeHtml(v: string): string {
@@ -3537,9 +3663,14 @@ async function saveConfig() {
     },
   });
 
-  await saveProjectConfig();
-  resultEl.textContent = "設定を保存しました";
-  await loadModelCatalog(true);
+  try {
+    await saveProjectConfig();
+    projectCrawlSettings = currentCrawlSettings();
+    resultEl.textContent = "設定を保存しました";
+    await loadModelCatalog(true);
+  } catch (error) {
+    resultEl.textContent = `設定保存エラー: ${String(error)}`;
+  }
 }
 
 function currentOcrConfigPayload(): Record<string, unknown> {
@@ -8064,102 +8195,19 @@ refreshModelCatalogBtn?.addEventListener("click", () => loadModelCatalog(true));
 );
 
 function setEventPipelineButtonsDisabled(disabled: boolean): void {
-  (document.getElementById("runExtractBtn") as HTMLButtonElement).disabled = disabled;
-  (document.getElementById("runPipelineBtn") as HTMLButtonElement).disabled = disabled;
+  const runButton = document.getElementById("runPipelineBtn") as HTMLButtonElement | null;
+  if (runButton) runButton.disabled = disabled;
   for (const element of document.querySelectorAll<HTMLElement>(
     "#eventList, .tab-pane",
   )) {
     element.inert = disabled;
     element.setAttribute("aria-busy", disabled ? "true" : "false");
   }
+  const bar = document.querySelector<HTMLElement>(".crawl-run-bar");
+  if (bar) bar.dataset.state = disabled ? "busy" : "ready";
+  const state = document.getElementById("crawlRunState");
+  if (state) state.textContent = disabled ? "実行中" : "実行準備";
 }
-
-(
-  document.getElementById("runExtractBtn") as HTMLButtonElement
-).addEventListener("click", async () => {
-  if (!canStartPipeline(operationState)) {
-    resultEl.textContent = "別のイベント処理を実行中です。完了後に再実行してください。";
-    return;
-  }
-  applyOperationEvent({ type: "request-pipeline" });
-  setEventPipelineButtonsDisabled(true);
-  try {
-  const preflightPlan = await preflightSelectedModels(
-    modelPreflightSlotsForOperation("catalog_reprocess"),
-  );
-  if (!preflightPlan) return;
-  const pendingCrawlMeta = captureCrawlMetaSnapshot();
-  cancelCrawlMetaSave();
-  await flushCrawlMetaSnapshot(pendingCrawlMeta, INTERNAL_OPERATION_SAVE);
-  const eventSlug = activeEventSlug;
-  const outputDir = getActiveEventDir();
-  const eventFile = (
-    document.getElementById("eventJsonHidden") as HTMLInputElement
-  ).value.trim();
-  if (!eventSlug || !outputDir || !eventFile || !eventJsonData) {
-    resultEl.textContent =
-      "既存イベントが選択されていません。イベントを選択してから実行してください。";
-    return;
-  }
-  const expectedEventFile = eventJsonPathForDir(outputDir);
-  if (!eventPathsEqual(eventFile, expectedEventFile)) {
-    resultEl.textContent =
-      "選択イベントとevent.jsonのパスが一致しないため、Twitterお品書き抽出を中止しました。イベントを選び直してください。";
-    return;
-  }
-
-  // 画面上の編集内容をevent.jsonへ反映してから、未取得サークルだけを再処理する。
-  const initialSave = await saveNow(INTERNAL_OPERATION_SAVE);
-  if (!initialSave.ok) {
-    resultEl.textContent = `実行前のevent.json保存に失敗しました: ${String(initialSave.error)}`;
-    return;
-  }
-  if (activeEventSlug !== eventSlug) {
-    resultEl.textContent =
-      "保存中に選択イベントが切り替わったため、Twitterお品書き抽出を中止しました。";
-    return;
-  }
-  const payload = applyModelPreflightToPayload(
-    buildPipelinePayload(),
-    preflightPlan,
-  );
-  if (!isValidEventDate(payload.event_date)) {
-    resultEl.textContent =
-      "イベント日が未設定または不正です。YYYY-MM-DD形式で設定してから実行してください。";
-    return;
-  }
-  const externalReloadOwner = await prepareExternalEventReloadOwner(
-    outputDir,
-    false,
-  );
-  if (!externalReloadOwner) {
-    resultEl.textContent =
-      "実行前のイベント所有権captureに失敗したため、Twitterお品書き抽出を中止しました。";
-    return;
-  }
-  payload.output_dir = outputDir;
-  payload.enable_twitter_catalog = true;
-  payload.reprocess = true;
-  payload.regenerate_coordinates = false;
-  payload.urls = [];
-  payload.event_sources = [];
-  applyOperationEvent({ type: "pipeline-started" });
-  await runJob("run_main_pipeline", payload, true);
-  const processingLog = resultEl.textContent;
-  const reloadSucceeded = await reloadExternalEvent(externalReloadOwner);
-  if (!reloadSucceeded) {
-    resultEl.textContent =
-      `${processingLog}\n\n❌ 外部pipeline結果を画面へ反映できませんでした。`;
-    return;
-  }
-  resultEl.textContent = processingLog;
-  } finally {
-    if (isPipelineOperation(operationState)) {
-      applyOperationEvent({ type: "finish-pipeline" });
-    }
-    setEventPipelineButtonsDisabled(false);
-  }
-});
 
 /** パイプライン共通ペイロードを構築 */
 function normalizeDateInputValue(value: unknown): string {
@@ -8172,6 +8220,11 @@ function normalizeDateInputValue(value: unknown): string {
 }
 
 function parseEventUrlList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    const urls: string[] = [];
+    for (const entry of value) pushUnique(urls, parseEventUrlList(entry));
+    return urls;
+  }
   if (typeof value !== "string") return [];
   const matches = value.match(/https?:\/\/[^\s,]+/g) || [];
   const urls: string[] = [];
@@ -8188,10 +8241,790 @@ function eventUrlListText(urls: unknown): string {
 }
 
 type EventSourcePayload = {
+  name?: string;
   url: string;
   map_urls?: string[];
   catalog_additional_prompt?: string;
 };
+
+let crawlSources: CrawlSource[] = [];
+let crawlCommonPrompt = "";
+let crawlSourceEditingIndex: number | null = null;
+let crawlSourcesHydratedForOwner = "";
+let projectCrawlSettings: CrawlSettings = { ...DEFAULT_CRAWL_SETTINGS };
+let eventDialogDraft: { name: string; date: string; venue: string } | null = null;
+let eventDialogCommitted = false;
+let crawlLoadedSourceUrls: string[] = [];
+let crawlLoadedSourceOwner = "";
+let crawlLoadedSourceHasData = false;
+type CrawlPresetValue = { form: Record<string, string> };
+let crawlPresets: CrawlPreset<CrawlPresetValue>[] = [];
+type CrawlModelSelectProxy = {
+  select: HTMLSelectElement;
+  placeholder: Comment;
+  wrapper: HTMLElement;
+};
+const crawlModelSelectProxies: CrawlModelSelectProxy[] = [];
+const CRAWL_MODEL_PROXY_IDS: Record<string, { primary: string; fallback: string }> = {
+  text: { primary: "model", fallback: "textFallbackModel" },
+  site: { primary: "siteStructureModel", fallback: "siteStructureFallbackModel" },
+  post: { primary: "catalogPostModel", fallback: "catalogPostFallbackModel" },
+  image: { primary: "visionModelId", fallback: "visionFallbackModel" },
+};
+
+function restoreCrawlModelSelectProxies(): void {
+  while (crawlModelSelectProxies.length) {
+    const proxy = crawlModelSelectProxies.pop()!;
+    const parent = proxy.placeholder.parentElement;
+    if (parent) parent.insertBefore(proxy.select, proxy.placeholder.nextSibling);
+    proxy.wrapper.remove();
+    proxy.placeholder.remove();
+  }
+}
+
+function moveCrawlModelSelectsIntoDialog(role?: string): void {
+  restoreCrawlModelSelectProxies();
+  const roles = role && CRAWL_MODEL_PROXY_IDS[role] ? [role] : Object.keys(CRAWL_MODEL_PROXY_IDS);
+  for (const currentRole of roles) {
+    const ids = CRAWL_MODEL_PROXY_IDS[currentRole];
+    const section = document.querySelector<HTMLElement>(`[data-model-section="${currentRole}"]`);
+    const fields = section?.querySelector<HTMLElement>(".crawl-dialog-fields");
+    if (!fields) continue;
+    for (const [kind, id] of [["primary", ids.primary], ["fallback", ids.fallback]] as const) {
+      const select = document.getElementById(id) as HTMLSelectElement | null;
+      if (!select || !select.parentElement || select.closest("dialog")) continue;
+      const placeholder = document.createComment(`crawl model ${id}`);
+      select.parentElement.insertBefore(placeholder, select);
+      const wrapper = document.createElement("div");
+      wrapper.className = "crawl-model-proxy-field";
+      const label = document.createElement("label");
+      label.textContent = `${kind === "primary" ? "主" : "予備"}モデル`;
+      label.htmlFor = id;
+      wrapper.append(label, select);
+      fields.appendChild(wrapper);
+      crawlModelSelectProxies.push({ select, placeholder, wrapper });
+    }
+  }
+}
+
+function captureCrawlPreset(): CrawlPresetValue {
+  const form: Record<string, string> = {};
+  for (const id of CRAWL_MODEL_PRESET_FORM_IDS) {
+    const element = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
+    if (!element) continue;
+    form[id] = element instanceof HTMLInputElement && element.type === "checkbox"
+      ? String(element.checked)
+      : element.value;
+  }
+  return { form: filterCrawlModelPresetForm(form) };
+}
+
+function applyCrawlPreset(value: CrawlPresetValue): void {
+  for (const [id, raw] of Object.entries(value?.form || {})) {
+    if (!(CRAWL_MODEL_PRESET_FORM_IDS as readonly string[]).includes(id)) continue;
+    const element = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
+    if (!element) continue;
+    if (element instanceof HTMLInputElement && element.type === "checkbox") element.checked = raw === "true";
+    else {
+      if (element instanceof HTMLSelectElement && raw && !Array.from(element.options).some((option) => option.value === raw)) {
+        const option = document.createElement("option");
+        option.value = raw;
+        option.textContent = `${raw}（保存済み）`;
+        element.appendChild(option);
+      }
+      element.value = raw;
+    }
+  }
+  hydrateModelControls();
+  updateModelExecutionOrderSummaries();
+  applyCrawlSettingsToControls(currentCrawlSettings());
+  updateCrawlDateRange();
+  updateCrawlSettingsStatus();
+  saveFormValues();
+  scheduleCrawlMetaSave();
+}
+
+function renderCrawlPresets(): void {
+  const select = document.getElementById("crawlPresetSelect") as HTMLSelectElement | null;
+  if (select) {
+    const current = select.value;
+    select.innerHTML = "<option value=\"\">標準設定</option>";
+    crawlPresets.forEach((preset) => {
+      const option = document.createElement("option");
+      option.value = preset.name;
+      option.textContent = preset.name;
+      select.appendChild(option);
+    });
+    if (crawlPresets.some((preset) => preset.name === current)) select.value = current;
+  }
+  const list = document.getElementById("crawlPresetList");
+  if (!list) return;
+  list.innerHTML = "";
+  for (const preset of crawlPresets) {
+    const row = document.createElement("div");
+    row.className = "crawl-preset-row";
+    row.innerHTML = `<span>${escapeHtml(preset.name)}</span><span><button type=\"button\" class=\"crawl-button\" data-crawl-preset-load=\"${escapeHtml(preset.name)}\">読み込む</button><button type=\"button\" class=\"crawl-button\" data-crawl-preset-delete=\"${escapeHtml(preset.name)}\">削除</button></span>`;
+    list.appendChild(row);
+  }
+  list.querySelectorAll<HTMLButtonElement>("[data-crawl-preset-load]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const preset = crawlPresets.find((item) => item.name === button.dataset.crawlPresetLoad);
+      if (!preset) return;
+      applyCrawlPreset(preset.value);
+      const select = document.getElementById("crawlPresetSelect") as HTMLSelectElement | null;
+      if (select) select.value = preset.name;
+      closeNativeDialog("crawlPresetDialog");
+    });
+  });
+  list.querySelectorAll<HTMLButtonElement>("[data-crawl-preset-delete]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const name = button.dataset.crawlPresetDelete || "";
+      crawlPresets = removeCrawlPreset(crawlPresets, name);
+      writeCrawlPresets(localStorage, crawlPresets, CRAWL_PRESETS_STORAGE_KEY);
+      renderCrawlPresets();
+    });
+  });
+}
+
+function crawlOwnerKey(): string {
+  const ev = activeEventSlug ? eventList.find((entry) => entry.slug === activeEventSlug) : null;
+  return ev ? `${ev.slug}\n${normalizeEventPath(ev.dir)}` : "";
+}
+
+function rawCrawlDayValue(id: string): number {
+  const raw = controlValue(id);
+  return raw === "" ? Number.NaN : Number(raw);
+}
+
+function crawlSettingsDaysAreValid(settings: CrawlSettings): boolean {
+  return Number.isInteger(settings.days_before) && settings.days_before >= 0 && settings.days_before <= 3650 &&
+    Number.isInteger(settings.days_after) && settings.days_after >= 0 && settings.days_after <= 3650;
+}
+
+function currentCrawlSettings(): CrawlSettings {
+  const daysBefore = rawCrawlDayValue("daysBefore");
+  const daysAfter = rawCrawlDayValue("daysAfter");
+  const normalized = normalizeCrawlSettings({
+    collect_catalogs: boolFromSelect("collectCatalogs"),
+    enable_twitter_catalog: boolFromSelect("enableTwitter"),
+    use_grok_search: boolFromSelect("useGrokSearch"),
+    grok_search_mode: controlValue("grokSearchMode") || "api",
+    days_before: daysBefore,
+    days_after: daysAfter,
+    backup: boolFromSelect("backup"),
+    reprocess: boolFromSelect("reprocess"),
+    regenerate_coordinates: boolFromSelect("regen"),
+    skip_circle_images: boolFromSelect("skipCircleImages"),
+    verbose: boolFromSelect("verbose"),
+  });
+  // normalizeは保存値hydrate用。DOMの不正値はvalidatorへ届くようrawを戻す。
+  return { ...normalized, days_before: daysBefore, days_after: daysAfter };
+}
+
+function applyCrawlSettingsToControls(value: unknown): CrawlSettings {
+  const settings = normalizeCrawlSettings(value, DEFAULT_CRAWL_SETTINGS);
+  setBoolSelect("collectCatalogs", settings.collect_catalogs);
+  setBoolSelect("enableTwitter", settings.enable_twitter_catalog);
+  setBoolSelect("useGrokSearch", settings.use_grok_search);
+  setBoolSelect("backup", settings.backup);
+  setBoolSelect("reprocess", settings.reprocess);
+  setBoolSelect("regen", settings.regenerate_coordinates);
+  setBoolSelect("skipCircleImages", settings.skip_circle_images);
+  setBoolSelect("verbose", settings.verbose);
+  const grokMode = document.getElementById("grokSearchMode") as HTMLSelectElement | null;
+  if (grokMode) grokMode.value = settings.grok_search_mode;
+  const before = document.getElementById("daysBefore") as HTMLInputElement | null;
+  const after = document.getElementById("daysAfter") as HTMLInputElement | null;
+  if (before) before.value = String(settings.days_before);
+  if (after) after.value = String(settings.days_after);
+  document.querySelectorAll<HTMLButtonElement>("[data-crawl-toggle]").forEach((toggle) => {
+    const id = toggle.dataset.crawlToggle || "";
+    const value = id === "skipCircleImages"
+      ? !settings.skip_circle_images
+      : id === "collectCatalogs"
+        ? settings.collect_catalogs
+        : id === "enableTwitter"
+          ? settings.enable_twitter_catalog
+          : id === "useGrokSearch"
+            ? settings.use_grok_search
+            : id === "verbose"
+              ? settings.verbose
+              : false;
+    toggle.setAttribute("aria-checked", String(value));
+  });
+  return settings;
+}
+
+function renderCrawlSourceRows(): void {
+  const rows = document.getElementById("crawlSourceRows");
+  if (!rows) return;
+  rows.innerHTML = "";
+  crawlSources.forEach((source, index) => {
+    const row = document.createElement("tr");
+    row.dataset.sourceIndex = String(index);
+    const prompt = source.catalog_additional_prompt.trim();
+    const mapText = source.map_urls.join("\n") || "—";
+    const editIcon = '<svg class="crawl-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 16 9.5-9.5 4 4L8 20H4v-4Z"/><path d="m14 6 2-2 4 4-2 2"/></svg>';
+    const deleteIcon = '<svg class="crawl-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5"/></svg>';
+    row.innerHTML = `
+      <td>${index + 1}</td>
+      <td>${escapeHtml(source.name)}</td>
+      <td title="${escapeHtml(source.url)}">${escapeHtml(source.url)}</td>
+      <td title="${escapeHtml(mapText)}">${escapeHtml(mapText)}</td>
+      <td title="${escapeHtml(prompt || "—")}">${escapeHtml(prompt || "—")}</td>
+      <td><button type="button" class="crawl-icon-button" data-crawl-source-edit="${index}" aria-label="編集" title="編集">${editIcon}</button>
+        <button type="button" class="crawl-icon-button" data-crawl-source-delete="${index}" aria-label="削除" title="削除">${deleteIcon}</button></td>`;
+    rows.appendChild(row);
+  });
+  rows.querySelectorAll<HTMLButtonElement>("[data-crawl-source-edit]").forEach((button) => {
+    button.addEventListener("click", () => openCrawlSourceDialog(Number(button.dataset.crawlSourceEdit)));
+  });
+  rows.querySelectorAll<HTMLButtonElement>("[data-crawl-source-delete]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.crawlSourceDelete);
+      if (!Number.isInteger(index) || !crawlSources[index]) return;
+      crawlSources = crawlSources.filter((_, sourceIndex) => sourceIndex !== index);
+      syncCrawlSourceFields();
+      renderCrawlSourceRows();
+      scheduleCrawlMetaSave();
+      updateCrawlSettingsStatus();
+    });
+  });
+}
+
+function syncCrawlSourceFields(): void {
+  const urls = sourceUrls(crawlSources);
+  const eventUrl = document.getElementById("eventUrl") as HTMLTextAreaElement | null;
+  if (eventUrl) eventUrl.value = urls.join("\n");
+  const mapUrl = document.getElementById("mapUrl") as HTMLTextAreaElement | null;
+  if (mapUrl) {
+    mapUrl.value = crawlSources
+      .filter((source) => source.map_urls.length)
+      .map((source) => `${source.url} => ${source.map_urls.join(", ")}`)
+      .join("\n");
+  }
+  const prompt = document.getElementById("additionalPrompt") as HTMLTextAreaElement | null;
+  if (prompt) prompt.value = serializePromptSections(crawlCommonPrompt, crawlSources);
+  updateConcurrentEventSummary();
+}
+
+function hydrateCrawlEditor(meta: EventMeta, loadedEvent: Record<string, unknown> = {}): void {
+  const owner = crawlOwnerKey();
+  const rawSources = meta.event_sources ?? loadedEvent.event_sources;
+  const legacyUrls = meta.event_urls ?? loadedEvent.event_urls ?? loadedEvent.source_urls ??
+    (meta.event_url || loadedEvent.url ? [meta.event_url || loadedEvent.url] : []);
+  const urls = parseEventUrlList(legacyUrls as unknown);
+  const loadedSourceUrls = parseEventUrlList(
+    loadedEvent.source_urls ?? meta.crawl_data_source_urls ?? loadedEvent.event_urls ?? meta.event_urls ?? meta.event_url,
+  );
+  crawlLoadedSourceUrls = loadedSourceUrls.length ? loadedSourceUrls : [...urls];
+  crawlLoadedSourceOwner = owner;
+  crawlLoadedSourceHasData = Array.isArray(eventJsonData?.circles) && eventJsonData.circles.length > 0;
+  const parsedPrompts = splitPromptSections(
+    meta.additional_prompt ?? loadedEvent.additional_prompt ?? "",
+    urls,
+  );
+  let nextSources = normalizeCrawlSources(rawSources);
+  if (!nextSources.length) {
+    const mapRaw = String(meta.map_config ?? loadedEvent.map_config ?? meta.map_url ?? loadedEvent.map_url ?? "");
+    const parsedMaps = parseEventMapConfig(mapRaw, urls);
+    nextSources = urls.map((url, index) => ({
+      name: `ソース${index + 1}`,
+      url,
+      map_urls: parsedMaps.byUrl.get(url) || [],
+      catalog_additional_prompt: parsedPrompts.sourcePrompts[url] || "",
+    }));
+  } else {
+    nextSources = nextSources.map((source) => ({
+      ...source,
+      catalog_additional_prompt: (() => {
+        const effective = source.catalog_additional_prompt.trim();
+        const common = parsedPrompts.common.trim();
+        const rawPrompt = parsedPrompts.sourcePrompts[source.url] || "";
+        const rawSource = Array.isArray(rawSources)
+          ? rawSources.find((entry) => entry && typeof entry === "object" && !Array.isArray(entry) &&
+            (entry as Record<string, unknown>).url === source.url)
+          : null;
+        const hasExplicitPrompt = Boolean(rawSource && (
+          Object.prototype.hasOwnProperty.call(rawSource, "catalog_additional_prompt") ||
+          Object.prototype.hasOwnProperty.call(rawSource, "additional_prompt")
+        ));
+        if (common && effective === common) return "";
+        if (common && effective.startsWith(`${common}\n\n`)) return effective.slice(common.length + 2).trim();
+        return hasExplicitPrompt ? effective : effective || rawPrompt;
+      })(),
+    }));
+  }
+  crawlSources = nextSources;
+  crawlCommonPrompt = parsedPrompts.common;
+  crawlSourcesHydratedForOwner = owner;
+  syncCrawlSourceFields();
+  renderCrawlSourceRows();
+  applyCrawlSettingsToControls(meta.crawl_settings || projectCrawlSettings);
+  updateCrawlDateRange();
+}
+
+function ensureCrawlSourcesFromForm(): CrawlSource[] {
+  const urls = parseEventUrlList(controlValue("eventUrl"));
+  if (crawlSourcesHydratedForOwner !== crawlOwnerKey() || !crawlSources.length) {
+    const mapRaw = controlValue("mapUrl");
+    const mapConfig = parseEventMapConfig(mapRaw, urls);
+    const prompt = splitPromptSections(controlValue("additionalPrompt"), urls);
+    crawlSources = urls.map((url, index) => ({
+      name: `ソース${index + 1}`,
+      url,
+      map_urls: mapConfig.byUrl.get(url) || [],
+      catalog_additional_prompt: prompt.sourcePrompts[url] || "",
+    }));
+    crawlCommonPrompt = prompt.common;
+    crawlSourcesHydratedForOwner = crawlOwnerKey();
+  }
+  return crawlSources;
+}
+
+function updateCrawlDateRange(): void {
+  const range = document.getElementById("crawlDateRange");
+  if (!range) return;
+  const date = controlValue("eventDate");
+  const settings = currentCrawlSettings();
+  if (!crawlSettingsDaysAreValid(settings)) {
+    range.textContent = "検索対象期間：前後日数を0〜3650の整数で指定してください";
+    return;
+  }
+  if (!date) {
+    range.textContent = "検索対象期間：イベントを選択してください";
+    return;
+  }
+  const parsed = new Date(`${date}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) {
+    range.textContent = "検索対象期間：開催日を確認してください";
+    return;
+  }
+  const from = new Date(parsed.getTime() - settings.days_before * 86400000);
+  const to = new Date(parsed.getTime() + settings.days_after * 86400000);
+  const iso = (value: Date) => value.toISOString().slice(0, 10);
+  range.textContent = `検索対象期間：${iso(from)} 〜 ${iso(to)}`;
+}
+
+let grokAvailabilityGeneration = 0;
+let grokAvailabilityState: { mode: string; available: boolean | null; reason?: string } | null = null;
+function isGrokSearchActive(settings: CrawlSettings = currentCrawlSettings()): boolean {
+  return settings.collect_catalogs && settings.enable_twitter_catalog && settings.use_grok_search;
+}
+async function refreshGrokAvailability(): Promise<void> {
+  const output = document.getElementById("crawlGrokAvailability");
+  if (!output) return;
+  if (!isGrokSearchActive()) {
+    grokAvailabilityState = null;
+    output.textContent = "";
+    output.hidden = true;
+    return;
+  }
+  output.hidden = false;
+  const generation = ++grokAvailabilityGeneration;
+  grokAvailabilityState = { mode: controlValue("grokSearchMode") || "api", available: null };
+  output.textContent = "Grok検索の利用可否を確認中…";
+  try {
+    const response = await invokeBridgeJob<Record<string, unknown>>(
+      "probe_grok_search",
+      {
+        project_root: projectRootEl.value || ".",
+        grok_search_mode: controlValue("grokSearchMode") || "api",
+      },
+      currentBridgeJobOptions(15_000),
+    );
+    if (generation !== grokAvailabilityGeneration) return;
+    const bridge = response.bridge as Record<string, unknown> | undefined;
+    const mode = controlValue("grokSearchMode") || "api";
+    const modes = bridge?.modes as Record<string, Record<string, unknown>> | undefined;
+    const status = modes?.[mode];
+    if (response.ok && status?.available === true) {
+      grokAvailabilityState = { mode, available: true };
+      output.textContent = `${mode.toUpperCase()} 利用可能`;
+    } else if (status?.reason) {
+      grokAvailabilityState = { mode, available: false, reason: String(status.reason) };
+      output.textContent = `${mode.toUpperCase()}：${String(status.reason)}`;
+    } else if (response.ok === false) {
+      grokAvailabilityState = { mode, available: null, reason: "利用可否を確認できません" };
+      output.textContent = "Grok検索の利用可否を確認できません";
+    } else {
+      grokAvailabilityState = { mode, available: null, reason: "利用可否不明" };
+      output.textContent = `${mode.toUpperCase()} 利用可否不明`;
+    }
+  } catch (error) {
+    if (generation === grokAvailabilityGeneration) {
+      grokAvailabilityState = { mode: controlValue("grokSearchMode") || "api", available: null, reason: String(error) };
+      output.textContent = `Grok検索確認失敗: ${String(error)}`;
+    }
+  }
+}
+
+function crawlPrimaryModelAuthErrors(settings: CrawlSettings): string[] {
+  if (!modelCatalogRefreshKnown) return [];
+  const checks: Array<{ label: string; selection: TextProviderSelection; model: string }> = [
+    ...(!settings.reprocess ? [
+      { label: "テキスト解析", selection: selectedTextProvider(), model: selectedTextModel() },
+      { label: "サイト構造解析", selection: parseTextProviderValue(controlValue("siteStructureModelProvider") || DEFAULT_MODEL_SELECTIONS.siteStructure.provider), model: controlValue("siteStructureModel") || DEFAULT_MODEL_SELECTIONS.siteStructure.model },
+    ] : []),
+    ...(settings.collect_catalogs && (settings.enable_twitter_catalog || settings.reprocess)
+      ? [{ label: "おしながき解析", selection: parseTextProviderValue(controlValue("catalogPostModelProvider") || DEFAULT_MODEL_SELECTIONS.catalogPost.provider), model: controlValue("catalogPostModel") || DEFAULT_MODEL_SELECTIONS.catalogPost.model }]
+      : []),
+    ...((settings.regenerate_coordinates || (!settings.reprocess && !settings.skip_circle_images) || settings.collect_catalogs)
+      ? [{ label: "画像処理", selection: selectedImageProvider(), model: selectedImageModel() }]
+      : []),
+  ];
+  const errors: string[] = [];
+  for (const check of checks) {
+    if (!check.model) {
+      errors.push(`${check.label}の主モデルが未選択です`);
+      continue;
+    }
+    if (check.selection.kind === "api") {
+      const status = apiProviderState(check.selection.provider);
+      if (!status) errors.push(`${check.label}のAPI認証状態を確認できません`);
+      else if (status.status === "credential_not_configured") errors.push(`${check.label}のAPI認証が未設定です`);
+      else if (status?.status === "permission_denied") errors.push(`${check.label}のAPI権限を確認できません`);
+      else if (![...modelCatalog.apiModels, ...FALLBACK_MODEL_CATALOG.apiModels].some((candidate) => candidate.provider === check.selection.provider && candidate.id === check.model)) {
+        errors.push(`${check.label}のモデル候補を確認できません`);
+      }
+    } else {
+      const provider = modelProvider(check.selection.provider);
+      if (!provider) errors.push(`${check.label}のCLI状態を確認できません`);
+      else if (provider.available === false) errors.push(`${check.label}のCLIが見つかりません`);
+      else if (provider?.authenticated === false) errors.push(`${check.label}のCLIが未認証です`);
+      else if (!provider.models.some((candidate) => candidate.id === check.model)) errors.push(`${check.label}のモデル候補を確認できません`);
+    }
+  }
+  return errors;
+}
+
+function crawlModelPreflightSlots(settings: CrawlSettings): ModelPreflightSlot[] {
+  const slots: ModelPreflightSlot[] = [];
+  if (!settings.reprocess) {
+    slots.push("text", "text_fallback", "site_structure", "site_structure_fallback");
+  }
+  const imageActive = settings.regenerate_coordinates ||
+    (!settings.reprocess && !settings.skip_circle_images) ||
+    settings.collect_catalogs;
+  if (imageActive) slots.push("vision", "vision_fallback");
+  if (settings.collect_catalogs && (settings.enable_twitter_catalog || settings.reprocess)) slots.push("oshinagaki_post");
+  return slots;
+}
+
+function updateCrawlSettingsStatus(message?: string): void {
+  const check = document.getElementById("crawlSettingsCheck");
+  const state = document.getElementById("crawlRunState");
+  const runEvent = document.getElementById("crawlRunEvent");
+  const bar = document.querySelector<HTMLElement>(".crawl-run-bar");
+  const settings = currentCrawlSettings();
+  const result = validateCrawlRequest({
+    settings,
+    sources: ensureCrawlSourcesFromForm(),
+    eventDate: controlValue("eventDate"),
+    activeEventSelected: Boolean(activeEventSlug),
+    authErrors: [
+      ...(isGrokSearchActive(settings) && grokAvailabilityState?.available === false
+        ? [`Grok ${settings.grok_search_mode}: ${grokAvailabilityState.reason || "利用できません"}`]
+        : []),
+      ...crawlPrimaryModelAuthErrors(settings),
+    ],
+  });
+  if (check) check.textContent = message || crawlValidationMessage(result);
+  if (runEvent) {
+    const ev = activeEventSlug ? eventList.find((entry) => entry.slug === activeEventSlug) : null;
+    runEvent.textContent = ev
+      ? [ev.meta.name || activeEventSlug, ev.meta.date].filter(Boolean).join(" / ")
+      : "イベント未選択";
+  }
+  const circleImageToggle = document.querySelector<HTMLButtonElement>('[data-crawl-toggle="skipCircleImages"]');
+  if (circleImageToggle) {
+    circleImageToggle.disabled = settings.reprocess;
+    circleImageToggle.setAttribute("aria-disabled", String(settings.reprocess));
+    circleImageToggle.title = settings.reprocess ? "再処理では既存のサークル画像を保持します" : "サークル画像の取得を切り替えます";
+  }
+  const modelCheckPending = !modelCatalogRefreshKnown && !settings.reprocess;
+  const grokCheckPending = isGrokSearchActive(settings) && (
+    grokAvailabilityState?.available === null ||
+    grokAvailabilityState?.mode !== settings.grok_search_mode
+  );
+  if (!message && modelCheckPending) {
+    if (check) check.textContent = "モデル・認証確認中 / 実行時確認が必要";
+  }
+  if (!message && grokCheckPending && check) {
+    check.textContent = "モデル・認証確認中 / Grok利用可否を確認中";
+  }
+  if (state && !message) state.textContent = result.ok && !modelCheckPending && !grokCheckPending ? "実行準備" : result.ok ? "確認中" : "設定確認が必要";
+  if (bar && !isOperationBusy(operationState)) bar.dataset.state = result.ok && !modelCheckPending && !grokCheckPending ? "ready" : "invalid";
+}
+
+function openNativeDialog(id: string): void {
+  const dialog = document.getElementById(id) as HTMLDialogElement | null;
+  if (!dialog) return;
+  if (typeof dialog.showModal === "function") dialog.showModal();
+  else dialog.setAttribute("open", "");
+}
+
+function closeNativeDialog(id: string): void {
+  const dialog = document.getElementById(id) as HTMLDialogElement | null;
+  if (!dialog) return;
+  if (typeof dialog.close === "function") dialog.close();
+  else dialog.removeAttribute("open");
+  if (id === "crawlModelSettingsDialog") restoreCrawlModelSelectProxies();
+}
+
+function setCrawlDialogError(dialogId: string, message: string, focusId?: string): void {
+  const dialog = document.getElementById(dialogId);
+  if (!dialog) return;
+  let error = dialog.querySelector<HTMLElement>("[data-crawl-dialog-error]");
+  if (!error) {
+    error = document.createElement("p");
+    error.dataset.crawlDialogError = "true";
+    error.setAttribute("role", "alert");
+    error.className = "form-hint text-red-400";
+    dialog.querySelector(".crawl-dialog-actions")?.before(error);
+  }
+  error.textContent = message;
+  if (focusId) (document.getElementById(focusId) as HTMLElement | null)?.focus();
+}
+
+function clearCrawlDialogError(dialogId: string): void {
+  document.getElementById(dialogId)?.querySelector<HTMLElement>("[data-crawl-dialog-error]")?.remove();
+}
+
+function openCrawlSourceDialog(index: number | null = null): void {
+  const source = index !== null && crawlSources[index] ? crawlSources[index] : null;
+  crawlSourceEditingIndex = source ? index : null;
+  const set = (id: string, value: string) => {
+    const element = document.getElementById(id) as HTMLInputElement | HTMLTextAreaElement | null;
+    if (element) element.value = value;
+  };
+  set("crawlSourceName", source?.name || "");
+  set("crawlSourceUrl", source?.url || "");
+  set("crawlSourceMaps", source?.map_urls.join("\n") || "");
+  set("crawlSourcePrompt", source?.catalog_additional_prompt || "");
+  clearCrawlDialogError("crawlSourceDialog");
+  openNativeDialog("crawlSourceDialog");
+}
+
+function initCrawlEditorUi(): void {
+  crawlPresets = readCrawlPresets<CrawlPresetValue>(localStorage, CRAWL_PRESETS_STORAGE_KEY);
+  renderCrawlPresets();
+  document.getElementById("crawlLoadSettingsBtn")?.addEventListener("click", async () => {
+    const loaded = await loadProjectConfig();
+    if (loaded) {
+      if (activeEventSlug) {
+        crawlSourcesHydratedForOwner = "";
+        ensureCrawlSourcesFromForm();
+        renderCrawlSourceRows();
+      }
+      hydrateModelControls();
+      await loadModelCatalog(true);
+      await refreshGrokAvailability();
+      updateCrawlSettingsStatus();
+      resultEl.textContent = "クロール設定を読み込みました";
+    } else {
+      resultEl.textContent = "設定ファイルが見つかりません";
+    }
+  });
+  document.getElementById("crawlSaveSettingsBtn")?.addEventListener("click", () => {
+    void saveConfig();
+  });
+  const output = document.getElementById("outputDir") as HTMLInputElement | null;
+  if (output) {
+    output.readOnly = true;
+    output.setAttribute("aria-readonly", "true");
+  }
+  document.querySelectorAll<HTMLElement>("[data-crawl-close]").forEach((button) => {
+    button.addEventListener("click", () => closeNativeDialog(button.dataset.crawlClose || ""));
+  });
+  document.querySelectorAll<HTMLDialogElement>("dialog.crawl-dialog").forEach((dialog) => {
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) dialog.close();
+    });
+    dialog.addEventListener("cancel", () => dialog.close());
+    dialog.addEventListener("close", () => {
+      if (dialog.id === "crawlModelSettingsDialog") restoreCrawlModelSelectProxies();
+      if (dialog.id === "crawlEventDialog") {
+        if (!eventDialogCommitted && eventDialogDraft) {
+          const restore = (id: string, value: string) => {
+            const element = document.getElementById(id) as HTMLInputElement | null;
+            if (element) element.value = value;
+          };
+          restore("eventName", eventDialogDraft.name);
+          restore("eventDate", eventDialogDraft.date);
+          restore("eventVenue", eventDialogDraft.venue);
+        }
+        eventDialogDraft = null;
+        eventDialogCommitted = false;
+      }
+    });
+  });
+  document.getElementById("crawlAddSourceBtn")?.addEventListener("click", () => openCrawlSourceDialog());
+  document.getElementById("crawlSourceSaveBtn")?.addEventListener("click", () => {
+    const url = controlValue("crawlSourceUrl");
+    const source = normalizedSource({
+      name: controlValue("crawlSourceName"),
+      url,
+      map_urls: parseUrlList(controlValue("crawlSourceMaps")),
+      catalog_additional_prompt: controlValue("crawlSourcePrompt"),
+    }, (crawlSourceEditingIndex ?? crawlSources.length));
+    if (!source.url || !/^https?:\/\//i.test(source.url)) {
+      setCrawlDialogError("crawlSourceDialog", "ソースURLはhttp(s)形式で指定してください", "crawlSourceUrl");
+      resultEl.textContent = "ソースURLはhttp(s)形式で指定してください";
+      return;
+    }
+    if (crawlSources.some((entry, index) => entry.url === source.url && index !== crawlSourceEditingIndex)) {
+      setCrawlDialogError("crawlSourceDialog", "同じURLのソースは重複登録できません", "crawlSourceUrl");
+      resultEl.textContent = "同じURLのソースは重複登録できません";
+      return;
+    }
+    clearCrawlDialogError("crawlSourceDialog");
+    if (crawlSourceEditingIndex === null) crawlSources = [...crawlSources, source];
+    else crawlSources = crawlSources.map((entry, index) => index === crawlSourceEditingIndex ? source : entry);
+    crawlSourceEditingIndex = null;
+    syncCrawlSourceFields();
+    renderCrawlSourceRows();
+    closeNativeDialog("crawlSourceDialog");
+    scheduleCrawlMetaSave();
+    updateCrawlSettingsStatus();
+  });
+  document.getElementById("crawlCommonPromptBtn")?.addEventListener("click", () => {
+    const prompt = document.getElementById("crawlCommonPrompt") as HTMLTextAreaElement | null;
+    if (prompt) prompt.value = crawlCommonPrompt;
+    openNativeDialog("crawlCommonPromptDialog");
+  });
+  document.getElementById("crawlCommonPromptSaveBtn")?.addEventListener("click", () => {
+    crawlCommonPrompt = controlValue("crawlCommonPrompt");
+    syncCrawlSourceFields();
+    closeNativeDialog("crawlCommonPromptDialog");
+    scheduleCrawlMetaSave();
+  });
+  document.getElementById("crawlOutputBrowseBtn")?.addEventListener("click", async () => {
+    try {
+      const outputDir = getActiveEventDir();
+      if (!outputDir) {
+        resultEl.textContent = "イベントを選択してから出力先フォルダを開いてください。";
+        return;
+      }
+      await invoke("open_file_default", { filePath: outputDir });
+    } catch (error) {
+      resultEl.textContent = `出力先フォルダを開けませんでした: ${String(error)}`;
+    }
+  });
+  document.getElementById("crawlEditEventBtn")?.addEventListener("click", () => {
+    eventDialogDraft = {
+      name: controlValue("eventName"),
+      date: controlValue("eventDate"),
+      venue: controlValue("eventVenue"),
+    };
+    eventDialogCommitted = false;
+    clearCrawlDialogError("crawlEventDialog");
+    openNativeDialog("crawlEventDialog");
+  });
+  document.getElementById("crawlEventSaveBtn")?.addEventListener("click", async () => {
+    const ev = activeEventSlug ? eventList.find((entry) => entry.slug === activeEventSlug) : null;
+    if (!ev) return;
+    const date = controlValue("eventDate");
+    if (date && !isValidEventDate(date)) {
+      setCrawlDialogError("crawlEventDialog", "開催日はYYYY-MM-DD形式で指定してください", "eventDate");
+      return;
+    }
+    const nextMeta: EventMeta = {
+      ...cloneJsonSnapshot(ev.meta),
+      name: controlValue("eventName") || ev.meta.name,
+      date: controlValue("eventDate") || null,
+      venue: controlValue("eventVenue") || null,
+    };
+    try {
+      await writeEventMetaSnapshot(ev, nextMeta);
+      updateActiveEventDisplay(nextMeta);
+      renderSidebar();
+      eventDialogCommitted = true;
+      closeNativeDialog("crawlEventDialog");
+      updateCrawlDateRange();
+      updateCrawlSettingsStatus();
+    } catch (error) {
+      setCrawlDialogError("crawlEventDialog", `イベント情報保存エラー: ${String(error)}`);
+      resultEl.textContent = `イベント情報保存エラー: ${String(error)}`;
+    }
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-crawl-toggle]").forEach((toggle) => {
+    toggle.addEventListener("click", () => {
+      const id = toggle.dataset.crawlToggle || "";
+      const invert = toggle.dataset.crawlInvert === "true";
+      const current = id === "skipCircleImages" ? !boolFromSelect(id) : boolFromSelect(id);
+      const next = !current;
+      setBoolSelect(id, invert ? !next : next);
+      document.getElementById(id)?.dispatchEvent(new Event("change", { bubbles: true }));
+      toggle.setAttribute("aria-checked", String(next));
+      if (id === "collectCatalogs" || id === "enableTwitter" || id === "useGrokSearch") return;
+      saveFormValues();
+      updateCrawlDateRange();
+      updateCrawlSettingsStatus();
+      scheduleCrawlMetaSave();
+    });
+  });
+  ["daysBefore", "daysAfter", "eventDate", "grokSearchMode", "collectCatalogs", "enableTwitter", "useGrokSearch", "backup", "reprocess", "regen"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("input", () => {
+      if (id === "eventDate" && (document.getElementById("crawlEventDialog") as HTMLDialogElement | null)?.open) return;
+      updateCrawlDateRange();
+      updateCrawlSettingsStatus();
+      saveFormValues();
+      scheduleCrawlMetaSave();
+    });
+    document.getElementById(id)?.addEventListener("change", () => {
+      if (id === "eventDate" && (document.getElementById("crawlEventDialog") as HTMLDialogElement | null)?.open) return;
+      updateCrawlDateRange();
+      updateCrawlSettingsStatus();
+      saveFormValues();
+      scheduleCrawlMetaSave();
+      if (id === "grokSearchMode") void refreshGrokAvailability();
+      if (id === "collectCatalogs" || id === "enableTwitter" || id === "useGrokSearch") {
+        void refreshGrokAvailability();
+      }
+    });
+  });
+  document.getElementById("crawlModelsDetailsBtn")?.addEventListener("click", () => {
+    moveCrawlModelSelectsIntoDialog();
+    document.querySelectorAll<HTMLElement>("[data-model-section]").forEach((section) => { section.hidden = false; });
+    openNativeDialog("crawlModelSettingsDialog");
+  });
+  document.getElementById("crawlManagePresetsBtn")?.addEventListener("click", () => {
+    renderCrawlPresets();
+    openNativeDialog("crawlPresetDialog");
+  });
+  document.getElementById("crawlSavePresetBtn")?.addEventListener("click", () => {
+    openNativeDialog("crawlPresetDialog");
+    (document.getElementById("crawlPresetName") as HTMLInputElement | null)?.focus();
+  });
+  document.getElementById("crawlPresetSelect")?.addEventListener("change", () => {
+    const name = controlValue("crawlPresetSelect");
+    const preset = crawlPresets.find((item) => item.name === name);
+    if (preset) applyCrawlPreset(preset.value);
+  });
+  document.getElementById("crawlPresetCreateBtn")?.addEventListener("click", () => {
+    const name = controlValue("crawlPresetName");
+    if (!name) {
+      resultEl.textContent = "プリセット名を入力してください";
+      return;
+    }
+    crawlPresets = upsertCrawlPreset(crawlPresets, name, captureCrawlPreset());
+    writeCrawlPresets(localStorage, crawlPresets, CRAWL_PRESETS_STORAGE_KEY);
+    renderCrawlPresets();
+    const select = document.getElementById("crawlPresetSelect") as HTMLSelectElement | null;
+    if (select) select.value = name.trim().replace(/\s+/g, " ").slice(0, 80);
+    closeNativeDialog("crawlPresetDialog");
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-crawl-model-settings]").forEach((button) => {
+    button.addEventListener("click", () => {
+      moveCrawlModelSelectsIntoDialog(button.dataset.crawlModelSettings);
+      openNativeDialog("crawlModelSettingsDialog");
+      document.querySelectorAll<HTMLElement>("[data-model-section]").forEach((section) => {
+        section.hidden = Boolean(button.dataset.crawlModelSettings) && section.dataset.modelSection !== button.dataset.crawlModelSettings;
+      });
+    });
+  });
+}
 
 function pushUnique(target: string[], values: string[]) {
   for (const value of values) {
@@ -8287,10 +9120,33 @@ function buildEventSourcesPayload(
   mapRaw: string,
   promptRaw: string,
 ): { eventSources: EventSourcePayload[]; mapUrls: string[] } {
+  const storedSources = crawlSources.filter((source) => sourceUrls.includes(source.url));
+  if (storedSources.length > 0) {
+    const common = crawlCommonPrompt.trim() || splitPromptSections(promptRaw, sourceUrls).common;
+    const eventSources = sourceUrls.map((url, index) => {
+      const stored = storedSources.find((source) => source.url === url);
+      const fallback = stored || {
+        name: `ソース${index + 1}`,
+        url,
+        map_urls: [],
+        catalog_additional_prompt: "",
+      };
+      return {
+        name: fallback.name,
+        url,
+        map_urls: fallback.map_urls.length ? [...fallback.map_urls] : undefined,
+        catalog_additional_prompt: promptForSource(common, fallback.catalog_additional_prompt),
+      } satisfies EventSourcePayload;
+    });
+    return {
+      eventSources,
+      mapUrls: Array.from(new Set(eventSources.flatMap((source) => source.map_urls || []))),
+    };
+  }
   const mapConfig = parseEventMapConfig(mapRaw, sourceUrls);
   const promptConfig = parseEventPromptConfig(promptRaw, sourceUrls);
   const eventSources = sourceUrls.map((url) => {
-    const source: EventSourcePayload = { url };
+    const source: EventSourcePayload = { name: `ソース${sourceUrls.indexOf(url) + 1}`, url };
     const mapUrls = mapConfig.byUrl.get(url) ?? [];
     if (mapUrls.length) source.map_urls = mapUrls;
     const explicitSourcePrompt = promptConfig.sourcePrompts.get(url)?.trim() || "";
@@ -8323,6 +9179,7 @@ function buildPipelinePayload() {
     (document.getElementById("additionalPrompt") as HTMLTextAreaElement).value,
   );
   const sourceConfig = buildEventSourcesPayload(sourceUrls, mapRaw, additionalPrompt);
+  const crawlSettings = currentCrawlSettings();
   const eventDate =
     (document.getElementById("eventDate") as HTMLInputElement).value ||
     normalizeDateInputValue(event.date);
@@ -8340,10 +9197,12 @@ function buildPipelinePayload() {
     url: eventUrl,
     urls: sourceUrls,
     event_sources: sourceConfig.eventSources,
+    crawl_settings: crawlSettings,
     model: textModel,
-    output_dir: (
+    // 実行先は任意の表示用outputDirではなく、active event ownerに固定する。
+    output_dir: getActiveEventDir() || (
       document.getElementById("pipelineOutputDir") as HTMLInputElement
-    ).value,
+    )?.value || "",
     text_llm_provider: providerConfigValue(textProvider),
     text_llm_cli_models: selectedTextCliModelMap(),
     text_llm_cli_efforts: selectedTextCliEffortMap(),
@@ -8366,24 +9225,28 @@ function buildPipelinePayload() {
     oshinagaki_post: selectedCatalogPostRole(),
     map_url: sourceConfig.mapUrls[0] || "",
     map_urls: sourceConfig.mapUrls,
-    enable_twitter_catalog: boolFromSelect("enableTwitter"),
+    collect_catalogs: crawlSettings.collect_catalogs,
+    enable_twitter_catalog: crawlSettings.enable_twitter_catalog,
+    use_grok_search: crawlSettings.use_grok_search,
+    grok_search_mode: crawlSettings.grok_search_mode,
     tweet_llm_cli_providers: selectedTweetProviders(),
     tweet_llm_cli_models: selectedTweetModelMap(),
     tweet_llm_cli_efforts: selectedTweetEffortMap(),
     tweet_llm_cli_timeout: 900,
-    reprocess: boolFromSelect("reprocess"),
-    regenerate_coordinates: boolFromSelect("regen"),
-    skip_circle_images: boolFromSelect("skipCircleImages"),
-    verbose: boolFromSelect("verbose"),
+    backup: crawlSettings.backup,
+    reprocess: crawlSettings.reprocess,
+    regenerate_coordinates: crawlSettings.regenerate_coordinates,
+    skip_circle_images: crawlSettings.skip_circle_images,
+    verbose: crawlSettings.verbose,
     event_date: eventDate,
     event_name: eventName,
     catalog_additional_prompt: additionalPrompt,
     cookie_file: getCookieFilePathForRun(),
     days_before: Number(
-      (document.getElementById("daysBefore") as HTMLInputElement)?.value || "30",
+      String(crawlSettings.days_before),
     ),
     days_after: Number(
-      (document.getElementById("daysAfter") as HTMLInputElement)?.value || "7",
+      String(crawlSettings.days_after),
     ),
     // 通常の run_main_pipeline 経路でも OCR 設定を保持する。auto_place の
     // 専用経路だけに渡すと GUIで選んだモデル/venvが座標再生成時に失われる。
@@ -8411,23 +9274,60 @@ function isValidEventDate(value: unknown): value is string {
 ).addEventListener("click", async () => {
   if (!canStartPipeline(operationState)) {
     resultEl.textContent = "別のイベント処理を実行中です。完了後に再実行してください。";
+    updateCrawlSettingsStatus("別のイベント処理を実行中です。完了後に再実行してください。");
     return;
   }
   applyOperationEvent({ type: "request-pipeline" });
   setEventPipelineButtonsDisabled(true);
+  let pipelineRunState: "complete" | "error" | "invalid" = "complete";
   try {
+  const crawlSettings = currentCrawlSettings();
+  const formSources = ensureCrawlSourcesFromForm();
+  const grokActive = isGrokSearchActive(crawlSettings);
+  if (grokActive) await refreshGrokAvailability();
+  const savedEventForMismatch = activeEventSlug
+    ? eventList.find((event) => event.slug === activeEventSlug)
+    : null;
+  // meta flushの前に保存済みURLをcaptureする。flush後のev.meta参照だと
+  // 入力値で上書きされ、不一致確認が常に消える。
+  const savedUrlsBeforeMetaFlush = savedEventForMismatch
+    ? crawlLoadedSourceOwner === crawlOwnerKey() && crawlLoadedSourceHasData
+      ? [...crawlLoadedSourceUrls]
+      : [...(savedEventForMismatch.meta.event_urls || (savedEventForMismatch.meta.event_url ? [savedEventForMismatch.meta.event_url] : []))]
+    : [];
+  const validation = validateCrawlRequest({
+    settings: crawlSettings,
+    sources: formSources,
+    eventDate: controlValue("eventDate"),
+    activeEventSelected: Boolean(activeEventSlug && eventJsonData),
+    authErrors: grokActive && (
+      grokAvailabilityState?.mode !== crawlSettings.grok_search_mode ||
+      grokAvailabilityState?.available !== true
+    )
+      ? [`Grok ${crawlSettings.grok_search_mode}の利用可否を確認できないため実行を停止しました。再確認してから実行してください。`]
+      : [],
+  });
+  updateCrawlSettingsStatus(crawlValidationMessage(validation));
+  if (!validation.ok) {
+    pipelineRunState = "invalid";
+    resultEl.textContent = `実行前チェックで停止: ${crawlValidationMessage(validation)}`;
+    const bar = document.querySelector<HTMLElement>(".crawl-run-bar");
+    if (bar) bar.dataset.state = "invalid";
+    return;
+  }
   const preflightPlan = await preflightSelectedModels(
-    modelPreflightSlotsForOperation(
-      "pipeline",
-      boolFromSelect("enableTwitter"),
-    ),
+    crawlModelPreflightSlots(crawlSettings),
   );
-  if (!preflightPlan) return;
+  if (!preflightPlan) {
+    pipelineRunState = "invalid";
+    return;
+  }
   const pendingCrawlMeta = captureCrawlMetaSnapshot();
   cancelCrawlMetaSave();
   await flushCrawlMetaSnapshot(pendingCrawlMeta, INTERNAL_OPERATION_SAVE);
   const initialSave = await saveNow(INTERNAL_OPERATION_SAVE);
   if (!initialSave.ok) {
+    pipelineRunState = "error";
     resultEl.textContent = `実行前のevent.json保存に失敗しました: ${String(initialSave.error)}`;
     return;
   }
@@ -8436,30 +9336,28 @@ function isValidEventDate(value: unknown): value is string {
     buildPipelinePayload(),
     preflightPlan,
   );
-  if (!payload.url) {
+  if (!crawlSettings.reprocess && !payload.url) {
+    pipelineRunState = "invalid";
     resultEl.textContent =
       "イベントURLが未設定です。イベントURLを入力してから実行してください。";
     return;
   }
 
-  // クロール実行前: URLの不一致チェック
-  if (activeEventSlug && payload.url) {
+  // クロール実行前: URLの不一致チェック。再処理ではURL不要のため省略。
+  if (!crawlSettings.reprocess && activeEventSlug && payload.url) {
     const ev = eventList.find((e) => e.slug === activeEventSlug);
-    const savedUrls = ev?.meta.event_urls?.length
-      ? ev.meta.event_urls
-      : ev?.meta.event_url
-        ? [ev.meta.event_url]
-        : [];
+    const savedUrls = savedUrlsBeforeMetaFlush;
     const savedUrl = savedUrls.map((url) => url.replace(/\/+$/, "")).join("\n");
     const formUrls = (payload.urls?.length ? payload.urls : [payload.url]) as string[];
     const formUrl = formUrls.map((url) => url.replace(/\/+$/, "")).join("\n");
-    if (savedUrl && savedUrl !== formUrl) {
+    if (crawlLoadedSourceHasData && savedUrl && savedUrl !== formUrl) {
       const choice = await showCrawlMismatchDialog(
         formUrl,
         savedUrl,
         ev?.meta.name || activeEventSlug,
       );
       if (choice === "cancel") {
+        pipelineRunState = "invalid";
         resultEl.textContent = "パイプラインをキャンセルしました。";
         return;
       }
@@ -8485,6 +9383,8 @@ function isValidEventDate(value: unknown): value is string {
               date: payload.event_date || null,
               event_url: formUrls[0] || null,
               event_urls: formUrls.length ? formUrls : null,
+              event_sources: ensureCrawlSourcesFromForm(),
+              crawl_settings: crawlSettings,
               created_at: new Date().toISOString(),
               source: "desktop_created",
               },
@@ -8496,6 +9396,7 @@ function isValidEventDate(value: unknown): value is string {
           await selectEvent(newSlug, INTERNAL_OPERATION_SAVE);
           payload.output_dir = res.dir;
         } catch (e) {
+          pipelineRunState = "error";
           resultEl.textContent = `新規イベント作成エラー: ${String(e)}`;
           return;
         }
@@ -8509,11 +9410,29 @@ function isValidEventDate(value: unknown): value is string {
         try {
           await writeEventMetaSnapshot(ev, nextMeta);
         } catch (error) {
+          pipelineRunState = "error";
           resultEl.textContent = `イベントURL保存エラー: ${String(error)}`;
           return;
         }
       }
     }
+  }
+
+  // 再処理では既存eventを必須とし、backendへURLを渡さない。
+  if (crawlSettings.reprocess) {
+    const eventSlug = activeEventSlug;
+    const outputDir = getActiveEventDir();
+    const eventFile = controlValue("eventJsonHidden");
+    if (!eventSlug || !outputDir || !eventFile || !eventJsonData ||
+      !eventPathsEqual(eventFile, eventJsonPathForDir(outputDir))) {
+      pipelineRunState = "invalid";
+      resultEl.textContent = "再処理には選択イベントのevent.jsonが必要です。イベントを選び直してください。";
+      return;
+    }
+    payload.output_dir = outputDir;
+    payload.url = "";
+    payload.urls = [];
+    payload.event_sources = [];
   }
 
   // テーブル・画像表示をクリアしてファイルロックを解放
@@ -8526,18 +9445,36 @@ function isValidEventDate(value: unknown): value is string {
     if (ev) {
       const mapInput = (document.getElementById("mapUrl") as HTMLTextAreaElement).value;
       const mapConfig = parseEventMapConfig(mapInput, payload.urls || []);
+      const sourceMeta = ensureCrawlSourcesFromForm().map((source) => ({
+        ...source,
+        map_urls: [...source.map_urls],
+        catalog_additional_prompt: source.catalog_additional_prompt.trim(),
+      }));
       const nextMeta = {
         ...cloneJsonSnapshot(ev.meta),
-        event_url: payload.url || null,
-        event_urls: payload.urls?.length ? payload.urls : null,
-        map_config:
-          (payload.urls?.length || 0) > 1 ? mapInput || null : null,
-        map_url: mapConfig.allMapUrls[0] || mapInput || null,
-        additional_prompt: payload.catalog_additional_prompt || null,
+        event_url: crawlSettings.reprocess ? ev.meta.event_url ?? null : payload.url || null,
+        event_urls: crawlSettings.reprocess
+          ? ev.meta.event_urls ?? null
+          : payload.urls?.length ? payload.urls : null,
+        crawl_data_source_urls: crawlSettings.reprocess
+          ? ev.meta.crawl_data_source_urls ?? null
+          : ev.meta.crawl_data_source_urls ?? null,
+        map_config: crawlSettings.reprocess
+          ? ev.meta.map_config ?? null
+          : (payload.urls?.length || 0) > 1 ? mapInput || null : null,
+        map_url: crawlSettings.reprocess
+          ? ev.meta.map_url ?? null
+          : mapConfig.allMapUrls[0] || mapInput || null,
+        additional_prompt: crawlSettings.reprocess
+          ? ev.meta.additional_prompt ?? null
+          : payload.catalog_additional_prompt || null,
+        event_sources: sourceMeta.length ? sourceMeta : null,
+        crawl_settings: currentCrawlSettings(),
       };
       try {
         await writeEventMetaSnapshot(ev, nextMeta);
       } catch (error) {
+        pipelineRunState = "error";
         resultEl.textContent = `クロール情報保存エラー: ${String(error)}`;
         return;
       }
@@ -8552,15 +9489,18 @@ function isValidEventDate(value: unknown): value is string {
     false,
   );
   if (!externalReloadOwner) {
+    pipelineRunState = "error";
     resultEl.textContent =
       "実行前のイベント所有権captureに失敗したため、パイプラインを中止しました。";
     return;
   }
 
   // 再処理モードの場合はプレビューなしで直接実行
-  if (boolFromSelect("reprocess")) {
-    await runJob("run_main_pipeline", payload, true);
+  if (crawlSettings.reprocess) {
+    const response = await runJob("run_main_pipeline", payload, true);
+    if (!response?.ok) pipelineRunState = "error";
     if (!(await reloadExternalEvent(externalReloadOwner))) {
+      pipelineRunState = "error";
       resultEl.textContent =
         "パイプライン完了後のイベント再読み込みに失敗しました。";
     }
@@ -8600,10 +9540,17 @@ function isValidEventDate(value: unknown): value is string {
       site_parsing: payload.site_parsing,
       oshinagaki_post: payload.oshinagaki_post,
       catalog_additional_prompt: payload.catalog_additional_prompt,
+      event_sources: payload.event_sources,
+      collect_catalogs: payload.collect_catalogs,
+      enable_twitter_catalog: payload.enable_twitter_catalog,
+      use_grok_search: payload.use_grok_search,
+      grok_search_mode: payload.grok_search_mode,
+      days_before: payload.days_before,
+      days_after: payload.days_after,
       cookie_file: payload.cookie_file,
     })) as any;
   } catch (e) {
-    resultEl.textContent = `プレビュー解析失敗: ${String(e)}。フルパイプラインを実行します...`;
+    resultEl.textContent = `プレビュー解析失敗: ${String(e)}。収集処理を実行します...`;
     parseResult = null;
   }
 
@@ -8619,6 +9566,7 @@ function isValidEventDate(value: unknown): value is string {
       payload,
     );
     if (!approved) {
+      pipelineRunState = "invalid";
       resultEl.textContent = "パイプラインをキャンセルしました。";
       circleEditorEl.innerHTML = "";
       return;
@@ -8626,13 +9574,20 @@ function isValidEventDate(value: unknown): value is string {
   }
 
   // Phase 2: フルパイプライン
-  resultEl.textContent = "フルパイプライン実行中...";
+  resultEl.textContent = "収集処理を実行中...";
   }
-  await runJob("run_main_pipeline", payload, true);
+  const pipelineResponse = await runJob("run_main_pipeline", payload, true);
+  if (!pipelineResponse?.ok) pipelineRunState = "error";
   if (!(await reloadExternalEvent(externalReloadOwner))) {
+    pipelineRunState = "error";
     resultEl.textContent =
       "パイプライン完了後のイベント再読み込みに失敗したため、後続処理を中止しました。";
     return;
+  }
+  if (payload.urls?.length) {
+    crawlLoadedSourceUrls = [...payload.urls];
+    crawlLoadedSourceOwner = crawlOwnerKey();
+    crawlLoadedSourceHasData = true;
   }
 
   // パイプライン完了後: フォルダ名リネーム（スクレイピングで名前が取得された場合）
@@ -8647,6 +9602,7 @@ function isValidEventDate(value: unknown): value is string {
       if (newSlug) {
         const renamedOwner = captureExternalEventReloadOwner();
         if (!renamedOwner || renamedOwner.slug !== newSlug) {
+          pipelineRunState = "error";
           logExternalReloadFailure(
             "renamed-owner-missing",
             renamedOwner ?? externalReloadOwner,
@@ -8656,6 +9612,7 @@ function isValidEventDate(value: unknown): value is string {
           return;
         }
         if (!(await reloadExternalEvent(renamedOwner))) {
+          pipelineRunState = "error";
           resultEl.textContent =
             "パイプライン後のイベントrename結果を再読み込みできなかったため、後続処理を中止しました。";
           return;
@@ -8678,11 +9635,18 @@ function isValidEventDate(value: unknown): value is string {
       scheduleAutoSave();
     }
   }
+  } catch (error) {
+    pipelineRunState = "error";
+    resultEl.textContent = `パイプライン実行エラー: ${String(error)}`;
   } finally {
     if (isPipelineOperation(operationState)) {
       applyOperationEvent({ type: "finish-pipeline" });
     }
     setEventPipelineButtonsDisabled(false);
+    const bar = document.querySelector<HTMLElement>(".crawl-run-bar");
+    if (bar) bar.dataset.state = pipelineRunState;
+    const state = document.getElementById("crawlRunState");
+    if (state) state.textContent = pipelineRunState === "complete" ? "完了" : pipelineRunState === "invalid" ? "設定確認が必要" : "エラー";
   }
 });
 
@@ -10176,6 +11140,12 @@ function parseYamlEventSources(raw: string): EventSourcePayload[] {
     }
     if (!current) continue;
 
+    const nameMatch = line.match(/^\s+name:\s*(.+)$/);
+    if (nameMatch) {
+      current.name = parseYamlScalar(nameMatch[1]);
+      continue;
+    }
+
     const mapListMatch = line.match(/^\s+map_urls:\s*$/);
     if (mapListMatch) {
       if (!current.map_urls) current.map_urls = [];
@@ -10281,9 +11251,12 @@ async function loadProjectConfig(): Promise<boolean> {
         eventSourceMaps;
 
     const outputDir = parseYamlValue(raw, "output_dir");
-    if (outputDir)
-      (document.getElementById("pipelineOutputDir") as HTMLInputElement).value =
-        outputDir;
+    if (outputDir) {
+      // 旧設定は表示用にのみ読み込む。実行時のowner pathは選択イベントで
+      // 上書きし、任意フォルダを別イベントへ書き込まない。
+      const visibleOutputDir = document.getElementById("outputDir") as HTMLInputElement | null;
+      if (visibleOutputDir && !activeEventSlug) visibleOutputDir.value = outputDir;
+    }
 
     const models = parseYamlList(raw, "models");
     const modelPreferences: ModelControlPreferences = {};
@@ -10466,6 +11439,12 @@ async function loadProjectConfig(): Promise<boolean> {
     );
     const preferLegacyCli =
       parseYamlNestedValue(raw, "site_parsing", "prefer_cli") !== "false";
+    const structureFallbackEnabled = parseOptionalBoolean(
+      parseYamlNestedValue(raw, "site_parsing", "fallback_enabled"),
+    );
+    if (modelPreferences.siteStructure && structureFallbackEnabled !== undefined) {
+      modelPreferences.siteStructure.fallback_enabled = structureFallbackEnabled;
+    }
     if (structureFallbackProvider && structureFallbackModel) {
       legacySiteStructureFallback = {
         fallback_provider: textProviderValueFromConfig(
@@ -10525,7 +11504,30 @@ async function loadProjectConfig(): Promise<boolean> {
       (document.getElementById("useGrokSearch") as HTMLSelectElement).value =
         useGrokSearch;
 
+    const collectCatalogs = parseYamlValue(raw, "collect_catalogs");
+    const grokSearchMode = parseYamlValue(raw, "grok_search_mode");
+    const backup = parseYamlValue(raw, "backup");
+    const reprocess = parseYamlValue(raw, "reprocess");
+    const regenerateCoordinates = parseYamlValue(raw, "regenerate_coordinates");
+    const daysBefore = parseYamlValue(raw, "days_before");
+    const daysAfter = parseYamlValue(raw, "days_after");
+    const verbose = parseYamlValue(raw, "verbose");
     const skipCircleImages = parseYamlValue(raw, "skip_circle_images");
+    projectCrawlSettings = normalizeCrawlSettings({
+      collect_catalogs: parseOptionalBoolean(collectCatalogs),
+      enable_twitter_catalog: parseOptionalBoolean(enableTwitter),
+      use_grok_search: parseOptionalBoolean(useGrokSearch),
+      grok_search_mode: grokSearchMode,
+      backup: parseOptionalBoolean(backup),
+      reprocess: parseOptionalBoolean(reprocess),
+      regenerate_coordinates: parseOptionalBoolean(regenerateCoordinates),
+      skip_circle_images: parseOptionalBoolean(skipCircleImages),
+      days_before: daysBefore,
+      days_after: daysAfter,
+      verbose: parseOptionalBoolean(verbose),
+    }, projectCrawlSettings);
+    applyCrawlSettingsToControls(projectCrawlSettings);
+
     if (skipCircleImages)
       (document.getElementById("skipCircleImages") as HTMLSelectElement).value =
         skipCircleImages;
@@ -10632,6 +11634,7 @@ function buildConfigYaml(): string {
     ...yamlMapLines("cli_effort_map", siteStructureRole.cli_effort_map, "  "),
     ...(siteStructureRole.fallback_provider
       ? [
+          `  fallback_enabled: ${siteStructureRole.fallback_enabled === false ? "false" : "true"}`,
           `  fallback_provider: "${yamlQuote(String(siteStructureRole.fallback_provider))}"`,
           `  fallback_model: "${yamlQuote(String(siteStructureRole.fallback_model || ""))}"`,
           `  fallback_effort: "${yamlQuote(String(siteStructureRole.fallback_effort || ""))}"`,
@@ -10661,23 +11664,23 @@ function buildConfigYaml(): string {
           "urls:",
           ...configUrls.map((url) => `  - "${yamlQuote(url)}"`),
         ]
-      : [`url: "${yamlQuote(val("eventUrl"))}"`];
+      : configUrls.length === 1
+        ? [`url: "${yamlQuote(configUrls[0])}"`, "urls:", `  - "${yamlQuote(configUrls[0])}"`]
+        : [`url: ""`, "urls: []"];
   const mapYamlLines =
     configSource.mapUrls.length > 0
       ? [
           `map_url: "${yamlQuote(configSource.mapUrls[0])}"`,
-          ...(configSource.mapUrls.length > 1
-            ? ["map_urls:", ...configSource.mapUrls.map((url) => `  - "${yamlQuote(url)}"`)]
-            : []),
+          "map_urls:",
+          ...configSource.mapUrls.map((url) => `  - "${yamlQuote(url)}"`),
         ]
-      : [`map_url: ""`];
-  const eventSourcesYamlLines =
-    configSource.eventSources.length > 1 ||
-    configSource.eventSources.some((source) => source.map_urls?.length)
+      : [`map_url: ""`, "map_urls: []"];
+  const eventSourcesYamlLines = configSource.eventSources.length
       ? [
           "event_sources:",
           ...configSource.eventSources.flatMap((source) => [
             `  - url: "${yamlQuote(source.url)}"`,
+            ...(source.name ? [`    name: "${yamlQuote(source.name)}"`] : []),
             ...(source.map_urls?.length
               ? [
                   "    map_urls:",
@@ -10694,7 +11697,7 @@ function buildConfigYaml(): string {
               : []),
           ]),
         ]
-      : [];
+      : ["event_sources: []"];
 
   return [
     "# Event AutoPin 設定",
@@ -10725,10 +11728,17 @@ function buildConfigYaml(): string {
     ...siteParsingYamlLines,
     ...catalogPostYamlLines,
     "",
+    `collect_catalogs: ${sel("collectCatalogs")}`,
     `skip_circle_images: ${sel("skipCircleImages")}`,
     "",
     `enable_twitter_catalog: ${sel("enableTwitter")}`,
     `use_grok_search: ${sel("useGrokSearch")}`,
+    `grok_search_mode: "${yamlQuote(controlValue("grokSearchMode") || "api")}"`,
+    `backup: ${sel("backup")}`,
+    `reprocess: ${sel("reprocess")}`,
+    `regenerate_coordinates: ${sel("regen")}`,
+    `days_before: ${controlValue("daysBefore") || "30"}`,
+    `days_after: ${controlValue("daysAfter") || "7"}`,
     "",
     `verbose: ${sel("verbose")}`,
     "",
@@ -10738,13 +11748,17 @@ function buildConfigYaml(): string {
 }
 
 async function saveProjectConfig() {
-  try {
-    await invoke("save_project_config", {
-      projectRoot: projectRootEl.value,
-      yamlContent: buildConfigYaml(),
-    });
-  } catch (e) {
-    // 保存失敗は無視
+  const response = await invokeBridgeJob<Record<string, unknown>>(
+    "save_crawl_project_config",
+    {
+      project_root: projectRootEl.value,
+      yaml_content: buildConfigYaml(),
+    },
+    currentBridgeJobOptions(15_000),
+  );
+  const bridge = response.bridge as Record<string, unknown> | undefined;
+  if (!response.ok || bridge?.status === "error") {
+    throw new Error(String(bridge?.error || response.stderr || "設定保存に失敗しました"));
   }
 }
 
@@ -10759,6 +11773,10 @@ const FORM_IDS = [
   "siteStructureModelProvider",
   "siteStructureModel",
   "siteStructureReasoningEffort",
+  "siteStructureFallbackEnabled",
+  "siteStructureFallbackModelProvider",
+  "siteStructureFallbackModel",
+  "siteStructureFallbackReasoningEffort",
   "catalogPostModelProvider",
   "catalogPostModel",
   "catalogPostReasoningEffort",
@@ -10780,9 +11798,11 @@ const FORM_IDS = [
   "mapUrl",
   "daysBefore",
   "daysAfter",
+  "collectCatalogs",
   "backup",
   "enableTwitter",
   "useGrokSearch",
+  "grokSearchMode",
   "reprocess",
   "regen",
   "skipCircleImages",
@@ -10853,6 +11873,15 @@ function restoreFormValues() {
         effort: data.siteStructureReasoningEffort,
       },
       "text",
+    );
+    hydrateSiteStructureFallbackControls(
+      {
+        fallback_provider: data.siteStructureFallbackModelProvider,
+        fallback_model: data.siteStructureFallbackModel,
+        fallback_effort: data.siteStructureFallbackReasoningEffort,
+        fallback_enabled: data.siteStructureFallbackEnabled !== "false",
+      },
+      null,
     );
     hydrateRoleControls(
       "catalogPostModelProvider",
@@ -11237,7 +12266,10 @@ initialConfigPromise
   })
   .then((loadedProjectConfig) => {
     if (!loadedProjectConfig) restoreFormValues();
-    return loadModelCatalog();
+    return loadModelCatalog().then(() => {
+      void refreshGrokAvailability();
+      updateCrawlSettingsStatus();
+    });
   })
   .catch(async (e) => {
     resultEl.textContent = `設定読み込み警告: ${String(e)}`;
@@ -11246,6 +12278,8 @@ initialConfigPromise
     timeoutMsEl.value = String(DEFAULT_DESKTOP_TIMEOUT_MS);
     restoreFormValues();
     await loadModelCatalog();
+    void refreshGrokAvailability();
+    updateCrawlSettingsStatus();
   });
 
 // === マップ編集 ===
@@ -12960,6 +13994,8 @@ type EventMeta = {
   venue?: string | null;
   event_url?: string | null;
   event_urls?: string[] | null;
+  /** クロール成功時の比較用immutable provenance。通常はsource_urlsを優先する。 */
+  crawl_data_source_urls?: string[] | null;
   /** Rust側の旧alias。event_url clear時もurl:nullを併記して確実に消す。 */
   url?: string | null;
   map_url?: string | null;
@@ -12967,6 +14003,8 @@ type EventMeta = {
   additional_prompt?: string | null;
   created_at?: string;
   source?: string;
+  event_sources?: CrawlSource[] | null;
+  crawl_settings?: Partial<CrawlSettings> | null;
   memo?: string;
   completed?: boolean;
   shopping_started_at?: string;
@@ -13169,16 +14207,32 @@ function captureCrawlMetaSnapshot(): CrawlMetaSnapshot | null {
   const mapConfigValue = eventUrls.length > 1 && mapUrl ? mapUrl : null;
   const mapUrlValue = mapConfig.allMapUrls[0] || mapUrl || null;
   const additionalPromptValue = additionalPrompt || null;
+  const sourceMeta = ensureCrawlSourcesFromForm().map((source) => ({
+    ...source,
+    map_urls: [...source.map_urls],
+    catalog_additional_prompt: source.catalog_additional_prompt.trim(),
+  }));
+  const currentSettings = currentCrawlSettings();
+  const persistedSettings = crawlSettingsDaysAreValid(currentSettings)
+    ? currentSettings
+    : normalizeCrawlSettings(ev.meta.crawl_settings ?? projectCrawlSettings);
+  const ownerKey = eventMetaOwnerKey(ev.slug, ev.dir);
+  const provenanceUrls = crawlLoadedSourceOwner === ownerKey && crawlLoadedSourceHasData
+    ? crawlLoadedSourceUrls
+    : parseEventUrlList(ev.meta.crawl_data_source_urls);
   const meta: EventMeta = {
     ...cloneJsonSnapshot(ev.meta),
     name: eventName || ev.meta.name,
     date: eventDate || null,
     event_url: eventUrlValue,
     event_urls: eventUrlsValue,
+    crawl_data_source_urls: provenanceUrls.length ? [...provenanceUrls] : null,
     url: eventUrlValue,
     map_config: mapConfigValue,
     map_url: mapUrlValue,
     additional_prompt: additionalPromptValue,
+    event_sources: sourceMeta.length ? sourceMeta : null,
+    crawl_settings: persistedSettings,
   };
   return {
     ownerSlug: ev.slug,
@@ -13368,8 +14422,14 @@ async function renameEventDirLocked(
 
     const eventJsonPath = eventJsonPathForDir(res.new_dir);
     activeEventSlug = res.new_slug;
+    crawlSourcesHydratedForOwner = `${res.new_slug}\n${normalizeEventPath(res.new_dir)}`;
+    if (crawlLoadedSourceOwner === `${oldSlug}\n${normalizeEventPath(oldDir)}`) {
+      crawlLoadedSourceOwner = crawlSourcesHydratedForOwner;
+    }
     (document.getElementById("pipelineOutputDir") as HTMLInputElement).value =
       res.new_dir;
+    const renamedOutput = document.getElementById("outputDir") as HTMLInputElement | null;
+    if (renamedOutput) renamedOutput.value = res.new_dir;
     (document.getElementById("eventJsonHidden") as HTMLInputElement).value =
       eventJsonPath;
     (document.getElementById("editorJsonPath") as HTMLInputElement).value =
@@ -13526,8 +14586,6 @@ function updateActiveEventDisplay(meta: EventMeta, pending = false) {
   const name = meta.name || "（名前未設定）";
   const date = meta.date || "";
   const venue = meta.venue || "";
-  const info = [name, date, venue].filter(Boolean).join(" / ");
-
   let shoppingHtml = "";
   if (meta.shopping_started_at) {
     const start = formatDateTime(meta.shopping_started_at);
@@ -13539,12 +14597,35 @@ function updateActiveEventDisplay(meta: EventMeta, pending = false) {
 
   const crawlEl = document.getElementById("crawlActiveEvent");
   const pendingLabel = pending ? ' <span class="event-selection-pending">読み込み中…</span>' : "";
-  if (crawlEl)
-    crawlEl.innerHTML = `<strong>対象イベント:</strong> ${escapeHtml(info)}${pendingLabel}${shoppingHtml}`;
+  const eventParts = [
+    `<span class="event-active-name">${escapeHtml(name)}</span>`,
+    date ? `<span class="event-active-date">${escapeHtml(date)}</span>` : "",
+    venue ? `<span class="event-active-venue">${escapeHtml(venue)}</span>` : "",
+  ].filter(Boolean).join(" <span aria-hidden=\"true\">/</span> ");
+  const crawlName = meta.name?.trim() || "未設定";
+  const crawlVenue = meta.venue?.trim() || "未設定";
+  const normalizedDate = normalizeDateInputValue(date);
+  const validCrawlDate = isValidEventDate(normalizedDate);
+  const crawlDateText = validCrawlDate
+    ? new Intl.DateTimeFormat("ja-JP", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      }).format(new Date(`${normalizedDate}T00:00:00Z`))
+    : "未設定";
+  const crawlDateTime = validCrawlDate
+    ? `<time datetime="${escapeHtml(normalizedDate)}">${escapeHtml(crawlDateText)}</time>`
+    : `<span>未設定</span>`;
+  if (crawlEl) {
+    crawlEl.innerHTML =
+      `<span class="crawl-event-copy"><strong>対象イベント: ${escapeHtml(crawlName)}</strong><span class="crawl-event-venue">会場 ${escapeHtml(crawlVenue)}</span></span>` +
+      `<span class="crawl-event-date"><svg class="crawl-event-date-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 2v6m10-6v6M3 11h18"/></svg><span>開催日</span>${crawlDateTime}</span>` +
+      pendingLabel + shoppingHtml;
+  }
 
   const mobileEl = document.getElementById("mobileActiveEvent");
   if (mobileEl)
-    mobileEl.innerHTML = `<strong>対象イベント:</strong> ${escapeHtml(info)}${pendingLabel}${shoppingHtml}`;
+    mobileEl.innerHTML = `<strong>対象イベント:</strong> ${eventParts}${pendingLabel}${shoppingHtml}`;
   refreshEventSyncTargetDisplay();
 }
 
@@ -14882,6 +15963,12 @@ async function selectEventLocked(
   updateSidebarSelectionClasses();
   void syncDesktopPerfCounters();
   (document.getElementById("pipelineOutputDir") as HTMLInputElement).value = ev.dir;
+  const visibleOutputDir = document.getElementById("outputDir") as HTMLInputElement | null;
+  if (visibleOutputDir) {
+    visibleOutputDir.value = ev.dir;
+    visibleOutputDir.readOnly = true;
+    visibleOutputDir.setAttribute("aria-readonly", "true");
+  }
   (document.getElementById("eventJsonHidden") as HTMLInputElement).value = eventJsonPath;
   (document.getElementById("editorJsonPath") as HTMLInputElement).value = eventJsonPath;
   (document.getElementById("editorOutputJsonPath") as HTMLInputElement).value = eventJsonPath;
@@ -14895,6 +15982,8 @@ async function selectEventLocked(
     (typeof loadedEvent.url === "string" ? loadedEvent.url : "");
   (document.getElementById("eventDate") as HTMLInputElement).value =
     nextMeta.date || normalizeDateInputValue(loadedEvent.date);
+  const venueInput = document.getElementById("eventVenue") as HTMLInputElement | null;
+  if (venueInput) venueInput.value = nextMeta.venue || (typeof loadedEvent.venue === "string" ? loadedEvent.venue : "");
   (document.getElementById("mapUrl") as HTMLInputElement).value =
     nextMeta.map_config ||
     (typeof loadedEvent.map_config === "string" ? loadedEvent.map_config : "") ||
@@ -14902,6 +15991,7 @@ async function selectEventLocked(
     (typeof loadedEvent.map_url === "string" ? loadedEvent.map_url : "");
   (document.getElementById("additionalPrompt") as HTMLTextAreaElement).value =
     displayAdditionalPromptText(loadedAdditionalPrompt);
+  hydrateCrawlEditor(nextMeta, loadedEvent as Record<string, unknown>);
 
   // 選択切替ではsidebar全カードを再生成せず、active/pending classだけを差分更新。
   updateSidebarSelectionClasses();
@@ -14911,6 +16001,12 @@ async function selectEventLocked(
   loadMapImage();
   updateConcurrentEventSummary();
   updateActiveEventDisplay(nextMeta);
+  // owner/sessionとフォームのcommit後に、イベント固有の設定表示を確定する。
+  // pending load中はこの地点へ到達しないため、古いイベントのvalidationを
+  // 新イベントへ一瞬も表示しない。
+  updateCrawlDateRange();
+  updateCrawlSettingsStatus();
+  if (isGrokSearchActive(currentCrawlSettings())) void refreshGrokAvailability();
   publishDesktopPerf();
 
   const qrArea = document.getElementById("qrCodeArea")!;
@@ -15127,6 +16223,17 @@ document.getElementById("siteStructureModelProvider")?.addEventListener("change"
   );
   saveFormValues();
 });
+document.getElementById("siteStructureFallbackModelProvider")?.addEventListener("change", () => {
+  updateProviderModelSelect(
+    "siteStructureFallbackModelProvider",
+    "siteStructureFallbackModel",
+    "siteStructureFallbackReasoningEffort",
+    undefined,
+    "text",
+  );
+  updateModelExecutionOrderSummaries();
+  saveFormValues();
+});
 document.getElementById("catalogPostModelProvider")?.addEventListener("change", () => {
   updateProviderModelSelect(
     "catalogPostModelProvider",
@@ -15160,6 +16267,8 @@ document.getElementById("catalogPostFallbackModelProvider")?.addEventListener("c
   "visionFallbackReasoningEffort",
   "siteStructureModel",
   "siteStructureReasoningEffort",
+  "siteStructureFallbackModel",
+  "siteStructureFallbackReasoningEffort",
   "catalogPostModel",
   "catalogPostReasoningEffort",
   "catalogPostFallbackModel",
@@ -15167,6 +16276,7 @@ document.getElementById("catalogPostFallbackModelProvider")?.addEventListener("c
   "textFallbackEnabled",
   "imageFallbackEnabled",
   "catalogPostFallbackEnabled",
+  "siteStructureFallbackEnabled",
 ].forEach((id) => {
   document.getElementById(id)?.addEventListener("change", () => {
     if (id === "model") updateTextModelSelect((document.getElementById("model") as HTMLSelectElement).value);
@@ -15174,6 +16284,7 @@ document.getElementById("catalogPostFallbackModelProvider")?.addEventListener("c
     if (id === "visionModelId") updateVisionModelSelect((document.getElementById("visionModelId") as HTMLSelectElement).value);
     if (id === "visionFallbackModel") updateVisionFallbackModelSelect((document.getElementById("visionFallbackModel") as HTMLSelectElement).value);
     if (id === "siteStructureModel") updateProviderModelSelect("siteStructureModelProvider", "siteStructureModel", "siteStructureReasoningEffort", controlValue("siteStructureModel"), "text");
+    if (id === "siteStructureFallbackModel") updateProviderModelSelect("siteStructureFallbackModelProvider", "siteStructureFallbackModel", "siteStructureFallbackReasoningEffort", controlValue("siteStructureFallbackModel"), "text");
     if (id === "catalogPostModel") updateProviderModelSelect("catalogPostModelProvider", "catalogPostModel", "catalogPostReasoningEffort", controlValue("catalogPostModel"), "image");
     if (id === "catalogPostFallbackModel") updateProviderModelSelect("catalogPostFallbackModelProvider", "catalogPostFallbackModel", "catalogPostFallbackReasoningEffort", controlValue("catalogPostFallbackModel"), "image");
     updateModelExecutionOrderSummaries();
@@ -15184,6 +16295,7 @@ document.getElementById("catalogPostFallbackModelProvider")?.addEventListener("c
 // イベント名・日付: クロールフォーム → サイドバー同期（blur時のみ実行し入力中のフォーカスを奪わない）
 ["eventName", "eventDate"].forEach((id) => {
   document.getElementById(id)?.addEventListener("blur", async () => {
+    if ((document.getElementById("crawlEventDialog") as HTMLDialogElement | null)?.open) return;
     if (syncInProgress || !activeEventSlug) return;
     const currentSlug = activeEventSlug;
     const ev = eventList.find((e) => e.slug === activeEventSlug);
@@ -16127,6 +17239,8 @@ initPriorityColorSettings();
 initLogToggle();
 initEventMemo();
 initBudgetPanel();
+initCrawlEditorUi();
+updateCrawlSettingsStatus();
 
 // 起動時はイベント一覧だけを読み込み、詳細は選択時に遅延ロードする
 initialConfigPromise

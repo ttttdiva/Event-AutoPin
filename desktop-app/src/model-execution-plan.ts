@@ -106,6 +106,16 @@ export function applyModelPreflightToPayload<
     next["image_fallback_llm_enabled"] = false;
   }
 
+  if (disabled.has("site_structure_fallback")) {
+    const site = next["site_parsing"];
+    if (site && typeof site === "object" && !Array.isArray(site)) {
+      next["site_parsing"] = {
+        ...(site as Record<string, unknown>),
+        fallback_enabled: false,
+      };
+    }
+  }
+
   const post = next["oshinagaki_post"];
   if (
     disabled.has("oshinagaki_post") &&
@@ -126,7 +136,7 @@ export function formatModelPreflightIssue(issue: ModelPreflightIssue): string {
     ? "画像"
     : issue.slot === "oshinagaki_post"
       ? "おしながきポスト"
-      : issue.slot === "text" || issue.slot === "text_fallback"
+      : issue.slot === "text" || issue.slot === "text_fallback" || issue.slot === "site_structure" || issue.slot === "site_structure_fallback"
         ? "テキスト"
         : issue.slot;
   const kind = issue.fallback ? "予備" : "主";

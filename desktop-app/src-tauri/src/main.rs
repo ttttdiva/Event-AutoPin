@@ -4268,6 +4268,9 @@ const EVENT_META_KEYS: &[&str] = &[
     "map_url",
     "map_config",
     "additional_prompt",
+    "event_sources",
+    "crawl_settings",
+    "crawl_data_source_urls",
     "created_at",
     "source",
     "memo",
@@ -5951,6 +5954,134 @@ async def parse_anim_idx(text: str, clt: HttpClient) -> list[int]:
         let cleared: Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();
         assert!(cleared["event"].get("event_image").is_none());
         assert_eq!(cleared["event"]["maps"][0]["filename"], "maps/map_1.png");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn structured_event_meta_round_trips_across_list_load_and_write() {
+        let root = std::env::temp_dir().join(format!(
+            "eventtrail-structured-meta-test-{}",
+            std::process::id()
+        ));
+        let event_dir = root.join("events").join("structured-event");
+        let event_path = event_dir.join("event.json");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&event_dir).unwrap();
+
+        let event_sources = json!([
+            {
+                "name": "primary",
+                "url": "https://example.test/event",
+                "map_urls": ["https://example.test/map"],
+                "catalog_additional_prompt": "primary prompt"
+            },
+            {
+                "name": "secondary",
+                "url": "https://example.test/secondary"
+            }
+        ]);
+        let crawl_settings = json!({
+            "collect_catalogs": true,
+            "enable_twitter_catalog": false,
+            "use_grok_search": true,
+            "grok_search_mode": "build",
+            "days_before": 14,
+            "days_after": 3,
+            "backup": true,
+            "reprocess": false,
+            "regenerate_coordinates": true,
+            "skip_circle_images": true,
+            "verbose": false
+        });
+        let crawl_data_source_urls = json!([
+            "https://source.example.test/primary",
+            "https://source.example.test/secondary"
+        ]);
+        fs::write(
+            &event_path,
+            serde_json::to_vec_pretty(&json!({
+                "event": {
+                    "name": "before",
+                    "event_urls": ["https://legacy.test/event"],
+                    "map_config": "https://legacy.test/map",
+                    "additional_prompt": "legacy prompt",
+                    "event_sources": [{"name": "old", "url": "https://old.test"}],
+                    "crawl_settings": {"days_before": 1},
+                    "crawl_data_source_urls": ["https://old-source.test"],
+                    "future_field": {"keep": true}
+                },
+                "circles": [{"future_circle_field": 7}],
+                "metadata": {"opaque": {"keep": true}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        write_event_meta(
+            event_dir.to_string_lossy().to_string(),
+            json!({
+                "event_sources": event_sources.clone(),
+                "crawl_settings": crawl_settings.clone(),
+                "crawl_data_source_urls": crawl_data_source_urls.clone(),
+                "unknown_from_form": {"ignored": true}
+            }),
+        )
+        .unwrap();
+
+        let saved: Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();
+        assert_eq!(saved["event"]["event_sources"], event_sources);
+        assert_eq!(saved["event"]["crawl_settings"], crawl_settings);
+        assert_eq!(saved["event"]["crawl_data_source_urls"], crawl_data_source_urls);
+        assert_eq!(saved["event"]["event_urls"][0], "https://legacy.test/event");
+        assert_eq!(saved["event"]["map_config"], "https://legacy.test/map");
+        assert_eq!(saved["event"]["additional_prompt"], "legacy prompt");
+        assert_eq!(saved["event"]["future_field"]["keep"], true);
+        assert!(saved["event"].get("unknown_from_form").is_none());
+        assert_eq!(saved["circles"][0]["future_circle_field"], 7);
+        assert_eq!(saved["metadata"]["opaque"]["keep"], true);
+
+        // Omitted structured fields are not clears; both native readers expose
+        // the exact nested values written above.
+        write_event_meta(
+            event_dir.to_string_lossy().to_string(),
+            json!({"name": "after"}),
+        )
+        .unwrap();
+        let loaded = load_event_bundle(
+            event_path.to_string_lossy().to_string(),
+            event_dir.to_string_lossy().to_string(),
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(loaded["meta"]["event_sources"], event_sources);
+        assert_eq!(loaded["meta"]["crawl_settings"], crawl_settings);
+        assert_eq!(loaded["meta"]["crawl_data_source_urls"], crawl_data_source_urls);
+
+        let listed = list_event_dirs(root.to_string_lossy().to_string()).unwrap();
+        let listed_meta = &listed["events"][0]["meta"];
+        assert_eq!(listed_meta["event_sources"], event_sources);
+        assert_eq!(listed_meta["crawl_settings"], crawl_settings);
+        assert_eq!(listed_meta["crawl_data_source_urls"], crawl_data_source_urls);
+
+        // JSON null explicitly removes only the addressed known field.
+        write_event_meta(
+            event_dir.to_string_lossy().to_string(),
+            json!({"crawl_data_source_urls": Value::Null}),
+        )
+        .unwrap();
+        let cleared: Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();
+        assert!(cleared["event"].get("crawl_data_source_urls").is_none());
+        assert_eq!(cleared["event"]["crawl_settings"], crawl_settings);
+
+        write_event_meta(
+            event_dir.to_string_lossy().to_string(),
+            json!({"crawl_settings": Value::Null}),
+        )
+        .unwrap();
+        let cleared: Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();
+        assert!(cleared["event"].get("crawl_settings").is_none());
+        assert_eq!(cleared["event"]["event_sources"], event_sources);
+        assert_eq!(cleared["event"]["future_field"]["keep"], true);
         let _ = fs::remove_dir_all(&root);
     }
 
