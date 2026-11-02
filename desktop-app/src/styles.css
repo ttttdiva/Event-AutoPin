@@ -1218,7 +1218,6 @@ html.dark {
   }
 
   .model-fallback-details {
-    grid-column: 1 / -1;
     @apply rounded border border-gray-700 p-2;
   }
 
