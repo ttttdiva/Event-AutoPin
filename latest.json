@@ -1,9 +1,9 @@
 {
   "desktop": {
-    "version": "0.1.40",
-    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.40/EventAutoPin.exe",
-    "notes": "おしながきポストの予備モデル設定の横幅を揃えました",
-    "date": "2026-11-02"
+    "version": "0.1.41",
+    "url": "https://github.com/ttttdiva/Event-AutoPin/releases/download/desktop-v0.1.41/EventAutoPin.exe",
+    "notes": "クロール実行画面を2カラム化し、ソース・AIモデル設定と実行管理を統合。Grok検索3方式、設定検証、バックアップ、再処理の反映を改善。",
+    "date": "2026-11-03"
   },
   "mobile": {
     "version": "1.4.85",
